@@ -2,6 +2,7 @@
 
 mod input;
 mod layout;
+mod screenshot;
 mod state;
 mod winit;
 

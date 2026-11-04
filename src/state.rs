@@ -40,7 +40,7 @@ use smithay::{
 };
 use tracing::info;
 
-use crate::layout::{Layout, WinId};
+use crate::layout::{Drag, Layout, WinId};
 
 /// A toplevel navi knows about. It's unmapped until its first commit, when its app ID is known.
 pub struct Managed {
@@ -57,6 +57,8 @@ pub struct Navi {
     pub loop_signal: LoopSignal,
     pub layout: Layout,
     pub windows: Vec<Managed>,
+    /// A drag in navi's strip or edges, from press to release.
+    pub drag: Option<Drag>,
 
     compositor_state: CompositorState,
     xdg_shell_state: XdgShellState,
@@ -91,10 +93,23 @@ impl Navi {
             loop_signal,
             layout: Layout::default(),
             windows: Vec::new(),
+            drag: None,
             seat_state,
             popups: PopupManager::default(),
             seat,
         })
+    }
+
+    pub fn now_ms(&self) -> u64 {
+        self.start_time.elapsed().as_millis() as u64
+    }
+
+    pub fn pointer_px(&self) -> (i32, i32) {
+        px(self
+            .seat
+            .get_pointer()
+            .map(|p| p.current_location())
+            .unwrap_or_default())
     }
 
     pub fn surface_under(
@@ -234,6 +249,11 @@ impl Navi {
     }
 }
 
+/// The logical pixel containing `p`.
+pub fn px(p: Point<f64, Logical>) -> (i32, i32) {
+    (p.x.floor() as i32, p.y.floor() as i32)
+}
+
 #[derive(Default)]
 pub struct ClientState {
     pub compositor_state: CompositorClientState,
@@ -366,7 +386,7 @@ impl XdgShellHandler for Navi {
         surface.send_repositioned(token);
     }
 
-    // Tiled windows don't move or resize themselves; dragging arrives in step 2.
+    // Only navi's own strip and edges move and resize tiles; clients can't start a drag.
     fn move_request(&mut self, _: ToplevelSurface, _: wl_seat::WlSeat, _: Serial) {}
 
     fn resize_request(

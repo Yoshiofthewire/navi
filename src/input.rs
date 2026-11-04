@@ -1,7 +1,7 @@
 use smithay::{
     backend::input::{
         AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, InputBackend, InputEvent,
-        KeyboardKeyEvent, PointerAxisEvent, PointerButtonEvent,
+        KeyboardKeyEvent, MouseButton, PointerAxisEvent, PointerButtonEvent,
     },
     input::{
         keyboard::FilterResult,
@@ -10,7 +10,12 @@ use smithay::{
     utils::SERIAL_COUNTER,
 };
 
-use crate::state::Navi;
+use tracing::info;
+
+use crate::{
+    layout::Drag,
+    state::{Navi, px},
+};
 
 impl Navi {
     pub fn process_input_event<I: InputBackend>(&mut self, event: InputEvent<I>) {
@@ -41,7 +46,18 @@ impl Navi {
                     return;
                 };
                 let pos = event.position_transformed(geo.size) + geo.loc.to_f64();
-                let under = self.surface_under(pos);
+                let now = self.now_ms();
+                // navi's zones win over client surfaces, and clients see nothing of a drag.
+                let under = if let Some(drag) = self.drag.as_mut() {
+                    if drag.motion(&mut self.layout, px(pos), now) {
+                        self.apply_layout();
+                    }
+                    None
+                } else if self.layout.hit(px(pos)).is_some() {
+                    None
+                } else {
+                    self.surface_under(pos)
+                };
                 pointer.motion(
                     self,
                     under,
@@ -59,12 +75,45 @@ impl Navi {
                     return;
                 };
                 let serial = SERIAL_COUNTER.next_serial();
-                if event.state() == ButtonState::Pressed && !pointer.is_grabbed() {
-                    // Keyboard focus follows click.
-                    let clicked = self
-                        .space
-                        .element_under(pointer.current_location())
-                        .map(|(w, _)| w.clone());
+                let pos = pointer.current_location();
+                let left = event.button() == Some(MouseButton::Left);
+                let pressed = event.state() == ButtonState::Pressed;
+                if let Some(drag) = self.drag.take() {
+                    if left && !pressed {
+                        let now = self.now_ms();
+                        if let Some((what, tiles)) = drag.release(&mut self.layout, px(pos), now) {
+                            let tiles: Vec<_> = tiles.iter().map(|t| (t.id, &t.cells)).collect();
+                            info!(?tiles, "{what}");
+                        }
+                        self.apply_layout();
+                        // Hand the pointer back to whatever is under it now.
+                        let under = match self.layout.hit(px(pos)) {
+                            Some(_) => None,
+                            None => self.surface_under(pos),
+                        };
+                        let motion = MotionEvent {
+                            location: pos,
+                            serial,
+                            time: event.time_msec(),
+                        };
+                        pointer.motion(self, under, &motion);
+                        pointer.frame(self);
+                    } else {
+                        self.drag = Some(drag);
+                    }
+                    return;
+                }
+                if pressed && !pointer.is_grabbed() {
+                    let hit = self.layout.hit(px(pos));
+                    // Keyboard focus follows click, in a tile's zones too.
+                    let clicked = match hit {
+                        Some(h) => self
+                            .windows
+                            .iter()
+                            .find(|m| m.tile == Some(h.id()))
+                            .map(|m| m.window.clone()),
+                        None => self.space.element_under(pos).map(|(w, _)| w.clone()),
+                    };
                     let focus = clicked.as_ref().and_then(|w| {
                         self.space.raise_element(w, true);
                         w.toplevel().map(|t| t.wl_surface().clone())
@@ -80,6 +129,12 @@ impl Navi {
                             t.send_pending_configure();
                         }
                     });
+                    if hit.is_some() {
+                        if left {
+                            self.drag = Drag::press(&self.layout, px(pos));
+                        }
+                        return;
+                    }
                 }
                 pointer.button(
                     self,
