@@ -67,7 +67,7 @@ use tracing::{error, info, warn};
 
 use desktop::Entry;
 use icons::{Icons, Themes};
-use layout::{BAR_H, DIM, IconOf, Item, Layout, Rect, Slot};
+use layout::{BAR_H, DIM, INK, IconOf, Item, Layout, Rect, Slot};
 use menu::Menu;
 
 const BTN_LEFT: u32 = 0x110;
@@ -107,7 +107,12 @@ fn run() -> Result<(), String> {
     let conn = connect()?;
     let (globals, queue) = registry_queue_init::<Bar>(&conn).map_err(|e| e.to_string())?;
     let qh = queue.handle();
-    let need = |what: &str| format!("no {what}: navi-bar must be started by navi");
+    let need = |what: &str| {
+        format!(
+            "the compositor offers no {what}. navi gives it only to the navi-bar it starts \
+             itself; run navi, not navi-bar by hand"
+        )
+    };
     let compositor = CompositorState::bind(&globals, &qh).map_err(|_| need("wl_compositor"))?;
     let layer_shell = LayerShell::bind(&globals, &qh).map_err(|_| need("zwlr_layer_shell_v1"))?;
     let _manager: ZwlrForeignToplevelManagerV1 = globals
@@ -329,20 +334,30 @@ impl Bar {
     }
 
     fn key(&mut self, event: KeyEvent, serial: u32, qh: &QueueHandle<Self>) {
-        let Some(menu) = self.menu.as_mut() else {
+        let Some(menu) = self.menu.as_ref() else {
             return;
         };
         match event.keysym {
-            Keysym::Escape => return self.close_menu(),
-            Keysym::BackSpace => menu.pop(&self.entries),
-            Keysym::Up => menu.step(-1),
-            Keysym::Down => menu.step(1),
+            Keysym::Escape => self.close_menu(),
             Keysym::Return | Keysym::KP_Enter => {
                 if let Some(e) = menu.selected() {
                     self.launch(e, serial, qh);
                 }
-                return;
             }
+            _ => self.edit(event),
+        }
+    }
+
+    /// Typing and moving in the menu; the keys that repeat while held.
+    fn edit(&mut self, event: KeyEvent) {
+        let Some(menu) = self.menu.as_mut() else {
+            return;
+        };
+        match event.keysym {
+            Keysym::BackSpace => menu.pop(&self.entries),
+            Keysym::Up => menu.step(-1),
+            Keysym::Down => menu.step(1),
+            Keysym::Escape | Keysym::Return | Keysym::KP_Enter => return,
             _ => {
                 let text = event.utf8.unwrap_or_default();
                 for c in text.chars().filter(|c| !c.is_control()) {
@@ -370,15 +385,15 @@ impl Bar {
             })
             .collect();
         let app_ids: Vec<String> = self.shown().map(|w| w.app_id.clone()).collect();
-        let (query, rows) = match &self.menu {
-            Some(m) => (m.query(), m.rows().collect()),
-            None => ("", Vec::new()),
+        let (query, rows, scroll) = match &self.menu {
+            Some(m) => (m.query(), m.rows().collect(), m.scroll_pos()),
+            None => ("", Vec::new(), (0, 0)),
         };
         let rows: Vec<(usize, bool, &str)> = rows
             .into_iter()
             .map(|(e, sel)| (e, sel, self.entries[e].name.as_str()))
             .collect();
-        let items = l.draw(&slots, query, &rows);
+        let items = l.draw(&slots, query, &rows, scroll);
         for item in items {
             match item {
                 Item::Fill(r, rgb) => fill(&mut canvas, scaled(r, s), rgb),
@@ -413,14 +428,33 @@ impl Bar {
                 }
                 Item::Text(text, r, rgb) => {
                     if let Some(font) = &self.font {
-                        draw_text(
-                            &mut canvas,
-                            font,
-                            &text,
-                            scaled(r, s),
-                            TEXT_PX * s as f32,
-                            rgb,
-                        );
+                        let px = TEXT_PX * s as f32;
+                        draw_text(&mut canvas, font, &text, scaled(r, s), px, rgb);
+                    }
+                }
+                Item::Field(query, r) => {
+                    let r = scaled(r, s);
+                    let px = TEXT_PX * s as f32;
+                    let end = match &self.font {
+                        Some(font) => draw_text(&mut canvas, font, &query, r, px, INK),
+                        None => r.x,
+                    };
+                    // The caret: after the query, or before the placeholder.
+                    let h = (px * 1.3) as i32;
+                    let caret = Rect {
+                        x: end + s,
+                        y: r.y + (r.h - h) / 2,
+                        w: s,
+                        h,
+                    };
+                    fill(&mut canvas, caret, INK);
+                    if let (Some(font), true) = (&self.font, query.is_empty()) {
+                        let rest = Rect {
+                            x: caret.x + 4 * s,
+                            w: r.w - 4 * s,
+                            ..r
+                        };
+                        draw_text(&mut canvas, font, "Search", rest, px, DIM);
                     }
                 }
             }
@@ -486,12 +520,20 @@ fn placeholder(canvas: &mut Pixmap, r: Rect) {
     }
 }
 
-/// `text` in `font` at `px`, vertically centred in `r` and cut to its width.
-fn draw_text(canvas: &mut Pixmap, font: &fontdue::Font, text: &str, r: Rect, px: f32, rgb: u32) {
+/// `text` in `font` at `px`, vertically centred in `r` and cut to its width. Returns where the
+/// text ends.
+fn draw_text(
+    canvas: &mut Pixmap,
+    font: &fontdue::Font,
+    text: &str,
+    r: Rect,
+    px: f32,
+    rgb: u32,
+) -> i32 {
     let advance =
         |c: char| (font.lookup_glyph_index(c) != 0).then(|| font.metrics(c, px).advance_width);
     let Some(line) = font.horizontal_line_metrics(px) else {
-        return;
+        return r.x;
     };
     let baseline = r.y as f32 + (r.h as f32 - (line.ascent - line.descent)) / 2.0 + line.ascent;
     let [_, cr, cg, cb] = rgb.to_be_bytes();
@@ -525,6 +567,7 @@ fn draw_text(canvas: &mut Pixmap, font: &fontdue::Font, text: &str, r: Rect, px:
         }
         pen += m.advance_width;
     }
+    pen.round() as i32
 }
 
 /// Runs `e`'s argv with no shell, detached in its own process group, with nothing of navi-bar's
@@ -717,7 +760,13 @@ impl SeatHandler for Bar {
         if capability == Capability::Keyboard && self.keyboard.is_none() {
             self.keyboard = self
                 .seat_state
-                .get_keyboard::<Bar, Bar>(qh, &seat, None)
+                .get_keyboard_with_repeat::<Bar, Bar>(
+                    qh,
+                    &seat,
+                    None,
+                    self.loop_handle.clone(),
+                    Box::new(|bar, _, event| bar.edit(event)),
+                )
                 .ok();
         }
         if capability == Capability::Pointer && self.pointer.is_none() {

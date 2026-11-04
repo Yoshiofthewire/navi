@@ -67,6 +67,8 @@ pub enum Item {
     Icon(IconOf, Rect, f32),
     /// Text, left-aligned and vertically centred in the rect, truncated to its width.
     Text(String, Rect, u32),
+    /// The search line: the query with a caret after it, or a caret and a placeholder.
+    Field(String, Rect),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -166,24 +168,47 @@ impl Layout {
             })
     }
 
-    /// What to draw, back to front. `rows` are the menu's shown rows (entry, selected, name).
-    pub fn draw(&self, slots: &[Slot], query: &str, rows: &[(usize, bool, &str)]) -> Vec<Item> {
+    /// What to draw, back to front. `rows` are the menu's shown rows (entry, selected, name);
+    /// `scroll` is the first shown match and the number of matches.
+    pub fn draw(
+        &self,
+        slots: &[Slot],
+        query: &str,
+        rows: &[(usize, bool, &str)],
+        (top, total): (usize, usize),
+    ) -> Vec<Item> {
         let mut out = Vec::new();
         if let Some(p) = self.panel() {
             out.push(Item::Fill(p, BG));
             out.extend(border(p));
             let s = self.search(p);
-            let (text, color) = match query.is_empty() {
-                true => ("Search", DIM),
-                false => (query, INK),
-            };
             let line = Rect {
                 y: s.y + s.h - 2,
                 h: 1,
                 ..s
             };
             out.push(Item::Fill(line, ACCENT));
-            out.push(Item::Text(text.into(), inset_x(s, 8), color));
+            out.push(Item::Field(query.into(), inset_x(s, 8)));
+            if rows.is_empty() && !query.is_empty() {
+                let r = inset_x(self.row(p, 0), 8);
+                out.push(Item::Text("No matching apps".into(), r, DIM));
+            }
+            if total > ROWS {
+                // A scrollbar in the gutter right of the rows.
+                let track = Rect {
+                    x: p.x + p.w - 6,
+                    y: self.row(p, 0).y,
+                    w: 3,
+                    h: ROWS as i32 * ROW_H,
+                };
+                let (top, total) = (top as i32, total as i32);
+                let thumb = Rect {
+                    y: track.y + track.h * top / total,
+                    h: (track.h * ROWS as i32 / total).max(8),
+                    ..track
+                };
+                out.push(Item::Fill(thumb, DIM));
+            }
             for (k, &(entry, selected, name)) in rows.iter().enumerate() {
                 let r = self.row(p, k);
                 if selected {
@@ -320,7 +345,7 @@ mod tests {
                 minimized: true,
             },
         ];
-        let items = l.draw(&slots, "", &[]);
+        let items = l.draw(&slots, "", &[], (0, 0));
         let icon = |i: usize| {
             items.iter().find_map(|it| match it {
                 Item::Icon(IconOf::Window(w), r, a) if *w == i => Some((*r, *a)),
@@ -389,16 +414,49 @@ mod tests {
             .rows()
             .map(|(e, s)| (e, s, entries[e].name.as_str()))
             .collect();
-        let items = l.draw(&[Slot::default()], "kon", &rows);
-        assert!(
-            items
-                .iter()
-                .any(|it| matches!(it, Item::Text(t, _, INK) if t == "kon"))
-        );
+        let items = l.draw(&[Slot::default()], "kon", &rows, m.scroll_pos());
+        assert!(items.contains(&Item::Field(
+            "kon".into(),
+            Rect {
+                x: PAD + 8,
+                y: PAD,
+                w: PANEL_W - 2 * PAD - 16,
+                h: SEARCH_H
+            }
+        )));
         assert!(
             items
                 .iter()
                 .any(|it| matches!(it, Item::Icon(IconOf::Entry(3), _, _)))
         );
+
+        // 20 matches from the 4th: a scrollbar thumb half the track, a quarter... down.
+        let track_y = PAD + SEARCH_H;
+        let thumb = Rect {
+            x: PANEL_W - 6,
+            y: track_y + 320 * 3 / 20,
+            w: 3,
+            h: 160,
+        };
+        assert!(items.contains(&Item::Fill(thumb, DIM)));
+        let few = l.draw(&[Slot::default()], "", &rows[..2], (0, 2));
+        assert!(
+            !few.iter()
+                .any(|it| matches!(it, Item::Fill(r, DIM) if r.w == 3)),
+            "no bar"
+        );
+        assert!(
+            !few.iter()
+                .any(|it| matches!(it, Item::Text(t, ..) if t == "No matching apps"))
+        );
+
+        let none = l.draw(&[Slot::default()], "zzz", &[], (0, 0));
+        let r = Rect {
+            x: PAD + 8,
+            y: track_y,
+            w: PANEL_W - 2 * PAD - 16,
+            h: ROW_H,
+        };
+        assert!(none.contains(&Item::Text("No matching apps".into(), r, DIM)));
     }
 }

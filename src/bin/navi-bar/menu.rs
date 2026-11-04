@@ -81,6 +81,11 @@ impl Menu {
         self.selected = self.selected.min(self.matches.len().saturating_sub(1));
     }
 
+    /// The first shown match, and how many there are.
+    pub fn scroll_pos(&self) -> (usize, usize) {
+        (self.top, self.matches.len())
+    }
+
     /// The entry selected, if any match.
     pub fn selected(&self) -> Option<usize> {
         self.matches.get(self.selected).copied()

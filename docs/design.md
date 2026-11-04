@@ -217,9 +217,11 @@ session.
   layer surface gets the keyboard only when clicked (`exclusive` is treated as on-demand), and
   can't shrink the grid below half the monitor. If `navi-bar` crashes, navi keeps running without
   a bar until it restarts.
-- **Activation tokens** (`xdg-activation`) are made only for a request that carries an input
-  serial from the surface holding the keyboard. Each works once, within 10 s, so an app in the
-  background can't steal focus.
+- **Activation tokens** (`xdg-activation`) are made only for a request from the surface holding
+  the keyboard, with a serial from its current focus (no older than its keyboard enter, no newer
+  than navi's latest). Each works once, within 10 s, and only while the keyboard is still on the
+  surface that asked or on the one being activated, so an app can't stash tokens and take focus
+  back after you've moved on.
 - **Locking** uses `ext-session-lock`. If the lock screen crashes, the screen stays locked with a
   solid colour; it never unlocks.
 - **No network access**, no plugins, and no shell commands anywhere in the compositor or shell.
@@ -261,3 +263,5 @@ session.
 - Multi-monitor test of COSMIC in a real session, after the running T3 tasks finish.
 - An app that never leaves fullscreen holds its monitor until it exits or is closed elsewhere:
   the taskbar is hidden, and there is no keyboard escape yet.
+- The taskbar and menu need a pointer to open: there's no keyboard shortcut for the menu or the
+  window slots yet, and the bar exposes nothing to screen readers.

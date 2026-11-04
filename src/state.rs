@@ -1066,10 +1066,22 @@ impl XdgActivationHandler for Navi {
     fn token_created(&mut self, _: XdgActivationToken, data: XdgActivationTokenData) -> bool {
         self.xdg_activation_state
             .retain_tokens(|_, d| d.timestamp.elapsed() <= activation::TTL);
-        let focus = self.seat.get_keyboard().and_then(|kb| kb.current_focus());
-        let focused = data.surface.is_some() && data.surface == focus;
-        let issued = may_issue(data.serial.is_some(), focused);
-        info!(app = data.app_id, issued, "activation token");
+        let kb = self.seat.get_keyboard();
+        let focus = kb.as_ref().and_then(|kb| kb.current_focus());
+        let since = kb
+            .and_then(|kb| kb.last_enter())
+            .filter(|_| data.surface.is_some() && data.surface == focus)
+            .map(u32::from);
+        let serial = data.serial.as_ref().map(|(s, _)| u32::from(*s));
+        let now = u32::from(SERIAL_COUNTER.next_serial());
+        let issued = may_issue(serial, since, now);
+        info!(
+            app = data.app_id,
+            ?serial,
+            ?since,
+            issued,
+            "activation token"
+        );
         issued
     }
 
@@ -1081,12 +1093,16 @@ impl XdgActivationHandler for Navi {
     ) {
         let first_use = self.xdg_activation_state.remove_token(&token);
         let id = self.tile_of(&surface);
-        match id.filter(|_| may_redeem(first_use, data.timestamp.elapsed())) {
+        let focus = self.seat.get_keyboard().and_then(|kb| kb.current_focus());
+        let focus_kept =
+            focus.is_some() && (focus == data.surface || focus.as_ref() == Some(&surface));
+        let age = data.timestamp.elapsed();
+        match id.filter(|_| may_redeem(first_use, age, focus_kept)) {
             Some(id) => {
                 info!(id, by = "activation", "activate");
                 self.focus_or_restore(id);
             }
-            None => info!(?id, "activation refused"),
+            None => info!(?id, first_use, ?age, focus_kept, "activation refused"),
         }
     }
 }
