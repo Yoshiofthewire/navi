@@ -9,7 +9,7 @@ use smithay::{
             ExportMem, Texture, TextureMapping,
             damage::OutputDamageTracker,
             element::{
-                Id, Kind,
+                AsRenderElements, Id, Kind,
                 memory::{MemoryRenderBuffer, MemoryRenderBufferRenderElement},
                 render_elements,
                 solid::SolidColorRenderElement,
@@ -20,13 +20,11 @@ use smithay::{
         },
         winit::{self, WinitEvent},
     },
-    desktop::{
-        layer_map_for_output,
-        space::{SpaceRenderElements, space_render_elements},
-    },
+    desktop::{LayerMap, layer_map_for_output},
     output::{Mode, Output, PhysicalProperties, Subpixel},
     reexports::calloop::EventLoop,
-    utils::{Rectangle, Transform},
+    utils::{Rectangle, Scale, Transform},
+    wayland::shell::wlr_layer::Layer,
 };
 use tracing::warn;
 
@@ -40,7 +38,7 @@ render_elements! {
     /// Everything on screen, top first.
     Frame<=GlesRenderer>;
     Overlay=SolidColorRenderElement,
-    Space=SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>,
+    Surface=WaylandSurfaceRenderElement<GlesRenderer>,
     Wallpaper=MemoryRenderBufferRenderElement<GlesRenderer>,
 }
 
@@ -89,8 +87,6 @@ pub fn init(
 
     let mut damage_tracker = OutputDamageTracker::from_output(&output);
     let mut shot = Screenshot::from_env();
-    // Logged once, not every frame.
-    let mut space_failed = false;
 
     event_loop
         .handle()
@@ -138,14 +134,8 @@ pub fn init(
                     let mut copy = None;
                     match backend.bind() {
                         Ok((renderer, mut framebuffer)) => {
-                            match space_render_elements(renderer, [&state.space], &output, 1.0) {
-                                Ok(space) => elements.extend(space.into_iter().map(Frame::from)),
-                                Err(e) if !space_failed => {
-                                    space_failed = true;
-                                    warn!("no space elements: {e:?}");
-                                }
-                                Err(_) => {}
-                            }
+                            let surfaces = surfaces(renderer, state, &output);
+                            elements.extend(surfaces.into_iter().map(Frame::from));
                             if let Some((buffer, img)) = &wallpaper {
                                 match wallpaper_element(renderer, buffer, *img, size.into()) {
                                     Ok(e) => elements.push(Frame::from(e)),
@@ -208,6 +198,7 @@ pub fn init(
                     }
                     state.space.refresh();
                     state.popups.cleanup();
+                    state.refresh_toplevels();
                     let _ = data.display.flush_clients();
                     backend.window().request_redraw();
                 }
@@ -216,6 +207,54 @@ pub fn init(
             }
         })?;
     Ok(())
+}
+
+/// The output's layer surfaces and windows, top first. While a window is fullscreen there, the
+/// Top layer (the taskbar) is left out.
+fn surfaces(
+    renderer: &mut GlesRenderer,
+    state: &Navi,
+    output: &Output,
+) -> Vec<WaylandSurfaceRenderElement<GlesRenderer>> {
+    let map = layer_map_for_output(output);
+    let upper: &[Layer] = match state.layout.fullscreen_on(&output.name()) {
+        true => &[Layer::Overlay],
+        false => &[Layer::Overlay, Layer::Top],
+    };
+    let mut out = layers(renderer, &map, upper);
+    if let Some(geo) = state.space.output_geometry(output) {
+        out.extend(
+            state
+                .space
+                .render_elements_for_region(renderer, &geo, 1.0, 1.0),
+        );
+    }
+    out.extend(layers(renderer, &map, &[Layer::Bottom, Layer::Background]));
+    out
+}
+
+/// The surfaces on `which` layers, in that order, the most recently mapped first.
+fn layers(
+    renderer: &mut GlesRenderer,
+    map: &LayerMap,
+    which: &[Layer],
+) -> Vec<WaylandSurfaceRenderElement<GlesRenderer>> {
+    let mut out = Vec::new();
+    for &layer in which {
+        for l in map.layers_on(layer).rev() {
+            let Some(geo) = map.layer_geometry(l) else {
+                continue;
+            };
+            out.extend(AsRenderElements::<GlesRenderer>::render_elements(
+                l,
+                renderer,
+                geo.loc.to_physical(1),
+                Scale::from(1.0),
+                1.0,
+            ));
+        }
+    }
+    out
 }
 
 /// A copied framebuffer as RGBA, top row first.

@@ -1,10 +1,10 @@
 use smithay::{
     backend::input::{
         AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, InputBackend, InputEvent,
-        KeyboardKeyEvent, MouseButton, PointerAxisEvent, PointerButtonEvent,
+        KeyState, KeyboardKeyEvent, MouseButton, PointerAxisEvent, PointerButtonEvent,
     },
     input::{
-        keyboard::FilterResult,
+        keyboard::{FilterResult, Keycode},
         pointer::{AxisFrame, ButtonEvent, MotionEvent},
     },
     utils::{Logical, Point, SERIAL_COUNTER},
@@ -21,17 +21,7 @@ impl Navi {
     pub fn process_input_event<I: InputBackend>(&mut self, event: InputEvent<I>) {
         match event {
             InputEvent::Keyboard { event, .. } => {
-                let Some(kb) = self.seat.get_keyboard() else {
-                    return;
-                };
-                kb.input::<(), _>(
-                    self,
-                    event.key_code(),
-                    event.state(),
-                    SERIAL_COUNTER.next_serial(),
-                    Event::time_msec(&event),
-                    |_, _, _| FilterResult::Forward,
-                );
+                self.keyboard_key(event.key_code(), event.state(), Event::time_msec(&event));
             }
             InputEvent::PointerMotionAbsolute { event, .. } => {
                 let Some(geo) = self
@@ -80,6 +70,21 @@ impl Navi {
 }
 
 impl Navi {
+    /// A key (an xkb keycode), from winit or the debug replay.
+    pub fn keyboard_key(&mut self, code: Keycode, state: KeyState, time: u32) {
+        let Some(kb) = self.seat.get_keyboard() else {
+            return;
+        };
+        kb.input::<(), _>(
+            self,
+            code,
+            state,
+            SERIAL_COUNTER.next_serial(),
+            time,
+            |_, _, _| FilterResult::Forward,
+        );
+    }
+
     /// Pointer motion to `pos`, from winit or the debug replay.
     pub fn pointer_motion(&mut self, pos: Point<f64, Logical>, time: u32) {
         let Some(pointer) = self.seat.get_pointer() else {

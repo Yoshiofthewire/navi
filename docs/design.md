@@ -120,6 +120,11 @@ space when you want it.
 - An app's own maximize and minimize buttons do exactly what navi's do. Hidden windows can't
   maximize or minimize, so a window nobody can see can't hide the ones they can.
 - Dialogs stay floating over their parent, hide while it's hidden, and re-centre when it moves.
+- **Fullscreen** (the app asks for it) covers the whole monitor, taskbar included, on the
+  monitor the window is on, and hides the other windows there; the taskbar can't be seen or
+  clicked meanwhile, but keeps its space. It ends when the app leaves fullscreen, closes or is
+  minimized, when a new window opens on that monitor, or when another window there is
+  activated; the window goes back to its tile. Its dialogs still float over it.
 
 ## Monitors
 
@@ -144,9 +149,15 @@ The screen shows a wallpaper, a taskbar and your apps. There are no desktop icon
   `<monitor> <absolute path>` line per monitor, where monitor 0 is the main one and the rest
   follow by priority, e.g. `0 /home/me/Pictures/city.jpg`. Edits apply on restart. Delete the
   file to import from Plasma again.
-- **Taskbar:** centred at the bottom of the main monitor. It holds the app launcher and the
-  running apps. Hover the bottom edge of another monitor for about 300 ms, and the taskbar moves
-  there and stays. Where it last was is remembered. A fullscreen app hides it.
+- **Taskbar:** centred at the bottom of the main monitor. It holds the app menu button and one
+  icon per running window, in the order they opened; the focused one is underlined, minimized
+  ones are dimmed. Click a running app to focus or restore it: it's un-minimized, shown in its
+  tab group, and any maximized or fullscreen window covering it steps back. Hover the bottom
+  edge of another monitor for about 300 ms, and the taskbar moves there and stays. Where it last
+  was is remembered. A fullscreen app hides it.
+- **App menu:** the button opens a list of installed apps (`.desktop` files) with a search line:
+  type to filter by name, Up/Down to select, Enter or a click to launch, Escape or a click
+  elsewhere to close.
 - **Corners:** on the main monitor. Notifications are top-left; status (clock, network, volume,
   battery, tray) is top-right. The corners stay where they are when the taskbar moves.
 - **Laptop alone:** the same layout with a slimmer taskbar.
@@ -200,14 +211,25 @@ session.
   screen capture (screencopy and image-copy), clipboard managers (`data-control`), virtual
   keyboard and pointer, input method, and window lists (`foreign-toplevel`). Screenshots and
   screen sharing for other apps go through `xdg-desktop-portal`, which asks first.
-- **Layer shell** is open to every client for now, until navi starts its own shell clients. A
+- **navi's own shell** is `navi-bar`, the binary next to navi's own, which navi starts itself
+  over a socket pair it made. Only that connection sees layer shell and the window list
+  (`wlr-foreign-toplevel-management`); other clients don't find them in the registry at all. A
   layer surface gets the keyboard only when clicked (`exclusive` is treated as on-demand), and
-  can't shrink the grid below half the monitor.
+  can't shrink the grid below half the monitor. If `navi-bar` crashes, navi keeps running without
+  a bar until it restarts.
+- **Activation tokens** (`xdg-activation`) are made only for a request from the surface holding
+  the keyboard, with a serial from its current focus (no older than its keyboard enter, no newer
+  than navi's latest). Each works once, within 10 s, and only while the keyboard is still on the
+  surface that asked or on the one being activated, so an app can't stash tokens and take focus
+  back after you've moved on.
 - **Locking** uses `ext-session-lock`. If the lock screen crashes, the screen stays locked with a
   solid colour; it never unlocks.
 - **No network access**, no plugins, and no shell commands anywhere in the compositor or shell.
-  Launching an app runs its `.desktop` `Exec=` line, broken into arguments, with an XDG
-  activation token, inside its own `app-*.scope`.
+  navi-bar, not navi, launches apps, so `.desktop` files, icon themes and fonts (all untrusted)
+  are parsed outside the compositor. Launching runs the `Exec=` line broken into arguments (any
+  shell syntax rejects the entry), with an XDG activation token, in its own process group and
+  without navi-bar's socket. Running each app in its own `app-*.scope` comes later (it needs
+  D-Bus).
 - **Config** is plain data. A config file can never run a command.
 
 ## Build
@@ -225,9 +247,10 @@ session.
   rendered frame there as a PNG (mode 0600), on the first frame and then once a second. Unset, it
   costs nothing. No client or config can turn it on.
 - **Input replay for testing (debug builds only):** `NAVI_INPUT_REPLAY=<file>` plays a pointer
-  script through the same handlers as real input: one step per line, `wait <ms>`,
-  `move <x> <y>` (global logical px), `press`, `release` (left button), `#` comments. A bad line
-  logs one error and nothing is replayed. Release builds don't contain it.
+  and keyboard script through the same handlers as real input: one step per line, `wait <ms>`,
+  `move <x> <y>` (global logical px), `press`, `release` (left button), `key <evdev keycode>`
+  (press and release), `#` comments. A bad line logs one error and nothing is replayed. Release
+  builds don't contain it.
 - The shell (taskbar, corners, launcher) runs as separate `layer-shell` clients, so a taskbar
   crash can't take your windows down.
 
@@ -238,3 +261,7 @@ session.
 - More look references, beyond the logo.
 - Is this a daily driver? That decides whether laptop polish is in v1.
 - Multi-monitor test of COSMIC in a real session, after the running T3 tasks finish.
+- An app that never leaves fullscreen holds its monitor until it exits or is closed elsewhere:
+  the taskbar is hidden, and there is no keyboard escape yet.
+- The taskbar and menu need a pointer to open: there's no keyboard shortcut for the menu or the
+  window slots yet, and the bar exposes nothing to screen readers.

@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod activation;
+mod files;
 mod image;
 mod input;
 mod layout;
@@ -7,7 +9,9 @@ mod persist;
 #[cfg(debug_assertions)]
 mod replay;
 mod screenshot;
+mod shell;
 mod state;
+mod toplevels;
 mod wallpaper;
 mod winit;
 
@@ -38,9 +42,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let state = Navi::new(display.handle(), event_loop.get_signal())?;
 
     let socket = ListeningSocketSource::new_auto()?;
+    let socket_name = socket.socket_name().to_os_string();
     info!(
         "listening on WAYLAND_DISPLAY={}",
-        socket.socket_name().to_string_lossy()
+        socket_name.to_string_lossy()
     );
     let handle = event_loop.handle();
     handle.insert_source(socket, |stream, _, data| {
@@ -62,6 +67,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut data = CalloopData { state, display };
     winit::init(&mut event_loop, &mut data)?;
+    // After the first output exists, so the bar lands on it.
+    shell::start_bar(&mut data.state.display_handle, &socket_name);
     #[cfg(debug_assertions)]
     replay::start(&event_loop.handle());
     event_loop.run(None, &mut data, |_| {})?;

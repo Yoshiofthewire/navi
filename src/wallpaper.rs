@@ -9,7 +9,7 @@ use tracing::{info, warn};
 
 use crate::image::{self, Image};
 use crate::layout::Rect;
-use crate::persist;
+use crate::{files, persist};
 
 const HEADER: &str = "navi-wallpaper 1";
 const PLASMA: &str = "plasma-org.kde.plasma.desktop-appletsrc";
@@ -258,8 +258,8 @@ fn open_image(path: &Path) -> Result<Image, String> {
     if path.is_dir() {
         return Err("unsupported: a directory".into());
     }
-    match persist::read_bytes(path, image::MAX_FILE)? {
-        Some(bytes) => image::decode(&bytes),
+    match files::read_bytes(path, image::MAX_FILE)? {
+        Some(bytes) => image::decode(&bytes, image::MAX_SIDE),
         None => Err("not found".into()),
     }
 }
@@ -268,7 +268,7 @@ fn open_image(path: &Path) -> Result<Image, String> {
 /// distinct path is decoded once.
 pub fn open(outputs: &[(&str, u32)]) -> Vec<Option<Rc<Image>>> {
     let var = std::env::var_os;
-    let Some(dir) = persist::xdg_dir(
+    let Some(dir) = files::xdg_dir(
         var("XDG_CONFIG_HOME").as_deref(),
         var("HOME").as_deref(),
         ".config",

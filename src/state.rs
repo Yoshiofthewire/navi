@@ -1,7 +1,8 @@
 use smithay::{
     backend::renderer::utils::on_commit_buffer_handler,
     delegate_compositor, delegate_data_device, delegate_layer_shell, delegate_output,
-    delegate_seat, delegate_shm, delegate_xdg_decoration, delegate_xdg_shell,
+    delegate_seat, delegate_shm, delegate_xdg_activation, delegate_xdg_decoration,
+    delegate_xdg_shell,
     desktop::{
         LayerSurface, PopupKind, PopupManager, Space, Window, WindowSurfaceType,
         find_popup_root_surface, get_popup_toplevel_coords, layer_map_for_output,
@@ -16,6 +17,10 @@ use smithay::{
         wayland_protocols::xdg::{
             decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as Decoration,
             shell::server::xdg_toplevel,
+        },
+        wayland_protocols_wlr::foreign_toplevel::v1::server::{
+            zwlr_foreign_toplevel_handle_v1::State as ListState,
+            zwlr_foreign_toplevel_manager_v1::ZwlrForeignToplevelManagerV1,
         },
         wayland_server::{
             Client, DisplayHandle, Resource,
@@ -50,12 +55,17 @@ use smithay::{
             },
         },
         shm::{ShmHandler, ShmState},
+        xdg_activation::{
+            XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData,
+        },
     },
 };
 use tracing::info;
 
+use crate::activation::{self, may_issue, may_redeem};
 use crate::layout::{self, Decor, Drag, Layout, Rect, WinId, decoration};
 use crate::persist::Store;
+use crate::toplevels::{self, Toplevels};
 use crate::wallpaper::usable_area;
 
 /// A toplevel navi knows about. It's unmapped until its first commit, when its app ID is known.
@@ -64,6 +74,8 @@ pub struct Managed {
     /// `None` for dialogs, which float over their parent.
     pub tile: Option<WinId>,
     last_size: Size<i32, Logical>,
+    /// Asked for fullscreen before it was placed.
+    want_fullscreen: bool,
 }
 
 pub struct Navi {
@@ -78,11 +90,13 @@ pub struct Navi {
     pub drag: Option<Drag>,
     /// The layout's outputs, with the area layer surfaces leave for the grid.
     grid: Vec<layout::Output>,
+    pub toplevels: Toplevels,
 
     compositor_state: CompositorState,
     xdg_shell_state: XdgShellState,
     _xdg_decoration_state: XdgDecorationState,
     layer_shell_state: WlrLayerShellState,
+    xdg_activation_state: XdgActivationState,
     shm_state: ShmState,
     _output_manager_state: smithay::wayland::output::OutputManagerState,
     seat_state: SeatState<Navi>,
@@ -103,20 +117,26 @@ impl Navi {
         // Before the first window is placed.
         let mut layout = Layout::default();
         let memory = Store::open(&mut layout);
+        // Only navi-bar sees the window list and layer shell; other clients don't even see them.
+        dh.create_global::<Self, ZwlrForeignToplevelManagerV1, _>(3, toplevels::Filter);
 
         Ok(Self {
             start_time: std::time::Instant::now(),
             compositor_state: CompositorState::new::<Self>(&dh),
-            // Only what navi does: clients hide fullscreen and window-menu entries.
+            // Only what navi does: clients hide window-menu entries.
             xdg_shell_state: XdgShellState::new_with_capabilities::<Self>(
                 &dh,
                 [
                     xdg_toplevel::WmCapabilities::Maximize,
                     xdg_toplevel::WmCapabilities::Minimize,
+                    xdg_toplevel::WmCapabilities::Fullscreen,
                 ],
             ),
             _xdg_decoration_state: XdgDecorationState::new::<Self>(&dh),
-            layer_shell_state: WlrLayerShellState::new::<Self>(&dh),
+            layer_shell_state: WlrLayerShellState::new_with_filter::<Self, _>(&dh, |c| {
+                privileged(c.get_data())
+            }),
+            xdg_activation_state: XdgActivationState::new::<Self>(&dh),
             shm_state: ShmState::new::<Self>(&dh, vec![]),
             _output_manager_state:
                 smithay::wayland::output::OutputManagerState::new_with_xdg_output::<Self>(&dh),
@@ -129,6 +149,7 @@ impl Navi {
             windows: Vec::new(),
             drag: None,
             grid: Vec::new(),
+            toplevels: Toplevels::default(),
             seat_state,
             popups: PopupManager::default(),
             seat,
@@ -161,6 +182,7 @@ impl Navi {
     }
 
     /// The topmost layer surface at `pos` on one of `layers`, and the surface under `pos` in it.
+    /// The Top layer is skipped on an output with a fullscreen window.
     fn layer_under(
         &self,
         pos: Point<f64, Logical>,
@@ -168,8 +190,12 @@ impl Navi {
     ) -> Option<(LayerSurface, WlSurface, Point<f64, Logical>)> {
         let output = self.space.output_under(pos).next()?;
         let origin = self.space.output_geometry(output)?.loc;
+        let fullscreen = self.layout.fullscreen_on(&output.name());
         let map = layer_map_for_output(output);
         layers.into_iter().find_map(|l| {
+            if l == Layer::Top && fullscreen {
+                return None;
+            }
             let layer = map.layer_under(l, pos - origin.to_f64())?;
             let loc = origin + map.layer_geometry(layer)?.loc;
             let (s, p) = layer.surface_under(pos - loc.to_f64(), WindowSurfaceType::ALL)?;
@@ -200,6 +226,23 @@ impl Navi {
             };
             let mapped = self.space.element_location(&m.window).is_some();
             let rect = self.layout.rect(id).filter(|_| self.layout.visible(id));
+            let fullscreen = self.layout.is_fullscreen(id);
+            let was = toplevel.with_pending_state(|s| {
+                let was = s.states.contains(xdg_toplevel::State::Fullscreen);
+                match fullscreen {
+                    true => s.states.set(xdg_toplevel::State::Fullscreen),
+                    false => s.states.unset(xdg_toplevel::State::Fullscreen),
+                };
+                was
+            });
+            if was != fullscreen {
+                let what = if fullscreen {
+                    "fullscreen"
+                } else {
+                    "unfullscreen"
+                };
+                info!(id, "{what}");
+            }
             let Some(r) = rect else {
                 if mapped {
                     self.space.unmap_elem(&m.window);
@@ -229,6 +272,9 @@ impl Navi {
         }
         if !hidden.is_empty() {
             info!(?hidden, "hidden");
+        }
+        if !shown.is_empty() {
+            info!(?shown, "shown");
         }
         self.recenter_dialogs();
         self.keep_focus_mapped(&shown);
@@ -269,14 +315,16 @@ impl Navi {
 
     /// Adds an output to the grid, all of it until layer surfaces reserve space.
     pub fn add_output(&mut self, output: &Output, priority: u32) {
+        let none = Rect {
+            x: 0,
+            y: 0,
+            w: 0,
+            h: 0,
+        };
         self.grid.push(layout::Output {
             name: output.name(),
-            area: Rect {
-                x: 0,
-                y: 0,
-                w: 0,
-                h: 0,
-            },
+            area: none,
+            full: none,
             priority,
         });
         self.arrange_layers(output);
@@ -303,10 +351,11 @@ impl Navi {
         let Some(o) = self.grid.iter_mut().find(|o| o.name == name) else {
             return;
         };
-        if o.area == area {
+        let full = rect(geo.loc, geo.size);
+        if (o.area, o.full) == (area, full) {
             return;
         }
-        o.area = area;
+        (o.area, o.full) = (area, full);
         info!(output = name, ?area, "grid area");
         self.layout.set_outputs(self.grid.clone());
         self.apply_layout();
@@ -362,6 +411,64 @@ impl Navi {
             .iter()
             .find(|m| m.window.toplevel().is_some_and(|t| t.wl_surface() == s))?
             .tile
+    }
+
+    /// The output layer surfaces go on when they name none: the main one, priority 0.
+    fn main_output(&self) -> Option<Output> {
+        let priority = |o: &&Output| {
+            let g = self.grid.iter().find(|g| g.name == o.name());
+            g.map_or(u32::MAX, |g| g.priority)
+        };
+        self.space.outputs().min_by_key(priority).cloned()
+    }
+
+    /// Focus or restore, from the bar or an activation token: `id` is shown in its group,
+    /// restored, uncovered, and gets keyboard focus.
+    pub fn focus_or_restore(&mut self, id: WinId) {
+        if self.layout.activate(id) {
+            self.apply_layout();
+        }
+        if self.layout.visible(id) {
+            self.focus(self.window_of(id));
+        }
+    }
+
+    /// Sends the window list what changed: tiled windows in open order.
+    pub fn refresh_toplevels(&mut self) {
+        let focus = self.seat.get_keyboard().and_then(|kb| kb.current_focus());
+        let now = self
+            .windows
+            .iter()
+            .filter_map(|m| {
+                let id = m.tile?;
+                let surface = m.window.toplevel()?.wl_surface();
+                let tile = self.layout.tile(id)?;
+                let states = [
+                    (ListState::Maximized, self.layout.is_maximized(id)),
+                    (ListState::Minimized, tile.minimized),
+                    (ListState::Activated, focus.as_ref() == Some(surface)),
+                    (ListState::Fullscreen, tile.fullscreen),
+                ];
+                let info = toplevels::Info {
+                    title: title(surface),
+                    app_id: app_id(surface),
+                    output: self
+                        .space
+                        .outputs()
+                        .find(|o| o.name() == tile.output)
+                        .cloned(),
+                    states: states.into_iter().filter(|s| s.1).map(|s| s.0).collect(),
+                };
+                Some((id, info))
+            })
+            .collect();
+        self.toplevels.refresh(&self.display_handle, now);
+    }
+
+    fn managed_mut(&mut self, s: &WlSurface) -> Option<&mut Managed> {
+        self.windows
+            .iter_mut()
+            .find(|m| m.window.toplevel().is_some_and(|t| t.wl_surface() == s))
     }
 
     pub fn window_of(&self, id: WinId) -> Option<Window> {
@@ -480,6 +587,9 @@ impl Navi {
                 .unwrap_or_default();
             if let Some((id, step)) = self.layout.place(&app, (pointer.x, pointer.y)) {
                 self.windows[idx].tile = Some(id);
+                if self.windows[idx].want_fullscreen {
+                    self.layout.fullscreen(id);
+                }
                 info!(app, id, ?mode, "decoration");
                 self.layout.set_decorated(id, mode == Some(Decor::Server));
                 surface.with_pending_state(|s| {
@@ -609,6 +719,15 @@ fn app_id(s: &WlSurface) -> String {
     .unwrap_or_else(|| "unknown".into())
 }
 
+fn title(s: &WlSurface) -> String {
+    with_states(s, |s| {
+        s.data_map
+            .get::<XdgToplevelSurfaceData>()
+            .and_then(|d| d.lock().ok()?.title.clone())
+    })
+    .unwrap_or_default()
+}
+
 /// The logical pixel containing `p`.
 pub fn px(p: Point<f64, Logical>) -> (i32, i32) {
     (p.x.floor() as i32, p.y.floor() as i32)
@@ -617,6 +736,13 @@ pub fn px(p: Point<f64, Logical>) -> (i32, i32) {
 #[derive(Default)]
 pub struct ClientState {
     pub compositor_state: CompositorClientState,
+    /// Set only on the connection navi made for navi-bar; never for the listening socket.
+    pub privileged: bool,
+}
+
+/// The filter on privileged globals: layer shell and the window list.
+pub fn privileged(client: Option<&ClientState>) -> bool {
+    client.is_some_and(|c| c.privileged)
 }
 
 impl ClientData for ClientState {
@@ -727,6 +853,7 @@ impl XdgShellHandler for Navi {
             window: Window::new_wayland_window(surface),
             tile: None,
             last_size: Size::default(),
+            want_fullscreen: false,
         });
     }
 
@@ -802,6 +929,39 @@ impl XdgShellHandler for Navi {
     fn minimize_request(&mut self, surface: ToplevelSurface) {
         self.app_request(&surface, "minimized", Layout::minimize);
     }
+
+    // It stays on its own output, whatever output it names. `apply_layout` logs the change.
+    fn fullscreen_request(&mut self, surface: ToplevelSurface, _: Option<WlOutput>) {
+        let s = surface.wl_surface();
+        if !surface.is_initial_configure_sent() {
+            // Applied when it's placed.
+            if let Some(m) = self.managed_mut(s) {
+                m.want_fullscreen = true;
+            }
+            return;
+        }
+        match self.tile_of(s) {
+            Some(id) if self.layout.fullscreen(id) => self.apply_layout(),
+            id => {
+                info!(?id, by = "app", refused = "fullscreen", "request refused");
+                surface.send_configure();
+            }
+        }
+    }
+
+    fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
+        let s = surface.wl_surface();
+        if let Some(m) = self.managed_mut(s) {
+            m.want_fullscreen = false;
+        }
+        match self.tile_of(s) {
+            Some(id) if self.layout.unfullscreen(id) => self.apply_layout(),
+            _ if surface.is_initial_configure_sent() => {
+                surface.send_configure();
+            }
+            _ => {}
+        }
+    }
 }
 
 impl XdgDecorationHandler for Navi {
@@ -851,8 +1011,8 @@ impl WlrLayerShellHandler for Navi {
         &mut self.layer_shell_state
     }
 
-    /// Maps the surface on the output it asked for, else the first. Its first commit arranges it
-    /// and sends the configure.
+    /// Maps the surface on the output it asked for, else the main one. Its first commit arranges
+    /// it and sends the configure.
     fn new_layer_surface(
         &mut self,
         surface: WlrLayerSurface,
@@ -863,7 +1023,7 @@ impl WlrLayerShellHandler for Navi {
         let Some(output) = output
             .as_ref()
             .and_then(Output::from_resource)
-            .or_else(|| self.space.outputs().next().cloned())
+            .or_else(|| self.main_output())
         else {
             surface.send_close();
             return;
@@ -898,6 +1058,55 @@ impl WlrLayerShellHandler for Navi {
     }
 }
 
+impl XdgActivationHandler for Navi {
+    fn activation_state(&mut self) -> &mut XdgActivationState {
+        &mut self.xdg_activation_state
+    }
+
+    fn token_created(&mut self, _: XdgActivationToken, data: XdgActivationTokenData) -> bool {
+        self.xdg_activation_state
+            .retain_tokens(|_, d| d.timestamp.elapsed() <= activation::TTL);
+        let kb = self.seat.get_keyboard();
+        let focus = kb.as_ref().and_then(|kb| kb.current_focus());
+        let since = kb
+            .and_then(|kb| kb.last_enter())
+            .filter(|_| data.surface.is_some() && data.surface == focus)
+            .map(u32::from);
+        let serial = data.serial.as_ref().map(|(s, _)| u32::from(*s));
+        let now = u32::from(SERIAL_COUNTER.next_serial());
+        let issued = may_issue(serial, since, now);
+        info!(
+            app = data.app_id,
+            ?serial,
+            ?since,
+            issued,
+            "activation token"
+        );
+        issued
+    }
+
+    fn request_activation(
+        &mut self,
+        token: XdgActivationToken,
+        data: XdgActivationTokenData,
+        surface: WlSurface,
+    ) {
+        let first_use = self.xdg_activation_state.remove_token(&token);
+        let id = self.tile_of(&surface);
+        let focus = self.seat.get_keyboard().and_then(|kb| kb.current_focus());
+        let focus_kept =
+            focus.is_some() && (focus == data.surface || focus.as_ref() == Some(&surface));
+        let age = data.timestamp.elapsed();
+        match id.filter(|_| may_redeem(first_use, age, focus_kept)) {
+            Some(id) => {
+                info!(id, by = "activation", "activate");
+                self.focus_or_restore(id);
+            }
+            None => info!(?id, first_use, ?age, focus_kept, "activation refused"),
+        }
+    }
+}
+
 impl ClientDndGrabHandler for Navi {}
 impl ServerDndGrabHandler for Navi {}
 impl OutputHandler for Navi {}
@@ -910,3 +1119,21 @@ delegate_layer_shell!(Navi);
 delegate_seat!(Navi);
 delegate_data_device!(Navi);
 delegate_output!(Navi);
+delegate_xdg_activation!(Navi);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ac1_only_navis_own_connection_is_privileged() {
+        assert!(!ClientState::default().privileged);
+        assert!(!privileged(Some(&ClientState::default())));
+        assert!(!privileged(None));
+        let bar = ClientState {
+            privileged: true,
+            ..Default::default()
+        };
+        assert!(privileged(Some(&bar)));
+    }
+}
