@@ -63,6 +63,7 @@ pub struct Bar {
     cursor: Option<(String, u32)>,
     /// Real hardware: the session's variables, and navi-bar exports them to D-Bus.
     session: bool,
+    xdisplay: Option<String>,
     respawn: Respawn,
     clock: Instant,
 }
@@ -74,6 +75,7 @@ pub fn start_bar(
     dh: &mut DisplayHandle,
     wayland_display: &OsStr,
     cursor: Option<(String, u32)>,
+    xdisplay: Option<String>,
     session: bool,
 ) {
     let path = match std::env::current_exe() {
@@ -89,6 +91,7 @@ pub fn start_bar(
         wayland_display: wayland_display.to_os_string(),
         cursor,
         session,
+        xdisplay,
         respawn: Respawn::default(),
         clock: Instant::now(),
     }));
@@ -134,12 +137,19 @@ impl Bar {
                 .env("XCURSOR_SIZE", size.to_string());
         }
         session_env(&mut cmd, self.session);
+        match &self.xdisplay {
+            Some(display) => {
+                cmd.env("DISPLAY", display).env_remove("XAUTHORITY");
+            }
+            None => {
+                cmd.env_remove("DISPLAY");
+            }
+        }
         let mut child = cmd
             // Its stdin is the socket; navi-bar moves it off fd 0 as it connects.
             .stdin(Stdio::from(OwnedFd::from(theirs)))
             .env("WAYLAND_SOCKET", "0")
             .env("WAYLAND_DISPLAY", &self.wayland_display)
-            .env_remove("DISPLAY")
             .spawn()?;
         let pid = child.id();
         let bar = ClientState {

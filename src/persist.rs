@@ -160,6 +160,14 @@ pub mod tests {
     use super::*;
     use crate::layout::{Output, Rect};
 
+    /// Integration tests must never write the user's layout memory.
+    pub fn volatile() -> Store {
+        Store {
+            path: None,
+            saved: String::new(),
+        }
+    }
+
     /// A fresh empty dir, removed on drop.
     pub struct Tmp(pub PathBuf);
 

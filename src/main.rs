@@ -3,6 +3,7 @@
 mod activation;
 mod cursor;
 mod files;
+mod focus;
 mod image;
 mod input;
 mod layout;
@@ -19,6 +20,7 @@ mod toplevels;
 mod udev;
 mod wallpaper;
 mod winit;
+mod xwayland;
 
 use std::{
     error::Error,
@@ -155,11 +157,13 @@ fn run(backend: Backend) -> Result<(), Box<dyn Error>> {
         Backend::Drm => udev::init(&mut event_loop, &mut data)?,
     };
     // After the first output exists, so the bar lands on it.
+    let xdisplay = xwayland::start(&handle, &data.state);
     shell::start_bar(
         &handle,
         &mut data.state.display_handle,
         &socket_name,
         theme,
+        xdisplay,
         backend == Backend::Drm,
     );
     #[cfg(debug_assertions)]

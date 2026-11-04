@@ -182,9 +182,7 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, WinId> for Navi {
             }
             handle::Request::Close => {
                 info!(id, by = "bar", "close");
-                if let Some(t) = state.window_of(id).as_ref().and_then(|w| w.toplevel()) {
-                    t.send_close();
-                }
+                state.close_window(id);
             }
             // Maximize, minimize, fullscreen and rectangles are navi's or the app's call.
             _ => {}

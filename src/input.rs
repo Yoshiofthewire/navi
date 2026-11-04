@@ -233,9 +233,7 @@ impl Navi {
                 match done {
                     // The app decides; navi never kills it.
                     Some(Done::Click(Action::Close, id)) => {
-                        if let Some(t) = self.window_of(id).as_ref().and_then(|w| w.toplevel()) {
-                            t.send_close();
-                        }
+                        self.close_window(id);
                     }
                     Some(Done::Click(Action::Activate | Action::Restore, id)) => {
                         let shown = self.window_of(id).filter(|_| self.layout.visible(id));
