@@ -129,10 +129,10 @@ impl Navi {
                             t.send_pending_configure();
                         }
                     });
-                    if hit.is_some() {
-                        if left {
-                            self.drag = Drag::press(&self.layout, px(pos));
-                        }
+                    // Other buttons go on with no pointer focus over a zone, so neither the press nor
+                    // its release reaches a client.
+                    if hit.is_some() && left {
+                        self.drag = Drag::press(&self.layout, px(pos));
                         return;
                     }
                 }

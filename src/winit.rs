@@ -85,21 +85,25 @@ pub fn init(
                     let damage = Rectangle::from_size(size);
                     // The one output sits at (0, 0) at scale 1, so global logical px are its
                     // physical px.
-                    let overlay: Vec<_> =
-                        layout::overlay(&state.layout, state.drag.as_ref(), state.pointer_px())
-                            .into_iter()
-                            .map(|(r, color)| {
-                                let geo = Rectangle::new((r.x, r.y).into(), (r.w, r.h).into());
-                                let commit = CommitCounter::default();
-                                SolidColorRenderElement::new(
-                                    Id::new(),
-                                    geo,
-                                    commit,
-                                    color,
-                                    Kind::Unspecified,
-                                )
-                            })
-                            .collect();
+                    let overlay: Vec<_> = layout::overlay(
+                        &state.layout,
+                        state.drag.as_ref(),
+                        state.pointer_px(),
+                        state.now_ms(),
+                    )
+                    .into_iter()
+                    .map(|(r, color)| {
+                        let geo = Rectangle::new((r.x, r.y).into(), (r.w, r.h).into());
+                        let commit = CommitCounter::default();
+                        SolidColorRenderElement::new(
+                            Id::new(),
+                            geo,
+                            commit,
+                            color,
+                            Kind::Unspecified,
+                        )
+                    })
+                    .collect();
                     let mut copy = None;
                     match backend.bind() {
                         Ok((renderer, mut framebuffer)) => {
@@ -115,7 +119,7 @@ pub fn init(
                                 [0.05, 0.05, 0.08, 1.0],
                             ) {
                                 warn!("render failed: {e:?}");
-                            } else if shot.as_ref().is_some_and(Screenshot::due) {
+                            } else if shot.as_mut().is_some_and(Screenshot::due) {
                                 // Copied before the swap; mapped after it, since mapping drops
                                 // the window surface from the GL context.
                                 let region = Rectangle::from_size((size.w, size.h).into());
@@ -125,7 +129,11 @@ pub fn init(
                                     Fourcc::Abgr8888,
                                 ) {
                                     Ok(c) => copy = Some(c),
-                                    Err(e) => warn!("screenshot copy failed: {e:?}"),
+                                    Err(e) => {
+                                        if let Some(s) = shot.as_mut() {
+                                            s.fail(format!("copy: {e:?}"));
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -137,7 +145,7 @@ pub fn init(
                     if let (Some(shot), Some(copy)) = (shot.as_mut(), copy) {
                         match upright(backend.renderer(), &copy) {
                             Ok(px) => shot.save(size.w as u32, size.h as u32, &px),
-                            Err(e) => warn!("screenshot readback failed: {e:?}"),
+                            Err(e) => shot.fail(format!("readback: {e:?}")),
                         }
                     }
 

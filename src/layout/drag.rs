@@ -10,6 +10,8 @@ const ARM_PX: u64 = 8;
 const HOLD_MS: u64 = 500;
 const GRID_ALPHA: f32 = 0.2;
 const PREVIEW_ALPHA: f32 = 0.35;
+/// Once a hold over a tile's middle will tab, the preview turns this solid.
+const TAB_ALPHA: f32 = 0.7;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Side {
@@ -249,6 +251,11 @@ fn with_span(c: Cells, x: bool, start: i32, len: i32) -> Cells {
     }
 }
 
+/// Whether the pointer has been in a tile's middle long enough for the drop to tab.
+fn held(middle: Option<(WinId, u64)>, now_ms: u64) -> bool {
+    middle.is_some_and(|(_, since)| now_ms.saturating_sub(since) >= HOLD_MS)
+}
+
 /// The inner half of `r` in both axes.
 fn middle(r: Rect) -> Rect {
     Rect {
@@ -429,7 +436,7 @@ impl Drag {
                 middle,
             } => {
                 let group = l.group(id);
-                let held = middle.is_some_and(|(_, since)| now_ms.saturating_sub(since) >= HOLD_MS);
+                let held = held(middle, now_ms);
                 let (what, ids) = match target {
                     Target::Own(_) | Target::Nowhere => return None,
                     Target::Free(c) => {
@@ -464,16 +471,31 @@ impl Drag {
 }
 
 /// Solid rects to draw over the windows: global logical px, premultiplied RGBA.
-/// The hovered or dragged zone; during a move, the grid and a preview of the landing tile.
-pub fn overlay(l: &Layout, drag: Option<&Drag>, p: (i32, i32)) -> Vec<(Rect, [f32; 4])> {
+/// The hovered or dragged zone; during a move, the grid and a preview of the landing tile, more
+/// solid once the drop would tab.
+pub fn overlay(
+    l: &Layout,
+    drag: Option<&Drag>,
+    p: (i32, i32),
+    now_ms: u64,
+) -> Vec<(Rect, [f32; 4])> {
     let zone = match drag.map(|d| &d.0) {
         None => l.hit(p),
         Some(State::Armed { id, .. }) => Some(Hit::Strip(*id)),
         Some(State::Resize(r)) => Some(Hit::Edge(r.id, r.side)),
-        Some(State::Move { output, target, .. }) => {
+        Some(State::Move {
+            output,
+            target,
+            middle,
+            ..
+        }) => {
+            let alpha = match held(*middle, now_ms) {
+                true => TAB_ALPHA,
+                false => PREVIEW_ALPHA,
+            };
             return l
                 .output(output)
-                .map(|o| move_overlay(o, *target))
+                .map(|o| move_overlay(o, *target, alpha))
                 .unwrap_or_default();
         }
         Some(State::Cancelled) => None,
@@ -485,7 +507,7 @@ pub fn overlay(l: &Layout, drag: Option<&Drag>, p: (i32, i32)) -> Vec<(Rect, [f3
 }
 
 /// The output's interior cell boundaries, 1 px wide, and the preview where the window would go.
-fn move_overlay(o: &Output, target: Target) -> Vec<(Rect, [f32; 4])> {
+fn move_overlay(o: &Output, target: Target, alpha: f32) -> Vec<(Rect, [f32; 4])> {
     let a = o.area;
     let cols = (1..COLS).map(|k| Rect {
         x: o.x_edge(k),
@@ -499,11 +521,7 @@ fn move_overlay(o: &Output, target: Target) -> Vec<(Rect, [f32; 4])> {
     });
     cols.chain(rows)
         .map(|r| (r, accent(GRID_ALPHA)))
-        .chain(
-            target
-                .cells()
-                .map(|c| (o.tile_rect(c), accent(PREVIEW_ALPHA))),
-        )
+        .chain(target.cells().map(|c| (o.tile_rect(c), accent(alpha))))
         .collect()
 }
 
@@ -767,7 +785,7 @@ mod tests {
         d.motion(&mut l, gap, 0);
         assert_eq!(preview(&d), None);
         assert_eq!(
-            overlay(&l, Some(&d), gap).len(),
+            overlay(&l, Some(&d), gap, 0).len(),
             (COLS - 1 + ROWS - 1) as usize
         );
         assert!(d.release(&mut l, gap, 10).is_none());
@@ -883,21 +901,21 @@ mod tests {
         let mut d = Drag::press(&l, A_STRIP).unwrap();
         l.remove(0);
         d.motion(&mut l, A_STRIP, 0);
-        assert!(overlay(&l, Some(&d), A_STRIP).is_empty());
+        assert!(overlay(&l, Some(&d), A_STRIP, 0).is_empty());
         assert!(d.release(&mut l, B_RIM, 0).is_none());
     }
 
     #[test]
     fn ac13_overlay() {
         let mut l = halves();
-        assert!(overlay(&l, None, (500, 700)).is_empty());
+        assert!(overlay(&l, None, (500, 700), 0).is_empty());
         let strip = Rect {
             x: 4,
             y: 0,
             w: 1708,
             h: GAP,
         };
-        assert_eq!(overlay(&l, None, A_STRIP), vec![(strip, accent(1.0))]);
+        assert_eq!(overlay(&l, None, A_STRIP, 0), vec![(strip, accent(1.0))]);
         assert_eq!(
             accent(1.0),
             [
@@ -909,15 +927,26 @@ mod tests {
         );
 
         let mut d = Drag::press(&l, A_STRIP).unwrap();
-        assert_eq!(overlay(&l, Some(&d), A_STRIP), vec![(strip, accent(1.0))]);
+        assert_eq!(
+            overlay(&l, Some(&d), A_STRIP, 0),
+            vec![(strip, accent(1.0))]
+        );
         d.motion(&mut l, B_RIM, 0);
-        let rects = overlay(&l, Some(&d), B_RIM);
+        let rects = overlay(&l, Some(&d), B_RIM, 0);
         assert_eq!(rects.len(), (COLS - 1 + ROWS - 1 + 1) as usize);
         let lines = &rects[..rects.len() - 1];
         assert!(lines.iter().all(|(r, _)| r.w == 1 || r.h == 1));
         assert!(lines.iter().all(|&(_, k)| k == accent(GRID_ALPHA)));
         // The preview is where the window itself would go: the tile rect.
         assert_eq!(rects.last().unwrap().0, uw().tile_rect(c(6, 0, 6, 6)));
+        assert_eq!(rects.last().unwrap().1, accent(PREVIEW_ALPHA));
+
+        // Swap and tab previews look different: more solid once the hold has elapsed.
+        d.motion(&mut l, B_MIDDLE, 1000);
+        let preview_at = |t| *overlay(&l, Some(&d), B_MIDDLE, t).last().unwrap();
+        assert_eq!(preview_at(1499).1, accent(PREVIEW_ALPHA));
+        assert_eq!(preview_at(1500).1, accent(TAB_ALPHA));
+        assert_eq!(preview_at(1500).0, preview_at(1499).0);
     }
 
     #[test]
@@ -941,10 +970,10 @@ mod tests {
             (i32::MIN, i32::MIN),
             (i32::MAX, i32::MAX),
         ] {
-            overlay(&l, None, p);
+            overlay(&l, None, p, 0);
             if let Some(mut d) = Drag::press(&l, p) {
                 d.motion(&mut l, (i32::MAX, i32::MIN), 0);
-                overlay(&l, Some(&d), p);
+                overlay(&l, Some(&d), p, 0);
                 d.release(&mut l, (i32::MIN, i32::MAX), u64::MAX);
             }
         }

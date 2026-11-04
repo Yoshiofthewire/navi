@@ -14,26 +14,45 @@ use tracing::{info, warn};
 pub struct Screenshot {
     path: PathBuf,
     last: Option<Instant>,
+    /// The last failure, so a lasting one is logged once, not every second.
+    error: Option<String>,
 }
 
 impl Screenshot {
     pub fn from_env() -> Option<Self> {
         let path = PathBuf::from(std::env::var_os("NAVI_SCREENSHOT")?);
         info!(path = %path.display(), "NAVI_SCREENSHOT set: writing a frame there every second");
-        Some(Self { path, last: None })
+        Some(Self {
+            path,
+            last: None,
+            error: None,
+        })
     }
 
-    /// The first frame, then at most once per second.
-    pub fn due(&self) -> bool {
-        self.last
-            .is_none_or(|t| t.elapsed() >= Duration::from_secs(1))
+    /// The first frame, then at most once per second, whether or not the attempt succeeds.
+    pub fn due(&mut self) -> bool {
+        let due = self
+            .last
+            .is_none_or(|t| t.elapsed() >= Duration::from_secs(1));
+        if due {
+            self.last = Some(Instant::now());
+        }
+        due
     }
 
     /// Writes `rgba`, top row first. Failures are logged, never fatal.
     pub fn save(&mut self, w: u32, h: u32, rgba: &[u8]) {
-        self.last = Some(Instant::now());
-        if let Err(e) = encode(w, h, rgba).and_then(|png| write(&self.path, &png)) {
+        match encode(w, h, rgba).and_then(|png| write(&self.path, &png)) {
+            Ok(()) => self.error = None,
+            Err(e) => self.fail(e.to_string()),
+        }
+    }
+
+    /// Logs a failure unless it is the same as the last one.
+    pub fn fail(&mut self, e: String) {
+        if self.error.as_ref() != Some(&e) {
             warn!(path = %self.path.display(), "screenshot failed: {e}");
+            self.error = Some(e);
         }
     }
 }
