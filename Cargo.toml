@@ -9,6 +9,8 @@ description = "Tiling Wayland desktop with opinions about big monitors"
 png = "0.18"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# SIMD features off: without them the crate forbids unsafe code.
+zune-jpeg = { version = "0.5.15", default-features = false, features = ["std"] }
 
 [dependencies.smithay]
 version = "0.7.0"
