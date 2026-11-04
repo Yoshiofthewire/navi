@@ -181,23 +181,39 @@ The screen shows a wallpaper, a taskbar and your apps. There are no desktop icon
   `<monitor> <absolute path>` line per monitor, where monitor 0 is the main one and the rest
   follow by priority, e.g. `0 /home/me/Pictures/city.jpg`. Edits apply on restart. Delete the
   file to import from Plasma again.
-- **Taskbar:** centred at the bottom of the main monitor. It holds the app menu button and one
-  icon per running window, in the order they opened; the focused one is underlined, minimized
-  ones are dimmed. Click a running app to focus or restore it: it's un-minimized, shown in its
-  tab group, and any maximized or fullscreen window covering it steps back. Hover the bottom
-  edge of another monitor (its bottom 2 logical px) for 300 ms, and the taskbar moves there and
-  stays. Where it last was is remembered in `~/.local/state/navi/bar` (one monitor identity),
-  and used while that monitor is connected; otherwise it's on the main one. A fullscreen app
-  hides it.
-- **App menu:** the button opens a list of installed apps (`.desktop` files) with a search line:
-  type to filter by name, Up/Down to select, Enter or a click to launch, Escape or a click
-  elsewhere to close.
+- **Taskbar:** a compact, rounded dock centered 8 logical px above the bottom of its monitor.
+  Its visible body is 40 px high, with 24 px icons in 36 px slots, a subtle outline, and a blue
+  active-window indicator. The logo opens the launcher. Pinned apps come first, in pin order;
+  other running apps follow in opening order. Each app has one icon, with up to three dots for
+  its windows. Click an app to launch it if closed, focus or restore it if running, or cycle its
+  windows when already focused. Minimized apps are dimmed.
+- **Pins:** use the **Pin / Unpin** button beside an app in the launcher, press Insert on a
+  selected app, or right-click an app's dock icon. Pins survive restarts in
+  `$XDG_CONFIG_HOME/navi/pins` (default `~/.config/navi/pins`): `navi-pins 1`, then one installed
+  desktop file ID per line, at most 32. Uninstalled pins are retained in the file and hidden until
+  the app is installed again. Saves are private and atomic; a damaged file is left intact and
+  reports an error when pinning is attempted.
+- **Taskbar monitor:** hover the bottom edge of another monitor (its bottom 2 logical px) for
+  300 ms, and the dock moves there and stays. Its monitor is remembered in
+  `~/.local/state/navi/bar`; if unavailable, it uses the main monitor. Fullscreen hides it.
+- **App menu:** opens to folders derived from the installed apps' Desktop Entry categories:
+  Internet, Development, Office, Graphics, Sound & Video, Games, Education, Science, Settings,
+  System, Utilities, and Other. Only nonempty folders appear; apps are alphabetized within each
+  and appear in one folder. Click a folder to browse it; Back, Escape, Left, or Backspace with
+  an empty search returns to folders. Typing searches all folders by app name or desktop ID.
+  Up/Down selects, Enter opens the selected folder or launches the app, and Escape at the root
+  or clicking elsewhere closes the launcher. The mouse wheel and two-finger touchpad gestures
+  scroll both folders and app lists; small continuous movements accumulate across frames, and
+  gesture end, pointer leave or navigation clears any remainder. Short result lists shrink the
+  launcher to fit. The search, rows and pin buttons have distinct targets, and transparent space
+  around the dock and launcher takes no clicks.
 - **Corners:** on the main monitor, and they stay there when the taskbar moves or the main
-  monitor changes. A 24 px status
-  band runs across the top and takes space from the grid, like the taskbar; it takes no clicks
-  and a fullscreen app hides it. Status is top-right: the battery (`BAT 87%`, `+` while charging,
-  the mean of the system's batteries, read every 30 s; mice and headsets don't count) and the
-  local time (`Tue 04 Nov 14:05`, 24-hour), on a dim box so it reads over any wallpaper.
+  monitor changes. A 32 px status
+  bar runs across the top, with the same opaque dark surface and outline as the dock. Navi's logo
+  and name align left, the local date and 24-hour clock sit in the center, and a battery glyph
+  and percentage align right, labeled while charging. Battery capacity is the mean of the
+  system's batteries, read every 30 s; mice and headsets don't count. The bar takes space from
+  the grid, takes no clicks, and hides in fullscreen.
   Notifications are top-left, below the band. Volume, network and tray come later. Volume has no
   small route: PipeWire's native API is C (`libpipewire`, which needs `unsafe` and a new system
   library), pipewire-pulse has no D-Bus volume interface, and running `wpctl` would break the

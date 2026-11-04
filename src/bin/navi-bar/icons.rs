@@ -237,14 +237,7 @@ fn ini(text: &str) -> Vec<(String, Vec<(&str, &str)>)> {
 /// Icon names to try for a running app: its desktop entry's icon (by ID, or by
 /// `StartupWMClass`), the app ID itself, then the generic one.
 pub fn app_icon_names(app_id: &str, entries: &[Entry]) -> Vec<String> {
-    let id = format!("{app_id}.desktop");
-    let entry = entries.iter().find(|e| e.id == id).or_else(|| {
-        entries.iter().find(|e| {
-            e.wm_class
-                .as_ref()
-                .is_some_and(|c| c.eq_ignore_ascii_case(app_id))
-        })
-    });
+    let entry = crate::desktop::entry_for(app_id, entries).map(|i| &entries[i]);
     entry
         .and_then(|e| e.icon.clone())
         .into_iter()
@@ -486,6 +479,7 @@ mod tests {
             icon: Some(icon.into()),
             argv: vec!["x".into()],
             wm_class: class.map(Into::into),
+            category: crate::desktop::Category::Other,
         };
         let entries = [
             e("org.kde.konsole.desktop", "utilities-terminal", None),

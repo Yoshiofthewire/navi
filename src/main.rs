@@ -164,7 +164,10 @@ fn run(backend: Backend) -> Result<(), Box<dyn Error>> {
     );
     #[cfg(debug_assertions)]
     replay::start(&handle);
-    event_loop.run(None, &mut data, |_| {})?;
+    // Clients must receive replies even while the host throttles an obscured nested window.
+    event_loop.run(None, &mut data, |data| {
+        let _ = data.display.flush_clients();
+    })?;
     Ok(())
 }
 

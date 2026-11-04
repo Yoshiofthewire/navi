@@ -1,9 +1,35 @@
 //! File helpers shared by navi and navi-bar: XDG base dirs and capped reads.
 
 use std::ffi::OsStr;
-use std::fs::{self, File};
-use std::io::{ErrorKind, Read};
+use std::fs::{self, DirBuilder, File, OpenOptions};
+use std::io::{self, ErrorKind, Read, Write};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+
+/// A new private temp file beside `path`, in a private directory.
+pub fn private_tmp(path: &Path) -> io::Result<(File, PathBuf)> {
+    let dir = path.parent().ok_or(ErrorKind::InvalidInput)?;
+    DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    let tmp = path.with_extension("tmp");
+    match fs::remove_file(&tmp) {
+        Err(e) if e.kind() != ErrorKind::NotFound => return Err(e),
+        _ => {}
+    }
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    Ok((file, tmp))
+}
+
+/// Atomic, private replacement shared by compositor state and shell preferences.
+pub fn write_private(path: &Path, text: &str) -> io::Result<()> {
+    let (mut file, tmp) = private_tmp(path)?;
+    file.write_all(text.as_bytes())?;
+    file.sync_all()?;
+    fs::rename(tmp, path)
+}
 
 /// An XDG base dir: `var` (e.g. `$XDG_STATE_HOME`), else `$HOME/<fallback>`. Relative values are
 /// ignored, as the XDG spec says, so navi never writes relative to its working directory.

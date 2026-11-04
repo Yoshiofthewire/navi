@@ -13,6 +13,7 @@ mod theme;
 mod cards;
 mod dbus;
 mod desktop;
+mod dock;
 mod exec;
 mod font;
 mod icons;
@@ -77,19 +78,19 @@ use dbus::Call;
 use desktop::Entry;
 use icons::{Icons, Themes};
 use layout::{BAR_H, IconOf, Item, Layout, Rect, Slot};
-use menu::Menu;
+use menu::{Menu, Row};
 use notify::{Closed, Notes};
-use theme::{BG, DIM, INK};
+use theme::{DIM, INK};
 
 const BTN_LEFT: u32 = 0x110;
-const TEXT_PX: f32 = 15.0;
+const BTN_RIGHT: u32 = 0x111;
+const TEXT_PX: f32 = 14.0;
 /// How long a launch waits for its activation token.
 const TOKEN_WAIT: Duration = Duration::from_secs(1);
 /// The status band across the top of the main output.
-const BAND_H: i32 = 24;
+const BAND_H: i32 = 32;
 /// Between the status text and the band's right edge, and the cards and the output's edges.
 const EDGE: i32 = 8;
-const BAND_ALPHA: f32 = 0.85;
 const POWER: &str = "/sys/class/power_supply";
 
 fn main() {
@@ -188,6 +189,7 @@ fn run() -> Result<(), String> {
         band_configured: false,
         band_w: 0,
         status: String::new(),
+        battery: None,
         cards_layer: None,
         cards_size: (0, 0),
         cards_configured: false,
@@ -214,6 +216,9 @@ fn run() -> Result<(), String> {
         entries: desktop::scan(&data_dirs),
         data_dirs,
         menu: None,
+        pins: dock::Pins::load(),
+        hover: None,
+        pin_message: String::new(),
         icons: Icons::new(themes),
         font,
         launches: 0,
@@ -221,6 +226,7 @@ fn run() -> Result<(), String> {
         closed: false,
     };
     bar.refresh_status();
+    bar.relayout();
     WaylandSource::new(conn, queue)
         .insert(event_loop.handle())
         .map_err(|e| e.to_string())?;
@@ -287,6 +293,7 @@ struct Bar {
     band_configured: bool,
     band_w: i32,
     status: String,
+    battery: Option<status::Battery>,
     /// The notification cards' surface, while any are shown.
     cards_layer: Option<LayerSurface>,
     cards_size: (i32, i32),
@@ -317,6 +324,9 @@ struct Bar {
     entries: Vec<Entry>,
     data_dirs: Vec<PathBuf>,
     menu: Option<Menu>,
+    pins: dock::Pins,
+    hover: Option<layout::Hit>,
+    pin_message: String,
     icons: Icons,
     font: Option<fontdue::Font>,
     launches: u64,
@@ -352,17 +362,24 @@ impl Bar {
 
     /// Resizes the surface to what it now holds, or redraws it at its size.
     fn relayout(&mut self) {
-        let l = Layout::new(self.shown().count(), self.menu.is_some());
+        let rows = self.menu.as_ref().map_or(menu::ROWS, |m| m.rows().count());
+        let l = Layout::new(self.dock_apps().len(), self.menu.is_some()).with_rows(rows);
         if l == self.layout {
             return self.draw();
         }
         self.layout = l;
         self.layer.set_size(l.w as u32, l.h as u32);
-        // Drawn on the configure that follows.
-        self.layer.commit();
+        // A client-requested layer size need not produce another configure. Commit the new
+        // buffer and input region with that size, so an old image never moves into its place.
+        if self.configured {
+            self.draw();
+        } else {
+            self.layer.commit();
+        }
     }
 
     fn toggle_menu(&mut self) {
+        self.pin_message.clear();
         self.menu = match self.menu {
             Some(_) => None,
             None => {
@@ -370,6 +387,7 @@ impl Bar {
                 Some(Menu::new(&self.entries))
             }
         };
+        debug!(open = self.menu.is_some(), "launcher toggled");
         self.relayout();
     }
 
@@ -416,22 +434,118 @@ impl Bar {
         Some(self.pending.remove(at).1)
     }
 
+    fn dock_apps(&self) -> Vec<dock::App> {
+        let windows: Vec<dock::Running<'_>> = self
+            .shown()
+            .map(|w| dock::Running {
+                app_id: &w.app_id,
+                focused: w.activated,
+                minimized: w.minimized,
+            })
+            .collect();
+        dock::apps(&self.pins.ids, &self.entries, &windows)
+    }
+
+    fn toggle_pin(&mut self, entry: usize) {
+        let Some(e) = self.entries.get(entry) else {
+            return;
+        };
+        match self.pins.toggle(&e.id) {
+            Ok(pinned) => {
+                self.pin_message = format!(
+                    "{} {} the dock",
+                    e.name,
+                    if pinned { "pinned to" } else { "removed from" }
+                );
+                info!(id = e.id, pinned, "dock pin changed");
+            }
+            Err(err) => {
+                warn!("{err}");
+                self.pin_message = err;
+                if self.menu.is_none() {
+                    let mut menu = Menu::new(&self.entries);
+                    menu.set_query(&e.name, &self.entries);
+                    self.menu = Some(menu);
+                }
+            }
+        }
+        self.relayout();
+    }
+
+    fn open_row(&mut self, row: Row, serial: u32, qh: &QueueHandle<Self>) {
+        match row {
+            Row::Folder(folder) => {
+                if let Some(menu) = &mut self.menu {
+                    menu.open(folder, &self.entries);
+                }
+                self.relayout();
+            }
+            Row::App(entry) => self.launch(entry, serial, qh),
+        }
+    }
+
     fn click(&mut self, serial: u32, qh: &QueueHandle<Self>) {
         let (x, y) = (self.pointer_at.0 as i32, self.pointer_at.1 as i32);
+        debug!(x, y, hit = ?self.layout.hit(x, y), "dock click");
         match self.layout.hit(x, y) {
             Some(layout::Hit::Button) => self.toggle_menu(),
             Some(layout::Hit::Window(i)) => {
-                let win = self.shown().nth(i).map(|w| w.handle.clone());
-                if let (Some(h), Some(seat)) = (win, &self.seat) {
-                    h.activate(seat);
+                let apps = self.dock_apps();
+                let Some(app) = apps.get(i) else {
+                    return;
+                };
+                if app.windows.is_empty() {
+                    if let Some(e) = app.entry {
+                        self.launch(e, serial, qh);
+                    }
+                } else {
+                    let focused = app
+                        .windows
+                        .iter()
+                        .position(|&i| self.shown().nth(i).is_some_and(|w| w.activated));
+                    let next = focused.map_or(0, |i| (i + 1) % app.windows.len());
+                    let win = self
+                        .shown()
+                        .nth(app.windows[next])
+                        .map(|w| w.handle.clone());
+                    if let (Some(h), Some(seat)) = (win, &self.seat) {
+                        h.activate(seat);
+                    }
+                    self.close_menu();
                 }
             }
-            Some(layout::Hit::Row(k)) => {
-                if let Some(e) = self.menu.as_ref().and_then(|m| m.at_row(k)) {
-                    self.launch(e, serial, qh);
+            Some(layout::Hit::Row(k) | layout::Hit::Pin(k)) => {
+                if let Some(row) = self.menu.as_ref().and_then(|m| m.at_row(k)) {
+                    match (self.layout.hit(x, y), row) {
+                        (Some(layout::Hit::Pin(_)), Row::App(e)) => self.toggle_pin(e),
+                        _ => self.open_row(row, serial, qh),
+                    }
                 }
+            }
+            Some(layout::Hit::Back) => {
+                if let Some(menu) = &mut self.menu {
+                    menu.back(&self.entries);
+                }
+                self.relayout();
             }
             None => {}
+        }
+    }
+
+    fn right_click(&mut self) {
+        let (x, y) = (self.pointer_at.0 as i32, self.pointer_at.1 as i32);
+        let entry = match self.layout.hit(x, y) {
+            Some(layout::Hit::Window(i)) => self.dock_apps().get(i).and_then(|app| app.entry),
+            Some(layout::Hit::Row(k) | layout::Hit::Pin(k)) => {
+                self.menu.as_ref().and_then(|m| match m.at_row(k) {
+                    Some(Row::App(e)) => Some(e),
+                    _ => None,
+                })
+            }
+            _ => None,
+        };
+        if let Some(e) = entry {
+            self.toggle_pin(e);
         }
     }
 
@@ -440,10 +554,21 @@ impl Bar {
             return;
         };
         match event.keysym {
-            Keysym::Escape => self.close_menu(),
+            Keysym::Escape => {
+                if !self.menu.as_mut().is_some_and(|m| m.back(&self.entries)) {
+                    self.close_menu();
+                } else {
+                    self.relayout();
+                }
+            }
+            Keysym::Insert => {
+                if let Some(Row::App(e)) = menu.selected() {
+                    self.toggle_pin(e);
+                }
+            }
             Keysym::Return | Keysym::KP_Enter => {
                 if let Some(e) = menu.selected() {
-                    self.launch(e, serial, qh);
+                    self.open_row(e, serial, qh);
                 }
             }
             _ => self.edit(event),
@@ -457,6 +582,9 @@ impl Bar {
         };
         match event.keysym {
             Keysym::BackSpace => menu.pop(&self.entries),
+            Keysym::Left => {
+                menu.back(&self.entries);
+            }
             Keysym::Up => menu.step(-1),
             Keysym::Down => menu.step(1),
             Keysym::Escape | Keysym::Return | Keysym::KP_Enter => return,
@@ -467,7 +595,7 @@ impl Bar {
                 }
             }
         }
-        self.draw();
+        self.relayout();
     }
 
     fn draw(&mut self) {
@@ -479,36 +607,56 @@ impl Bar {
         let Some(mut canvas) = Pixmap::new((l.w * s) as u32, (l.h * s) as u32) else {
             return;
         };
-        let slots: Vec<Slot> = self
-            .shown()
-            .map(|w| Slot {
-                focused: w.activated,
-                minimized: w.minimized,
+        let apps = self.dock_apps();
+        let slots: Vec<Slot> = apps
+            .iter()
+            .map(|app| Slot {
+                focused: app.focused,
+                minimized: app.minimized,
+                running: app.windows.len(),
+                pinned: app.pinned,
             })
             .collect();
-        let app_ids: Vec<String> = self.shown().map(|w| w.app_id.clone()).collect();
-        let (query, rows, scroll) = match &self.menu {
-            Some(m) => (m.query(), m.rows().collect(), m.scroll_pos()),
-            None => ("", Vec::new(), (0, 0)),
-        };
-        let rows: Vec<(usize, bool, &str)> = rows
-            .into_iter()
-            .map(|(e, sel)| (e, sel, self.entries[e].name.as_str()))
-            .collect();
-        let items = l.draw(&slots, query, &rows, scroll);
+        let items = l.draw(
+            &slots,
+            self.menu.as_ref(),
+            &self.entries,
+            &self.pins.ids,
+            self.hover,
+            &self.pin_message,
+        );
+        if let Ok(region) = Region::new(&self.compositor) {
+            for r in [Some(l.bar()), l.panel()].into_iter().flatten() {
+                region.add(r.x, r.y, r.w, r.h);
+            }
+            self.layer
+                .wl_surface()
+                .set_input_region(Some(region.wl_region()));
+        }
         for item in items {
             match item {
-                Item::Fill(..) | Item::Text(..) => paint(&mut canvas, self.font.as_ref(), item, s),
+                Item::Fill(..) | Item::Round(..) | Item::Text(..) => {
+                    paint(&mut canvas, self.font.as_ref(), item, s)
+                }
                 Item::Icon(of, r, alpha) => {
                     let r = scaled(r, s);
                     let size = r.w as u32;
                     let px = match of {
                         IconOf::Button => self.icons.navi(size),
                         IconOf::Window(i) => {
-                            let id = &app_ids[i];
-                            let names = icons::app_icon_names(id, &self.entries);
-                            self.icons.get(&format!("app:{id}"), &names, size)
+                            let app = &apps[i];
+                            let names = match app.entry {
+                                Some(e) => self.entries[e]
+                                    .icon
+                                    .iter()
+                                    .cloned()
+                                    .chain(["application-x-executable".into()])
+                                    .collect(),
+                                None => icons::app_icon_names(&app.app_id, &self.entries),
+                            };
+                            self.icons.get(&format!("app:{}", app.app_id), &names, size)
                         }
+                        IconOf::Folder => self.icons.get("folder", &["folder".into()], size),
                         IconOf::Entry(e) => {
                             let entry = &self.entries[e];
                             let names: Vec<String> = entry.icon.iter().cloned().collect();
@@ -550,7 +698,7 @@ impl Bar {
                             w: r.w - 4 * s,
                             ..r
                         };
-                        draw_text(&mut canvas, font, "Search", rest, px, DIM);
+                        draw_text(&mut canvas, font, "Search all apps…", rest, px, DIM);
                     }
                 }
             }
@@ -563,35 +711,154 @@ impl Bar {
     }
 
     fn refresh_status(&mut self) {
-        let status = status::format(&jiff::Zoned::now(), status::battery(Path::new(POWER)));
+        let battery = status::battery(Path::new(POWER));
+        let status = status::format(&jiff::Zoned::now(), battery);
         if status != self.status {
             self.status = status;
+            self.battery = battery;
             self.draw_band();
         }
     }
 
-    /// The status text flush right on a dim box just big enough for it; the rest transparent.
+    /// A deliberate status bar: identity left, clock centered, power right.
     fn draw_band(&mut self) {
+        if !self.band_configured {
+            return;
+        }
         let s = self.scale.max(1);
         let Some(mut canvas) = Pixmap::new((self.band_w * s) as u32, (BAND_H * s) as u32) else {
             return;
         };
-        if let Some(font) = &self.font {
-            let w = text_w(font, &self.status, TEXT_PX).ceil() as i32 + 2 * EDGE;
-            let r = Rect {
-                x: self.band_w - w,
+        fill(
+            &mut canvas,
+            Rect {
+                x: 0,
                 y: 0,
-                w,
-                h: BAND_H,
-            };
-            fill(&mut canvas, scaled(r, s), BG, BAND_ALPHA);
-            let text = Rect {
-                x: r.x + EDGE,
-                w: r.w - EDGE,
-                ..r
-            };
-            let item = Item::Text(self.status.clone(), text, INK);
-            paint(&mut canvas, Some(font), item, s);
+                w: self.band_w * s,
+                h: BAND_H * s,
+            },
+            theme::BAR_BG,
+            1.0,
+        );
+        fill(
+            &mut canvas,
+            Rect {
+                x: 0,
+                y: (BAND_H - 1) * s,
+                w: self.band_w * s,
+                h: s,
+            },
+            theme::SHELL_EDGE,
+            1.0,
+        );
+        if let Some(icon) = self.icons.navi((16 * s) as u32) {
+            canvas.draw_pixmap(
+                12 * s,
+                8 * s,
+                icon.as_ref(),
+                &PixmapPaint::default(),
+                Transform::identity(),
+                None,
+            );
+        }
+        if let Some(font) = &self.font {
+            let now = jiff::Zoned::now();
+            let clock = now
+                .strftime(if self.band_w < 520 {
+                    "%H:%M"
+                } else {
+                    "%a %d %b   %H:%M"
+                })
+                .to_string();
+            let w = text_w(font, &clock, TEXT_PX).ceil() as i32;
+            for item in [
+                Item::Text(
+                    "Navi".into(),
+                    Rect {
+                        x: 36,
+                        y: 0,
+                        w: 64,
+                        h: BAND_H,
+                    },
+                    INK,
+                ),
+                Item::Text(
+                    clock,
+                    Rect {
+                        x: (self.band_w - w) / 2,
+                        y: 0,
+                        w: w + 1,
+                        h: BAND_H,
+                    },
+                    INK,
+                ),
+            ] {
+                paint(&mut canvas, Some(font), item, s);
+            }
+            if let Some(b) = self.battery {
+                let text = format!(
+                    "{}{}%",
+                    if b.charging { "Charging  " } else { "" },
+                    b.percent
+                );
+                let w = text_w(font, &text, TEXT_PX).ceil() as i32;
+                let x = self.band_w - 12 - w;
+                paint(
+                    &mut canvas,
+                    Some(font),
+                    Item::Text(
+                        text,
+                        Rect {
+                            x,
+                            y: 0,
+                            w: w + 1,
+                            h: BAND_H,
+                        },
+                        INK,
+                    ),
+                    s,
+                );
+                let r = Rect {
+                    x: x - 27,
+                    y: 11,
+                    w: 18,
+                    h: 10,
+                };
+                for edge in [
+                    Rect { h: 1, ..r },
+                    Rect {
+                        y: r.y + r.h - 1,
+                        h: 1,
+                        ..r
+                    },
+                    Rect { w: 1, ..r },
+                    Rect {
+                        x: r.x + r.w - 1,
+                        w: 1,
+                        ..r
+                    },
+                    Rect {
+                        x: r.x + r.w,
+                        y: r.y + 3,
+                        w: 2,
+                        h: 4,
+                    },
+                ] {
+                    fill(&mut canvas, scaled(edge, s), DIM, 1.0);
+                }
+                let charge = Rect {
+                    x: r.x + 2,
+                    y: r.y + 2,
+                    w: (14 * b.percent as i32 / 100).max(1),
+                    h: 6,
+                };
+                fill(
+                    &mut canvas,
+                    scaled(charge, s),
+                    if b.charging { theme::ACCENT } else { INK },
+                    1.0,
+                );
+            }
         }
         present(&mut self.pool, &self.band, &canvas, s);
     }
@@ -723,6 +990,7 @@ fn present(pool: &mut SlotPool, layer: &LayerSurface, canvas: &Pixmap, s: i32) {
 fn paint(canvas: &mut Pixmap, font: Option<&fontdue::Font>, item: Item, s: i32) {
     match item {
         Item::Fill(r, rgb) => fill(canvas, scaled(r, s), rgb, 1.0),
+        Item::Round(r, radius, rgb) => rounded(canvas, scaled(r, s), radius * s, rgb),
         Item::Text(text, r, rgb) => {
             if let Some(font) = font {
                 draw_text(canvas, font, &text, scaled(r, s), TEXT_PX * s as f32, rgb);
@@ -763,6 +1031,57 @@ fn fill(canvas: &mut Pixmap, r: Rect, rgb: u32, alpha: f32) {
     let mut paint = Paint::default();
     paint.set_color(color(rgb, alpha));
     canvas.fill_rect(rect, &paint, Transform::identity(), None);
+}
+
+/// Rounded shell surfaces, rendered with the rasterizer already used for icons.
+fn rounded(canvas: &mut Pixmap, r: Rect, radius: i32, rgb: u32) {
+    let (x, y, w, h) = (r.x as f32, r.y as f32, r.w as f32, r.h as f32);
+    let radius = (radius as f32).min(w / 2.0).min(h / 2.0).max(0.0);
+    let k = radius * 0.5522848;
+    let (right, bottom) = (x + w, y + h);
+    let mut path = tiny_skia::PathBuilder::new();
+    path.move_to(x + radius, y);
+    path.line_to(right - radius, y);
+    path.cubic_to(
+        right - radius + k,
+        y,
+        right,
+        y + radius - k,
+        right,
+        y + radius,
+    );
+    path.line_to(right, bottom - radius);
+    path.cubic_to(
+        right,
+        bottom - radius + k,
+        right - radius + k,
+        bottom,
+        right - radius,
+        bottom,
+    );
+    path.line_to(x + radius, bottom);
+    path.cubic_to(
+        x + radius - k,
+        bottom,
+        x,
+        bottom - radius + k,
+        x,
+        bottom - radius,
+    );
+    path.line_to(x, y + radius);
+    path.cubic_to(x, y + radius - k, x + radius - k, y, x + radius, y);
+    path.close();
+    if let Some(path) = path.finish() {
+        let mut paint = Paint::default();
+        paint.set_color(color(rgb, 1.0));
+        canvas.fill_path(
+            &path,
+            &paint,
+            tiny_skia::FillRule::Winding,
+            Transform::identity(),
+            None,
+        );
+    }
 }
 
 /// A dim outlined square where an icon couldn't be found.
@@ -1181,15 +1500,37 @@ impl PointerHandler for Bar {
                     serial,
                     ..
                 } => self.click(serial, qh),
-                PointerEventKind::Axis { vertical, .. } => {
-                    let steps = match vertical.discrete {
-                        0 => (vertical.absolute / 15.0).round() as isize,
-                        d => d as isize,
-                    };
-                    if let Some(m) = self.menu.as_mut()
-                        && steps != 0
+                PointerEventKind::Press {
+                    button: BTN_RIGHT, ..
+                } => self.right_click(),
+                PointerEventKind::Enter { .. }
+                | PointerEventKind::Motion { .. }
+                | PointerEventKind::Leave { .. } => {
+                    if matches!(e.kind, PointerEventKind::Leave { .. })
+                        && let Some(menu) = self.menu.as_mut()
                     {
-                        m.scroll(steps);
+                        menu.stop_scroll();
+                    }
+                    let hover = if matches!(e.kind, PointerEventKind::Leave { .. }) {
+                        None
+                    } else {
+                        self.layout.hit(e.position.0 as i32, e.position.1 as i32)
+                    };
+                    let selected = match (self.menu.as_mut(), hover) {
+                        (Some(menu), Some(layout::Hit::Row(k) | layout::Hit::Pin(k))) => {
+                            menu.select_row(k)
+                        }
+                        _ => false,
+                    };
+                    if hover != self.hover || selected {
+                        self.hover = hover;
+                        self.draw();
+                    }
+                }
+                PointerEventKind::Axis { vertical, .. } => {
+                    if let Some(m) = self.menu.as_mut()
+                        && m.scroll_axis(vertical.absolute, vertical.discrete, vertical.stop)
+                    {
                         self.draw();
                     }
                 }

@@ -15,6 +15,8 @@ pub const BAR_BG: u32 = 0x151922;
 /// An inactive tab, and the selected menu row.
 pub const TAB_BG: u32 = 0x262C38;
 pub const SELECTED: u32 = TAB_BG;
+/// The subtle boundary of the dock, launcher and top status bar.
+pub const SHELL_EDGE: u32 = 0x303847;
 /// A minimized tile's strip or tab: a dimmed accent, still 3:1 against the bar and background.
 pub const MINIMIZED: u32 = 0x20769E;
 /// Outlines inactive tabs, which can't be 3:1 against both the bar and the active tab.
@@ -55,6 +57,7 @@ mod tests {
             (INK, BAR_BG),
             (INK, TAB_BG),
             (DIM, BG),
+            (DIM, BAR_BG),
             (INK_ON_ACCENT, ACCENT),
         ] {
             assert!(contrast(fg, bg) >= 4.5, "{fg:06x} on {bg:06x}");
