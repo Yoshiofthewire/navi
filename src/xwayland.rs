@@ -527,11 +527,11 @@ mod tests {
             surface.geometry().size.w,
             data.state.layout.rect(id).unwrap().w
         );
-        // Keyboard focus includes X input focus, not just Wayland focus on the X server.
-        assert_eq!(
-            conn.get_input_focus().unwrap().reply().unwrap().focus,
-            window
-        );
+        // The test client and XWM use separate X11 connections. Mapping in Navi doesn't mean
+        // the server has processed the XWM's focus request yet; wait for actual X input focus.
+        pump(&mut event_loop, &mut data, |_| {
+            conn.get_input_focus().unwrap().reply().unwrap().focus == window
+        });
         data.state.keyboard_key(38u32.into(), KeyState::Pressed, 1);
         data.state.keyboard_key(38u32.into(), KeyState::Released, 2);
         let mut key = false;
