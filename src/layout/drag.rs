@@ -178,6 +178,13 @@ impl Layout {
         }
     }
 
+    /// The user put `ids` where they are: a returning output doesn't take them back.
+    fn stay(&mut self, ids: &[WinId]) {
+        for t in self.tiles.iter_mut().filter(|t| ids.contains(&t.id)) {
+            t.home = None;
+        }
+    }
+
     fn tiles_in(&self, ids: &[WinId]) -> Vec<Tile> {
         let has = |t: &&Tile| ids.contains(&t.id);
         self.tiles.iter().filter(has).cloned().collect()
@@ -546,13 +553,16 @@ impl Drag {
                 // What lands is shown, and a new tile there must be visible.
                 l.clear_maximized(&output);
                 l.touch(id);
+                l.stay(&ids);
                 let tiles = l.tiles_in(&ids);
                 l.learn(&tiles, false);
                 Some(Done::Layout(what, tiles))
             }
             State::Resize(r) => {
                 let moved = |t: &&Tile| r.before.iter().any(|b| b.id == t.id && b.cells != t.cells);
-                let tiles: Vec<Tile> = l.tiles.iter().filter(moved).cloned().collect();
+                let ids: Vec<WinId> = l.tiles.iter().filter(moved).map(|t| t.id).collect();
+                l.stay(&ids);
+                let tiles = l.tiles_in(&ids);
                 l.learn(&tiles, true);
                 (!tiles.is_empty()).then_some(Done::Layout("resized", tiles))
             }

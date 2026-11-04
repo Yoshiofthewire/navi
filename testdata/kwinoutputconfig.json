@@ -1,0 +1,223 @@
+[
+  {
+    "name": "outputs",
+    "data": [
+      {
+        "connectorName": "eDP-1",
+        "edidIdentifier": "SDC 16797 0 0 2022 0",
+        "scale": 1.6,
+        "transform": "Normal",
+        "mode": {
+          "cvt": {
+            "hdisplay": 2880,
+            "vdisplay": 1800
+          }
+        }
+      },
+      {
+        "connectorName": "DP-11",
+        "edidIdentifier": "ACR 1359 4294967295 0 0 2016",
+        "scale": 1,
+        "transform": "Normal",
+        "mode": {
+          "cvt": {
+            "hdisplay": 3440,
+            "vdisplay": 1440
+          }
+        }
+      },
+      {
+        "connectorName": "DP-13",
+        "edidIdentifier": "SAM 29247 0 42 2021 0",
+        "scale": 1,
+        "transform": "Normal",
+        "mode": {
+          "cvt": {
+            "hdisplay": 3840,
+            "vdisplay": 2160
+          }
+        }
+      }
+    ]
+  },
+  {
+    "data": [
+      {
+        "lidClosed": false,
+        "outputs": [
+          {
+            "enabled": true,
+            "outputIndex": 0,
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "priority": 1,
+            "replicationSource": ""
+          }
+        ]
+      },
+      {
+        "lidClosed": true,
+        "outputs": [
+          {
+            "enabled": true,
+            "outputIndex": 0,
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "priority": 1,
+            "replicationSource": ""
+          }
+        ]
+      },
+      {
+        "lidClosed": false,
+        "outputs": [
+          {
+            "enabled": true,
+            "outputIndex": 0,
+            "position": {
+              "x": 0,
+              "y": 2306
+            },
+            "priority": 2,
+            "replicationSource": ""
+          },
+          {
+            "enabled": true,
+            "outputIndex": 1,
+            "position": {
+              "x": 1800,
+              "y": 2160
+            },
+            "priority": 1,
+            "replicationSource": ""
+          },
+          {
+            "enabled": true,
+            "outputIndex": 2,
+            "position": {
+              "x": 1640,
+              "y": 0
+            },
+            "priority": 3,
+            "replicationSource": ""
+          }
+        ]
+      },
+      {
+        "lidClosed": false,
+        "outputs": [
+          {
+            "enabled": true,
+            "outputIndex": 0,
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "priority": 1,
+            "replicationSource": ""
+          },
+          {
+            "enabled": true,
+            "outputIndex": 1,
+            "position": {
+              "x": 1800,
+              "y": 0
+            },
+            "priority": 2,
+            "replicationSource": ""
+          }
+        ]
+      },
+      {
+        "lidClosed": true,
+        "outputs": [
+          {
+            "enabled": false,
+            "outputIndex": 0,
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "priority": 1,
+            "replicationSource": ""
+          },
+          {
+            "enabled": true,
+            "outputIndex": 1,
+            "position": {
+              "x": 1800,
+              "y": 0
+            },
+            "priority": 2,
+            "replicationSource": ""
+          }
+        ]
+      },
+      {
+        "lidClosed": true,
+        "outputs": [
+          {
+            "enabled": false,
+            "outputIndex": 0,
+            "position": {
+              "x": 0,
+              "y": 2306
+            },
+            "priority": 1,
+            "replicationSource": ""
+          },
+          {
+            "enabled": true,
+            "outputIndex": 1,
+            "position": {
+              "x": 1800,
+              "y": 2160
+            },
+            "priority": 2,
+            "replicationSource": ""
+          },
+          {
+            "enabled": true,
+            "outputIndex": 2,
+            "position": {
+              "x": 1640,
+              "y": 0
+            },
+            "priority": 3,
+            "replicationSource": ""
+          }
+        ]
+      },
+      {
+        "lidClosed": false,
+        "outputs": [
+          {
+            "enabled": true,
+            "outputIndex": 0,
+            "position": {
+              "x": 0,
+              "y": 0
+            },
+            "priority": 1,
+            "replicationSource": ""
+          },
+          {
+            "enabled": true,
+            "outputIndex": 2,
+            "position": {
+              "x": 1800,
+              "y": 0
+            },
+            "priority": 2,
+            "replicationSource": ""
+          }
+        ]
+      }
+    ],
+    "name": "setups"
+  }
+]

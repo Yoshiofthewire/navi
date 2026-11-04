@@ -1,5 +1,6 @@
 use smithay::{
     backend::renderer::utils::on_commit_buffer_handler,
+    backend::session::libseat::LibSeatSession,
     delegate_compositor, delegate_data_device, delegate_layer_shell, delegate_output,
     delegate_seat, delegate_shm, delegate_xdg_activation, delegate_xdg_decoration,
     delegate_xdg_shell,
@@ -9,11 +10,15 @@ use smithay::{
     },
     input::{
         Seat, SeatHandler, SeatState,
+        keyboard::Keycode,
         pointer::{CursorImageStatus, MotionEvent},
     },
     output::Output,
     reexports::{
-        calloop::LoopSignal,
+        calloop::{
+            LoopHandle, LoopSignal, RegistrationToken,
+            timer::{TimeoutAction, Timer},
+        },
         wayland_protocols::xdg::{
             decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as Decoration,
             shell::server::xdg_toplevel,
@@ -60,11 +65,13 @@ use smithay::{
         },
     },
 };
-use tracing::info;
+use tracing::{info, warn};
 
+use crate::CalloopData;
 use crate::activation::{self, may_issue, may_redeem};
 use crate::layout::{self, Decor, Drag, Layout, Rect, WinId, decoration};
-use crate::persist::Store;
+use crate::monitors::{BarHover, Hover};
+use crate::persist::{self, Store};
 use crate::toplevels::{self, Toplevels};
 use crate::wallpaper::usable_area;
 
@@ -91,6 +98,15 @@ pub struct Navi {
     /// The layout's outputs, with the area layer surfaces leave for the grid.
     grid: Vec<layout::Output>,
     pub toplevels: Toplevels,
+    pub loop_handle: LoopHandle<'static, CalloopData>,
+    /// The seat session on real hardware, for VT switches; `None` nested.
+    pub session: Option<LibSeatSession>,
+    /// Keys whose press navi kept for itself; their release is kept too.
+    pub suppressed: Vec<Keycode>,
+    bar_hover: BarHover,
+    hover_timer: Option<RegistrationToken>,
+    /// The output the taskbar goes on, as last moved there.
+    bar_output: Option<String>,
 
     compositor_state: CompositorState,
     xdg_shell_state: XdgShellState,
@@ -108,6 +124,7 @@ pub struct Navi {
 impl Navi {
     pub fn new(
         dh: DisplayHandle,
+        loop_handle: LoopHandle<'static, CalloopData>,
         loop_signal: LoopSignal,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let mut seat_state = SeatState::new();
@@ -150,6 +167,12 @@ impl Navi {
             drag: None,
             grid: Vec::new(),
             toplevels: Toplevels::default(),
+            loop_handle,
+            session: None,
+            suppressed: Vec::new(),
+            bar_hover: BarHover::default(),
+            hover_timer: None,
+            bar_output: persist::load_bar(),
             seat_state,
             popups: PopupManager::default(),
             seat,
@@ -160,12 +183,15 @@ impl Navi {
         self.start_time.elapsed().as_millis() as u64
     }
 
-    pub fn pointer_px(&self) -> (i32, i32) {
-        px(self
-            .seat
+    pub fn pointer_location(&self) -> Point<f64, Logical> {
+        self.seat
             .get_pointer()
             .map(|p| p.current_location())
-            .unwrap_or_default())
+            .unwrap_or_default()
+    }
+
+    pub fn pointer_px(&self) -> (i32, i32) {
+        px(self.pointer_location())
     }
 
     fn window_surface_under(
@@ -330,6 +356,36 @@ impl Navi {
         self.arrange_layers(output);
     }
 
+    /// Takes `output` away: its layer surfaces are closed (navi-bar makes new ones elsewhere) and
+    /// its tiles move to the other outputs.
+    pub fn remove_output(&mut self, output: &Output) {
+        let name = output.name();
+        {
+            let mut map = layer_map_for_output(output);
+            for l in map.layers().cloned().collect::<Vec<_>>() {
+                l.layer_surface().send_close();
+                map.unmap_layer(&l);
+            }
+        }
+        self.space.unmap_output(output);
+        self.grid.retain(|o| o.name != name);
+        self.layout.remove_output(&name);
+        info!(output = name, "output removed");
+        self.apply_layout();
+    }
+
+    /// New priorities by output name, lowest first.
+    pub fn set_priorities(&mut self, order: &[String]) {
+        for o in &mut self.grid {
+            o.priority = order
+                .iter()
+                .position(|n| *n == o.name)
+                .unwrap_or(order.len()) as u32;
+        }
+        self.layout.set_outputs(self.grid.clone());
+        self.apply_layout();
+    }
+
     /// Re-arranges `output`'s layer surfaces, and gives the grid what they leave of it.
     pub fn arrange_layers(&mut self, output: &Output) {
         let Some(geo) = self.space.output_geometry(output) else {
@@ -420,13 +476,121 @@ impl Navi {
         self.tile_of(&focus)
     }
 
-    /// The output layer surfaces go on when they name none: the main one, priority 0.
-    fn main_output(&self) -> Option<Output> {
-        let priority = |o: &&Output| {
-            let g = self.grid.iter().find(|g| g.name == o.name());
-            g.map_or(u32::MAX, |g| g.priority)
+    /// The output with navi-bar's taskbar.
+    fn bar_on(&self) -> Option<String> {
+        self.space
+            .outputs()
+            .find(|o| {
+                layer_map_for_output(o)
+                    .layers()
+                    .any(|l| l.namespace() == BAR)
+            })
+            .map(|o| o.name())
+    }
+
+    /// Where a new taskbar goes: where it was last moved, if that's connected, else main.
+    fn bar_target(&self) -> Option<Output> {
+        let last = self.bar_output.as_ref();
+        last.and_then(|n| self.space.outputs().find(|o| o.name() == *n).cloned())
+            .or_else(|| self.main_output())
+    }
+
+    /// Feeds the taskbar's hover band at `pos`; after a rest on another output's bottom edge the
+    /// taskbar moves there.
+    pub fn bar_hover(&mut self, pos: Point<f64, Logical>) {
+        let Some(bar) = self.bar_on() else {
+            return;
         };
-        self.space.outputs().min_by_key(priority).cloned()
+        let outputs: Vec<(String, Rect)> = self
+            .space
+            .outputs()
+            .filter_map(|o| {
+                let g = self.space.output_geometry(o)?;
+                let r = Rect {
+                    x: g.loc.x,
+                    y: g.loc.y,
+                    w: g.size.w,
+                    h: g.size.h,
+                };
+                Some((o.name(), r))
+            })
+            .collect();
+        let now = self.now_ms();
+        match self.bar_hover.feed((pos.x, pos.y), &outputs, &bar, now) {
+            Hover::Idle => {}
+            Hover::Arm(at) => self.arm_hover(at.saturating_sub(now)),
+            Hover::MoveTo(to) => self.move_bar(to),
+        }
+    }
+
+    /// Re-feeds the pointer in `ms`, so a still pointer moves the taskbar too.
+    fn arm_hover(&mut self, ms: u64) {
+        if self.hover_timer.is_some() {
+            return;
+        }
+        let timer = Timer::from_duration(std::time::Duration::from_millis(ms));
+        let armed = self.loop_handle.insert_source(timer, |_, _, data| {
+            let s = &mut data.state;
+            s.hover_timer = None;
+            let p = s.pointer_location();
+            s.bar_hover(p);
+            TimeoutAction::Drop
+        });
+        match armed {
+            Ok(t) => self.hover_timer = Some(t),
+            Err(e) => warn!("taskbar hover not timed: {e}"),
+        }
+    }
+
+    /// Closes the taskbar where it is; navi-bar makes a new one, which maps on `to`.
+    fn move_bar(&mut self, to: String) {
+        info!(output = to, "taskbar moves");
+        persist::save_bar(&to);
+        self.bar_output = Some(to);
+        self.close_layers(|_, ns| ns == BAR);
+    }
+
+    /// The status band and notifications stay on the main output.
+    pub fn corners_to_main(&mut self) {
+        let main = self.main_output().map(|o| o.name());
+        self.close_layers(|o, ns| Some(o) != main.as_deref() && ns != BAR);
+    }
+
+    /// Closes and unmaps the layer surfaces `which(output, namespace)` picks.
+    fn close_layers(&mut self, which: impl Fn(&str, &str) -> bool) {
+        for o in self.space.outputs().cloned().collect::<Vec<_>>() {
+            let name = o.name();
+            let closed = {
+                let mut map = layer_map_for_output(&o);
+                let picked: Vec<LayerSurface> = map
+                    .layers()
+                    .filter(|l| which(&name, l.namespace()))
+                    .cloned()
+                    .collect();
+                for l in &picked {
+                    info!(namespace = l.namespace(), output = name, "layer closed");
+                    l.layer_surface().send_close();
+                    map.unmap_layer(l);
+                }
+                !picked.is_empty()
+            };
+            if closed {
+                self.arrange_layers(&o);
+            }
+        }
+    }
+
+    /// The output layer surfaces go on when they name none: the main one, priority 0.
+    pub fn main_output(&self) -> Option<Output> {
+        self.space
+            .outputs()
+            .min_by_key(|o| self.priority_of(&o.name()))
+            .cloned()
+    }
+
+    pub fn priority_of(&self, output: &str) -> u32 {
+        let g = self.grid.iter().find(|g| g.name == output);
+        g.map_or(u32::MAX, |g| g.priority)
     }
 
     /// Focus or restore, from the bar or an activation token: `id` is shown in its group,
@@ -650,10 +814,8 @@ impl Navi {
                 }
                 Some(_) => None,
                 None => self
-                    .space
-                    .outputs()
-                    .next()
-                    .and_then(|o| self.space.output_geometry(o)),
+                    .main_output()
+                    .and_then(|o| self.space.output_geometry(&o)),
             };
             match over {
                 Some(over) => {
@@ -686,10 +848,10 @@ impl Navi {
         else {
             return;
         };
-        let (Some(output), Some(window_geo)) = (
-            self.space.outputs().next(),
-            self.space.element_geometry(window),
-        ) else {
+        let Some(window_geo) = self.space.element_geometry(window) else {
+            return;
+        };
+        let Some(output) = self.space.output_under(window_geo.loc.to_f64()).next() else {
             return;
         };
         let Some(mut target) = self.space.output_geometry(output) else {
@@ -734,6 +896,9 @@ fn title(s: &WlSurface) -> String {
     })
     .unwrap_or_default()
 }
+
+/// navi-bar's taskbar namespace; only navi-bar has layer shell, so it can be trusted.
+const BAR: &str = "navi-bar";
 
 /// The logical pixel containing `p`.
 pub fn px(p: Point<f64, Logical>) -> (i32, i32) {
@@ -1027,10 +1192,14 @@ impl WlrLayerShellHandler for Navi {
         layer: Layer,
         namespace: String,
     ) {
-        let Some(output) = output
-            .as_ref()
-            .and_then(Output::from_resource)
-            .or_else(|| self.main_output())
+        let Some(output) =
+            output
+                .as_ref()
+                .and_then(Output::from_resource)
+                .or_else(|| match namespace == BAR {
+                    true => self.bar_target(),
+                    false => self.main_output(),
+                })
         else {
             surface.send_close();
             return;

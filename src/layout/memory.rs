@@ -18,7 +18,7 @@ const MAX_NAME: usize = 255;
 const MAX_PX: i32 = 65535;
 
 /// Printable ASCII without whitespace, so a name is one field on one line and no escape.
-fn safe(name: &str) -> bool {
+pub fn safe(name: &str) -> bool {
     (1..=MAX_NAME).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_graphic())
 }
 

@@ -7,6 +7,7 @@ mod drag;
 mod memory;
 pub use bar::{Decor, decoration};
 pub use drag::{Action, Done, Drag, overlay};
+pub use memory::safe;
 
 pub const COLS: i32 = 12;
 pub const ROWS: i32 = 6;
@@ -147,6 +148,9 @@ pub struct Tile {
     pub fullscreen: bool,
     /// When it was last placed, moved or activated; a group shows its most recent member.
     pub stamp: u64,
+    /// Where it was before its output was unplugged; it goes back when that output returns,
+    /// unless the user moved it since.
+    pub home: Option<(String, Cells)>,
 }
 
 impl Tile {
@@ -187,9 +191,94 @@ pub struct Layout {
 }
 
 impl Layout {
+    /// An output that wasn't there before takes back the tiles whose home it is.
     pub fn set_outputs(&mut self, mut outputs: Vec<Output>) {
         outputs.sort_by_key(|o| o.priority);
+        let new: Vec<String> = outputs
+            .iter()
+            .filter(|o| self.output(&o.name).is_none())
+            .map(|o| o.name.clone())
+            .collect();
         self.outputs = outputs;
+        for name in new {
+            self.return_home(&name);
+        }
+    }
+
+    /// Tiles whose home is `output` go back to their cells there, by id, where nothing else is.
+    /// Either way their home is forgotten.
+    fn return_home(&mut self, output: &str) {
+        let mut ids: Vec<WinId> = self
+            .tiles
+            .iter()
+            .filter(|t| t.home.as_ref().is_some_and(|h| h.0 == output))
+            .map(|t| t.id)
+            .collect();
+        ids.sort_unstable();
+        let mut back: Vec<WinId> = Vec::new();
+        for id in ids {
+            let Some(t) = self.tile_mut(id) else {
+                continue;
+            };
+            let Some((_, cells)) = t.home.take() else {
+                continue;
+            };
+            // Tabs coming home together share their cells.
+            let free = !self.tiles.iter().any(|u| {
+                u.output == output
+                    && u.cells.overlaps(&cells)
+                    && !(back.contains(&u.id) && u.cells == cells)
+            });
+            if free && let Some(t) = self.tile_mut(id) {
+                t.output = output.to_string();
+                t.cells = cells;
+                t.maximized = false;
+                t.fullscreen = false;
+                back.push(id);
+            }
+        }
+    }
+
+    /// Moves `name`'s tiles, a tab group at a time, to the other outputs with the placement steps
+    /// from the main output's centre, and forgets `name`. Memory doesn't change.
+    pub fn remove_output(&mut self, name: &str) {
+        self.outputs.retain(|o| o.name != name);
+        let Some(main) = self.outputs.first().cloned() else {
+            return;
+        };
+        let mut ids: Vec<WinId> = self
+            .tiles
+            .iter()
+            .filter(|t| t.output == name)
+            .map(|t| t.id)
+            .collect();
+        ids.sort_unstable();
+        while !ids.is_empty() {
+            let id = ids.remove(0);
+            let group = self.group(id);
+            ids.retain(|i| !group.contains(i));
+            let Some(t) = self.tile(id).cloned() else {
+                continue;
+            };
+            let size = self.output_size(&t);
+            let (output, cells, _) = self.find_spot(&main, size, main.area.center(), None);
+            for t in self.tiles.iter_mut().filter(|t| group.contains(&t.id)) {
+                t.home = t.home.take().or(Some((t.output.clone(), t.cells)));
+                t.output = output.clone();
+                t.cells = cells;
+                t.maximized = false;
+                t.fullscreen = false;
+            }
+        }
+    }
+
+    /// The px size `t` wants: its memory, else half an output's width.
+    fn output_size(&self, t: &Tile) -> (i32, i32) {
+        let half = self
+            .outputs
+            .first()
+            .map_or((MIN_W, MIN_H), |o| (o.area.w / 2, o.area.h));
+        self.memory.get(&t.app).map_or(half, |m| m.size)
     }
 
     pub fn tiles(&self) -> &[Tile] {
@@ -1157,6 +1246,127 @@ mod tests {
         assert!(l.maximize(t));
         assert!(l.activate(b));
         assert!(l.is_maximized(b) && l.visible(b));
+    }
+
+    /// Yoshi's rig: ultrawide (main), 4K above it, laptop left.
+    fn rig() -> Vec<Output> {
+        vec![
+            out("uw", 1800, 2160, 3440, 1440, 0),
+            out("4k", 1640, 0, 3840, 2160, 1),
+            out("laptop", 0, 2306, 1800, 1125, 2),
+        ]
+    }
+
+    /// Two tiles on the 4K and one on the ultrawide.
+    fn rig_with_tiles() -> (Layout, [WinId; 3]) {
+        let mut l = layout(rig());
+        let (a, _) = l.place("a", (2000, 100)).unwrap();
+        let (b, _) = l.place("b", (5000, 100)).unwrap();
+        let (c, _) = l.place("c", (2000, 2200)).unwrap();
+        assert_eq!(l.tile(a).unwrap().output, "4k");
+        assert_eq!(l.tile(b).unwrap().output, "4k");
+        assert_eq!(l.tile(c).unwrap().output, "uw");
+        (l, [a, b, c])
+    }
+
+    fn spot(l: &Layout, id: WinId) -> (String, Cells) {
+        let t = l.tile(id).unwrap();
+        (t.output.clone(), t.cells)
+    }
+
+    #[test]
+    fn ac8_unplug_evacuates_and_replug_returns() {
+        let (mut l, [a, b, c]) = rig_with_tiles();
+        let (was_a, was_b) = (spot(&l, a), spot(&l, b));
+        let memory = l.memory_text();
+
+        l.remove_output("4k");
+        for id in [a, b] {
+            let (o, _) = spot(&l, id);
+            assert!(o == "uw" || o == "laptop", "{o}");
+        }
+        assert_eq!(l.tile(a).unwrap().home, Some(was_a.clone()));
+        assert_eq!(l.tile(b).unwrap().home, Some(was_b.clone()));
+        assert_eq!(l.memory_text(), memory);
+        assert!(l.tile(c).unwrap().home.is_none());
+        for id in [a, b, c] {
+            assert!(l.rect(id).is_some(), "{id} shown");
+        }
+        let after = spot(&l, c);
+        assert_eq!(after.0, "uw");
+
+        l.set_outputs(rig());
+        assert_eq!((spot(&l, a), spot(&l, b)), (was_a, was_b));
+        assert!(l.tiles().iter().all(|t| t.home.is_none()));
+        assert_eq!(l.memory_text(), memory);
+        // A tile that was never on the 4K doesn't move when it returns.
+        assert_eq!(spot(&l, c), after);
+    }
+
+    #[test]
+    fn ac8_tiles_never_on_the_output_stay_put() {
+        let mut l = layout(rig());
+        let (c, _) = l.place("c", (2000, 2200)).unwrap();
+        let (d, _) = l.place("d", (100, 2400)).unwrap();
+        let before = (spot(&l, c), spot(&l, d));
+        l.remove_output("4k");
+        l.set_outputs(rig());
+        assert_eq!((spot(&l, c), spot(&l, d)), before);
+    }
+
+    #[test]
+    fn ac8_moved_since_stays_where_the_user_put_it() {
+        let (mut l, [a, b, _]) = rig_with_tiles();
+        let was_b = spot(&l, b);
+        l.remove_output("4k");
+        // Drag a's strip to the laptop.
+        let r = l.frame(a).unwrap().0;
+        let from = (r.x + r.w / 2, r.y + 2);
+        let mut d = Drag::press(&l, from).expect("a's strip");
+        d.motion(&mut l, (200, 2600), 10);
+        let done = d.release(&mut l, (300, 2700), 20);
+        assert!(matches!(done, Some(Done::Layout("moved", _))));
+        let moved = spot(&l, a);
+        assert_eq!(moved.0, "laptop");
+        assert!(l.tile(a).unwrap().home.is_none());
+
+        l.set_outputs(rig());
+        assert_eq!(spot(&l, a), moved);
+        assert_eq!(spot(&l, b), was_b);
+    }
+
+    #[test]
+    fn ac8_taken_home_cells_keep_the_tile_put() {
+        let (mut l, [a, b, _]) = rig_with_tiles();
+        let was_a = spot(&l, a);
+        l.remove_output("4k");
+        let evacuated = spot(&l, b);
+        // Something took b's cells on the 4K meanwhile.
+        let (_, home) = l.tile(b).unwrap().home.clone().unwrap();
+        l.tiles.push(Tile {
+            id: 99,
+            app: "z".into(),
+            output: "4k".into(),
+            cells: home,
+            ..Tile::default()
+        });
+        l.set_outputs(rig());
+        assert_eq!(spot(&l, a), was_a);
+        assert_eq!(spot(&l, b), evacuated);
+        assert!(l.tile(b).unwrap().home.is_none());
+    }
+
+    #[test]
+    fn unplug_keeps_tab_groups_together() {
+        let (mut l, [a, b, _]) = rig_with_tiles();
+        // Tab b onto a.
+        let cells = l.tile(a).unwrap().cells;
+        l.tile_mut(b).unwrap().cells = cells;
+        l.remove_output("4k");
+        assert_eq!(spot(&l, a), spot(&l, b));
+        l.set_outputs(rig());
+        assert_eq!(spot(&l, a), ("4k".into(), cells));
+        assert_eq!(spot(&l, b), ("4k".into(), cells));
     }
 
     #[test]

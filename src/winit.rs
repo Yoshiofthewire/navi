@@ -1,47 +1,31 @@
 //! Nested backend: navi runs as a window inside another compositor, as one output.
 
-use std::time::Duration;
-
 use smithay::{
     backend::{
         allocator::Fourcc,
         renderer::{
             ExportMem, Texture, TextureMapping,
             damage::OutputDamageTracker,
-            element::{
-                AsRenderElements, Id, Kind,
-                memory::{MemoryRenderBuffer, MemoryRenderBufferRenderElement},
-                render_elements,
-                solid::SolidColorRenderElement,
-                surface::WaylandSurfaceRenderElement,
-            },
             gles::{GlesError, GlesMapping, GlesRenderer},
-            utils::CommitCounter,
         },
         winit::{self, WinitEvent},
     },
-    desktop::{LayerMap, layer_map_for_output},
     output::{Mode, Output, PhysicalProperties, Subpixel},
     reexports::calloop::EventLoop,
-    utils::{Rectangle, Scale, Transform},
-    wayland::shell::wlr_layer::Layer,
+    utils::{Rectangle, Transform},
 };
 use tracing::{info, warn};
 
 use crate::{
-    CalloopData, cursor::Cursor, layout, screenshot::Screenshot, state::Navi, theme, wallpaper,
+    CalloopData,
+    cursor::Cursor,
+    render::{self, Arrow, Pointer, Wallpaper},
+    screenshot::Screenshot,
+    state::Navi,
+    wallpaper,
 };
 
 const NAME: &str = "winit";
-
-render_elements! {
-    /// Everything on screen, top first.
-    Frame<=GlesRenderer>;
-    Overlay=SolidColorRenderElement,
-    Surface=WaylandSurfaceRenderElement<GlesRenderer>,
-    /// The wallpaper and the pointer.
-    Memory=MemoryRenderBufferRenderElement<GlesRenderer>,
-}
 
 /// With a `cursor`, navi hides the host's pointer over its window and draws its own.
 pub fn init(
@@ -55,16 +39,7 @@ pub fn init(
         // Winit sends the host `wl_pointer.set_cursor` with no surface on every pointer enter.
         backend.window().set_cursor_visible(false);
         info!("host cursor hidden over navi's window");
-        let size = (c.w as i32, c.h as i32);
-        let buf = MemoryRenderBuffer::from_slice(
-            &c.pixels,
-            Fourcc::Argb8888,
-            size,
-            1,
-            Transform::Normal,
-            None,
-        );
-        (buf, (c.hotspot.0 as i32, c.hotspot.1 as i32))
+        Pointer::new(&c, 1)
     });
     let mode = Mode {
         size: backend.window_size(),
@@ -91,18 +66,9 @@ pub fn init(
     data.state.add_output(&output, 0);
 
     // Copied into the buffer, so the decoded image is freed here.
-    let mut wallpaper = wallpaper::open(&[(NAME, 0)])[0].as_ref().map(|img| {
-        let size = (img.w as i32, img.h as i32);
-        let buf = MemoryRenderBuffer::from_slice(
-            &img.rgba,
-            Fourcc::Abgr8888,
-            size,
-            1,
-            Transform::Normal,
-            None,
-        );
-        (buf, size)
-    });
+    let mut wallpaper = wallpaper::open(&[(NAME, 0)])[0]
+        .as_ref()
+        .map(|img| Wallpaper::new(img));
 
     let mut damage_tracker = OutputDamageTracker::from_output(&output);
     let mut shot = Screenshot::from_env();
@@ -129,64 +95,18 @@ pub fn init(
                 WinitEvent::Redraw => {
                     let size = backend.window_size();
                     let damage = Rectangle::from_size(size);
-                    // The one output sits at (0, 0) at scale 1, so global logical px are its
-                    // physical px.
-                    let mut elements: Vec<Frame> = layout::overlay(
-                        &state.layout,
-                        state.drag.as_ref(),
-                        state.pointer_px(),
-                        state.now_ms(),
-                        state.focused_tile(),
-                    )
-                    .into_iter()
-                    .map(|(r, color)| {
-                        let geo = Rectangle::new((r.x, r.y).into(), (r.w, r.h).into());
-                        let commit = CommitCounter::default();
-                        Frame::from(SolidColorRenderElement::new(
-                            Id::new(),
-                            geo,
-                            commit,
-                            color,
-                            Kind::Unspecified,
-                        ))
-                    })
-                    .collect();
                     let mut copy = None;
                     match backend.bind() {
                         Ok((renderer, mut framebuffer)) => {
-                            if let Some((buffer, (hx, hy))) = &cursor {
-                                let (x, y) = state.pointer_px();
-                                let at = (f64::from(x - hx), f64::from(y - hy));
-                                match MemoryRenderBufferRenderElement::from_buffer(
-                                    renderer,
-                                    at,
-                                    buffer,
-                                    None,
-                                    None,
-                                    None,
-                                    Kind::Cursor,
-                                ) {
-                                    Ok(e) => elements.insert(0, Frame::from(e)),
-                                    Err(e) => warn!("cursor not drawn: {e:?}"),
-                                }
-                            }
-                            let surfaces = surfaces(renderer, state, &output);
-                            elements.extend(surfaces.into_iter().map(Frame::from));
-                            if let Some((buffer, img)) = &wallpaper {
-                                match wallpaper_element(renderer, buffer, *img, size.into()) {
-                                    Ok(e) => elements.push(Frame::from(e)),
-                                    Err(e) => {
-                                        warn!("wallpaper not drawn, solid from now on: {e:?}");
-                                        wallpaper = None;
-                                    }
-                                }
-                            }
+                            let arrow = cursor.as_ref().map_or(Arrow::None, Arrow::Image);
+                            let elements =
+                                render::elements(renderer, state, &output, arrow, &mut wallpaper);
                             let rendered = damage_tracker.render_output(
                                 renderer,
                                 &mut framebuffer,
                                 0,
                                 &elements,
-                                theme::rgba(theme::BG, 1.0),
+                                render::clear(),
                             );
                             if let Err(e) = rendered {
                                 warn!("render failed: {e:?}");
@@ -220,18 +140,7 @@ pub fn init(
                         }
                     }
 
-                    let time = state.start_time.elapsed();
-                    let on_output = |_: &_, _: &_| Some(output.clone());
-                    state.space.elements().for_each(|window| {
-                        window.send_frame(&output, time, Some(Duration::ZERO), on_output)
-                    });
-                    {
-                        let mut layers = layer_map_for_output(&output);
-                        for layer in layers.layers() {
-                            layer.send_frame(&output, time, Some(Duration::ZERO), on_output);
-                        }
-                        layers.cleanup();
-                    }
+                    render::send_frames(state, &output);
                     state.space.refresh();
                     state.popups.cleanup();
                     state.refresh_toplevels();
@@ -245,54 +154,6 @@ pub fn init(
     Ok(())
 }
 
-/// The output's layer surfaces and windows, top first. While a window is fullscreen there, the
-/// Top layer (the taskbar) is left out.
-fn surfaces(
-    renderer: &mut GlesRenderer,
-    state: &Navi,
-    output: &Output,
-) -> Vec<WaylandSurfaceRenderElement<GlesRenderer>> {
-    let map = layer_map_for_output(output);
-    let upper: &[Layer] = match state.layout.fullscreen_on(&output.name()) {
-        true => &[Layer::Overlay],
-        false => &[Layer::Overlay, Layer::Top],
-    };
-    let mut out = layers(renderer, &map, upper);
-    if let Some(geo) = state.space.output_geometry(output) {
-        out.extend(
-            state
-                .space
-                .render_elements_for_region(renderer, &geo, 1.0, 1.0),
-        );
-    }
-    out.extend(layers(renderer, &map, &[Layer::Bottom, Layer::Background]));
-    out
-}
-
-/// The surfaces on `which` layers, in that order, the most recently mapped first.
-fn layers(
-    renderer: &mut GlesRenderer,
-    map: &LayerMap,
-    which: &[Layer],
-) -> Vec<WaylandSurfaceRenderElement<GlesRenderer>> {
-    let mut out = Vec::new();
-    for &layer in which {
-        for l in map.layers_on(layer).rev() {
-            let Some(geo) = map.layer_geometry(l) else {
-                continue;
-            };
-            out.extend(AsRenderElements::<GlesRenderer>::render_elements(
-                l,
-                renderer,
-                geo.loc.to_physical(1),
-                Scale::from(1.0),
-                1.0,
-            ));
-        }
-    }
-    out
-}
-
 /// A copied framebuffer as RGBA, top row first.
 fn upright(renderer: &mut GlesRenderer, copy: &GlesMapping) -> Result<Vec<u8>, GlesError> {
     let px = renderer.map_texture(copy)?;
@@ -301,24 +162,4 @@ fn upright(renderer: &mut GlesRenderer, copy: &GlesMapping) -> Result<Vec<u8>, G
         true => px.chunks_exact(row).rev().flatten().copied().collect(),
         false => px.to_vec(),
     })
-}
-
-/// The wallpaper filling a `w`×`h` output, scaled and cropped.
-fn wallpaper_element(
-    renderer: &mut GlesRenderer,
-    buffer: &MemoryRenderBuffer,
-    (img_w, img_h): (i32, i32),
-    (w, h): (i32, i32),
-) -> Result<MemoryRenderBufferRenderElement<GlesRenderer>, GlesError> {
-    let src = wallpaper::cover(img_w, img_h, w, h);
-    let src = Rectangle::new((src.x, src.y).into(), (src.w, src.h).into()).to_f64();
-    MemoryRenderBufferRenderElement::from_buffer(
-        renderer,
-        (0.0, 0.0),
-        buffer,
-        None,
-        Some(src),
-        Some((w, h).into()),
-        Kind::Unspecified,
-    )
 }
