@@ -6,7 +6,12 @@ license = "MIT"
 description = "Tiling Wayland desktop with opinions about big monitors"
 
 [dependencies]
+fontdue = { version = "0.9", default-features = false, features = ["std"] }
 png = "0.18"
+resvg = { version = "0.49", default-features = false }
+# Already in the lock via smithay; `stdio` lets navi-bar move its socket off fd 0 safely.
+rustix = { version = "1", default-features = false, features = ["stdio"] }
+smithay-client-toolkit = { version = "0.19", default-features = false, features = ["calloop", "xkbcommon"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # SIMD features off: without them the crate forbids unsafe code.

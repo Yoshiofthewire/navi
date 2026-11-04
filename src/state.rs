@@ -273,6 +273,9 @@ impl Navi {
         if !hidden.is_empty() {
             info!(?hidden, "hidden");
         }
+        if !shown.is_empty() {
+            info!(?shown, "shown");
+        }
         self.recenter_dialogs();
         self.keep_focus_mapped(&shown);
         // Tiles moved: refocus a still pointer, so a click can't land in the window that left.

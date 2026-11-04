@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod activation;
+mod files;
 mod image;
 mod input;
 mod layout;
