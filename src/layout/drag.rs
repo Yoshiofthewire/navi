@@ -9,6 +9,8 @@ use crate::theme::{ACCENT, MINIMIZED, rgba};
 
 /// A press on a strip becomes a move once the pointer travels this far, in px.
 const ARM_PX: u64 = 8;
+const CORNER_PX: i32 = 32;
+const DOUBLE_CLICK_MS: u64 = 400;
 /// Holding a move over a tile's middle this long, in ms, tabs instead of swapping.
 const HOLD_MS: u64 = 500;
 const GRID_ALPHA: f32 = 0.2;
@@ -29,19 +31,24 @@ pub enum Side {
     Bottom,
 }
 
-/// A navi zone in the gaps: a tile's grab strip (or the free part of its bar), one of its edges,
+/// A navi zone in the gaps: a tile's grab strip (or the free part of its bar), an edge or corner,
 /// a tab, or a window button of the group's active tile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Hit {
     Strip(WinId),
     Edge(WinId, Side),
+    Corner(WinId, Side, Side),
     Tab(WinId),
     Button(WinId, Button),
 }
 
 impl Hit {
     pub fn id(self) -> WinId {
-        let (Hit::Strip(id) | Hit::Edge(id, _) | Hit::Tab(id) | Hit::Button(id, _)) = self;
+        let (Hit::Strip(id)
+        | Hit::Edge(id, _)
+        | Hit::Corner(id, _, _)
+        | Hit::Tab(id)
+        | Hit::Button(id, _)) = self;
         id
     }
 }
@@ -102,7 +109,7 @@ impl Layout {
             .chain(ids().map(|id| Hit::Edge(id, Side::Top)))
             .find(|&h| self.zone(h).is_some_and(|z| z.contains(p)))?;
         let Hit::Strip(id) = hit else {
-            return Some(hit);
+            return Some(self.corner_hit(hit, p));
         };
         let Some(bar) = self.bar(id) else {
             return Some(hit);
@@ -121,11 +128,31 @@ impl Layout {
         }
     }
 
+    /// Corners use only the existing gaps, leaving client pixels, tabs and buttons alone.
+    fn corner_hit(&self, hit: Hit, p: (i32, i32)) -> Hit {
+        let Hit::Edge(id, side) = hit else { return hit };
+        let Some((c, _)) = self.frame(id) else {
+            return hit;
+        };
+        match side {
+            Side::Left | Side::Right if p.1 < c.y + CORNER_PX => Hit::Corner(id, side, Side::Top),
+            Side::Left | Side::Right if p.1 >= c.y + c.h - CORNER_PX => {
+                Hit::Corner(id, side, Side::Bottom)
+            }
+            Side::Top | Side::Bottom if p.0 < c.x + CORNER_PX => Hit::Corner(id, Side::Left, side),
+            Side::Top | Side::Bottom if p.0 >= c.x + c.w - CORNER_PX => {
+                Hit::Corner(id, Side::Right, side)
+            }
+            _ => hit,
+        }
+    }
+
     /// The px of a zone, all inside the gaps around the tile's window.
     pub(super) fn zone(&self, hit: Hit) -> Option<Rect> {
         let t = self.tile(hit.id())?;
         let (c, r) = self.frame(t.id)?;
         Some(match hit {
+            Hit::Corner(..) => return None, // The overlay lights its two edge zones instead.
             Hit::Strip(_) => Rect {
                 x: r.x,
                 w: r.w,
@@ -254,11 +281,11 @@ impl Layout {
     /// Moves the dragged edge to the cell boundary nearest `p`, from the `before` snapshot, as far
     /// as every changed tile stays at least the minimum, on the grid, and clear of other tiles.
     /// Returns whether any cells changed.
-    fn resize_to(&mut self, r: &Resize, p: (i32, i32)) -> bool {
+    fn resize_to(&mut self, r: &Resize, edge: &ResizeEdge, p: (i32, i32)) -> bool {
         let Some(o) = self.output(&r.output) else {
             return false;
         };
-        let x = matches!(r.side, Side::Left | Side::Right);
+        let x = matches!(edge.side, Side::Left | Side::Right);
         let (min_c, min_r) = o.span_for((MIN_W, MIN_H));
         let (n, min) = if x { (COLS, min_c) } else { (ROWS, min_r) };
         let off = |k: i32| {
@@ -269,10 +296,10 @@ impl Layout {
             };
             (i64::from(edge) - i64::from(at)).abs()
         };
-        let to = (0..=n).min_by_key(|&k| off(k)).unwrap_or(r.from);
-        let is_changed = |id: WinId| r.changed.iter().any(|&(c, _)| c == id);
+        let to = (0..=n).min_by_key(|&k| off(k)).unwrap_or(edge.from);
+        let is_changed = |id: WinId| edge.changed.iter().any(|&(c, _)| c == id);
         let cells_at = |at: i32| -> Option<Vec<(WinId, Cells)>> {
-            r.changed
+            edge.changed
                 .iter()
                 .map(|&(id, far)| {
                     let b = r.before.iter().find(|t| t.id == id)?.cells;
@@ -281,7 +308,8 @@ impl Layout {
                         true => (start, at - start),
                         false => (at, start + len - at),
                     };
-                    let c = with_span(b, x, start, len);
+                    // Preserve the other axis, which a corner drag may have resized already.
+                    let c = with_span(self.tile(id)?.cells, x, start, len);
                     let clear = !self
                         .tiles
                         .iter()
@@ -290,8 +318,8 @@ impl Layout {
                 })
                 .collect()
         };
-        let step = (to - r.from).signum();
-        let (mut at, mut cells) = (r.from, cells_at(r.from).unwrap_or_default());
+        let step = (to - edge.from).signum();
+        let (mut at, mut cells) = (edge.from, cells_at(edge.from).unwrap_or_default());
         while at != to {
             let Some(next) = cells_at(at + step) else {
                 break;
@@ -309,6 +337,66 @@ impl Layout {
             }
         }
         changed
+    }
+
+    fn finish_resize(&mut self, before: &[Tile], what: &'static str) -> Option<Done> {
+        let moved = |t: &&Tile| before.iter().any(|b| b.id == t.id && b.cells != t.cells);
+        let ids: Vec<WinId> = self.tiles.iter().filter(moved).map(|t| t.id).collect();
+        self.stay(&ids);
+        let tiles = self.tiles_in(&ids);
+        self.learn(&tiles, true);
+        (!tiles.is_empty()).then_some(Done::Layout(what, tiles))
+    }
+
+    /// Expand only the clicked side, using the same collision and minimum-size rules as a drag.
+    fn expand_edge(&mut self, hit: Hit) -> Option<Done> {
+        let Hit::Edge(_, side) = hit else { return None };
+        let r = Resize::new(self, hit, (0, 0))?;
+        let o = self.output(&r.output)?;
+        let p = match side {
+            Side::Left => (o.area.x, 0),
+            Side::Right => (o.area.x + o.area.w, 0),
+            Side::Top => (0, o.area.y),
+            Side::Bottom => (0, o.area.y + o.area.h),
+        };
+        self.resize_to(&r, &r.edges[0], p);
+        self.finish_resize(&r.before, "expanded")
+    }
+}
+
+/// Only two stationary left clicks on the same edge form a double click.
+#[derive(Default)]
+pub struct EdgeClicks(Option<(Hit, (i32, i32), u64)>);
+
+impl EdgeClicks {
+    pub fn motion(&mut self, p: (i32, i32)) {
+        if self
+            .0
+            .is_some_and(|(_, from, _)| dist2(from, p) >= ARM_PX * ARM_PX)
+        {
+            self.0 = None;
+        }
+    }
+
+    pub fn release(
+        &mut self,
+        l: &mut Layout,
+        hit: Option<Hit>,
+        p: (i32, i32),
+        now: u64,
+    ) -> Option<Done> {
+        let previous = self.0.take();
+        let hit = hit?;
+        if previous.is_some_and(|(h, from, time)| {
+            h == hit
+                && now.saturating_sub(time) <= DOUBLE_CLICK_MS
+                && dist2(from, p) < ARM_PX * ARM_PX
+        }) {
+            l.expand_edge(hit)
+        } else {
+            self.0 = Some((hit, p, now));
+            None
+        }
     }
 }
 
@@ -375,14 +463,100 @@ impl Target {
 }
 
 struct Resize {
-    id: WinId,
-    side: Side,
+    hit: Hit,
     output: String,
+    press: (i32, i32),
+    dragged: bool,
+    before: Vec<Tile>,
+    edges: Vec<ResizeEdge>,
+}
+
+struct ResizeEdge {
+    side: Side,
     /// The edge's cell boundary at the press.
     from: i32,
-    before: Vec<Tile>,
     /// The tiles that move with the edge, and whether it is their far side (right or bottom).
     changed: Vec<(WinId, bool)>,
+}
+
+impl Resize {
+    fn new(l: &Layout, hit: Hit, press: (i32, i32)) -> Option<Self> {
+        let t = l.tile(hit.id())?;
+        let (sides, corner) = match hit {
+            Hit::Edge(_, side) => (vec![side], None),
+            Hit::Corner(_, x, y) => (
+                vec![x, y],
+                Some((
+                    if x == Side::Left {
+                        t.cells.col
+                    } else {
+                        t.cells.col + t.cells.cols
+                    },
+                    if y == Side::Top {
+                        t.cells.row
+                    } else {
+                        t.cells.row + t.cells.rows
+                    },
+                )),
+            ),
+            _ => return None,
+        };
+        let edges = sides
+            .into_iter()
+            .map(|side| {
+                let x = matches!(side, Side::Left | Side::Right);
+                let far = matches!(side, Side::Right | Side::Bottom);
+                let (start, len) = span(t.cells, x);
+                let from = if far { start + len } else { start };
+                let (a, alen) = span(t.cells, !x);
+                let changed = l
+                    .tiles
+                    .iter()
+                    .filter(|u| u.output == t.output)
+                    .filter_map(|u| {
+                        if u.cells == t.cells {
+                            return Some((u.id, far));
+                        }
+                        let (s, n) = span(u.cells, x);
+                        let (b, blen) = span(u.cells, !x);
+                        // At a junction, include every tile meeting the corner on this boundary.
+                        let meets_corner = corner.is_some_and(|(cx, cy)| {
+                            let at = if x { cy } else { cx };
+                            b <= at && at <= b + blen
+                        });
+                        if meets_corner && (s == from || s + n == from) {
+                            return Some((u.id, s + n == from));
+                        }
+                        let near = if far { s } else { s + n };
+                        (near == from && a < b + blen && b < a + alen).then_some((u.id, !far))
+                    })
+                    .collect();
+                ResizeEdge {
+                    side,
+                    from,
+                    changed,
+                }
+            })
+            .collect();
+        Some(Self {
+            hit,
+            output: t.output.clone(),
+            press,
+            dragged: false,
+            before: l.tiles.clone(),
+            edges,
+        })
+    }
+
+    fn motion(&mut self, l: &mut Layout, p: (i32, i32)) -> bool {
+        self.dragged |= dist2(self.press, p) >= ARM_PX * ARM_PX;
+        let before: Vec<Cells> = l.tiles.iter().map(|t| t.cells).collect();
+        l.restore(&self.before);
+        for edge in &self.edges {
+            l.resize_to(self, edge, p);
+        }
+        l.tiles.iter().map(|t| t.cells).ne(before)
+    }
 }
 
 enum State {
@@ -409,43 +583,28 @@ pub struct Drag(State);
 
 impl Drag {
     /// A left press at `p`: arms a click or move on a strip, tab or button, starts a resize on an
-    /// edge, `None` elsewhere.
+    /// edge or corner, `None` elsewhere.
     pub fn press(l: &Layout, p: (i32, i32)) -> Option<Drag> {
         let state = match l.hit(p)? {
             hit @ (Hit::Strip(_) | Hit::Tab(_) | Hit::Button(..)) => State::Armed { hit, from: p },
-            Hit::Edge(id, side) => {
-                let t = l.tile(id)?;
-                let x = matches!(side, Side::Left | Side::Right);
-                let far = matches!(side, Side::Right | Side::Bottom);
-                let (start, len) = span(t.cells, x);
-                let from = if far { start + len } else { start };
-                let (a, alen) = span(t.cells, !x);
-                // The group, plus tiles whose near side lies on the edge and overlaps its span.
-                let changed = l
-                    .tiles
-                    .iter()
-                    .filter(|u| u.output == t.output)
-                    .filter_map(|u| {
-                        if u.cells == t.cells {
-                            return Some((u.id, far));
-                        }
-                        let (s, n) = span(u.cells, x);
-                        let (b, blen) = span(u.cells, !x);
-                        let near = if far { s } else { s + n };
-                        (near == from && a < b + blen && b < a + alen).then_some((u.id, !far))
-                    })
-                    .collect();
-                State::Resize(Resize {
-                    id,
-                    side,
-                    output: t.output.clone(),
-                    from,
-                    before: l.tiles.clone(),
-                    changed,
-                })
-            }
+            hit @ (Hit::Edge(..) | Hit::Corner(..)) => State::Resize(Resize::new(l, hit, p)?),
         };
         Some(Drag(state))
+    }
+
+    /// A stationary edge press/release; moving away and back must still count as a drag.
+    pub fn edge_click(&self, l: &Layout, p: (i32, i32)) -> Option<Hit> {
+        match &self.0 {
+            State::Resize(r)
+                if matches!(r.hit, Hit::Edge(..))
+                    && !r.dragged
+                    && dist2(r.press, p) < ARM_PX * ARM_PX
+                    && l.hit(p) == Some(r.hit) =>
+            {
+                Some(r.hit)
+            }
+            _ => None,
+        }
     }
 
     /// Follows the pointer to `p`. Returns whether any tile's cells changed.
@@ -497,13 +656,13 @@ impl Drag {
                 }
                 None => self.0 = State::Cancelled,
             },
-            State::Resize(r) if l.tile(r.id).is_none() => {
+            State::Resize(r) if l.tile(r.hit.id()).is_none() => {
                 // Undo, so a window closing mid-drag leaves the rest as they were.
                 let changed = l.restore(&r.before);
                 self.0 = State::Cancelled;
                 return changed;
             }
-            State::Resize(r) => return l.resize_to(r, p),
+            State::Resize(r) => return r.motion(l, p),
             _ => {}
         }
         false
@@ -558,14 +717,7 @@ impl Drag {
                 l.learn(&tiles, false);
                 Some(Done::Layout(what, tiles))
             }
-            State::Resize(r) => {
-                let moved = |t: &&Tile| r.before.iter().any(|b| b.id == t.id && b.cells != t.cells);
-                let ids: Vec<WinId> = l.tiles.iter().filter(moved).map(|t| t.id).collect();
-                l.stay(&ids);
-                let tiles = l.tiles_in(&ids);
-                l.learn(&tiles, true);
-                (!tiles.is_empty()).then_some(Done::Layout("resized", tiles))
-            }
+            State::Resize(r) => l.finish_resize(&r.before, "resized"),
             State::Armed { hit, .. } => l.click(hit, p).map(|(a, id)| Done::Click(a, id)),
             State::Cancelled => None,
         }
@@ -596,7 +748,7 @@ impl Layout {
             }
             Hit::Button(id, Button::Maximize) => done(Action::Maximize, self.maximize(id)),
             Hit::Button(_, Button::Close) => done(Action::Close, true),
-            Hit::Edge(..) => None,
+            Hit::Edge(..) | Hit::Corner(..) => None,
         }
     }
 }
@@ -617,7 +769,7 @@ pub fn overlay(
     let hover = match drag.map(|d| &d.0) {
         None => l.hit(p),
         Some(State::Armed { hit, .. }) => Some(*hit),
-        Some(State::Resize(r)) => Some(Hit::Edge(r.id, r.side)),
+        Some(State::Resize(r)) => Some(r.hit),
         Some(State::Move {
             id,
             tab,
@@ -659,6 +811,11 @@ pub fn overlay(
         _ => None,
     };
     out.extend(lit.map(|z| (z, accent(1.0))));
+    if let Some(Hit::Corner(id, x, y)) = hover {
+        for side in [x, y] {
+            out.extend(l.zone(Hit::Edge(id, side)).map(|z| (z, accent(1.0))));
+        }
+    }
     // Where a frame's top goes when it runs along the top of a bar, in front of it.
     let front = out.len();
     for t in &l.tiles {
@@ -1139,6 +1296,230 @@ pub(super) mod tests {
         drag(&mut l, (2500, 718), &[(row(1), 0)]);
         assert_eq!(at(&l, 2), c(6, 1, 6, 5));
         assert_eq!(at(&l, 0), c(0, 0, 6, 3));
+    }
+
+    #[test]
+    fn all_four_corners_resize_both_axes_and_remember_the_size() {
+        let original = c(3, 1, 6, 4);
+        for (x, y, target, expected) in [
+            (Side::Left, Side::Top, (2, 0), c(2, 0, 7, 5)),
+            (Side::Right, Side::Top, (10, 0), c(3, 0, 7, 5)),
+            (Side::Left, Side::Bottom, (2, 6), c(2, 1, 7, 5)),
+            (Side::Right, Side::Bottom, (10, 6), c(3, 1, 7, 5)),
+        ] {
+            let mut l = with(&[original]);
+            let (frame, _) = l.frame(0).unwrap();
+            let from = (
+                if x == Side::Left {
+                    frame.x + 1
+                } else {
+                    frame.x + frame.w - 2
+                },
+                if y == Side::Top {
+                    frame.y + 1
+                } else {
+                    frame.y + frame.h - 2
+                },
+            );
+            assert_eq!(l.hit(from), Some(Hit::Corner(0, x, y)));
+            let to = (uw().x_edge(target.0), uw().y_edge(target.1));
+            assert_eq!(drag(&mut l, from, &[(to, 0)]), Some("resized"));
+            assert_eq!(at(&l, 0), expected);
+            assert_eq!(l.memory["a0"].cells, expected);
+            let rect = uw().cells_rect(expected);
+            assert_eq!(l.memory["a0"].size, (rect.w, rect.h));
+        }
+    }
+
+    #[test]
+    fn diagonal_junction_moves_four_tiles_and_reverses_without_drift() {
+        let original = [c(0, 0, 6, 3), c(6, 0, 6, 3), c(0, 3, 6, 3), c(6, 3, 6, 3)];
+        let mut l = with(&original);
+        let from = (uw().x_edge(6) - 2, uw().y_edge(3) - 2);
+        let mut d = Drag::press(&l, from).unwrap();
+        for (col, row) in [(8, 4), (2, 1), (10, 5), (6, 3)] {
+            let p = (uw().x_edge(col), uw().y_edge(row));
+            d.motion(&mut l, p, 0);
+            let expected = [
+                c(0, 0, col, row),
+                c(col, 0, 12 - col, row),
+                c(0, row, col, 6 - row),
+                c(col, row, 12 - col, 6 - row),
+            ];
+            assert_eq!(
+                l.tiles.iter().map(|t| t.cells).collect::<Vec<_>>(),
+                expected
+            );
+            assert_valid(&l);
+        }
+        assert!(d.release(&mut l, from, 0).is_none());
+        assert_eq!(
+            l.tiles.iter().map(|t| t.cells).collect::<Vec<_>>(),
+            original
+        );
+    }
+
+    #[test]
+    fn diagonal_limits_each_axis_and_keeps_tabs_together() {
+        let mut l = with(&[
+            c(0, 0, 6, 3),
+            c(0, 0, 6, 3),
+            c(6, 0, 6, 3),
+            c(0, 3, 6, 3),
+            c(6, 3, 6, 3),
+        ]);
+        let from = (uw().x_edge(6) - 2, uw().y_edge(3) - 2);
+        let mut d = Drag::press(&l, from).unwrap();
+        d.motion(&mut l, (i32::MAX, i32::MAX), 0);
+        assert_eq!(at(&l, 0), c(0, 0, 10, 5));
+        assert_eq!(at(&l, 1), at(&l, 0));
+        assert_eq!(at(&l, 4), c(10, 5, 2, 1));
+        assert_valid(&l);
+        assert!(d.cancel(&mut l));
+        assert_eq!(at(&l, 0), c(0, 0, 6, 3));
+        assert_eq!(at(&l, 4), c(6, 3, 6, 3));
+
+        // A full-height neighbor shares only the vertical boundary.
+        let mut l = with(&[c(0, 0, 6, 3), c(6, 0, 6, 6), c(0, 3, 6, 3)]);
+        drag(&mut l, from, &[((uw().x_edge(8), uw().y_edge(4)), 0)]);
+        assert_eq!(at(&l, 0), c(0, 0, 8, 4));
+        assert_eq!(at(&l, 1), c(8, 0, 4, 6));
+        assert_eq!(at(&l, 2), c(0, 4, 8, 2));
+    }
+
+    #[test]
+    fn corner_targets_stay_in_gaps_and_light_both_edges() {
+        let l = with(&[c(3, 1, 6, 4)]);
+        let (frame, win) = l.frame(0).unwrap();
+        for x in frame.x - 5..frame.x + frame.w + 5 {
+            for y in frame.y - 5..frame.y + frame.h + 5 {
+                if matches!(l.hit((x, y)), Some(Hit::Corner(..))) {
+                    assert!(!win.contains((x, y)));
+                }
+            }
+        }
+        let p = (frame.x + frame.w - 2, frame.y + frame.h - 2);
+        let lit = zones(&l, None, p, 0);
+        assert_eq!(lit.len(), 2);
+        for side in [Side::Right, Side::Bottom] {
+            assert!(lit.contains(&(l.zone(Hit::Edge(0, side)).unwrap(), accent(1.0))));
+        }
+        let mut l = l;
+        l.set_decorated(0, true);
+        let b = l.bar(0).unwrap();
+        for (button, rect) in b.buttons {
+            assert_eq!(l.hit(rect.center()), Some(Hit::Button(0, button)));
+        }
+        l.maximize(0);
+        assert!(!matches!(l.hit(p), Some(Hit::Corner(..))));
+        l.fullscreen(0);
+        assert!(l.hit(p).is_none());
+    }
+
+    /// Feed real press/motion/release geometry through the same double-click tracker as input.
+    fn edge_click(
+        l: &mut Layout,
+        clicks: &mut EdgeClicks,
+        p: (i32, i32),
+        now: u64,
+    ) -> Option<Done> {
+        let d = Drag::press(l, p).unwrap();
+        let edge = d.edge_click(l, p);
+        assert!(d.release(l, p, now).is_none());
+        clicks.release(l, edge, p, now)
+    }
+
+    #[test]
+    fn double_click_expands_only_the_clicked_side_in_all_directions() {
+        for (side, expected) in [
+            (Side::Left, c(0, 1, 9, 4)),
+            (Side::Right, c(3, 1, 9, 4)),
+            (Side::Top, c(3, 0, 6, 5)),
+            (Side::Bottom, c(3, 1, 6, 5)),
+        ] {
+            let mut l = with(&[c(3, 1, 6, 4)]);
+            let p = l.zone(Hit::Edge(0, side)).unwrap().center();
+            let mut clicks = EdgeClicks::default();
+            assert!(edge_click(&mut l, &mut clicks, p, 0).is_none());
+            assert_eq!(
+                what(edge_click(&mut l, &mut clicks, p, 400)),
+                Some("expanded")
+            );
+            assert_eq!(at(&l, 0), expected, "{side:?}");
+            assert_eq!(l.memory["a0"].cells, expected);
+            assert_valid(&l);
+        }
+    }
+
+    #[test]
+    fn edge_expansion_honors_neighbors_panels_and_output_origin() {
+        let mut l = halves();
+        let p = (1714, 700);
+        let mut clicks = EdgeClicks::default();
+        edge_click(&mut l, &mut clicks, p, 0);
+        assert_eq!(
+            what(edge_click(&mut l, &mut clicks, p, 100)),
+            Some("expanded")
+        );
+        assert_eq!(at(&l, 0), c(0, 0, 10, 6));
+        assert_eq!(at(&l, 1), c(10, 0, 2, 6));
+        assert_valid(&l);
+
+        let mut l = with(&[c(3, 1, 6, 4)]);
+        let mut o = uw();
+        o.full.x = -3440;
+        o.full.y = -1440;
+        o.area = Rect {
+            x: -3440,
+            y: -1416,
+            w: 3440,
+            h: 1368,
+        };
+        l.set_outputs(vec![o.clone()]);
+        for side in [Side::Top, Side::Bottom] {
+            let p = l.zone(Hit::Edge(0, side)).unwrap().center();
+            edge_click(&mut l, &mut clicks, p, 0);
+            edge_click(&mut l, &mut clicks, p, 100);
+        }
+        assert_eq!(at(&l, 0), c(3, 0, 6, 6));
+        let rect = l.rect(0).unwrap();
+        assert!(rect.y >= o.area.y && rect.y + rect.h <= o.area.y + o.area.h);
+    }
+
+    #[test]
+    fn double_click_rejects_delays_other_edges_intervening_clicks_and_motion() {
+        for scenario in 0..5 {
+            let mut l = with(&[c(3, 1, 6, 4)]);
+            let mut clicks = EdgeClicks::default();
+            let p = l.zone(Hit::Edge(0, Side::Right)).unwrap().center();
+            edge_click(&mut l, &mut clicks, p, 0);
+            let mut next = p;
+            let mut time = 100;
+            match scenario {
+                0 => time = 401,
+                1 => next = l.zone(Hit::Edge(0, Side::Left)).unwrap().center(),
+                2 => {
+                    clicks.release(&mut l, None, p, 50);
+                }
+                3 => {
+                    clicks.motion((p.0, p.1 + 8));
+                    clicks.motion(p);
+                }
+                _ => next.1 += 8,
+            }
+            assert!(edge_click(&mut l, &mut clicks, next, time).is_none());
+            assert_eq!(at(&l, 0), c(3, 1, 6, 4));
+        }
+        let mut l = halves();
+        let p = (1714, 700);
+        let mut d = Drag::press(&l, p).unwrap();
+        d.motion(&mut l, col(8), 0);
+        d.motion(&mut l, p, 1);
+        assert!(
+            d.edge_click(&l, p).is_none(),
+            "a drag back to its origin is no click"
+        );
+        assert!(d.release(&mut l, p, 2).is_none());
     }
 
     #[test]

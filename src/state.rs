@@ -95,6 +95,7 @@ pub struct Navi {
     pub windows: Vec<Managed>,
     /// A drag in navi's strip or edges, from press to release.
     pub drag: Option<Drag>,
+    pub edge_clicks: layout::EdgeClicks,
     /// The layout's outputs, with the area layer surfaces leave for the grid.
     grid: Vec<layout::Output>,
     pub toplevels: Toplevels,
@@ -165,6 +166,7 @@ impl Navi {
             memory,
             windows: Vec::new(),
             drag: None,
+            edge_clicks: layout::EdgeClicks::default(),
             grid: Vec::new(),
             toplevels: Toplevels::default(),
             loop_handle,

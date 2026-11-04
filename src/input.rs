@@ -179,6 +179,7 @@ impl Navi {
             .filter_map(|o| self.space.output_geometry(o))
             .any(|g| g.to_f64().contains(pos));
         let now = self.now_ms();
+        self.edge_clicks.motion(px(pos));
         if !inside {
             // Off every output the release may never arrive; give up rather than stick.
             self.cancel_drag();
@@ -205,10 +206,19 @@ impl Navi {
         };
         let serial = SERIAL_COUNTER.next_serial();
         let pos = pointer.current_location();
+        if !left {
+            self.edge_clicks = Default::default();
+        }
         if let Some(drag) = self.drag.take() {
             if left && !pressed {
                 let now = self.now_ms();
+                let edge = drag.edge_click(&self.layout, px(pos));
                 let done = drag.release(&mut self.layout, px(pos), now);
+                let edge = edge.filter(|_| done.is_none());
+                let expanded = self
+                    .edge_clicks
+                    .release(&mut self.layout, edge, px(pos), now);
+                let done = done.or(expanded);
                 match &done {
                     Some(Done::Layout(what, tiles)) => {
                         let tiles: Vec<_> = tiles.iter().map(|t| (t.id, &t.cells)).collect();
@@ -264,6 +274,7 @@ impl Navi {
                 return;
             }
         }
+        self.edge_clicks = Default::default();
         let state = match pressed {
             true => ButtonState::Pressed,
             false => ButtonState::Released,
@@ -282,6 +293,7 @@ impl Navi {
 
     /// The window losing focus mid-drag may swallow the release: cancel the drag.
     pub fn cancel_drag(&mut self) {
+        self.edge_clicks = Default::default();
         if let Some(d) = self.drag.take() {
             info!("drag cancelled");
             if d.cancel(&mut self.layout) {

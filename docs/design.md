@@ -85,6 +85,13 @@ space when you want it.
 - **Resize:** drag any tile edge. It moves in whole cells. When two tiles share that edge, both
   change. Nothing else changes (principle 4). The edge stops when a tile reaches its minimum. The
   new size becomes that app's remembered size.
+- **Diagonal resize:** drag a corner in the gaps around a window to change its width and height
+  together. The 32 px nearest each corner of an edge is the corner target; it never takes pixels
+  from the app, tabs or window buttons. At a four-window junction, both shared boundaries move.
+- **Fill toward an edge:** double-click an edge (two clicks within 400 ms, moving less than 8 px)
+  to extend that side to the monitor's usable edge. The opposite side stays put. It uses the same
+  grid, neighbor and minimum-size rules as dragging, so another tile can stop it short. Panels
+  keep their space. This is a resize and is remembered, rather than a maximize toggle.
 - The strip is the 8 px gap above a window; the edges are the 4 px gaps beside and below it.
 - A click on the strip without moving (under 8 px) moves nothing.
 - Once a hold will form tabs, the preview turns more solid, so swap and tab look different.
