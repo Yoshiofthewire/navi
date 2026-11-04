@@ -6,7 +6,7 @@ mod bar;
 mod drag;
 mod memory;
 pub use bar::{Decor, decoration};
-pub use drag::{Action, Done, Drag, overlay};
+pub use drag::{Action, Done, Drag, EdgeClicks, overlay};
 pub use memory::safe;
 
 pub const COLS: i32 = 12;

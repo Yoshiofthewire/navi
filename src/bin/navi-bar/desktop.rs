@@ -21,6 +21,85 @@ pub struct Entry {
     pub icon: Option<String>,
     pub argv: Vec<String>,
     pub wm_class: Option<String>,
+    pub category: Category,
+}
+
+/// Desktop Entry Spec main categories. Each app appears in one folder.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Category {
+    Internet,
+    Development,
+    Office,
+    Graphics,
+    Media,
+    Games,
+    Education,
+    Science,
+    Settings,
+    System,
+    Utilities,
+    #[default]
+    Other,
+}
+
+impl Category {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Internet => "Internet",
+            Self::Development => "Development",
+            Self::Office => "Office",
+            Self::Graphics => "Graphics",
+            Self::Media => "Sound & Video",
+            Self::Games => "Games",
+            Self::Education => "Education",
+            Self::Science => "Science",
+            Self::Settings => "Settings",
+            Self::System => "System",
+            Self::Utilities => "Utilities",
+            Self::Other => "Other",
+        }
+    }
+
+    fn parse(categories: &str) -> Self {
+        // A stable priority makes multi-category apps appear once, in a useful folder.
+        for (key, category) in [
+            ("Network", Self::Internet),
+            ("Development", Self::Development),
+            ("Office", Self::Office),
+            ("Graphics", Self::Graphics),
+            ("AudioVideo", Self::Media),
+            ("Audio", Self::Media),
+            ("Video", Self::Media),
+            ("Game", Self::Games),
+            ("Education", Self::Education),
+            ("Science", Self::Science),
+            ("Settings", Self::Settings),
+            ("System", Self::System),
+            ("Utility", Self::Utilities),
+        ] {
+            if categories.split(';').any(|c| c == key) {
+                return category;
+            }
+        }
+        Self::Other
+    }
+}
+
+/// Match both native Wayland app IDs and apps that advertise their StartupWMClass.
+pub fn entry_for(app_id: &str, entries: &[Entry]) -> Option<usize> {
+    if app_id.is_empty() {
+        return None;
+    }
+    entries
+        .iter()
+        .position(|e| e.id == app_id || e.id.strip_suffix(".desktop") == Some(app_id))
+        .or_else(|| {
+            entries.iter().position(|e| {
+                e.wm_class
+                    .as_ref()
+                    .is_some_and(|c| c.eq_ignore_ascii_case(app_id))
+            })
+        })
 }
 
 /// `$XDG_DATA_HOME`, then each `$XDG_DATA_DIRS` entry, with defaults; relative values are ignored.
@@ -145,6 +224,7 @@ fn parse(id: String, text: &str) -> Option<Entry> {
         icon: get("Icon").filter(|i| !i.is_empty()),
         argv: exec::split(&get("Exec")?).ok()?,
         wm_class: get("StartupWMClass").filter(|c| !c.is_empty()),
+        category: Category::parse(&get("Categories").unwrap_or_default()),
     })
 }
 
@@ -269,5 +349,29 @@ mod tests {
             data_dirs(os("rel"), None, os("")),
             [PathBuf::from("/usr/local/share"), "/usr/share".into()]
         );
+    }
+
+    #[test]
+    fn desktop_categories_assign_one_stable_folder_and_match_app_ids() {
+        for (keys, category) in [
+            ("Network;WebBrowser;", Category::Internet),
+            ("Qt;KDE;Development;Utility;", Category::Development),
+            ("Video;Player;", Category::Media),
+            ("Game;", Category::Games),
+            ("Utility;TextEditor;", Category::Utilities),
+            ("NotNetwork;", Category::Other),
+            ("", Category::Other),
+        ] {
+            let text = app(
+                "Example",
+                &format!("Categories={keys}\nStartupWMClass=Example"),
+            );
+            let entry = parse("org.example.App.desktop".into(), &text).unwrap();
+            assert_eq!(entry.category, category);
+            for id in ["org.example.App", "org.example.App.desktop", "example"] {
+                assert_eq!(entry_for(id, std::slice::from_ref(&entry)), Some(0));
+            }
+            assert_eq!(entry_for("", &[entry]), None);
+        }
     }
 }

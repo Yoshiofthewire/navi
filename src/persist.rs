@@ -3,9 +3,8 @@
 //! serve navi's other files too.
 
 use std::ffi::OsStr;
-use std::fs::{self, DirBuilder, OpenOptions};
-use std::io::{self, ErrorKind, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::fs;
+use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 
 use tracing::{info, warn};
@@ -29,33 +28,8 @@ pub fn read(path: &Path) -> Result<Option<String>, String> {
     }
 }
 
-/// A new private temp file next to `path`, in a private dir, and its path. `create_new` never
-/// follows a symlink planted at the temp path.
-fn create_tmp(path: &Path) -> io::Result<(fs::File, PathBuf)> {
-    let dir = path.parent().ok_or(ErrorKind::InvalidInput)?;
-    DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
-    let tmp = path.with_extension("tmp");
-    // A killed run's leftover.
-    match fs::remove_file(&tmp) {
-        Err(e) if e.kind() != ErrorKind::NotFound => return Err(e),
-        _ => {}
-    }
-    let f = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&tmp)?;
-    Ok((f, tmp))
-}
-
-/// Writes a private temp file and renames it over `path`, so a crash leaves the old file or the
-/// new one.
-pub fn write(path: &Path, text: &str) -> io::Result<()> {
-    let (mut f, tmp) = create_tmp(path)?;
-    f.write_all(text.as_bytes())?;
-    f.sync_all()?;
-    fs::rename(&tmp, path)
-}
+use crate::files::private_tmp as create_tmp;
+pub use crate::files::write_private as write;
 
 /// `$XDG_STATE_HOME/navi/<name>`.
 pub fn state_file(name: &str) -> Option<PathBuf> {
@@ -180,6 +154,7 @@ impl Store {
 
 #[cfg(test)]
 pub mod tests {
+    use std::io::Write;
     use std::os::unix::fs::{PermissionsExt, symlink};
 
     use super::*;
