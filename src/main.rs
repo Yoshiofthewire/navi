@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod image;
 mod input;
 mod layout;
 mod persist;
@@ -7,6 +8,7 @@ mod persist;
 mod replay;
 mod screenshot;
 mod state;
+mod wallpaper;
 mod winit;
 
 use std::sync::Arc;

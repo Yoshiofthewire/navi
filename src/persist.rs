@@ -1,5 +1,6 @@
 //! Keeps the layout's memory in `$XDG_STATE_HOME/navi/memory` across restarts. Private (dir 0700,
-//! file 0600), replaced atomically, and a bad file is ignored, never fatal.
+//! file 0600), replaced atomically, and a bad file is ignored, never fatal. The file helpers here
+//! serve navi's other files too.
 
 use std::ffi::OsStr;
 use std::fs::{self, DirBuilder, File, OpenOptions};
@@ -13,21 +14,24 @@ use crate::layout::Layout;
 
 const MAX_BYTES: u64 = 1 << 20;
 
-/// `$XDG_STATE_HOME/navi/memory`, else `$HOME/.local/state/navi/memory`. Relative values are
+/// An XDG base dir: `var` (e.g. `$XDG_STATE_HOME`), else `$HOME/<fallback>`. Relative values are
 /// ignored, as the XDG spec says, so navi never writes relative to its working directory.
-fn path(state: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
+pub fn xdg_dir(var: Option<&OsStr>, home: Option<&OsStr>, fallback: &str) -> Option<PathBuf> {
     fn abs(v: Option<&OsStr>) -> Option<&Path> {
         v.map(Path::new).filter(|p| p.is_absolute())
     }
-    let dir = match abs(state) {
-        Some(s) => s.to_path_buf(),
-        None => abs(home)?.join(".local/state"),
-    };
-    Some(dir.join("navi/memory"))
+    match abs(var) {
+        Some(s) => Some(s.to_path_buf()),
+        None => Some(abs(home)?.join(fallback)),
+    }
 }
 
-/// The file's text; `None` if there is none yet.
-fn read(path: &Path) -> Result<Option<String>, String> {
+fn path(state: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
+    Some(xdg_dir(state, home, ".local/state")?.join("navi/memory"))
+}
+
+/// The file's bytes, at most `max`; `None` if there is no file.
+pub fn read_bytes(path: &Path, max: u64) -> Result<Option<Vec<u8>>, String> {
     match fs::metadata(path) {
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.to_string()),
@@ -36,19 +40,27 @@ fn read(path: &Path) -> Result<Option<String>, String> {
     }
     let mut bytes = Vec::new();
     File::open(path)
-        .and_then(|f| f.take(MAX_BYTES + 1).read_to_end(&mut bytes))
+        .and_then(|f| f.take(max + 1).read_to_end(&mut bytes))
         .map_err(|e| e.to_string())?;
-    if bytes.len() as u64 > MAX_BYTES {
-        return Err(format!("over {MAX_BYTES} bytes"));
+    if bytes.len() as u64 > max {
+        return Err(format!("over {max} bytes"));
     }
-    String::from_utf8(bytes)
-        .map(Some)
-        .map_err(|_| "not UTF-8".into())
+    Ok(Some(bytes))
+}
+
+/// The file's text, at most 1 MiB; `None` if there is no file.
+pub fn read(path: &Path) -> Result<Option<String>, String> {
+    match read_bytes(path, MAX_BYTES)? {
+        None => Ok(None),
+        Some(b) => String::from_utf8(b)
+            .map(Some)
+            .map_err(|_| "not UTF-8".into()),
+    }
 }
 
 /// Writes a private temp file and renames it over `path`, so a crash leaves the old file or the
 /// new one. `create_new` never follows a symlink planted at the temp path.
-fn write(path: &Path, text: &str) -> io::Result<()> {
+pub fn write(path: &Path, text: &str) -> io::Result<()> {
     let dir = path.parent().ok_or(ErrorKind::InvalidInput)?;
     DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
     let tmp = path.with_extension("tmp");
@@ -127,17 +139,17 @@ impl Store {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use std::os::unix::fs::{PermissionsExt, symlink};
 
     use super::*;
     use crate::layout::{Output, Rect};
 
     /// A fresh empty dir, removed on drop.
-    struct Tmp(PathBuf);
+    pub struct Tmp(pub PathBuf);
 
     impl Tmp {
-        fn new(name: &str) -> Tmp {
+        pub fn new(name: &str) -> Tmp {
             let p = std::env::temp_dir().join(format!("navi-{}-{name}", std::process::id()));
             let _ = fs::remove_dir_all(&p);
             fs::create_dir(&p).unwrap();
@@ -151,7 +163,7 @@ mod tests {
         }
     }
 
-    fn mode(p: &Path) -> u32 {
+    pub fn mode(p: &Path) -> u32 {
         fs::metadata(p).unwrap().permissions().mode() & 0o777
     }
 
