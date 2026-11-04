@@ -124,6 +124,7 @@ impl Navi {
                     Some(Done::Layout(what, tiles)) => {
                         let tiles: Vec<_> = tiles.iter().map(|t| (t.id, &t.cells)).collect();
                         info!(?tiles, "{what}");
+                        self.memory.sync(&self.layout);
                     }
                     Some(Done::Click(action, id)) => info!(id, by = "navi", "{}", action.log()),
                     None => {}

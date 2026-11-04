@@ -48,6 +48,7 @@ use smithay::{
 use tracing::info;
 
 use crate::layout::{Decor, Drag, Layout, WinId, decoration};
+use crate::persist::Store;
 
 /// A toplevel navi knows about. It's unmapped until its first commit, when its app ID is known.
 pub struct Managed {
@@ -63,6 +64,7 @@ pub struct Navi {
     pub space: Space<Window>,
     pub loop_signal: LoopSignal,
     pub layout: Layout,
+    pub memory: Store,
     pub windows: Vec<Managed>,
     /// A drag in navi's strip or edges, from press to release.
     pub drag: Option<Drag>,
@@ -87,6 +89,9 @@ impl Navi {
         let mut seat = seat_state.new_wl_seat(&dh, "seat0");
         seat.add_keyboard(Default::default(), 200, 25)?;
         seat.add_pointer();
+        // Before the first window is placed.
+        let mut layout = Layout::default();
+        let memory = Store::open(&mut layout);
 
         Ok(Self {
             start_time: std::time::Instant::now(),
@@ -107,7 +112,8 @@ impl Navi {
             display_handle: dh,
             space: Space::default(),
             loop_signal,
-            layout: Layout::default(),
+            layout,
+            memory,
             windows: Vec::new(),
             drag: None,
             seat_state,
@@ -353,6 +359,7 @@ impl Navi {
                 let tile = self.layout.tile(id).map(|t| (t.output.clone(), t.cells));
                 let rect = self.layout.rect(id);
                 info!(app, id, ?step, ?tile, ?rect, "placed");
+                self.memory.sync(&self.layout);
             }
         }
         // Sets the size before the first configure goes out.
