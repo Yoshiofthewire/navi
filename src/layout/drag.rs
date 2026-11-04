@@ -1,7 +1,9 @@
 //! Moving and resizing tiles with the mouse, as docs/design.md "Dragging" says.
 
 use super::{
-    COLS, Cells, GAP, Layout, MIN_H, MIN_W, Memory, Output, ROWS, Rect, Tile, WinId, dist2,
+    COLS, Cells, GAP, Layout, MIN_H, MIN_W, Memory, Output, ROWS, Rect, Tile, WinId,
+    bar::{self, ACCENT, Button, DIM},
+    dist2,
 };
 
 /// A press on a strip becomes a move once the pointer travels this far, in px.
@@ -21,25 +23,68 @@ pub enum Side {
     Bottom,
 }
 
-/// A navi zone in the gaps: a tile's grab strip, or one of its edges.
+/// A navi zone in the gaps: a tile's grab strip (or the free part of its bar), one of its edges,
+/// a tab, or a window button of the group's active tile.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Hit {
     Strip(WinId),
     Edge(WinId, Side),
+    Tab(WinId),
+    Button(WinId, Button),
 }
 
 impl Hit {
     pub fn id(self) -> WinId {
-        let (Hit::Strip(id) | Hit::Edge(id, _)) = self;
+        let (Hit::Strip(id) | Hit::Edge(id, _) | Hit::Tab(id) | Hit::Button(id, _)) = self;
         id
     }
 }
 
+/// A click on navi's controls, as `Drag::release` reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Action {
+    Activate,
+    Restore,
+    Minimize,
+    Maximize,
+    Unmaximize,
+    /// Not performed by the layout: glue asks the app to close.
+    Close,
+}
+
+impl Action {
+    pub fn log(self) -> &'static str {
+        match self {
+            Action::Activate => "tab switched",
+            Action::Restore => "restored",
+            Action::Minimize => "minimized",
+            Action::Maximize => "maximized",
+            Action::Unmaximize => "unmaximized",
+            Action::Close => "close requested",
+        }
+    }
+}
+
+/// What a drag did.
+#[derive(Debug, PartialEq)]
+pub enum Done {
+    /// Tiles moved or resized: what happened, and the tiles that changed.
+    Layout(&'static str, Vec<Tile>),
+    /// A click, applied to the layout already except `Close`.
+    Click(Action, WinId),
+}
+
 impl Layout {
     pub fn hit(&self, p: (i32, i32)) -> Option<Hit> {
-        let ids = || self.tiles.iter().map(|t| t.id);
+        // One set of zones per group, from its active tile, and none under a maximized group.
+        let ids = || {
+            self.tiles
+                .iter()
+                .filter(|t| self.active(t.id) == Some(t.id) && !self.covered(t))
+                .map(|t| t.id)
+        };
         // Top zones go last: where one meets the bottom zone of a tile above, that one wins.
-        ids()
+        let hit = ids()
             .flat_map(|id| {
                 [
                     Hit::Strip(id),
@@ -49,14 +94,31 @@ impl Layout {
                 ]
             })
             .chain(ids().map(|id| Hit::Edge(id, Side::Top)))
-            .find(|&h| self.zone(h).is_some_and(|z| z.contains(p)))
+            .find(|&h| self.zone(h).is_some_and(|z| z.contains(p)))?;
+        let Hit::Strip(id) = hit else {
+            return Some(hit);
+        };
+        let Some(bar) = self.bar(id) else {
+            return Some(hit);
+        };
+        if let Some(&(b, _)) = bar.buttons.iter().find(|(_, r)| r.contains(p)) {
+            return Some(Hit::Button(id, b));
+        }
+        match bar.tabs.is_empty() {
+            true => Some(hit),
+            // The 2 px between tabs are no zone.
+            false => bar
+                .tabs
+                .iter()
+                .find(|(_, r)| r.contains(p))
+                .map(|&(t, _)| Hit::Tab(t)),
+        }
     }
 
     /// The px of a zone, all inside the gaps around the tile's window.
-    fn zone(&self, hit: Hit) -> Option<Rect> {
+    pub(super) fn zone(&self, hit: Hit) -> Option<Rect> {
         let t = self.tile(hit.id())?;
-        let o = self.output(&t.output)?;
-        let (c, r) = (o.cells_rect(t.cells), o.tile_rect(t.cells));
+        let (c, r) = self.frame(t.id)?;
         Some(match hit {
             Hit::Strip(_) => Rect {
                 x: r.x,
@@ -64,6 +126,9 @@ impl Layout {
                 h: r.y - c.y,
                 ..c
             },
+            Hit::Tab(id) => self.bar(id)?.tabs.into_iter().find(|&(u, _)| u == id)?.1,
+            Hit::Button(id, b) => self.bar(id)?.buttons.into_iter().find(|&(u, _)| u == b)?.1,
+            Hit::Edge(..) if self.maximized(t) => return None,
             Hit::Edge(_, Side::Left) => Rect { w: r.x - c.x, ..c },
             Hit::Edge(_, Side::Right) => Rect {
                 x: r.x + r.w,
@@ -100,18 +165,6 @@ impl Layout {
         changed
     }
 
-    /// `id` and the tiles tabbed with it: same output, same cells.
-    fn group(&self, id: WinId) -> Vec<WinId> {
-        let Some(t) = self.tile(id) else {
-            return Vec::new();
-        };
-        self.tiles
-            .iter()
-            .filter(|u| u.output == t.output && u.cells == t.cells)
-            .map(|u| u.id)
-            .collect()
-    }
-
     fn put(&mut self, ids: &[WinId], output: &str, cells: Cells) {
         for t in self.tiles.iter_mut().filter(|t| ids.contains(&t.id)) {
             t.output = output.to_string();
@@ -145,8 +198,9 @@ impl Layout {
         }
     }
 
-    /// Where a move of `id`'s group lands with the pointer at `p`, on which output.
-    fn move_target(&self, id: WinId, p: (i32, i32)) -> Option<(String, Target)> {
+    /// Where a move of `moving` (`id`'s group, or `id` alone out of it) lands with the pointer at
+    /// `p`, on which output.
+    fn move_target(&self, id: WinId, moving: &[WinId], p: (i32, i32)) -> Option<(String, Target)> {
         let t = self.tile(id)?;
         let o = self
             .outputs
@@ -162,12 +216,12 @@ impl Layout {
             Some(u) if group.contains(&u.id) => Target::Own(u.cells),
             Some(u) => Target::Onto(u.id, u.cells),
             None => {
-                // The group's own cells count as free.
+                // The moving tiles' cells count as free.
                 let rest = Layout {
                     tiles: self
                         .tiles
                         .iter()
-                        .filter(|u| !group.contains(&u.id))
+                        .filter(|u| !moving.contains(&u.id))
                         .cloned()
                         .collect(),
                     ..Layout::default()
@@ -280,10 +334,8 @@ fn middle(r: Rect) -> Rect {
     }
 }
 
-/// Accent `#2BA3D8` at `alpha`, premultiplied.
 fn accent(alpha: f32) -> [f32; 4] {
-    let [r, g, b] = [0x2Bu8, 0xA3, 0xD8].map(|c| f32::from(c) / 255.0 * alpha);
-    [r, g, b, alpha]
+    bar::rgba(ACCENT, alpha)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -318,12 +370,15 @@ struct Resize {
 }
 
 enum State {
+    /// A press on a strip, tab or button: a click until the pointer travels `ARM_PX`.
     Armed {
-        id: WinId,
+        hit: Hit,
         from: (i32, i32),
     },
     Move {
         id: WinId,
+        /// A tab dragged out of its group, alone.
+        tab: bool,
         output: String,
         target: Target,
         /// The tile whose middle the pointer is in, and since when.
@@ -337,10 +392,11 @@ enum State {
 pub struct Drag(State);
 
 impl Drag {
-    /// A left press at `p`: arms a move on a strip, starts a resize on an edge, `None` elsewhere.
+    /// A left press at `p`: arms a click or move on a strip, tab or button, starts a resize on an
+    /// edge, `None` elsewhere.
     pub fn press(l: &Layout, p: (i32, i32)) -> Option<Drag> {
         let state = match l.hit(p)? {
-            Hit::Strip(id) => State::Armed { id, from: p },
+            hit @ (Hit::Strip(_) | Hit::Tab(_) | Hit::Button(..)) => State::Armed { hit, from: p },
             Hit::Edge(id, side) => {
                 let t = l.tile(id)?;
                 let x = matches!(side, Side::Left | Side::Right);
@@ -378,24 +434,36 @@ impl Drag {
 
     /// Follows the pointer to `p`. Returns whether any tile's cells changed.
     pub fn motion(&mut self, l: &mut Layout, p: (i32, i32), now_ms: u64) -> bool {
-        if let State::Armed { id, from } = self.0
+        if let State::Armed { hit, from } = self.0
             && dist2(from, p) >= ARM_PX * ARM_PX
         {
-            self.0 = State::Move {
-                id,
-                output: String::new(),
-                target: Target::Nowhere,
-                middle: None,
+            let (id, tab) = match hit {
+                Hit::Strip(id) => (id, false),
+                Hit::Tab(id) => (id, true),
+                _ => (hit.id(), false),
+            };
+            self.0 = match hit {
+                // A maximized group doesn't move; a button press stays a click.
+                Hit::Strip(_) | Hit::Tab(_) if l.is_maximized(id) => State::Cancelled,
+                Hit::Strip(_) | Hit::Tab(_) => State::Move {
+                    id,
+                    tab,
+                    output: String::new(),
+                    target: Target::Nowhere,
+                    middle: None,
+                },
+                _ => State::Armed { hit, from },
             };
         }
         match &mut self.0 {
-            State::Armed { id, .. } if l.tile(*id).is_none() => self.0 = State::Cancelled,
+            State::Armed { hit, .. } if l.tile(hit.id()).is_none() => self.0 = State::Cancelled,
             State::Move {
                 id,
+                tab,
                 output,
                 target,
                 middle,
-            } => match l.move_target(*id, p) {
+            } => match l.move_target(*id, &l.moving(*id, *tab), p) {
                 Some((o, t)) => {
                     let mid = match t {
                         Target::Onto(u, c) => l
@@ -433,91 +501,148 @@ impl Drag {
         }
     }
 
-    /// Ends the drag at `p`. Returns what happened and the tiles that changed, `None` if nothing
-    /// did.
-    pub fn release(
-        mut self,
-        l: &mut Layout,
-        p: (i32, i32),
-        now_ms: u64,
-    ) -> Option<(&'static str, Vec<Tile>)> {
+    /// Ends the drag at `p`. Returns what happened, `None` if nothing did.
+    pub fn release(mut self, l: &mut Layout, p: (i32, i32), now_ms: u64) -> Option<Done> {
         self.motion(l, p, now_ms);
         match self.0 {
             State::Move {
                 id,
+                tab,
                 output,
                 target,
                 middle,
             } => {
-                let group = l.group(id);
+                let moving = l.moving(id, tab);
                 let held = held(middle, now_ms);
                 let (what, ids) = match target {
                     Target::Own(_) | Target::Nowhere => return None,
                     Target::Free(c) => {
-                        l.put(&group, &output, c);
-                        ("moved", group)
+                        l.put(&moving, &output, c);
+                        (if tab { "untabbed" } else { "moved" }, moving)
                     }
                     Target::Onto(_, c) if held => {
-                        l.put(&group, &output, c);
-                        ("tabbed", group)
+                        l.put(&moving, &output, c);
+                        ("tabbed", moving)
                     }
+                    // The tabs left behind would overlap the swapped tile.
+                    Target::Onto(..) if tab => return None,
                     Target::Onto(u, c) => {
                         let theirs = l.group(u);
                         let (own_output, own) = l.tile(id).map(|t| (t.output.clone(), t.cells))?;
-                        l.put(&group, &output, c);
+                        l.put(&moving, &output, c);
                         l.put(&theirs, &own_output, own);
-                        ("swapped", [group, theirs].concat())
+                        ("swapped", [moving, theirs].concat())
                     }
                 };
+                // What lands is shown, and a new tile there must be visible.
+                l.clear_maximized(&output);
+                l.touch(id);
                 let tiles = l.tiles_in(&ids);
                 l.learn(&tiles, false);
-                Some((what, tiles))
+                Some(Done::Layout(what, tiles))
             }
             State::Resize(r) => {
                 let moved = |t: &&Tile| r.before.iter().any(|b| b.id == t.id && b.cells != t.cells);
                 let tiles: Vec<Tile> = l.tiles.iter().filter(moved).cloned().collect();
                 l.learn(&tiles, true);
-                (!tiles.is_empty()).then_some(("resized", tiles))
+                (!tiles.is_empty()).then_some(Done::Layout("resized", tiles))
             }
-            State::Armed { .. } | State::Cancelled => None,
+            State::Armed { hit, .. } => l.click(hit, p).map(|(a, id)| Done::Click(a, id)),
+            State::Cancelled => None,
         }
     }
 }
 
-/// Solid rects to draw over the windows: global logical px, premultiplied RGBA.
-/// The hovered or dragged zone; during a move, the grid and a preview of the landing tile, more
-/// solid once the drop would tab.
+impl Layout {
+    /// What a move from `id`'s strip or tab carries.
+    fn moving(&self, id: WinId, tab: bool) -> Vec<WinId> {
+        match tab {
+            true => vec![id],
+            false => self.group(id),
+        }
+    }
+
+    /// A press and release on `hit` with the pointer ending at `p`.
+    fn click(&mut self, hit: Hit, p: (i32, i32)) -> Option<(Action, WinId)> {
+        let done = |a: Action, changed: bool| changed.then_some((a, hit.id()));
+        match hit {
+            Hit::Tab(id) => done(Action::Activate, self.activate(id)),
+            Hit::Strip(id) if self.tile(id)?.minimized => done(Action::Restore, self.activate(id)),
+            // So navi can always undo a maximize, even with no maximize button.
+            Hit::Strip(id) => done(Action::Unmaximize, self.unmaximize(id)),
+            Hit::Button(..) if self.hit(p) != Some(hit) => None,
+            Hit::Button(id, Button::Minimize) => done(Action::Minimize, self.minimize(id)),
+            Hit::Button(id, Button::Maximize) if self.is_maximized(id) => {
+                done(Action::Unmaximize, self.unmaximize(id))
+            }
+            Hit::Button(id, Button::Maximize) => done(Action::Maximize, self.maximize(id)),
+            Hit::Button(_, Button::Close) => done(Action::Close, true),
+            Hit::Edge(..) => None,
+        }
+    }
+}
+
+/// Solid rects to draw over the windows: global logical px, premultiplied RGBA, front to back.
+/// During a move, the grid and a preview of the landing tile, more solid once the drop would tab;
+/// otherwise the hovered or pressed zone. Then every bar, and the dimmed strip of each minimized
+/// untabbed tile.
 pub fn overlay(
     l: &Layout,
     drag: Option<&Drag>,
     p: (i32, i32),
     now_ms: u64,
 ) -> Vec<(Rect, [f32; 4])> {
-    let zone = match drag.map(|d| &d.0) {
+    let mut out = Vec::new();
+    let hover = match drag.map(|d| &d.0) {
         None => l.hit(p),
-        Some(State::Armed { id, .. }) => Some(Hit::Strip(*id)),
+        Some(State::Armed { hit, .. }) => Some(*hit),
         Some(State::Resize(r)) => Some(Hit::Edge(r.id, r.side)),
         Some(State::Move {
+            tab,
             output,
             target,
             middle,
             ..
         }) => {
-            let alpha = match held(*middle, now_ms) {
-                true => TAB_ALPHA,
-                false => PREVIEW_ALPHA,
+            let held = held(*middle, now_ms);
+            let alpha = if held { TAB_ALPHA } else { PREVIEW_ALPHA };
+            // A tab can't swap, so over a tile only a hold that will tab shows where it lands.
+            let target = match target {
+                Target::Onto(..) if *tab && !held => Target::Nowhere,
+                t => *t,
             };
-            return l
-                .output(output)
-                .map(|o| move_overlay(o, *target, alpha))
-                .unwrap_or_default();
+            if let Some(o) = l.output(output) {
+                out.extend(move_overlay(o, target, alpha));
+            }
+            None
         }
         Some(State::Cancelled) => None,
     };
-    zone.and_then(|h| l.zone(h))
-        .map(|z| (z, accent(1.0)))
-        .into_iter()
-        .collect()
+    // A lit strip stops at the buttons.
+    let lit = match hover {
+        Some(Hit::Strip(id)) => l.zone(Hit::Strip(id)).map(|z| {
+            let buttons = l.bar(id).map_or(0, |b| b.buttons.len() as i32);
+            Rect {
+                w: z.w - buttons * super::BAR,
+                ..z
+            }
+        }),
+        Some(h @ Hit::Edge(..)) => l.zone(h),
+        _ => None,
+    };
+    out.extend(lit.map(|z| (z, accent(1.0))));
+    for t in &l.tiles {
+        if l.active(t.id) != Some(t.id) || l.covered(t) {
+            continue;
+        }
+        let tabbed = l.group(t.id).len() > 1;
+        if t.minimized && !tabbed {
+            out.extend(l.zone(Hit::Strip(t.id)).map(|z| (z, accent(DIM))));
+        } else if let Some(b) = l.bar(t.id) {
+            out.extend(bar::draw(l, t.id, &b, hover));
+        }
+    }
+    out
 }
 
 /// The output's interior cell boundaries, 1 px wide, and the preview where the window would go.
@@ -540,10 +665,10 @@ fn move_overlay(o: &Output, target: Target, alpha: f32) -> Vec<(Rect, [f32; 4])>
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
 
-    fn c(col: i32, row: i32, cols: i32, rows: i32) -> Cells {
+    pub(in crate::layout) fn c(col: i32, row: i32, cols: i32, rows: i32) -> Cells {
         Cells {
             col,
             row,
@@ -552,7 +677,7 @@ mod tests {
         }
     }
 
-    fn uw() -> Output {
+    pub(in crate::layout) fn uw() -> Output {
         Output {
             name: "uw".into(),
             area: Rect {
@@ -566,7 +691,7 @@ mod tests {
     }
 
     /// The ultrawide with tiles 0, 1, 2… of apps "a0", "a1"…, each remembering its own size.
-    fn with(tiles: &[Cells]) -> Layout {
+    pub(in crate::layout) fn with(tiles: &[Cells]) -> Layout {
         let mut l = Layout::default();
         l.set_outputs(vec![uw()]);
         for (i, &cells) in tiles.iter().enumerate() {
@@ -585,17 +710,29 @@ mod tests {
                 app,
                 output: "uw".into(),
                 cells,
+                stamp: i as u64,
+                ..Tile::default()
             });
         }
+        l.clock = tiles.len() as u64;
+        l.next_id = tiles.len() as WinId;
         l
     }
 
-    fn at(l: &Layout, id: WinId) -> Cells {
+    /// What a release did, as it is logged.
+    fn what(done: Option<Done>) -> Option<&'static str> {
+        done.map(|d| match d {
+            Done::Layout(what, _) => what,
+            Done::Click(a, _) => a.log(),
+        })
+    }
+
+    pub(in crate::layout) fn at(l: &Layout, id: WinId) -> Cells {
         l.tile(id).unwrap().cells
     }
 
     /// AC11: tiles overlap only as tab groups, stay on the grid and at least the minimum.
-    fn assert_valid(l: &Layout) {
+    pub(in crate::layout) fn assert_valid(l: &Layout) {
         let (min_c, min_r) = uw().span_for((MIN_W, MIN_H));
         for (i, t) in l.tiles.iter().enumerate() {
             let k = t.cells;
@@ -614,14 +751,18 @@ mod tests {
     }
 
     /// Presses at `from`, moves through `path` (point, ms), releases at the last point.
-    fn drag(l: &mut Layout, from: (i32, i32), path: &[((i32, i32), u64)]) -> Option<&'static str> {
+    pub(in crate::layout) fn drag(
+        l: &mut Layout,
+        from: (i32, i32),
+        path: &[((i32, i32), u64)],
+    ) -> Option<&'static str> {
         let mut d = Drag::press(l, from).expect("press in a zone");
         for &(p, t) in path {
             d.motion(l, p, t);
             assert_valid(l);
         }
         let &(p, t) = path.last().unwrap_or(&(from, 0));
-        let what = d.release(l, p, t).map(|(w, _)| w);
+        let what = what(d.release(l, p, t));
         assert_valid(l);
         what
     }
@@ -729,7 +870,9 @@ mod tests {
         let mut d = Drag::press(&l, A_STRIP).unwrap();
         d.motion(&mut l, (3000, 700), 0);
         assert_eq!(preview(&d), Some(c(6, 0, 6, 6)));
-        let (what, tiles) = d.release(&mut l, (3000, 700), 10).unwrap();
+        let Some(Done::Layout(what, tiles)) = d.release(&mut l, (3000, 700), 10) else {
+            panic!("not moved");
+        };
         assert_eq!((what, tiles[0].cells), ("moved", c(6, 0, 6, 6)));
         assert_eq!(at(&l, 0), c(6, 0, 6, 6));
         assert_eq!(l.memory["a0"].cells, c(6, 0, 6, 6));
@@ -791,6 +934,7 @@ mod tests {
                 app,
                 output,
                 cells,
+                ..Tile::default()
             });
         }
         let tiles = l.tiles.clone();
@@ -807,11 +951,12 @@ mod tests {
     }
 
     #[test]
-    fn ac7_a_tab_group_moves_together() {
+    fn ac7_dragging_a_tab_moves_only_that_tab() {
+        // Job 003: the bar is all tabs, and A_STRIP is in tile 0's.
         let mut l = with(&[c(0, 0, 6, 6), c(0, 0, 6, 6)]);
-        assert_eq!(drag(&mut l, A_STRIP, &[((3000, 700), 0)]), Some("moved"));
+        assert_eq!(drag(&mut l, A_STRIP, &[((3000, 700), 0)]), Some("untabbed"));
         assert_eq!(at(&l, 0), c(6, 0, 6, 6));
-        assert_eq!(at(&l, 1), c(6, 0, 6, 6));
+        assert_eq!(at(&l, 1), c(0, 0, 6, 6));
     }
 
     /// x of column boundary `k`, y of row boundary `k`, on the ultrawide.
@@ -878,10 +1023,7 @@ mod tests {
         d.motion(&mut l, row(6), 0);
         assert_eq!((at(&l, 0), at(&l, 1)), (c(0, 0, 6, 5), c(0, 5, 6, 1)));
         assert_valid(&l);
-        assert_eq!(
-            d.release(&mut l, row(6), 0).map(|(w, _)| w),
-            Some("resized")
-        );
+        assert_eq!(what(d.release(&mut l, row(6), 0)), Some("resized"));
 
         // The top edge of the lower tile is the same boundary.
         let mut l = with(&[c(0, 0, 6, 3), c(0, 3, 6, 3), c(6, 3, 6, 3)]);
