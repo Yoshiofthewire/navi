@@ -1,15 +1,19 @@
-//! Debug builds only: `NAVI_INPUT_REPLAY=<file>` plays a pointer script through the same handlers
-//! as real input, so drags can be tested nested on a host with no input-injection tool.
+//! Debug builds only: `NAVI_INPUT_REPLAY=<file>` plays a pointer and keyboard script through the
+//! same handlers as real input, so drags and typing can be tested nested on a host with no
+//! input-injection tool.
 //!
 //! One step per line, in global logical px: `wait <ms>`, `move <x> <y>`, `press`, `release`
-//! (the left button). Blank lines and `#` comments are skipped. Any other line is an error, and
-//! then nothing is replayed.
+//! (the left button), `key <evdev keycode>` (press and release). Blank lines and `#` comments
+//! are skipped. Any other line is an error, and then nothing is replayed.
 
 use std::time::Duration;
 
-use smithay::reexports::calloop::{
-    LoopHandle,
-    timer::{TimeoutAction, Timer},
+use smithay::{
+    backend::input::KeyState,
+    reexports::calloop::{
+        LoopHandle,
+        timer::{TimeoutAction, Timer},
+    },
 };
 use tracing::{error, info};
 
@@ -17,6 +21,8 @@ use crate::CalloopData;
 
 const BTN_LEFT: u32 = 0x110;
 const MAX_BYTES: u64 = 1 << 20;
+/// evdev's KEY_MAX.
+const KEY_MAX: u32 = 0x2ff;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Step {
@@ -24,6 +30,7 @@ enum Step {
     Move(i32, i32),
     Press,
     Release,
+    Key(u32),
 }
 
 fn parse(script: &str) -> Result<Vec<Step>, String> {
@@ -41,6 +48,7 @@ fn parse(script: &str) -> Result<Vec<Step>, String> {
                 .map(|(x, y)| Step::Move(x, y)),
             ["press"] => Some(Step::Press),
             ["release"] => Some(Step::Release),
+            ["key", code] => code.parse().ok().filter(|&c| c <= KEY_MAX).map(Step::Key),
             _ => None,
         };
         steps.push(step.ok_or_else(|| format!("line {}: {line:?}", n + 1))?);
@@ -71,7 +79,7 @@ pub fn start(handle: &LoopHandle<'static, CalloopData>) {
     info!(
         path,
         steps = steps.len(),
-        "NAVI_INPUT_REPLAY: replaying pointer input"
+        "NAVI_INPUT_REPLAY: replaying input"
     );
     let mut next = steps.into_iter();
     let timer = handle.insert_source(Timer::immediate(), move |_, _, data| {
@@ -84,6 +92,12 @@ pub fn start(handle: &LoopHandle<'static, CalloopData>) {
                 Step::Move(x, y) => state.pointer_motion((f64::from(x), f64::from(y)).into(), time),
                 Step::Press => state.pointer_button(BTN_LEFT, true, true, time),
                 Step::Release => state.pointer_button(BTN_LEFT, true, false, time),
+                Step::Key(code) => {
+                    for key in [KeyState::Pressed, KeyState::Released] {
+                        // xkb keycodes are evdev's plus 8.
+                        state.keyboard_key((code + 8).into(), key, time);
+                    }
+                }
             }
         }
         info!("replay done");
@@ -100,7 +114,7 @@ mod tests {
 
     #[test]
     fn parses_the_four_steps() {
-        let script = "# drag a\nwait 500\n\nmove 100 2\npress\nmove -5 1439\nrelease\n";
+        let script = "# drag a\nwait 500\n\nmove 100 2\npress\nmove -5 1439\nrelease\nkey 46\n";
         assert_eq!(
             parse(script),
             Ok(vec![
@@ -109,6 +123,7 @@ mod tests {
                 Step::Press,
                 Step::Move(-5, 1439),
                 Step::Release,
+                Step::Key(46),
             ])
         );
     }
@@ -124,7 +139,11 @@ mod tests {
             "move x 2",
             "press 1",
             "click",
-            "key a",
+            "key",
+            "key x",
+            "key -1",
+            "key 768",
+            "key 1 2",
         ] {
             let script = format!("move 1 1\n{bad}\nrelease");
             assert_eq!(parse(&script), Err(format!("line 2: {bad:?}")), "{bad}");

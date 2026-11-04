@@ -76,11 +76,11 @@ pub enum Done {
 
 impl Layout {
     pub fn hit(&self, p: (i32, i32)) -> Option<Hit> {
-        // One set of zones per group, from its active tile, and none under a maximized group.
+        // One set of zones per group, from its active tile; none for a fullscreen tile or one it covers.
         let ids = || {
             self.tiles
                 .iter()
-                .filter(|t| self.active(t.id) == Some(t.id) && !self.covered(t))
+                .filter(|t| self.active(t.id) == Some(t.id) && !self.covered(t) && !t.fullscreen)
                 .map(|t| t.id)
         };
         // Top zones go last: where one meets the bottom zone of a tile above, that one wins.
@@ -642,7 +642,7 @@ pub fn overlay(
     };
     out.extend(lit.map(|z| (z, accent(1.0))));
     for t in &l.tiles {
-        if l.active(t.id) != Some(t.id) || l.covered(t) {
+        if l.active(t.id) != Some(t.id) || l.covered(t) || t.fullscreen {
             continue;
         }
         let tabbed = l.group(t.id).len() > 1;
@@ -698,6 +698,12 @@ pub(super) mod tests {
         Output {
             name: "uw".into(),
             area: Rect {
+                x: 0,
+                y: 0,
+                w: 3440,
+                h: 1440,
+            },
+            full: Rect {
                 x: 0,
                 y: 0,
                 w: 3440,
@@ -942,6 +948,12 @@ pub(super) mod tests {
                 w: 1125,
                 h: 703,
             },
+            full: Rect {
+                x: 3440,
+                y: 0,
+                w: 1125,
+                h: 703,
+            },
             priority: 1,
         };
         l.set_outputs(vec![uw(), laptop]);
@@ -1153,6 +1165,12 @@ pub(super) mod tests {
         l.set_outputs(vec![Output {
             name: "tiny".into(),
             area: Rect {
+                x: 0,
+                y: 0,
+                w: 10,
+                h: 5,
+            },
+            full: Rect {
                 x: 0,
                 y: 0,
                 w: 10,

@@ -197,6 +197,7 @@ mod tests {
         Output {
             name: name.into(),
             area: Rect { x: 0, y: 0, w, h },
+            full: Rect { x: 0, y: 0, w, h },
             priority: 0,
         }
     }

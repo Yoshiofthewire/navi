@@ -60,8 +60,10 @@ impl Cells {
 #[derive(Clone, Debug)]
 pub struct Output {
     pub name: String,
-    /// Logical px in the global coordinate space.
+    /// The grid's px in the global coordinate space: what layer surfaces leave of the output.
     pub area: Rect,
+    /// The whole output, which a fullscreen window covers.
+    pub full: Rect,
     /// Lower is preferred.
     pub priority: u32,
 }
@@ -141,6 +143,8 @@ pub struct Tile {
     pub minimized: bool,
     /// Set on every member of a maximized group.
     pub maximized: bool,
+    /// Covers its whole output, layer surfaces included; only ever set on a visible tile.
+    pub fullscreen: bool,
     /// When it was last placed, moved or activated; a group shows its most recent member.
     pub stamp: u64,
 }
@@ -198,7 +202,11 @@ impl Layout {
 
     /// The window's rect in global logical px.
     pub fn rect(&self, id: WinId) -> Option<Rect> {
-        Some(self.frame(id)?.1)
+        let t = self.tile(id)?;
+        match t.fullscreen {
+            true => Some(self.output(&t.output)?.full),
+            false => Some(self.frame(id)?.1),
+        }
     }
 
     /// The px of `id`'s cells (the whole grid while maximized) and of its window, which sits below
@@ -249,11 +257,23 @@ impl Layout {
         self.tiles.iter().any(|u| u.maximized && u.tabbed(t))
     }
 
-    /// Another group on its output is maximized over it.
+    /// Another group on its output is maximized over it, or another window is fullscreen there.
     fn covered(&self, t: &Tile) -> bool {
+        self.tiles.iter().any(|u| {
+            u.output == t.output
+                && ((u.maximized && u.cells != t.cells) || (u.fullscreen && u.id != t.id))
+        })
+    }
+
+    pub fn is_fullscreen(&self, id: WinId) -> bool {
+        self.tile(id).is_some_and(|t| t.fullscreen)
+    }
+
+    /// A window is fullscreen on `output`.
+    pub fn fullscreen_on(&self, output: &str) -> bool {
         self.tiles
             .iter()
-            .any(|u| u.maximized && u.output == t.output && u.cells != t.cells)
+            .any(|t| t.fullscreen && t.output == output)
     }
 
     pub fn is_maximized(&self, id: WinId) -> bool {
@@ -301,9 +321,11 @@ impl Layout {
         }
     }
 
+    /// Ends every maximize and fullscreen on `output`.
     fn clear_maximized(&mut self, output: &str) {
         for t in self.tiles.iter_mut().filter(|t| t.output == output) {
             t.maximized = false;
+            t.fullscreen = false;
         }
     }
 
@@ -330,7 +352,7 @@ impl Layout {
         changed
     }
 
-    /// Hides `id`, keeping its cells, and ends its group's maximize.
+    /// Hides `id`, keeping its cells, and ends its group's maximize and its fullscreen.
     pub fn minimize(&mut self, id: WinId) -> bool {
         if !self.visible(id) {
             return false;
@@ -338,20 +360,51 @@ impl Layout {
         self.set_maximized(id, false);
         if let Some(t) = self.tile_mut(id) {
             t.minimized = true;
+            t.fullscreen = false;
         }
         true
     }
 
-    /// Shows `id` in its group, restoring it if minimized.
+    /// Covers `id`'s whole output with it. A hidden or unknown `id` changes nothing.
+    pub fn fullscreen(&mut self, id: WinId) -> bool {
+        if !self.visible(id) || self.is_fullscreen(id) {
+            return false;
+        }
+        if let Some(t) = self.tile_mut(id) {
+            t.fullscreen = true;
+        }
+        true
+    }
+
+    /// Back to its tile, or to its maximized group.
+    pub fn unfullscreen(&mut self, id: WinId) -> bool {
+        let Some(t) = self.tile_mut(id).filter(|t| t.fullscreen) else {
+            return false;
+        };
+        t.fullscreen = false;
+        true
+    }
+
+    /// Focus or restore: shows `id` as its group's active tile, restoring it if minimized, and
+    /// ends any other maximize or fullscreen covering it on its output.
     pub fn activate(&mut self, id: WinId) -> bool {
         let Some(t) = self.tile(id) else {
             return false;
         };
-        let changed = t.minimized || self.active(id) != Some(id);
+        let mut changed = t.minimized || self.active(id) != Some(id);
         if changed {
             self.touch(id);
             if let Some(t) = self.tile_mut(id) {
                 t.minimized = false;
+            }
+        }
+        let t = self.tile(id).cloned().unwrap_or_default();
+        for u in self.tiles.iter_mut().filter(|u| u.output == t.output) {
+            let other_group = u.cells != t.cells;
+            if (u.maximized && other_group) || (u.fullscreen && u.id != id) {
+                u.maximized = u.maximized && !other_group;
+                u.fullscreen = false;
+                changed = true;
             }
         }
         changed
@@ -604,6 +657,7 @@ mod tests {
         Output {
             name: name.into(),
             area: Rect { x, y, w, h },
+            full: Rect { x, y, w, h },
             priority,
         }
     }
@@ -1031,6 +1085,78 @@ mod tests {
                 h: 2148
             }
         );
+    }
+
+    #[test]
+    fn ac8_fullscreen_covers_the_output_and_ends() {
+        let mut l = layout(vec![ultrawide()]);
+        // The grid is the output minus a 48 px bar; fullscreen ignores that.
+        let mut o = ultrawide();
+        o.area.h -= 48;
+        l.set_outputs(vec![o]);
+        let (a, b) = two_halves(&mut l);
+        assert!(l.fullscreen(a));
+        assert!(!l.fullscreen(a), "already");
+        assert_eq!(l.rect(a), Some(ultrawide().area));
+        assert!(l.visible(a) && !l.visible(b));
+        assert!(l.fullscreen_on("uw"));
+        assert!(!l.fullscreen(b), "hidden");
+        // navi's zones for it are gone with its strip.
+        assert_eq!(l.hit((100, 2)), None);
+
+        assert!(l.unfullscreen(a));
+        assert!(!l.unfullscreen(a));
+        assert!(!l.is_maximized(a), "back to its tile");
+        assert_eq!(
+            l.rect(a),
+            Some(l.output("uw").unwrap().tile_rect(cells_of(&l, a)))
+        );
+        assert!(l.visible(b));
+
+        assert!(l.fullscreen(a) && l.minimize(a));
+        assert!(!l.is_fullscreen(a) && l.visible(b));
+        assert!(l.activate(a));
+
+        assert!(l.fullscreen(a) && l.activate(b));
+        assert!(!l.is_fullscreen(a) && l.visible(a) && l.visible(b));
+
+        assert!(l.fullscreen(a));
+        let (c, _) = l.place("c", (3400, 10)).unwrap();
+        assert!(!l.is_fullscreen(a) && l.visible(a) && l.visible(c));
+        assert!(!l.fullscreen_on("uw"));
+    }
+
+    #[test]
+    fn ac8_activate_uncovers_and_restores() {
+        let mut l = layout(vec![ultrawide()]);
+        let (a, b) = two_halves(&mut l);
+        assert!(l.maximize(a));
+        assert!(!l.visible(b));
+        assert!(l.activate(b));
+        assert!(!l.is_maximized(a) && l.visible(a) && l.visible(b));
+        assert!(!l.activate(b), "already shown");
+
+        // A minimized tab becomes the group's visible active tab.
+        let t = l.next_id;
+        l.next_id += 1;
+        l.tiles.push(Tile {
+            id: t,
+            app: "t".into(),
+            output: "uw".into(),
+            cells: cells_of(&l, b),
+            ..Tile::default()
+        });
+        l.touch(t);
+        assert!(l.visible(t) && !l.visible(b));
+        assert!(l.minimize(t));
+        assert!(l.visible(b));
+        assert!(l.activate(t));
+        assert!(l.visible(t) && !l.tile(t).unwrap().minimized && !l.visible(b));
+
+        // Its own group stays maximized.
+        assert!(l.maximize(t));
+        assert!(l.activate(b));
+        assert!(l.is_maximized(b) && l.visible(b));
     }
 
     #[test]

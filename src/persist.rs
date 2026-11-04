@@ -177,6 +177,12 @@ pub mod tests {
                 w: 3440,
                 h: 1440,
             },
+            full: Rect {
+                x: 0,
+                y: 0,
+                w: 3440,
+                h: 1440,
+            },
             priority: 0,
         }]);
         l.place("a", (10, 10)).unwrap();
