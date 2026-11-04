@@ -28,7 +28,9 @@ use smithay::{
 };
 use tracing::warn;
 
-use crate::{CalloopData, layout, screenshot::Screenshot, state::Navi, theme, wallpaper};
+use crate::{
+    CalloopData, cursor::Cursor, layout, screenshot::Screenshot, state::Navi, theme, wallpaper,
+};
 
 const NAME: &str = "winit";
 
@@ -37,14 +39,31 @@ render_elements! {
     Frame<=GlesRenderer>;
     Overlay=SolidColorRenderElement,
     Surface=WaylandSurfaceRenderElement<GlesRenderer>,
-    Wallpaper=MemoryRenderBufferRenderElement<GlesRenderer>,
+    /// The wallpaper and the pointer.
+    Memory=MemoryRenderBufferRenderElement<GlesRenderer>,
 }
 
+/// With a `cursor`, navi hides the host's pointer over its window and draws its own.
 pub fn init(
     event_loop: &mut EventLoop<CalloopData>,
     data: &mut CalloopData,
+    cursor: Option<Cursor>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (mut backend, winit) = winit::init::<GlesRenderer>()?;
+    // Winit drops `CursorLeft`, so this arrow stays where the pointer left the window.
+    let cursor = cursor.map(|c| {
+        backend.window().set_cursor_visible(false);
+        let size = (c.w as i32, c.h as i32);
+        let buf = MemoryRenderBuffer::from_slice(
+            &c.pixels,
+            Fourcc::Argb8888,
+            size,
+            1,
+            Transform::Normal,
+            None,
+        );
+        (buf, (c.hotspot.0 as i32, c.hotspot.1 as i32))
+    });
     let mode = Mode {
         size: backend.window_size(),
         refresh: 60_000,
@@ -133,6 +152,22 @@ pub fn init(
                     let mut copy = None;
                     match backend.bind() {
                         Ok((renderer, mut framebuffer)) => {
+                            if let Some((buffer, (hx, hy))) = &cursor {
+                                let (x, y) = state.pointer_px();
+                                let at = (f64::from(x - hx), f64::from(y - hy));
+                                match MemoryRenderBufferRenderElement::from_buffer(
+                                    renderer,
+                                    at,
+                                    buffer,
+                                    None,
+                                    None,
+                                    None,
+                                    Kind::Cursor,
+                                ) {
+                                    Ok(e) => elements.insert(0, Frame::from(e)),
+                                    Err(e) => warn!("cursor not drawn: {e:?}"),
+                                }
+                            }
                             let surfaces = surfaces(renderer, state, &output);
                             elements.extend(surfaces.into_iter().map(Frame::from));
                             if let Some((buffer, img)) = &wallpaper {

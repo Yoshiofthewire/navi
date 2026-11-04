@@ -6,6 +6,8 @@ license = "MIT"
 description = "Tiling Wayland desktop with opinions about big monitors"
 
 [dependencies]
+# Local time for the status clock: reads /etc/localtime and /usr/share/zoneinfo.
+jiff = { version = "0.2", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
 fontdue = { version = "0.9", default-features = false, features = ["std"] }
 png = "0.18"
 resvg = { version = "0.49", default-features = false }
@@ -13,6 +15,10 @@ resvg = { version = "0.49", default-features = false }
 rustix = { version = "1", default-features = false, features = ["stdio"] }
 smithay-client-toolkit = { version = "0.19", default-features = false, features = ["calloop", "xkbcommon"] }
 tracing = "0.1"
+# Already in the lock via wayland-cursor; only its parser is used.
+xcursor = "0.3"
+# navi-bar's notification server: pure Rust, no libdbus.
+zbus = "5"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # SIMD features off: without them the crate forbids unsafe code.
 zune-jpeg = { version = "0.5.15", default-features = false, features = ["std"] }

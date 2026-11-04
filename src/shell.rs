@@ -16,8 +16,8 @@ use crate::state::ClientState;
 
 /// Spawns the `navi-bar` next to navi's own executable, with no shell and no `PATH` search. Its
 /// connection is the only privileged one. Apps it launches get `wayland_display`, the public
-/// socket. Without it, navi runs without a bar.
-pub fn start_bar(dh: &mut DisplayHandle, wayland_display: &OsStr) {
+/// socket and `cursor`'s `XCURSOR_THEME` and `XCURSOR_SIZE`. Without it, navi runs without a bar.
+pub fn start_bar(dh: &mut DisplayHandle, wayland_display: &OsStr, cursor: Option<(String, u32)>) {
     let path = match std::env::current_exe() {
         Ok(exe) => exe.with_file_name("navi-bar"),
         Err(e) => {
@@ -25,14 +25,25 @@ pub fn start_bar(dh: &mut DisplayHandle, wayland_display: &OsStr) {
             return;
         }
     };
-    if let Err(e) = spawn(dh, &path, wayland_display) {
+    if let Err(e) = spawn(dh, &path, wayland_display, cursor) {
         warn!(path = %path.display(), "navi-bar not started, running without a bar: {e}");
     }
 }
 
-fn spawn(dh: &mut DisplayHandle, path: &Path, wayland_display: &OsStr) -> io::Result<()> {
+fn spawn(
+    dh: &mut DisplayHandle,
+    path: &Path,
+    wayland_display: &OsStr,
+    cursor: Option<(String, u32)>,
+) -> io::Result<()> {
     let (ours, theirs) = UnixStream::pair()?;
-    let mut child = Command::new(path)
+    let mut cmd = Command::new(path);
+    // Without a theme navi drew nothing either, so apps keep their own default.
+    if let Some((theme, size)) = cursor {
+        cmd.env("XCURSOR_THEME", theme)
+            .env("XCURSOR_SIZE", size.to_string());
+    }
+    let mut child = cmd
         // Its stdin is the socket; navi-bar moves it off fd 0 as it connects.
         .stdin(Stdio::from(OwnedFd::from(theirs)))
         .env("WAYLAND_SOCKET", "0")
