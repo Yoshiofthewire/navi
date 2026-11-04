@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 mod bar;
 mod drag;
+pub use bar::{Decor, decoration};
 pub use drag::{Action, Done, Drag, overlay};
 
 pub const COLS: i32 = 12;

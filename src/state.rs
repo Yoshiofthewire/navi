@@ -47,7 +47,7 @@ use smithay::{
 };
 use tracing::info;
 
-use crate::layout::{Drag, Layout, WinId};
+use crate::layout::{Decor, Drag, Layout, WinId, decoration};
 
 /// A toplevel navi knows about. It's unmapped until its first commit, when its app ID is known.
 pub struct Managed {
@@ -294,12 +294,9 @@ impl Navi {
         changed
     }
 
-    /// Records a toplevel's decoration mode; dialogs always draw their own.
-    fn set_decoration(&mut self, toplevel: ToplevelSurface, mode: Decoration) {
-        let mode = match toplevel.parent() {
-            Some(_) => Decoration::ClientSide,
-            None => mode,
-        };
+    /// Records a toplevel's decoration mode, as `layout::decoration` decides it.
+    fn set_decoration(&mut self, toplevel: ToplevelSurface, requested: Decoration) {
+        let mode = wire(decoration(toplevel.parent().is_some(), decor(requested)));
         let changed = toplevel.with_pending_state(|s| {
             let changed = s.decoration_mode != Some(mode);
             s.decoration_mode = Some(mode);
@@ -324,13 +321,15 @@ impl Navi {
     fn map_new(&mut self, idx: usize, surface: &ToplevelSurface) {
         let app = app_id(surface.wl_surface());
 
-        if surface.parent().is_some() {
-            info!(app, "dialog: floating over its parent");
-            surface.with_pending_state(|s| {
-                if s.decoration_mode.is_some() {
-                    s.decoration_mode = Some(Decoration::ClientSide);
-                }
-            });
+        // Re-applied now that the parent is known: set_parent may come after the mode request.
+        let parent = surface.parent().is_some();
+        let mode = surface.with_pending_state(|s| {
+            let mode = s.decoration_mode.map(|m| decoration(parent, decor(m)));
+            s.decoration_mode = mode.map(wire);
+            mode
+        });
+        if parent {
+            info!(app, ?mode, "dialog: floating over its parent");
         } else {
             let pointer = self
                 .seat
@@ -339,10 +338,8 @@ impl Navi {
                 .unwrap_or_default();
             if let Some((id, step)) = self.layout.place(&app, (pointer.x, pointer.y)) {
                 self.windows[idx].tile = Some(id);
-                let mode = surface.with_pending_state(|s| s.decoration_mode);
                 info!(app, id, ?mode, "decoration");
-                self.layout
-                    .set_decorated(id, mode == Some(Decoration::ServerSide));
+                self.layout.set_decorated(id, mode == Some(Decor::Server));
                 surface.with_pending_state(|s| {
                     for t in [
                         xdg_toplevel::State::TiledLeft,
@@ -443,6 +440,20 @@ impl Navi {
         popup.with_pending_state(|s| {
             s.geometry = s.positioner.get_unconstrained_geometry(target);
         });
+    }
+}
+
+fn decor(m: Decoration) -> Decor {
+    match m {
+        Decoration::ServerSide => Decor::Server,
+        _ => Decor::Client,
+    }
+}
+
+fn wire(d: Decor) -> Decoration {
+    match d {
+        Decor::Server => Decoration::ServerSide,
+        Decor::Client => Decoration::ClientSide,
     }
 }
 

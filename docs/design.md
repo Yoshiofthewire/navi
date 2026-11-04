@@ -111,8 +111,8 @@ space when you want it.
   Clicking a maximized app's strip also undoes it, so navi can always undo a maximize even when
   the app has no button for it.
 - **Minimize** hides the window but keeps its cells, so nothing moves into them. Its strip (or
-  bar) stays, drawn in the same dimmed blue as a minimized tab; click it to bring the window back. A minimized tab stays in the bar,
-  dimmed, and clicking it brings it back.
+  bar) stays, drawn in the same dimmed blue as a minimized tab; click it to bring the window
+  back. A minimized tab stays in the bar, dimmed, and clicking it brings it back.
 - An app's own maximize and minimize buttons do exactly what navi's do. Hidden windows can't
   maximize or minimize, so a window nobody can see can't hide the ones they can.
 - Dialogs stay floating over their parent, hide while it's hidden, and re-centre when it moves.

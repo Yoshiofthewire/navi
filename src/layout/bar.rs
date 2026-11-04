@@ -16,6 +16,22 @@ pub const MINIMIZED: u32 = 0x20769E;
 /// Outlines inactive tabs, which can't be 3:1 against both the bar and the active tab.
 pub const OUTLINE: u32 = 0x7A8396;
 
+/// Who draws a toplevel's title bar and controls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Decor {
+    Client,
+    Server,
+}
+
+/// What the app asked for, except that a dialog (a toplevel with a parent) always draws its own,
+/// so it never gets a navi bar or buttons.
+pub fn decoration(has_parent: bool, requested: Decor) -> Decor {
+    match has_parent {
+        true => Decor::Client,
+        false => requested,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Button {
     Minimize,
@@ -696,6 +712,20 @@ mod tests {
         );
         assert!(contrast(MINIMIZED, BACKGROUND) >= 3.0);
         assert!(contrast(ACCENT, BAR_BG) >= 3.0);
+    }
+
+    #[test]
+    fn dialogs_always_draw_their_own_decorations() {
+        for requested in [Decor::Client, Decor::Server] {
+            assert_eq!(decoration(true, requested), Decor::Client);
+            assert_eq!(decoration(false, requested), requested);
+        }
+        // A tiled toplevel that asks for server-side gets navi's bar and buttons.
+        let mut l = with(&[HALF_L]);
+        l.set_decorated(0, decoration(false, Decor::Server) == Decor::Server);
+        assert_eq!(l.bar(0).map(|b| b.buttons.len()), Some(3));
+        l.set_decorated(0, decoration(true, Decor::Server) == Decor::Server);
+        assert_eq!(l.bar(0), None);
     }
 
     /// winit.rs's clear colour, [0.05, 0.05, 0.08].
