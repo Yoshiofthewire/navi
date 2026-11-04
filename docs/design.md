@@ -99,7 +99,8 @@ space when you want it.
 - A tab group shows one window at a time. Above it, a 24 px bar replaces the strip and holds one
   tab per window, left to right in the order they opened. The active tab is accent blue, inactive
   tabs are outlined, and minimized ones are a dimmed blue. Tabs have no titles or icons yet; those
-  come with the Look job, so for now a tab tells you its window only by position.
+  come later, since titles would need fonts in the compositor and fonts stay out of it. For now a
+  tab tells you its window only by position.
 - Click a tab to switch to it. Drag a tab out (8 px or more) to untab that window: it lands in the
   nearest free space at its remembered size, or tabs into another tile after a half-second hold.
   Dropping it on another tile without the hold, or back on its own group, cancels.
@@ -158,12 +159,34 @@ The screen shows a wallpaper, a taskbar and your apps. There are no desktop icon
 - **App menu:** the button opens a list of installed apps (`.desktop` files) with a search line:
   type to filter by name, Up/Down to select, Enter or a click to launch, Escape or a click
   elsewhere to close.
-- **Corners:** on the main monitor. Notifications are top-left; status (clock, network, volume,
-  battery, tray) is top-right. The corners stay where they are when the taskbar moves.
+- **Corners:** on the main monitor, and they stay there when the taskbar moves. A 24 px status
+  band runs across the top and takes space from the grid, like the taskbar; it takes no clicks
+  and a fullscreen app hides it. Status is top-right: the battery (`BAT 87%`, `+` while charging,
+  the mean of the system's batteries, read every 30 s; mice and headsets don't count) and the
+  local time (`Tue 04 Nov 14:05`, 24-hour), on a dim box so it reads over any wallpaper.
+  Notifications are top-left, below the band. Volume, network and tray come later. Volume has no
+  small route: PipeWire's native API is C (`libpipewire`, which needs `unsafe` and a new system
+  library), pipewire-pulse has no D-Bus volume interface, and running `wpctl` would break the
+  no-shell rule.
+- **Notifications:** navi-bar serves `org.freedesktop.Notifications` (spec 1.2) only if no other
+  server holds the name when it starts. It asks with `DoNotQueue` and neither replace flag, so
+  it never takes the name from Plasma or anyone else, never queues for it, and can't have it
+  taken. Up to 3 cards, newest on top, each up to 5 s by default and never more than 10 s, `0`
+  ("never") included. A click dismisses one. Text is plain: markup shows as typed, control and
+  bidi-override characters are removed, and the app name, summary and body are cut at 64, 120
+  and 400 characters. Icons, images, sounds and actions are ignored; navi-bar never opens a path
+  a notification names. Replacing or closing a notification works only for the app that sent
+  it. Each app may send 5 per 10 s and all apps together 20; past that the call still gets an id,
+  but nothing shows. No history and no do-not-disturb; notifications that arrive during
+  fullscreen aren't shown, and expire as usual.
 - **Laptop alone:** the same layout with a slimmer taskbar.
 - **No virtual desktops.**
-- **Look:** cyberpunk, with minimal animation. The accent is the logo's neon blue, `#2BA3D8`, on
-  near-black. It's used in the gap and the grab strip.
+- **Look:** cyberpunk, with no animations: every state change is instant. (The half-second hold
+  before a drop tabs is a state change, not an animation.) The accent is the logo's neon blue,
+  `#2BA3D8`, on near-black, from one palette (`src/theme.rs`) that navi and navi-bar share. The
+  window with the keyboard has a 2 px accent frame just outside it, in the gap; every other shown
+  window has a dim 1 px one, so the gaps read as thin neon lines and the grab strips stay easy to
+  find. A lit strip or edge, the bars and the minimized strips draw in front of the frames.
 - **App menu button:** the navi logo, under the icon name `navi` (in `assets/icons/hicolor`). It's
   installed into `hicolor`, so an icon theme can replace it. A hand-simplified version with
   single lines is used at 16–32 px, where the full logo's double lines blur together.
@@ -184,10 +207,17 @@ don't affect navi's MIT licence.
 
 - **Default icon theme:** `candy-icons` if it's installed, otherwise `hicolor`. An icon theme the
   user explicitly chose in KDE wins over this default.
-- **Default cursor theme:** `Sweet-cursors` if it's installed, otherwise `Adwaita`. A cursor
-  theme the user explicitly chose in KDE wins over this default. The cursor's pixel size is
-  24 × the monitor's scale, rounded to the nearest size the theme provides (Sweet ships 24, 36
-  and 48). If the theme lacks a shape, navi uses the theme's `default` arrow.
+- **Default cursor theme:** `Sweet-cursors` if it's installed (it has a `cursors` dir in one of
+  the places above), otherwise `Adwaita`, otherwise none, and the nested host's pointer stays.
+  navi draws the `default` arrow (else `left_ptr`), found in the theme or what it inherits
+  (`Inherits=` in `index.theme`, at most 4 levels, no cycles). Its size is the one in the file
+  nearest 24 × the monitor's scale, the larger on a tie (Sweet ships 24, 36 and 48), and only its
+  first frame is used. Files over 2 MiB, images over 256 px a side and hotspots outside the image
+  are refused; then navi logs one warning and keeps the host's pointer. Built now: this arrow
+  for every surface, with `XCURSOR_THEME` and `XCURSOR_SIZE` (24 × scale) set for navi-bar and
+  the apps it launches. Still to come: apps' own cursors (`cursor-shape-v1`, cursor surfaces),
+  importing the cursor chosen in KDE, and animated cursors. Nested, the arrow stays at the edge
+  where the pointer left the window, since the winit backend doesn't report leaving.
 - **First run imports the KDE settings** if they exist: icons from `kdeglobals` `[Icons]`, sounds
   from `kdeglobals` `[Sounds]`, cursor from `kcminputrc` `[Mouse]`. This is a one-time copy into
   navi's config, so Plasma users keep the look they chose. After that, navi doesn't follow
@@ -230,6 +260,12 @@ session.
   shell syntax rejects the entry), with an XDG activation token, in its own process group and
   without navi-bar's socket. Running each app in its own `app-*.scope` comes later (it needs
   D-Bus).
+- **The session bus** reaches navi-bar only through the notification server: one name, one
+  object, no calls out. Every field a notification carries is untrusted and is never logged;
+  only ids, senders and text lengths are. zbus reads a whole message before navi-bar's caps apply,
+  so a hostile local app can make navi-bar allocate up to the bus's message limit per call; such
+  an app already runs as the user. A D-Bus bug takes the taskbar down with it, since there is one
+  privileged client.
 - **Config** is plain data. A config file can never run a command.
 
 ## Build
@@ -257,7 +293,6 @@ session.
 ## Open questions
 
 - Grid size: hard-coded at 12 × 6, or configurable? Leaning hard-coded.
-- What counts as "minimal": the exact animations to keep.
 - More look references, beyond the logo.
 - Is this a daily driver? That decides whether laptop polish is in v1.
 - Multi-monitor test of COSMIC in a real session, after the running T3 tasks finish.
