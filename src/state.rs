@@ -6,7 +6,10 @@ use smithay::{
         PopupKind, PopupManager, Space, Window, WindowSurfaceType, find_popup_root_surface,
         get_popup_toplevel_coords,
     },
-    input::{Seat, SeatHandler, SeatState, pointer::CursorImageStatus},
+    input::{
+        Seat, SeatHandler, SeatState,
+        pointer::{CursorImageStatus, MotionEvent},
+    },
     reexports::{
         calloop::LoopSignal,
         wayland_protocols::xdg::shell::server::xdg_toplevel,
@@ -40,7 +43,7 @@ use smithay::{
 };
 use tracing::info;
 
-use crate::layout::{Layout, WinId};
+use crate::layout::{Drag, Layout, WinId};
 
 /// A toplevel navi knows about. It's unmapped until its first commit, when its app ID is known.
 pub struct Managed {
@@ -57,6 +60,8 @@ pub struct Navi {
     pub loop_signal: LoopSignal,
     pub layout: Layout,
     pub windows: Vec<Managed>,
+    /// A drag in navi's strip or edges, from press to release.
+    pub drag: Option<Drag>,
 
     compositor_state: CompositorState,
     xdg_shell_state: XdgShellState,
@@ -91,10 +96,23 @@ impl Navi {
             loop_signal,
             layout: Layout::default(),
             windows: Vec::new(),
+            drag: None,
             seat_state,
             popups: PopupManager::default(),
             seat,
         })
+    }
+
+    pub fn now_ms(&self) -> u64 {
+        self.start_time.elapsed().as_millis() as u64
+    }
+
+    pub fn pointer_px(&self) -> (i32, i32) {
+        px(self
+            .seat
+            .get_pointer()
+            .map(|p| p.current_location())
+            .unwrap_or_default())
     }
 
     pub fn surface_under(
@@ -124,6 +142,29 @@ impl Navi {
                 toplevel.send_pending_configure();
             }
             self.space.map_element(m.window.clone(), (r.x, r.y), false);
+        }
+        // Tiles moved: refocus a still pointer, so a click can't land in the window that left.
+        if let Some(pointer) = self.seat.get_pointer() {
+            let pos = pointer.current_location();
+            let under = self.pointer_focus(pos);
+            let motion = MotionEvent {
+                location: pos,
+                serial: SERIAL_COUNTER.next_serial(),
+                time: self.now_ms() as u32,
+            };
+            pointer.motion(self, under, &motion);
+            pointer.frame(self);
+        }
+    }
+
+    /// What gets pointer focus at `pos`: nothing over navi's zones or during a drag.
+    pub fn pointer_focus(
+        &self,
+        pos: Point<f64, Logical>,
+    ) -> Option<(WlSurface, Point<f64, Logical>)> {
+        match self.drag.is_some() || self.layout.hit(px(pos)).is_some() {
+            true => None,
+            false => self.surface_under(pos),
         }
     }
 
@@ -232,6 +273,11 @@ impl Navi {
             s.geometry = s.positioner.get_unconstrained_geometry(target);
         });
     }
+}
+
+/// The logical pixel containing `p`.
+pub fn px(p: Point<f64, Logical>) -> (i32, i32) {
+    (p.x.floor() as i32, p.y.floor() as i32)
 }
 
 #[derive(Default)]
@@ -366,7 +412,7 @@ impl XdgShellHandler for Navi {
         surface.send_repositioned(token);
     }
 
-    // Tiled windows don't move or resize themselves; dragging arrives in step 2.
+    // Only navi's own strip and edges move and resize tiles; clients can't start a drag.
     fn move_request(&mut self, _: ToplevelSurface, _: wl_seat::WlSeat, _: Serial) {}
 
     fn resize_request(

@@ -2,6 +2,9 @@
 
 use std::collections::HashMap;
 
+mod drag;
+pub use drag::{Drag, overlay};
+
 pub const COLS: i32 = 12;
 pub const ROWS: i32 = 6;
 /// Space between tiles in logical px. Tiles are inset by half of it, and by all of it at the top,
@@ -116,7 +119,7 @@ impl Output {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Tile {
     pub id: WinId,
     pub app: String,
@@ -125,7 +128,7 @@ pub struct Tile {
 }
 
 /// What navi remembers per app ID: where it was, and the size it wants, in px.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 struct Memory {
     output: String,
     cells: Cells,
@@ -397,9 +400,10 @@ fn spots(cols: i32, rows: i32) -> impl Iterator<Item = Cells> {
     })
 }
 
-fn dist2((ax, ay): (i32, i32), (bx, by): (i32, i32)) -> i64 {
-    let (dx, dy) = ((ax - bx) as i64, (ay - by) as i64);
-    dx * dx + dy * dy
+/// Squared distance; saturates instead of overflowing on wild pointer coordinates.
+fn dist2((ax, ay): (i32, i32), (bx, by): (i32, i32)) -> u64 {
+    let d = |a: i32, b: i32| u64::from(a.abs_diff(b)).pow(2);
+    d(ax, bx).saturating_add(d(ay, by))
 }
 
 #[cfg(test)]

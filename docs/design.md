@@ -81,6 +81,14 @@ space when you want it.
 - **Resize:** drag any tile edge. It moves in whole cells. When two tiles share that edge, both
   change. Nothing else changes (principle 4). The edge stops when a tile reaches its minimum. The
   new size becomes that app's remembered size.
+- The strip is the 8 px gap above a window; the edges are the 4 px gaps beside and below it.
+- A click on the strip without moving (under 8 px) moves nothing.
+- Once a hold will form tabs, the preview turns more solid, so swap and tab look different.
+- A move takes the whole tab group with it.
+- The "middle" of a tile is the inner half of it, in both directions.
+- The top edge of a tile on the monitor's top border isn't draggable; the strip owns that gap.
+- Drop a window back on itself to cancel a move. A drag also cancels, putting everything back,
+  when the pointer leaves every monitor or the nested window loses focus.
 
 ### Window controls
 
@@ -179,6 +187,13 @@ session.
   With the layout gone, a fork would keep only the plumbing, at the price of GPL-3.0. Read
   cosmic-comp, niri and Smithay's `anvil` example as reference code; don't fork them.
 - Go was ruled out: it has no usable compositor library.
+- **Screenshots for testing:** `NAVI_SCREENSHOT=<path>` in navi's own environment writes its
+  rendered frame there as a PNG (mode 0600), on the first frame and then once a second. Unset, it
+  costs nothing. No client or config can turn it on.
+- **Input replay for testing (debug builds only):** `NAVI_INPUT_REPLAY=<file>` plays a pointer
+  script through the same handlers as real input: one step per line, `wait <ms>`,
+  `move <x> <y>` (global logical px), `press`, `release` (left button), `#` comments. A bad line
+  logs one error and nothing is replayed. Release builds don't contain it.
 - The shell (taskbar, corners, launcher) runs as separate `layer-shell` clients, so a taskbar
   crash can't take your windows down.
 
