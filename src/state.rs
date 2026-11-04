@@ -216,7 +216,7 @@ impl Navi {
     ) -> Option<(LayerSurface, WlSurface, Point<f64, Logical>)> {
         let output = self.space.output_under(pos).next()?;
         let origin = self.space.output_geometry(output)?.loc;
-        let fullscreen = self.layout.fullscreen_on(&output.name());
+        let fullscreen = self.layout.fullscreen_on(&identity(output));
         let map = layer_map_for_output(output);
         layers.into_iter().find_map(|l| {
             if l == Layer::Top && fullscreen {
@@ -348,7 +348,7 @@ impl Navi {
             h: 0,
         };
         self.grid.push(layout::Output {
-            name: output.name(),
+            name: identity(output),
             area: none,
             full: none,
             priority,
@@ -359,7 +359,7 @@ impl Navi {
     /// Takes `output` away: its layer surfaces are closed (navi-bar makes new ones elsewhere) and
     /// its tiles move to the other outputs.
     pub fn remove_output(&mut self, output: &Output) {
-        let name = output.name();
+        let name = identity(output);
         {
             let mut map = layer_map_for_output(output);
             for l in map.layers().cloned().collect::<Vec<_>>() {
@@ -403,7 +403,7 @@ impl Navi {
             h: size.h,
         };
         let area = usable_area(rect(geo.loc, geo.size), rect(geo.loc + zone.loc, zone.size));
-        let name = output.name();
+        let name = identity(output);
         let Some(o) = self.grid.iter_mut().find(|o| o.name == name) else {
             return;
         };
@@ -485,13 +485,13 @@ impl Navi {
                     .layers()
                     .any(|l| l.namespace() == BAR)
             })
-            .map(|o| o.name())
+            .map(identity)
     }
 
     /// Where a new taskbar goes: where it was last moved, if that's connected, else main.
     fn bar_target(&self) -> Option<Output> {
         let last = self.bar_output.as_ref();
-        last.and_then(|n| self.space.outputs().find(|o| o.name() == *n).cloned())
+        last.and_then(|n| self.space.outputs().find(|o| identity(o) == *n).cloned())
             .or_else(|| self.main_output())
     }
 
@@ -512,7 +512,7 @@ impl Navi {
                     w: g.size.w,
                     h: g.size.h,
                 };
-                Some((o.name(), r))
+                Some((identity(o), r))
             })
             .collect();
         let now = self.now_ms();
@@ -553,8 +553,8 @@ impl Navi {
     /// After the outputs change: the status band and notifications go back to the main output,
     /// and the taskbar to where it belongs. navi-bar remakes what is closed.
     pub fn place_shell(&mut self) {
-        let main = self.main_output().map(|o| o.name());
-        let bar = self.bar_target().map(|o| o.name());
+        let main = self.main_output().map(|o| identity(&o));
+        let bar = self.bar_target().map(|o| identity(&o));
         self.close_layers(|o, ns| match ns == BAR {
             true => Some(o) != bar.as_deref(),
             false => Some(o) != main.as_deref(),
@@ -564,7 +564,7 @@ impl Navi {
     /// Closes and unmaps the layer surfaces `which(output, namespace)` picks.
     fn close_layers(&mut self, which: impl Fn(&str, &str) -> bool) {
         for o in self.space.outputs().cloned().collect::<Vec<_>>() {
-            let name = o.name();
+            let name = identity(&o);
             let closed = {
                 let mut map = layer_map_for_output(&o);
                 let picked: Vec<LayerSurface> = map
@@ -589,7 +589,7 @@ impl Navi {
     pub fn main_output(&self) -> Option<Output> {
         self.space
             .outputs()
-            .min_by_key(|o| self.priority_of(&o.name()))
+            .min_by_key(|o| self.priority_of(&identity(o)))
             .cloned()
     }
 
@@ -631,7 +631,7 @@ impl Navi {
                     output: self
                         .space
                         .outputs()
-                        .find(|o| o.name() == tile.output)
+                        .find(|o| identity(o) == tile.output)
                         .cloned(),
                     states: states.into_iter().filter(|s| s.1).map(|s| s.0).collect(),
                 };
@@ -900,6 +900,22 @@ fn title(s: &WlSurface) -> String {
             .and_then(|d| d.lock().ok()?.title.clone())
     })
     .unwrap_or_default()
+}
+
+/// The monitor identity (from its EDID) an output is known by inside navi: layout, memory, the
+/// wallpaper and the taskbar file key by it. Clients only see the output's name, its connector.
+struct Identity(String);
+
+/// `output`'s identity; nested, and before one is set, its name.
+pub fn identity(output: &Output) -> String {
+    output
+        .user_data()
+        .get::<Identity>()
+        .map_or_else(|| output.name(), |i| i.0.clone())
+}
+
+pub fn set_identity(output: &Output, id: String) {
+    output.user_data().insert_if_missing(|| Identity(id));
 }
 
 /// navi-bar's taskbar namespace; only navi-bar has layer shell, so it can be trusted.
@@ -1209,7 +1225,7 @@ impl WlrLayerShellHandler for Navi {
             surface.send_close();
             return;
         };
-        let name = output.name();
+        let name = identity(&output);
         let surface = LayerSurface::new(surface, namespace);
         let namespace = surface.namespace();
         match layer_map_for_output(&output).map_layer(&surface) {

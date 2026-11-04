@@ -47,7 +47,7 @@ use crate::{
     monitors::{self, Arrangement, Mon},
     persist,
     render::{self, Arrow, Frame, Pointer, Wallpaper},
-    state::Navi,
+    state::{Navi, identity, set_identity},
     wallpaper,
 };
 
@@ -192,6 +192,10 @@ pub fn init(
                     for s in &mut udev.screens {
                         s.queued = false;
                     }
+                    // Monitors may have changed while switched away.
+                    if let Err(e) = scan(data) {
+                        warn!("monitors not rescanned: {e}");
+                    }
                     render_all(data);
                 }
             }
@@ -207,7 +211,10 @@ pub fn init(
     let ours = node.dev_id();
     handle
         .insert_source(udev_events, move |event, _, data| match event {
-            UdevEvent::Changed { device_id } if device_id == ours => {
+            // Without DRM master nothing can be set up; resuming rescans.
+            UdevEvent::Changed { device_id }
+                if device_id == ours && data.udev.as_ref().is_some_and(|u| u.active) =>
+            {
                 if let Err(e) = scan(data) {
                     warn!("monitors not rescanned: {e}");
                 }
@@ -315,12 +322,6 @@ fn scan(data: &mut CalloopData) -> Result<usize, String> {
     };
     let state = &mut data.state;
     let conns = connected(udev.manager.device())?;
-    let names: Vec<(&str, Option<&[u8]>)> = conns
-        .iter()
-        .map(|c| (c.name.as_str(), c.edid.as_deref()))
-        .collect();
-    let ids = monitors::identities(&names);
-
     let (gone, kept): (Vec<Screen>, Vec<Screen>) = std::mem::take(&mut udev.screens)
         .into_iter()
         .partition(|s| !conns.iter().any(|c| c.handle == s.connector));
@@ -330,11 +331,20 @@ fn scan(data: &mut CalloopData) -> Result<usize, String> {
         state.display_handle.remove_global::<Navi>(s.global);
     }
 
+    // New monitors get identities that the ones still connected don't hold.
+    let new: Vec<&Conn> = conns
+        .iter()
+        .filter(|c| !udev.screens.iter().any(|s| s.connector == c.handle))
+        .collect();
+    let names: Vec<(&str, Option<&[u8]>)> = new
+        .iter()
+        .map(|c| (c.name.as_str(), c.edid.as_deref()))
+        .collect();
+    let held: Vec<String> = udev.screens.iter().map(|s| identity(&s.output)).collect();
+    let ids = monitors::identities(&names, &held);
+
     let mut added = Vec::new();
-    for (c, (id, fallback)) in conns.iter().zip(&ids) {
-        if udev.screens.iter().any(|s| s.connector == c.handle) {
-            continue;
-        }
+    for (c, (id, fallback)) in new.into_iter().zip(&ids) {
         if *fallback {
             warn!(
                 connector = c.name,
@@ -357,8 +367,9 @@ fn scan(data: &mut CalloopData) -> Result<usize, String> {
             .and_then(monitors::make_model)
             .unwrap_or_else(|| ("Unknown".into(), c.name.clone()));
         let (mm_w, mm_h) = c.info.size().unwrap_or((0, 0));
+        // Clients see the connector, never the EDID's serial and date.
         let output = Output::new(
-            id.clone(),
+            c.name.clone(),
             PhysicalProperties {
                 size: (mm_w as i32, mm_h as i32).into(),
                 subpixel: c.info.subpixel().into(),
@@ -366,6 +377,7 @@ fn scan(data: &mut CalloopData) -> Result<usize, String> {
                 model,
             },
         );
+        set_identity(&output, id.clone());
         let wl_mode = Mode::from(*mode);
         output.set_preferred(wl_mode);
         output.change_current_state(Some(wl_mode), None, None, None);
@@ -435,7 +447,7 @@ fn scan(data: &mut CalloopData) -> Result<usize, String> {
             };
             Mon {
                 connector,
-                id: s.output.name(),
+                id: identity(&s.output),
                 size,
                 rect,
             }
@@ -473,7 +485,7 @@ fn scan(data: &mut CalloopData) -> Result<usize, String> {
     let outputs: Vec<(String, u32)> = udev
         .screens
         .iter()
-        .map(|s| (s.output.name(), state.priority_of(&s.output.name())))
+        .map(|s| (identity(&s.output), state.priority_of(&identity(&s.output))))
         .collect();
     let named: Vec<(&str, u32)> = outputs.iter().map(|(n, p)| (n.as_str(), *p)).collect();
     for (s, img) in udev.screens.iter_mut().zip(wallpaper::open(&named)) {
@@ -567,7 +579,7 @@ fn vblank(data: &mut CalloopData, crtc: crtc::Handle) {
     };
     s.queued = false;
     if let Err(e) = s.drm.frame_submitted() {
-        warn!(output = s.output.name(), "frame not submitted: {e}");
+        warn!(output = identity(&s.output), "frame not submitted: {e}");
     }
     render(data, crtc);
 }
@@ -627,7 +639,7 @@ fn render(data: &mut CalloopData, crtc: crtc::Handle) {
         }
         Err(e) => {
             if !s.failing {
-                warn!(output = output.name(), "frame failed: {e}");
+                warn!(output = identity(&output), "frame failed: {e}");
             }
             s.failing = true;
         }

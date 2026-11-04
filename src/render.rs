@@ -25,7 +25,13 @@ use smithay::{
 };
 use tracing::warn;
 
-use crate::{cursor::Cursor, image::Image, layout, monitors, state::Navi, theme, wallpaper};
+use crate::{
+    cursor::Cursor,
+    image::Image,
+    layout, monitors,
+    state::{Navi, identity},
+    theme, wallpaper,
+};
 
 render_elements! {
     /// Everything on screen, top first.
@@ -185,7 +191,7 @@ where
             Ok(e) => out.push(Frame::from(e)),
             Err(e) => {
                 warn!(
-                    output = output.name(),
+                    output = identity(output),
                     "wallpaper not drawn, solid from now on: {e:?}"
                 );
                 *wallpaper = None;
@@ -232,7 +238,7 @@ where
     R::TextureId: Texture + Clone + Send + 'static,
 {
     let map = layer_map_for_output(output);
-    let upper: &[Layer] = match state.layout.fullscreen_on(&output.name()) {
+    let upper: &[Layer] = match state.layout.fullscreen_on(&identity(output)) {
         true => &[Layer::Overlay],
         false => &[Layer::Overlay, Layer::Top],
     };

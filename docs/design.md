@@ -134,9 +134,12 @@ space when you want it.
   `edidIdentifier` with `_` for spaces, from the EDID's base block:
   `<PNP id>_<product>_<serial>_<week>_<year>_<model year>`, e.g. `ACR_1359_4294967295_0_0_2016`.
   A monitor with no valid EDID is known by its connector name (`DP-3`), with a warning, and two
-  identical monitors get `_2`, `_3`… in connector-name order. It names the Wayland output, so
-  memory, wallpapers and the taskbar follow the monitor. The output's description is Smithay's
-  `<make> - <model> - <identity>` (Smithay 0.7 has no way to set it).
+  identical monitors get `_2`, `_3`… in connector-name order (never one a connected monitor
+  holds). Memory, wallpapers, the arrangement and the taskbar key by it, so they follow the
+  monitor. It stays inside navi: it carries the monitor's serial and manufacture date, which
+  would let any app fingerprint the machine, so clients see the connector as the output's name
+  (`DP-11`) and Smithay's `<make> - <model> - <connector>` description, model being the EDID's
+  monitor name or product code.
 - **Arrangement:** `~/.config/navi/monitors`, a `navi-monitors 1` line, then
   `<identity> <x> <y> <scale>` per monitor (logical px within ±65535, scale 0.5–4.0) and an
   optional `main <identity>`. Any bad line makes navi ignore the whole file, with one warning,

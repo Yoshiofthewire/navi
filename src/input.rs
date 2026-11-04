@@ -22,7 +22,7 @@ use tracing::{info, warn};
 use crate::{
     layout::{Action, Done, Drag, Rect},
     monitors,
-    state::{Navi, px},
+    state::{Navi, identity, px},
 };
 
 /// What a key navi keeps does.
@@ -109,7 +109,7 @@ impl Navi {
     /// The outputs' logical rects, by priority.
     fn output_rects(&self) -> Vec<Rect> {
         let mut outs: Vec<_> = self.space.outputs().cloned().collect();
-        outs.sort_by_key(|o| self.priority_of(&o.name()));
+        outs.sort_by_key(|o| self.priority_of(&identity(o)));
         outs.iter()
             .filter_map(|o| self.space.output_geometry(o))
             .map(|g| Rect {

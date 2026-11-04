@@ -75,6 +75,15 @@ pub fn create(path: &Path) -> io::Result<fs::File> {
     Ok(f)
 }
 
+/// A fresh private log at `path` (`navi.log`); the last run's is kept as `navi.log.old`, so a
+/// failed start can still be read after logging in again.
+pub fn create_log(path: &Path) -> io::Result<fs::File> {
+    match fs::rename(path, path.with_extension("log.old")) {
+        Err(e) if e.kind() != ErrorKind::NotFound => Err(e),
+        _ => create(path),
+    }
+}
+
 /// The identity line of the `bar` state file.
 fn parse_bar(bytes: &[u8]) -> Option<String> {
     let text = std::str::from_utf8(bytes).ok()?;
@@ -307,6 +316,21 @@ pub mod tests {
         assert_eq!(fs::read_to_string(&file).unwrap(), "new");
         assert_eq!(mode(&file), 0o600);
         assert_eq!(mode(&tmp.0.join("navi")), 0o700);
+
+        // The next start keeps this run's log once.
+        drop(f);
+        let mut f = create_log(&file).unwrap();
+        f.write_all(b"newest").unwrap();
+        let old = tmp.0.join("navi/navi.log.old");
+        assert_eq!(fs::read_to_string(&old).unwrap(), "new");
+        assert_eq!(fs::read_to_string(&file).unwrap(), "newest");
+        assert_eq!(mode(&file), 0o600);
+        create_log(&file).unwrap();
+        assert_eq!(fs::read_to_string(&old).unwrap(), "newest");
+        // No log yet: nothing to keep.
+        let first = tmp.0.join("first/navi.log");
+        create_log(&first).unwrap();
+        assert!(!first.with_extension("log.old").exists());
     }
 
     #[test]

@@ -83,14 +83,15 @@ pub fn is_laptop(connector: &str) -> bool {
         .any(|p| connector.starts_with(p))
 }
 
-/// Each connector's identity: its EDID's, else the connector name. Repeats get `_2`, `_3`… in
-/// connector-name order. The flags say which fell back to the connector name.
-pub fn identities(conns: &[(&str, Option<&[u8]>)]) -> Vec<(String, bool)> {
+/// Each connector's identity: its EDID's, else the connector name. Repeats, and identities in
+/// `held` by monitors already connected, get `_2`, `_3`… in connector-name order. The flags say
+/// which fell back to the connector name.
+pub fn identities(conns: &[(&str, Option<&[u8]>)], held: &[String]) -> Vec<(String, bool)> {
     let mut order: Vec<usize> = (0..conns.len()).collect();
     order.sort_by_key(|&i| conns[i].0);
     let mut out = vec![(String::new(), false); conns.len()];
     let mut seen: HashMap<String, u32> = HashMap::new();
-    let mut taken: HashSet<String> = HashSet::new();
+    let mut taken: HashSet<String> = held.iter().cloned().collect();
     for i in order {
         let (name, edid) = conns[i];
         let (base, fallback) = match edid.and_then(identity) {
@@ -567,25 +568,34 @@ pub mod tests {
         let e = edid("SAM", 1, 2, 3, 4);
         let id = identity(&e).unwrap();
         // Given out of order: suffixes follow connector names.
-        let got = identities(&[
-            ("DP-2", Some(&e)),
-            ("DP-1", Some(&e)),
-            ("HDMI-A-1", None),
-            ("DP-3", Some(&e[..100])),
-        ]);
+        let got = identities(
+            &[
+                ("DP-2", Some(&e)),
+                ("DP-1", Some(&e)),
+                ("HDMI-A-1", None),
+                ("DP-3", Some(&e[..100])),
+            ],
+            &[],
+        );
         assert_eq!(
             got,
             [
                 (format!("{id}_2"), false),
-                (id, false),
+                (id.clone(), false),
                 ("HDMI-A-1".into(), true),
                 ("DP-3".into(), true),
             ]
         );
         // A fallback that collides with a real identity still gets a suffix.
-        let got = identities(&[("DP-1", None), ("DP-2", None)]);
+        let got = identities(&[("DP-1", None), ("DP-2", None)], &[]);
         assert_eq!(got[0].0, "DP-1");
         assert_eq!(got[1].0, "DP-2");
+        // Two identical monitors; the first unplugged, a third plugged in elsewhere: the new one
+        // can't take `_2`, which the one still connected holds.
+        let got = identities(&[("DP-3", Some(&e))], &[format!("{id}_2")]);
+        assert_eq!(got[0].0, id);
+        let got = identities(&[("DP-3", Some(&e))], &[id.clone(), format!("{id}_2")]);
+        assert_eq!(got[0].0, format!("{id}_3"));
     }
 
     #[test]
@@ -615,7 +625,7 @@ pub mod tests {
             }
         }
         assert!(valid > 3000, "{valid}");
-        for (id, _) in identities(&[("DP-1", Some(&rig_edids()[0])), ("DP-2", None)]) {
+        for (id, _) in identities(&[("DP-1", Some(&rig_edids()[0])), ("DP-2", None)], &[]) {
             assert!(safe(&id));
         }
     }

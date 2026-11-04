@@ -79,7 +79,8 @@ fn main() -> ExitCode {
         };
     }
     // Real hardware: stderr goes wherever the display manager puts it, so the log is kept too.
-    let (file, failed) = match persist::state_file("navi.log").map(|p| (persist::create(&p), p)) {
+    let (file, failed) = match persist::state_file("navi.log").map(|p| (persist::create_log(&p), p))
+    {
         Some((Ok(f), _)) => (Some(f), None),
         Some((Err(e), p)) => (None, Some(format!("{}: {e}", p.display()))),
         None => (None, Some("no absolute XDG_STATE_HOME or HOME".into())),
