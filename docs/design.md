@@ -1,0 +1,175 @@
+# navi design
+
+navi is a tiling Wayland desktop for people with several big monitors who don't want to learn
+Hyprland. Tiling is the product, not a mode. The mouse is enough; the keyboard is optional.
+
+Status: draft, 2026-11-03. Nothing is built yet.
+
+## Principles
+
+These come from hands-on tests of COSMIC and niri. Each one names the thing that felt wrong.
+
+1. **The space fits the app.** An app gets the size it needs; the layout arranges itself around
+   that. Empty space is allowed. (COSMIC stretches every app to fill whatever slot it's given.)
+2. **Windows never change orientation.** A window on the ultrawide's left stays on the left; it
+   is never moved to the top or bottom because a split tree rebalanced itself.
+3. **Tabs are the last resort.** Two windows share a tile only when there is no room anywhere
+   else.
+4. **Resizing is predictable.** Dragging an edge moves that edge, snaps to the grid, and changes
+   only the windows that touch it.
+5. **Tiling is not a toggle.** There's no "tiling mode" to turn on. Dialogs and popups float;
+   everything else tiles.
+6. **Every window stays on screen.** A window never scrolls or slides off its monitor. (niri
+   puts windows on an endless strip that runs off the edge.)
+
+## Layout model
+
+Each monitor is a **12 × 6 grid** in logical pixels. A window covers a rectangle of whole cells.
+Cells may be empty. There is no split tree, so nothing can flip orientation (principle 2).
+
+12 divides by 2, 3, 4 and 6, so common splits are exact:
+
+| Monitor | Cell | Example |
+|---|---|---|
+| 3440×1440 ultrawide | 287×240 | T3 8 cols + browser 4 cols; 3-wide (4 cols each) or 4-wide (3 cols each) |
+| 3840×2160 4K | 320×360 | 3×3 of 4×2-cell tiles; a video in the top 2×2 = 2560×1440 |
+| 1800×1125 @1.6 laptop | 94×117 | halves, thirds, quarters |
+
+Cell edges are rounded to whole pixels; any leftover goes to the last row or column. Tiles have a
+small gap around them. The gap at the top of each tile is 6–8 px, and only the compositor draws
+there (see *Grab strip*).
+
+### Remembered size
+
+navi remembers each app's last size **in pixels**, along with the monitor it was on. The key is
+the app ID, so two terminals share one memory. On any monitor, the size snaps to the nearest cell
+rectangle. A terminal stays about the same physical size everywhere and never inflates to half a
+4K screen (principle 1).
+
+If navi has no memory for an app, it uses the size the app asks for. If the app asks for nothing,
+it gets half the monitor's width at full height.
+
+### Placing a new window
+
+These steps are tried in order. The first one that fits wins.
+
+1. **Where the app was last time**, if those cells are empty on that monitor.
+2. **The nearest empty rectangle** of the remembered size on the monitor with the pointer.
+3. **Shrink the neighbours.** Tiles larger than their own remembered size give back columns,
+   starting with the largest. No tile shrinks below its minimum (about 320×240 logical px,
+   rounded up to whole cells).
+4. **Another monitor** that has room, by monitor priority (see *Monitors*).
+5. **Tab with the nearest tile** (principle 3).
+
+When a window closes, its cells stay empty. Other windows don't jump to fill them. You use the
+space when you want it.
+
+### Dragging
+
+- **Move:** hover near a tile's top edge and a thin strip lights up. Left-drag it. The grid
+  appears faintly, and one glowing preview shows where the window will land. The preview is the
+  window's remembered size, snapped under the pointer, and it's clamped to stay on screen. Drop
+  the window onto another tile to swap them. Hold the window over the middle of a tile for about
+  half a second, and the drop forms tabs instead.
+- **Resize:** drag any tile edge. It moves in whole cells. When two tiles share that edge, both
+  change. Nothing else changes (principle 4). The edge stops when a tile reaches its minimum. The
+  new size becomes that app's remembered size.
+
+### Window controls
+
+Apps that draw their own title bar keep it. Apps that ask the compositor to draw controls get
+minimize, maximize and close buttons inside the grab strip. **Maximize** means "cover every cell
+until clicked again," not fullscreen.
+
+## Monitors
+
+- **Identity is the EDID** (make, model, serial), not the port name. `DP-11` changes from one
+  dock to the next. Everything navi remembers is tied to the EDID.
+- **The main monitor** is the one in the middle of the layout: the one bordering the most other
+  monitors, with ties broken by size. You can override this, and the override is remembered.
+- **Priority:** the main monitor first, then the others by size. The built-in laptop panel comes
+  last whenever anything else is connected.
+- **Unplugging** moves that monitor's windows to the remaining ones using the placement steps
+  above. **Replugging** returns each window to its remembered cells on that monitor, as long as
+  you haven't moved it since.
+
+## Shell
+
+The screen shows a wallpaper, a taskbar and your apps. There are no desktop icons and no widgets.
+
+- **Wallpaper:** set per monitor, independent of the taskbar.
+- **Taskbar:** centred at the bottom of the main monitor. It holds the app launcher and the
+  running apps. Hover the bottom edge of another monitor for about 300 ms, and the taskbar moves
+  there and stays. Where it last was is remembered. A fullscreen app hides it.
+- **Corners:** on the main monitor. Notifications are top-left; status (clock, network, volume,
+  battery, tray) is top-right. The corners stay where they are when the taskbar moves.
+- **Laptop alone:** the same layout with a slimmer taskbar.
+- **No virtual desktops.**
+- **Look:** cyberpunk, with minimal animation. A neon accent sits in the gap and the grab strip.
+  Visual references are still to come.
+
+## Themes
+
+navi uses the user's installed themes and ships none of its own. Icons, cursors and sounds
+follow freedesktop.org standards, so any theme from the distro's repos or the KDE Store works,
+Breeze included. The themes stay on the user's system and are never bundled, so their licences
+don't affect navi's MIT licence.
+
+| Asset | Standard | Where navi looks |
+|---|---|---|
+| Icons | Icon Theme Spec | `~/.local/share/icons`, then `$XDG_DATA_DIRS/icons`, then `hicolor` |
+| Cursors | XCursor themes, plus the `cursor-shape-v1` protocol so apps ask for cursors by name | same folders, `<theme>/cursors` |
+| Sounds | Sound Theme Spec | `~/.local/share/sounds`, then `$XDG_DATA_DIRS/sounds`, then `freedesktop` |
+| Boot splash | Plymouth | not navi's job; it runs before login and works with any desktop |
+
+- **First run imports the KDE settings** if they exist: icons from `kdeglobals` `[Icons]`, sounds
+  from `kdeglobals` `[Sounds]`, cursor from `kcminputrc` `[Mouse]`. This is a one-time copy into
+  navi's config, so Plasma users keep the look they chose. After that, navi doesn't follow
+  changes made in Plasma.
+- **Other apps match:** navi passes the chosen themes to apps through `XCURSOR_THEME`,
+  `XCURSOR_SIZE` and the portal's appearance settings.
+- **No KDE login splash.** KDE's splash themes are QML programs. Running them would pull in Qt,
+  and would mean executing code that came from a theme download. navi starts fast enough to need
+  no splash.
+- **Theme files are untrusted input**, since anyone can upload a theme to the KDE Store. The
+  compositor decodes icons and cursors with memory-safe Rust libraries (`resvg`, `xcursor`) and
+  caps image size. Sounds are decoded and played in a separate process (`pw-play`), never inside
+  the compositor.
+
+## Security defaults
+
+The compositor sees every key press and every pixel, so it's the most trusted program in the
+session.
+
+- **Privileged protocols** are only for navi's own shell, plus anything you explicitly allow:
+  screen capture (screencopy and image-copy), clipboard managers (`data-control`), virtual
+  keyboard and pointer, input method, and window lists (`foreign-toplevel`). Screenshots and
+  screen sharing for other apps go through `xdg-desktop-portal`, which asks first.
+- **Locking** uses `ext-session-lock`. If the lock screen crashes, the screen stays locked with a
+  solid colour; it never unlocks.
+- **No network access**, no plugins, and no shell commands anywhere in the compositor or shell.
+  Launching an app runs its `.desktop` `Exec=` line, broken into arguments, with an XDG
+  activation token, inside its own `app-*.scope`.
+- **Config** is plain data. A config file can never run a command.
+
+## Build
+
+- **Rust on Smithay, written fresh, MIT licence.** Both close alternatives were tried nested on
+  2026-11-03 and rejected for their layout model, which is the part navi exists to replace:
+  - **cosmic-comp:** its split tree fits the app to the space, flips orientation, offers tabs too
+    readily, and resizes unpredictably.
+  - **niri:** windows scroll off the monitor. In navi, everything on a monitor stays visible.
+
+  With the layout gone, a fork would keep only the plumbing, at the price of GPL-3.0. Read
+  cosmic-comp, niri and Smithay's `anvil` example as reference code; don't fork them.
+- Go was ruled out: it has no usable compositor library.
+- The shell (taskbar, corners, launcher) runs as separate `layer-shell` clients, so a taskbar
+  crash can't take your windows down.
+
+## Open questions
+
+- Grid size: hard-coded at 12 × 6, or configurable? Leaning hard-coded.
+- What counts as "minimal": the exact animations to keep.
+- Look references.
+- Is this a daily driver? That decides whether laptop polish is in v1.
+- Multi-monitor test of COSMIC in a real session, after the running T3 tasks finish.
