@@ -154,7 +154,7 @@ pub fn init(
         Libinput::new_with_udev::<LibinputSessionInterface<LibSeatSession>>(session.clone().into());
     libinput
         .udev_assign_seat(&seat)
-        .map_err(|()| format!("no input devices on {seat}"))?;
+        .map_err(|()| format!("libinput: seat {seat} not assigned"))?;
     handle
         .insert_source(
             LibinputInputBackend::new(libinput.clone()),
@@ -468,7 +468,7 @@ fn scan(data: &mut CalloopData) -> Result<usize, String> {
         state.arrange_layers(&s.output);
     }
     state.set_priorities(&order);
-    state.corners_to_main();
+    state.place_shell();
 
     let outputs: Vec<(String, u32)> = udev
         .screens

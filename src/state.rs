@@ -550,10 +550,15 @@ impl Navi {
         self.close_layers(|_, ns| ns == BAR);
     }
 
-    /// The status band and notifications stay on the main output.
-    pub fn corners_to_main(&mut self) {
+    /// After the outputs change: the status band and notifications go back to the main output,
+    /// and the taskbar to where it belongs. navi-bar remakes what is closed.
+    pub fn place_shell(&mut self) {
         let main = self.main_output().map(|o| o.name());
-        self.close_layers(|o, ns| Some(o) != main.as_deref() && ns != BAR);
+        let bar = self.bar_target().map(|o| o.name());
+        self.close_layers(|o, ns| match ns == BAR {
+            true => Some(o) != bar.as_deref(),
+            false => Some(o) != main.as_deref(),
+        });
     }
 
     /// Closes and unmaps the layer surfaces `which(output, namespace)` picks.
