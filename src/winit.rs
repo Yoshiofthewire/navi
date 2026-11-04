@@ -74,7 +74,7 @@ pub fn init(
     data.state.add_output(&output, 0);
 
     // Copied into the buffer, so the decoded image is freed here.
-    let wallpaper = wallpaper::open(&[(NAME, 0)])[0].as_ref().map(|img| {
+    let mut wallpaper = wallpaper::open(&[(NAME, 0)])[0].as_ref().map(|img| {
         let size = (img.w as i32, img.h as i32);
         let buf = MemoryRenderBuffer::from_slice(
             &img.rgba,
@@ -89,6 +89,8 @@ pub fn init(
 
     let mut damage_tracker = OutputDamageTracker::from_output(&output);
     let mut shot = Screenshot::from_env();
+    // Logged once, not every frame.
+    let mut space_failed = false;
 
     event_loop
         .handle()
@@ -138,12 +140,19 @@ pub fn init(
                         Ok((renderer, mut framebuffer)) => {
                             match space_render_elements(renderer, [&state.space], &output, 1.0) {
                                 Ok(space) => elements.extend(space.into_iter().map(Frame::from)),
-                                Err(e) => warn!("no space elements: {e:?}"),
+                                Err(e) if !space_failed => {
+                                    space_failed = true;
+                                    warn!("no space elements: {e:?}");
+                                }
+                                Err(_) => {}
                             }
                             if let Some((buffer, img)) = &wallpaper {
                                 match wallpaper_element(renderer, buffer, *img, size.into()) {
                                     Ok(e) => elements.push(Frame::from(e)),
-                                    Err(e) => warn!("wallpaper not drawn: {e:?}"),
+                                    Err(e) => {
+                                        warn!("wallpaper not drawn, solid from now on: {e:?}");
+                                        wallpaper = None;
+                                    }
                                 }
                             }
                             let rendered = damage_tracker.render_output(

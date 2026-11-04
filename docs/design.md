@@ -140,7 +140,10 @@ The screen shows a wallpaper, a taskbar and your apps. There are no desktop icon
 - **Wallpaper:** set per monitor, independent of the taskbar, in `~/.config/navi/wallpaper`. The
   first run imports the image Plasma shows on each screen. PNG or JPEG only, scaled and cropped to
   fill the monitor, and capped at 8192 px a side and 8K's pixel count. Otherwise, or if the image
-  can't be read, the monitor is solid `#0B0D12`.
+  can't be read, the monitor is solid `#0B0D12`. The file is a `navi-wallpaper 1` line, then one
+  `<monitor> <absolute path>` line per monitor, where monitor 0 is the main one and the rest
+  follow by priority, e.g. `0 /home/me/Pictures/city.jpg`. Edits apply on restart. Delete the
+  file to import from Plasma again.
 - **Taskbar:** centred at the bottom of the main monitor. It holds the app launcher and the
   running apps. Hover the bottom edge of another monitor for about 300 ms, and the taskbar moves
   there and stays. Where it last was is remembered. A fullscreen app hides it.
@@ -198,8 +201,8 @@ session.
   keyboard and pointer, input method, and window lists (`foreign-toplevel`). Screenshots and
   screen sharing for other apps go through `xdg-desktop-portal`, which asks first.
 - **Layer shell** is open to every client for now, until navi starts its own shell clients. A
-  layer surface gets the keyboard only when clicked, and can't shrink the grid below half the
-  monitor.
+  layer surface gets the keyboard only when clicked (`exclusive` is treated as on-demand), and
+  can't shrink the grid below half the monitor.
 - **Locking** uses `ext-session-lock`. If the lock screen crashes, the screen stays locked with a
   solid colour; it never unlocks.
 - **No network access**, no plugins, and no shell commands anywhere in the compositor or shell.

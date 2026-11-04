@@ -681,10 +681,18 @@ impl CompositorHandler for Navi {
                     .get::<LayerSurfaceData>()
                     .is_some_and(|d| d.lock().is_ok_and(|d| d.initial_configure_sent))
             });
-            if !initial_sent {
-                let map = layer_map_for_output(&output);
-                if let Some(l) = map.layer_for_surface(surface, WindowSurfaceType::TOPLEVEL) {
+            let layer = layer_map_for_output(&output)
+                .layer_for_surface(surface, WindowSurfaceType::TOPLEVEL)
+                .cloned();
+            if let Some(l) = layer {
+                if !initial_sent {
                     l.layer_surface().send_configure();
+                }
+                // A surface that stops taking keys loses the keyboard.
+                let kb = self.seat.get_keyboard();
+                let focused = kb.is_some_and(|kb| kb.current_focus().as_ref() == Some(surface));
+                if focused && !l.can_receive_keyboard_focus() {
+                    self.focus(None);
                 }
             }
         }
@@ -860,10 +868,15 @@ impl WlrLayerShellHandler for Navi {
             surface.send_close();
             return;
         };
-        info!(namespace, ?layer, output = output.name(), "layer mapped");
+        let name = output.name();
         let surface = LayerSurface::new(surface, namespace);
-        if let Err(e) = layer_map_for_output(&output).map_layer(&surface) {
-            tracing::warn!("layer not mapped: {e}");
+        let namespace = surface.namespace();
+        match layer_map_for_output(&output).map_layer(&surface) {
+            Ok(()) => info!(namespace, ?layer, output = name, "layer mapped"),
+            Err(e) => {
+                tracing::warn!(namespace, output = name, "layer not mapped, closed: {e}");
+                surface.layer_surface().send_close();
+            }
         }
     }
 

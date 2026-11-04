@@ -37,6 +37,10 @@ fn percent_decode(s: &str) -> Option<String> {
         out.push(match b {
             b'%' => {
                 let hex = [bytes.next()?, bytes.next()?];
+                // from_str_radix alone would take a sign: "%+f".
+                if !hex.iter().all(u8::is_ascii_hexdigit) {
+                    return None;
+                }
                 u8::from_str_radix(std::str::from_utf8(&hex).ok()?, 16).ok()?
             }
             _ => b,
@@ -220,7 +224,8 @@ fn load_or_import(navi: &Path, plasma: &Path) -> Vec<Entry> {
                 entries
             }
             Err(e) => {
-                warn!(path = %navi.display(), "wallpaper file ignored: {e}");
+                let hint = "delete it to re-import from Plasma";
+                warn!(path = %navi.display(), "wallpaper file ignored: {e}; {hint}");
                 Vec::new()
             }
         },
@@ -271,7 +276,8 @@ pub fn open(outputs: &[(&str, u32)]) -> Vec<Option<Rc<Image>>> {
         warn!("no absolute XDG_CONFIG_HOME or HOME: no wallpaper");
         return vec![None; outputs.len()];
     };
-    let entries = load_or_import(&dir.join("navi/wallpaper"), &dir.join(PLASMA));
+    let file = dir.join("navi/wallpaper");
+    let entries = load_or_import(&file, &dir.join(PLASMA));
     let mut decoded: HashMap<&Path, Option<Rc<Image>>> = HashMap::new();
     let priorities: Vec<u32> = outputs.iter().map(|o| o.1).collect();
     let paths = for_outputs(&entries, &priorities);
@@ -285,7 +291,8 @@ pub fn open(outputs: &[(&str, u32)]) -> Vec<Option<Rc<Image>>> {
                     .or_insert_with(|| match open_image(p) {
                         Ok(img) => Some(Rc::new(img)),
                         Err(e) => {
-                            warn!(path = %p.display(), "wallpaper not shown: {e}");
+                            let hint = format!("edit {} and restart", file.display());
+                            warn!(path = %p.display(), "wallpaper not shown: {e}; {hint}");
                             None
                         }
                     })
@@ -408,6 +415,7 @@ screenMapping=
         assert_eq!(one("255", "/c.png"), [(255, "/c.png".into())]);
         assert_eq!(one("0", "file:///%C3%A9.png"), [(0, "/é.png".into())]);
         for (screen, image) in [
+            ("0", "file:///a%+f.png"),
             ("0", "file:///a%zz.png"),
             ("0", "file:///a%2"),
             ("0", "file:///%ff.png"),
