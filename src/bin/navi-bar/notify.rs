@@ -159,8 +159,9 @@ fn text(s: &str, max: usize, markup: bool) -> String {
     }
 }
 
-/// Markup made readable as plain text, in one pass: simple tags (`<b>`, `</a>`, `<a href="…">`) removed, then
-/// the five XML entities decoded. Nothing is interpreted, so `&lt;b&gt;` shows as `<b>`.
+/// Markup made readable as plain text, in one pass: simple tags (`<b>`, `</a>`, `<a href="…">`)
+/// removed, then the five XML entities decoded. Nothing is interpreted, so `&lt;b&gt;` shows as
+/// `<b>`.
 pub fn plain(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;

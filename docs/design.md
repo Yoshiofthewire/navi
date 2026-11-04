@@ -175,8 +175,9 @@ The screen shows a wallpaper, a taskbar and your apps. There are no desktop icon
   ("never") included. A click dismisses one. Text is plain: simple tags like `<b>` are dropped
   and the five XML entities decoded, nothing is styled or linked, control and bidi-override
   characters are removed, and the app name, summary and body are cut at 64, 120 and 400
-  characters (only the first four times that is read at all, so a huge message costs nothing). Icons, images, sounds and actions are ignored; navi-bar never opens a path
-  a notification names. Replacing or closing a notification works only for the app that sent
+  characters (only the first four times that is read at all, so a huge message costs nothing).
+  Icons, images, sounds and actions are ignored; navi-bar never opens a path a notification
+  names. Replacing or closing a notification works only for the app that sent
   it. Each app may send 5 per 10 s and all apps together 20; past that the call still gets an id,
   but nothing shows. No history and no do-not-disturb; notifications that arrive during
   fullscreen aren't shown, and expire as usual.

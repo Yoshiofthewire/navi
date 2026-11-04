@@ -26,7 +26,7 @@ use smithay::{
     utils::{Rectangle, Scale, Transform},
     wayland::shell::wlr_layer::Layer,
 };
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::{
     CalloopData, cursor::Cursor, layout, screenshot::Screenshot, state::Navi, theme, wallpaper,
@@ -52,7 +52,9 @@ pub fn init(
     let (mut backend, winit) = winit::init::<GlesRenderer>()?;
     // Winit drops `CursorLeft`, so this arrow stays where the pointer left the window.
     let cursor = cursor.map(|c| {
+        // Winit sends the host `wl_pointer.set_cursor` with no surface on every pointer enter.
         backend.window().set_cursor_visible(false);
+        info!("host cursor hidden over navi's window");
         let size = (c.w as i32, c.h as i32);
         let buf = MemoryRenderBuffer::from_slice(
             &c.pixels,
