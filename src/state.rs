@@ -22,7 +22,7 @@ use smithay::{
             protocol::{wl_buffer, wl_seat, wl_surface::WlSurface},
         },
     },
-    utils::{Logical, Point, SERIAL_COUNTER, Serial, Size},
+    utils::{Logical, Point, Rectangle, SERIAL_COUNTER, Serial, Size},
     wayland::{
         buffer::BufferHandler,
         compositor::{
@@ -326,9 +326,10 @@ impl Navi {
                 .unwrap_or_default();
             if let Some((id, step)) = self.layout.place(&app, (pointer.x, pointer.y)) {
                 self.windows[idx].tile = Some(id);
-                let server = surface
-                    .with_pending_state(|s| s.decoration_mode == Some(Decoration::ServerSide));
-                self.layout.set_decorated(id, server);
+                let mode = surface.with_pending_state(|s| s.decoration_mode);
+                info!(app, id, ?mode, "decoration");
+                self.layout
+                    .set_decorated(id, mode == Some(Decoration::ServerSide));
                 surface.with_pending_state(|s| {
                     for t in [
                         xdg_toplevel::State::TiledLeft,
@@ -365,12 +366,19 @@ impl Navi {
             if !toplevel.is_initial_configure_sent() {
                 continue;
             }
+            // A tiled parent's layout rect: its committed size lags a maximize.
             let over = match toplevel.parent() {
-                Some(p) => self
-                    .space
-                    .elements()
-                    .find(|w| w.toplevel().is_some_and(|t| t.wl_surface() == &p))
-                    .and_then(|w| self.space.element_geometry(w)),
+                Some(p) if self.is_mapped(&p) => {
+                    match self.tile_of(&p).and_then(|id| self.layout.rect(id)) {
+                        Some(r) => Some(Rectangle::new((r.x, r.y).into(), (r.w, r.h).into())),
+                        None => self
+                            .space
+                            .elements()
+                            .find(|w| w.toplevel().is_some_and(|t| t.wl_surface() == &p))
+                            .and_then(|w| self.space.element_geometry(w)),
+                    }
+                }
+                Some(_) => None,
                 None => self
                     .space
                     .outputs()
