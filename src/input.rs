@@ -1,21 +1,49 @@
+//! Input from either backend. navi keeps two bindings for itself, before any client sees them:
+//! Ctrl+Alt+Backspace quits, and Ctrl+Alt+F1…F12 switch VTs on real hardware.
+
 use smithay::{
-    backend::input::{
-        AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, InputBackend, InputEvent,
-        KeyState, KeyboardKeyEvent, MouseButton, PointerAxisEvent, PointerButtonEvent,
+    backend::{
+        input::{
+            AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, InputBackend, InputEvent,
+            KeyState, KeyboardKeyEvent, MouseButton, PointerAxisEvent, PointerButtonEvent,
+            PointerMotionEvent,
+        },
+        session::Session,
     },
     input::{
-        keyboard::{FilterResult, Keycode},
+        keyboard::{FilterResult, Keycode, Keysym, ModifiersState},
         pointer::{AxisFrame, ButtonEvent, MotionEvent},
     },
     utils::{Logical, Point, SERIAL_COUNTER},
 };
 
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::{
-    layout::{Action, Done, Drag},
-    state::{Navi, px},
+    layout::{Action, Done, Drag, Rect},
+    monitors,
+    state::{Navi, identity, px},
 };
+
+/// What a key navi keeps does.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Binding {
+    Quit,
+    Vt(i32),
+}
+
+/// navi's own bindings: Ctrl+Alt+Backspace, and Ctrl+Alt+F1…F12 as xkb gives them.
+pub fn binding(mods: &ModifiersState, sym: Keysym) -> Option<Binding> {
+    if !(mods.ctrl && mods.alt) {
+        return None;
+    }
+    let vt = sym.raw().wrapping_sub(Keysym::XF86_Switch_VT_1.raw());
+    match sym {
+        Keysym::BackSpace | Keysym::Terminate_Server => Some(Binding::Quit),
+        _ if vt < 12 => Some(Binding::Vt(vt as i32 + 1)),
+        _ => None,
+    }
+}
 
 impl Navi {
     pub fn process_input_event<I: InputBackend>(&mut self, event: InputEvent<I>) {
@@ -23,13 +51,21 @@ impl Navi {
             InputEvent::Keyboard { event, .. } => {
                 self.keyboard_key(event.key_code(), event.state(), Event::time_msec(&event));
             }
+            InputEvent::PointerMotion { event, .. } => {
+                let rects = self.output_rects();
+                let p = self.pointer_location() + event.delta();
+                let (x, y) = monitors::clamp((p.x, p.y), &rects);
+                self.pointer_motion((x, y).into(), event.time_msec());
+            }
             InputEvent::PointerMotionAbsolute { event, .. } => {
-                let Some(geo) = self
+                // The output under the pointer, as a tablet or touchscreen maps onto one.
+                let here = self.pointer_location();
+                let output = self
                     .space
-                    .outputs()
+                    .output_under(here)
                     .next()
-                    .and_then(|o| self.space.output_geometry(o))
-                else {
+                    .or(self.space.outputs().next());
+                let Some(geo) = output.and_then(|o| self.space.output_geometry(o)) else {
                     return;
                 };
                 let pos = event.position_transformed(geo.size) + geo.loc.to_f64();
@@ -70,19 +106,66 @@ impl Navi {
 }
 
 impl Navi {
-    /// A key (an xkb keycode), from winit or the debug replay.
+    /// The outputs' logical rects, by priority.
+    fn output_rects(&self) -> Vec<Rect> {
+        let mut outs: Vec<_> = self.space.outputs().cloned().collect();
+        outs.sort_by_key(|o| self.priority_of(&identity(o)));
+        outs.iter()
+            .filter_map(|o| self.space.output_geometry(o))
+            .map(|g| Rect {
+                x: g.loc.x,
+                y: g.loc.y,
+                w: g.size.w,
+                h: g.size.h,
+            })
+            .collect()
+    }
+
+    /// A key (an xkb keycode), from a backend or the debug replay.
     pub fn keyboard_key(&mut self, code: Keycode, state: KeyState, time: u32) {
         let Some(kb) = self.seat.get_keyboard() else {
             return;
         };
-        kb.input::<(), _>(
+        let vt = self.session.is_some();
+        let kept = kb.input::<Option<Binding>, _>(
             self,
             code,
             state,
             SERIAL_COUNTER.next_serial(),
             time,
-            |_, _, _| FilterResult::Forward,
+            |navi, mods, key| {
+                if state == KeyState::Released {
+                    let held = navi.suppressed.iter().position(|&c| c == code);
+                    return match held {
+                        Some(i) => {
+                            navi.suppressed.swap_remove(i);
+                            FilterResult::Intercept(None)
+                        }
+                        None => FilterResult::Forward,
+                    };
+                }
+                match binding(mods, key.modified_sym()) {
+                    Some(Binding::Vt(_)) if !vt => FilterResult::Forward,
+                    Some(b) => {
+                        navi.suppressed.push(code);
+                        FilterResult::Intercept(Some(b))
+                    }
+                    None => FilterResult::Forward,
+                }
+            },
         );
+        match kept.flatten() {
+            Some(Binding::Quit) => {
+                info!("quit: Ctrl+Alt+Backspace");
+                self.loop_signal.stop();
+            }
+            Some(Binding::Vt(n)) => {
+                if let Some(Err(e)) = self.session.as_mut().map(|s| s.change_vt(n)) {
+                    warn!(vt = n, "VT switch failed: {e}");
+                }
+            }
+            None => {}
+        }
     }
 
     /// Pointer motion to `pos`, from winit or the debug replay.
@@ -112,6 +195,7 @@ impl Navi {
         };
         pointer.motion(self, under, &motion);
         pointer.frame(self);
+        self.bar_hover(pos);
     }
 
     /// A pointer button, from winit or the debug replay.
@@ -203,6 +287,38 @@ impl Navi {
             if d.cancel(&mut self.layout) {
                 self.apply_layout();
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mods(ctrl: bool, alt: bool) -> ModifiersState {
+        ModifiersState {
+            ctrl,
+            alt,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn ac10_bindings() {
+        let ca = mods(true, true);
+        assert_eq!(binding(&ca, Keysym::BackSpace), Some(Binding::Quit));
+        assert_eq!(binding(&ca, Keysym::XF86_Switch_VT_3), Some(Binding::Vt(3)));
+        assert_eq!(binding(&ca, Keysym::XF86_Switch_VT_1), Some(Binding::Vt(1)));
+        assert_eq!(
+            binding(&ca, Keysym::XF86_Switch_VT_12),
+            Some(Binding::Vt(12))
+        );
+        assert_eq!(binding(&mods(false, false), Keysym::BackSpace), None);
+        assert_eq!(binding(&mods(true, false), Keysym::BackSpace), None);
+        assert_eq!(binding(&mods(false, true), Keysym::BackSpace), None);
+        assert_eq!(binding(&mods(false, false), Keysym::XF86_Switch_VT_3), None);
+        for other in [Keysym::F3, Keysym::Delete, Keysym::a, Keysym::XF86_Ungrab] {
+            assert_eq!(binding(&ca, other), None, "{other:?}");
         }
     }
 }

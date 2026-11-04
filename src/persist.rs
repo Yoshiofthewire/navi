@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
 use crate::files::{read_bytes, xdg_dir};
-use crate::layout::Layout;
+use crate::layout::{Layout, safe};
 
 const MAX_BYTES: u64 = 1 << 20;
 
@@ -29,9 +29,9 @@ pub fn read(path: &Path) -> Result<Option<String>, String> {
     }
 }
 
-/// Writes a private temp file and renames it over `path`, so a crash leaves the old file or the
-/// new one. `create_new` never follows a symlink planted at the temp path.
-pub fn write(path: &Path, text: &str) -> io::Result<()> {
+/// A new private temp file next to `path`, in a private dir, and its path. `create_new` never
+/// follows a symlink planted at the temp path.
+fn create_tmp(path: &Path) -> io::Result<(fs::File, PathBuf)> {
     let dir = path.parent().ok_or(ErrorKind::InvalidInput)?;
     DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
     let tmp = path.with_extension("tmp");
@@ -40,14 +40,83 @@ pub fn write(path: &Path, text: &str) -> io::Result<()> {
         Err(e) if e.kind() != ErrorKind::NotFound => return Err(e),
         _ => {}
     }
-    let mut f = OpenOptions::new()
+    let f = OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .open(&tmp)?;
+    Ok((f, tmp))
+}
+
+/// Writes a private temp file and renames it over `path`, so a crash leaves the old file or the
+/// new one.
+pub fn write(path: &Path, text: &str) -> io::Result<()> {
+    let (mut f, tmp) = create_tmp(path)?;
     f.write_all(text.as_bytes())?;
     f.sync_all()?;
     fs::rename(&tmp, path)
+}
+
+/// `$XDG_STATE_HOME/navi/<name>`.
+pub fn state_file(name: &str) -> Option<PathBuf> {
+    let var = std::env::var_os;
+    let dir = xdg_dir(
+        var("XDG_STATE_HOME").as_deref(),
+        var("HOME").as_deref(),
+        ".local/state",
+    )?;
+    Some(dir.join("navi").join(name))
+}
+
+/// An empty private file at `path` to append to, replacing any old one.
+pub fn create(path: &Path) -> io::Result<fs::File> {
+    let (f, tmp) = create_tmp(path)?;
+    fs::rename(&tmp, path)?;
+    Ok(f)
+}
+
+/// A fresh private log at `path` (`navi.log`); the last run's is kept as `navi.log.old`, so a
+/// failed start can still be read after logging in again.
+pub fn create_log(path: &Path) -> io::Result<fs::File> {
+    match fs::rename(path, path.with_extension("log.old")) {
+        Err(e) if e.kind() != ErrorKind::NotFound => Err(e),
+        _ => create(path),
+    }
+}
+
+/// The identity line of the `bar` state file.
+fn parse_bar(bytes: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let line = text.strip_suffix('\n').unwrap_or(text);
+    safe(line).then(|| line.to_string())
+}
+
+/// The output the taskbar was last moved to.
+pub fn load_bar() -> Option<String> {
+    let path = state_file("bar")?;
+    match read_bytes(&path, 4096) {
+        Ok(None) => None,
+        Ok(Some(b)) => {
+            let id = parse_bar(&b);
+            if id.is_none() {
+                warn!(path = %path.display(), "taskbar file ignored: not one monitor identity");
+            }
+            id
+        }
+        Err(e) => {
+            warn!(path = %path.display(), "taskbar file ignored: {e}");
+            None
+        }
+    }
+}
+
+pub fn save_bar(id: &str) {
+    let Some(path) = state_file("bar") else {
+        return;
+    };
+    if let Err(e) = write(&path, &format!("{id}\n")) {
+        warn!(path = %path.display(), "taskbar output not saved: {e}");
+    }
 }
 
 fn load(path: &Path, layout: &mut Layout) {
@@ -222,6 +291,46 @@ pub mod tests {
         check("over 1 MiB");
         fs::write(&file, b"navi-memory 1\n\xff\xfe uw 0 0 6 6 1720 1440\n").unwrap();
         check("not UTF-8");
+    }
+
+    #[test]
+    fn bar_file_is_one_safe_identity() {
+        assert_eq!(
+            parse_bar(b"ACR_1_2_3_4_5\n").as_deref(),
+            Some("ACR_1_2_3_4_5")
+        );
+        assert_eq!(parse_bar(b"winit").as_deref(), Some("winit"));
+        for bad in [&b""[..], b"\n", b"a b\n", b"a\nb\n", b"\xff\n", b"a\n\n"] {
+            assert_eq!(parse_bar(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn create_replaces_with_a_private_empty_file() {
+        let tmp = Tmp::new("create");
+        let file = tmp.0.join("navi/navi.log");
+        write(&file, "old run").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+        let mut f = create(&file).unwrap();
+        f.write_all(b"new").unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), "new");
+        assert_eq!(mode(&file), 0o600);
+        assert_eq!(mode(&tmp.0.join("navi")), 0o700);
+
+        // The next start keeps this run's log once.
+        drop(f);
+        let mut f = create_log(&file).unwrap();
+        f.write_all(b"newest").unwrap();
+        let old = tmp.0.join("navi/navi.log.old");
+        assert_eq!(fs::read_to_string(&old).unwrap(), "new");
+        assert_eq!(fs::read_to_string(&file).unwrap(), "newest");
+        assert_eq!(mode(&file), 0o600);
+        create_log(&file).unwrap();
+        assert_eq!(fs::read_to_string(&old).unwrap(), "newest");
+        // No log yet: nothing to keep.
+        let first = tmp.0.join("first/navi.log");
+        create_log(&first).unwrap();
+        assert!(!first.with_extension("log.old").exists());
     }
 
     #[test]

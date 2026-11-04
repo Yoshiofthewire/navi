@@ -15,7 +15,20 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libxkbcommon-dev libwayland-dev pkg-config
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libxkbcommon-dev libwayland-dev pkg-config libudev-dev libinput-dev libseat-dev libgbm-dev libdrm-dev
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
+      - run: cargo build --locked
+      # No display and no seat: navi must take the real-hardware path and exit 1 with its
+      # message, not hang (124), panic (101) or succeed.
+      - name: Fail-safe smoke
+        run: |
+          test "$(id -u)" -ne 0
+          code=0
+          env -u WAYLAND_DISPLAY -u DISPLAY timeout 20 target/debug/navi 2> err.txt || code=$?
+          echo "$code" > code.txt
+          cat err.txt
+          echo "exit status $code, uid $(id -u)"
+          test "$code" = 1
+          grep -F 'navi: cannot start on real hardware:' err.txt

@@ -138,26 +138,13 @@ fn run() -> Result<(), String> {
     let shm = Shm::bind(&globals, &qh).map_err(|_| need("wl_shm"))?;
     let activation = ActivationState::bind(&globals, &qh).map_err(|_| need("xdg_activation_v1"))?;
 
-    let surface = compositor.create_surface(&qh);
-    let layer = layer_shell.create_layer_surface(&qh, surface, Layer::Top, Some("navi-bar"), None);
-    layer.set_anchor(Anchor::BOTTOM);
-    layer.set_exclusive_zone(BAR_H);
-    layer.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
+    if dbus::wants_export(std::env::var_os("NAVI_EXPORT_ENV").as_deref()) {
+        // Off the main thread: a stuck bus mustn't hold up the taskbar.
+        std::thread::spawn(dbus::export_env);
+    }
     let l = Layout::new(0, false);
-    layer.set_size(l.w as u32, l.h as u32);
-    layer.commit();
-
-    // Takes no clicks: its input region is empty.
-    let surface = compositor.create_surface(&qh);
-    let band =
-        layer_shell.create_layer_surface(&qh, surface, Layer::Top, Some("navi-status"), None);
-    band.set_anchor(Anchor::TOP | Anchor::LEFT | Anchor::RIGHT);
-    band.set_size(0, BAND_H as u32);
-    band.set_exclusive_zone(BAND_H);
-    band.set_keyboard_interactivity(KeyboardInteractivity::None);
-    let none = Region::new(&compositor).map_err(|e| e.to_string())?;
-    band.wl_surface().set_input_region(Some(none.wl_region()));
-    band.commit();
+    let layer = bar_layer(&compositor, &layer_shell, &qh, &l);
+    let band = band_layer(&compositor, &layer_shell, &qh)?;
 
     let mut event_loop: EventLoop<Bar> = EventLoop::try_new().map_err(|e| e.to_string())?;
     let var = std::env::var_os;
@@ -198,6 +185,7 @@ fn run() -> Result<(), String> {
         notes: Notes::default(),
         start: Instant::now(),
         band,
+        band_configured: false,
         band_w: 0,
         status: String::new(),
         cards_layer: None,
@@ -244,6 +232,42 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
+/// The taskbar's layer surface, on whatever output navi picks.
+fn bar_layer(
+    compositor: &CompositorState,
+    layer_shell: &LayerShell,
+    qh: &QueueHandle<Bar>,
+    l: &Layout,
+) -> LayerSurface {
+    let surface = compositor.create_surface(qh);
+    let layer = layer_shell.create_layer_surface(qh, surface, Layer::Top, Some("navi-bar"), None);
+    layer.set_anchor(Anchor::BOTTOM);
+    layer.set_exclusive_zone(BAR_H);
+    layer.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
+    layer.set_size(l.w as u32, l.h as u32);
+    layer.commit();
+    layer
+}
+
+/// The status band across the top of the main output. Takes no clicks: its input region is
+/// empty.
+fn band_layer(
+    compositor: &CompositorState,
+    layer_shell: &LayerShell,
+    qh: &QueueHandle<Bar>,
+) -> Result<LayerSurface, String> {
+    let surface = compositor.create_surface(qh);
+    let band = layer_shell.create_layer_surface(qh, surface, Layer::Top, Some("navi-status"), None);
+    band.set_anchor(Anchor::TOP | Anchor::LEFT | Anchor::RIGHT);
+    band.set_size(0, BAND_H as u32);
+    band.set_exclusive_zone(BAND_H);
+    band.set_keyboard_interactivity(KeyboardInteractivity::None);
+    let none = Region::new(compositor).map_err(|e| e.to_string())?;
+    band.wl_surface().set_input_region(Some(none.wl_region()));
+    band.commit();
+    Ok(band)
+}
+
 /// A window from the window list.
 struct Win {
     handle: ZwlrForeignToplevelHandleV1,
@@ -260,6 +284,7 @@ struct Bar {
     layer_shell: LayerShell,
     /// The status band and its width, 0 until configured.
     band: LayerSurface,
+    band_configured: bool,
     band_w: i32,
     status: String,
     /// The notification cards' surface, while any are shown.
@@ -912,9 +937,29 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for Bar {
 
 impl LayerShellHandler for Bar {
     fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, layer: &LayerSurface) {
-        if layer == &self.layer {
+        // Closed before its first configure, navi refused it: making another would loop.
+        let refused = (layer == &self.layer && !self.configured)
+            || (layer == &self.band && !self.band_configured);
+        if refused {
             warn!("layer surface closed by navi");
             self.closed = true;
+        } else if layer == &self.layer {
+            // Moved to another output, or its output went away: navi places the new one.
+            info!("taskbar closed by navi, making a new one");
+            self.layer = bar_layer(&self.compositor, &self.layer_shell, &self.qh, &self.layout);
+            self.configured = false;
+        } else if layer == &self.band {
+            info!("status band closed by navi, making a new one");
+            match band_layer(&self.compositor, &self.layer_shell, &self.qh) {
+                Ok(b) => {
+                    self.band = b;
+                    self.band_configured = false;
+                }
+                Err(e) => {
+                    warn!("status band not remade: {e}");
+                    self.closed = true;
+                }
+            }
         } else if self.cards_layer.as_ref() == Some(layer) {
             // The next notification makes a new one.
             self.cards_layer = None;
@@ -934,6 +979,7 @@ impl LayerShellHandler for Bar {
             self.configured = true;
             self.draw();
         } else if layer == &self.band {
+            self.band_configured = true;
             self.band_w = configure.new_size.0 as i32;
             self.draw_band();
         } else if self.cards_layer.as_ref() == Some(layer) {
