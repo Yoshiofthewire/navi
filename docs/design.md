@@ -81,6 +81,11 @@ space when you want it.
 - **Resize:** drag any tile edge. It moves in whole cells. When two tiles share that edge, both
   change. Nothing else changes (principle 4). The edge stops when a tile reaches its minimum. The
   new size becomes that app's remembered size.
+- A click on the strip without moving (under 8 px) moves nothing.
+- A move takes the whole tab group with it.
+- The "middle" of a tile is the inner half of it, in both directions.
+- The top edge of a tile on the monitor's top border isn't draggable; the strip owns that gap.
+- Drop a window back on itself to cancel a move.
 
 ### Window controls
 
