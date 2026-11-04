@@ -31,11 +31,11 @@ Cells may be empty. There is no split tree, so nothing can flip orientation (pri
 
 | Monitor | Cell | Example |
 |---|---|---|
-| 3440×1440 ultrawide | 287×240 | T3 8 cols + browser 4 cols; 3-wide (4 cols each) or 4-wide (3 cols each) |
+| 3440×1440 ultrawide | 286×240 | T3 8 cols + browser 4 cols; 3-wide (4 cols each) or 4-wide (3 cols each) |
 | 3840×2160 4K | 320×360 | 3×3 of 4×2-cell tiles; a video in the top 2×2 = 2560×1440 |
 | 1800×1125 @1.6 laptop | 94×117 | halves, thirds, quarters |
 
-Cell edges are rounded to whole pixels; any leftover goes to the last row or column. Tiles have a
+Cell sizes are rounded down to whole pixels; the last row and column take the leftover. Tiles have a
 small gap around them. The gap at the top of each tile is 6–8 px, and only the compositor draws
 there (see *Grab strip*).
 
@@ -46,8 +46,8 @@ the app ID, so two terminals share one memory. On any monitor, the size snaps to
 rectangle. A terminal stays about the same physical size everywhere and never inflates to half a
 4K screen (principle 1).
 
-If navi has no memory for an app, it uses the size the app asks for. If the app asks for nothing,
-it gets half the monitor's width at full height.
+If navi has no memory for an app, it gets half the monitor's width at full height. Wayland gives
+an app no way to ask for a size before it's first placed.
 
 ### Placing a new window
 
@@ -55,11 +55,14 @@ These steps are tried in order. The first one that fits wins.
 
 1. **Where the app was last time**, if those cells are empty on that monitor.
 2. **The nearest empty rectangle** of the remembered size on the monitor with the pointer.
-3. **Shrink the neighbours.** Tiles larger than their own remembered size give back columns,
-   starting with the largest. No tile shrinks below its minimum (about 320×240 logical px,
-   rounded up to whole cells).
-4. **Another monitor** that has room, by monitor priority (see *Monitors*).
-5. **Tab with the nearest tile** (principle 3).
+3. **Open smaller.** The nearest empty rectangle at less than the remembered size, but no
+   smaller than the minimum (about 320×240 logical px, rounded up to whole cells).
+4. **Shrink the neighbours.** Tiles give back columns, largest first, until the new window fits
+   at its minimum. Tiles larger than their remembered size go first. No tile shrinks below the
+   minimum. Shrinking never changes what navi remembers for an app.
+5. **Another monitor** that has room, by monitor priority (see *Monitors*).
+6. **Tab with the nearest tile.** This happens only when every tile is already at its minimum
+   (principle 3).
 
 When a window closes, its cells stay empty. Other windows don't jump to fill them. You use the
 space when you want it.
@@ -105,8 +108,11 @@ The screen shows a wallpaper, a taskbar and your apps. There are no desktop icon
   battery, tray) is top-right. The corners stay where they are when the taskbar moves.
 - **Laptop alone:** the same layout with a slimmer taskbar.
 - **No virtual desktops.**
-- **Look:** cyberpunk, with minimal animation. A neon accent sits in the gap and the grab strip.
-  Visual references are still to come.
+- **Look:** cyberpunk, with minimal animation. The accent is the logo's neon blue, `#2BA3D8`, on
+  near-black. It's used in the gap and the grab strip.
+- **App menu button:** the navi logo, under the icon name `navi` (in `assets/icons/hicolor`). It's
+  installed into `hicolor`, so an icon theme can replace it. A hand-simplified version with
+  single lines is used at 16–32 px, where the full logo's double lines blur together.
 
 ## Themes
 
@@ -118,10 +124,16 @@ don't affect navi's MIT licence.
 | Asset | Standard | Where navi looks |
 |---|---|---|
 | Icons | Icon Theme Spec | `~/.local/share/icons`, then `$XDG_DATA_DIRS/icons`, then `hicolor` |
-| Cursors | XCursor themes, plus the `cursor-shape-v1` protocol so apps ask for cursors by name | same folders, `<theme>/cursors` |
+| Cursors | XCursor themes, plus the `cursor-shape-v1` protocol so apps ask for cursors by name | `~/.local/share/icons`, then `~/.icons`, then `$XDG_DATA_DIRS/icons`; inside each, `<theme>/cursors` |
 | Sounds | Sound Theme Spec | `~/.local/share/sounds`, then `$XDG_DATA_DIRS/sounds`, then `freedesktop` |
 | Boot splash | Plymouth | not navi's job; it runs before login and works with any desktop |
 
+- **Default icon theme:** `candy-icons` if it's installed, otherwise `hicolor`. An icon theme the
+  user explicitly chose in KDE wins over this default.
+- **Default cursor theme:** `Sweet-cursors` if it's installed, otherwise `Adwaita`. A cursor
+  theme the user explicitly chose in KDE wins over this default. The cursor's pixel size is
+  24 × the monitor's scale, rounded to the nearest size the theme provides (Sweet ships 24, 36
+  and 48). If the theme lacks a shape, navi uses the theme's `default` arrow.
 - **First run imports the KDE settings** if they exist: icons from `kdeglobals` `[Icons]`, sounds
   from `kdeglobals` `[Sounds]`, cursor from `kcminputrc` `[Mouse]`. This is a one-time copy into
   navi's config, so Plasma users keep the look they chose. After that, navi doesn't follow
@@ -170,6 +182,6 @@ session.
 
 - Grid size: hard-coded at 12 × 6, or configurable? Leaning hard-coded.
 - What counts as "minimal": the exact animations to keep.
-- Look references.
+- More look references, beyond the logo.
 - Is this a daily driver? That decides whether laptop polish is in v1.
 - Multi-monitor test of COSMIC in a real session, after the running T3 tasks finish.
