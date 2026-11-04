@@ -1,15 +1,16 @@
 use smithay::{
     backend::renderer::utils::on_commit_buffer_handler,
-    delegate_compositor, delegate_data_device, delegate_output, delegate_seat, delegate_shm,
-    delegate_xdg_decoration, delegate_xdg_shell,
+    delegate_compositor, delegate_data_device, delegate_layer_shell, delegate_output,
+    delegate_seat, delegate_shm, delegate_xdg_decoration, delegate_xdg_shell,
     desktop::{
-        PopupKind, PopupManager, Space, Window, WindowSurfaceType, find_popup_root_surface,
-        get_popup_toplevel_coords,
+        LayerSurface, PopupKind, PopupManager, Space, Window, WindowSurfaceType,
+        find_popup_root_surface, get_popup_toplevel_coords, layer_map_for_output,
     },
     input::{
         Seat, SeatHandler, SeatState,
         pointer::{CursorImageStatus, MotionEvent},
     },
+    output::Output,
     reexports::{
         calloop::LoopSignal,
         wayland_protocols::xdg::{
@@ -19,7 +20,7 @@ use smithay::{
         wayland_server::{
             Client, DisplayHandle, Resource,
             backend::{ClientData, ClientId, DisconnectReason},
-            protocol::{wl_buffer, wl_seat, wl_surface::WlSurface},
+            protocol::{wl_buffer, wl_output::WlOutput, wl_seat, wl_surface::WlSurface},
         },
     },
     utils::{Logical, Point, Rectangle, SERIAL_COUNTER, Serial, Size},
@@ -37,18 +38,25 @@ use smithay::{
                 set_data_device_focus,
             },
         },
-        shell::xdg::{
-            PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
-            XdgToplevelSurfaceData,
-            decoration::{XdgDecorationHandler, XdgDecorationState},
+        shell::{
+            wlr_layer::{
+                Layer, LayerSurface as WlrLayerSurface, LayerSurfaceData, WlrLayerShellHandler,
+                WlrLayerShellState,
+            },
+            xdg::{
+                PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
+                XdgToplevelSurfaceData,
+                decoration::{XdgDecorationHandler, XdgDecorationState},
+            },
         },
         shm::{ShmHandler, ShmState},
     },
 };
 use tracing::info;
 
-use crate::layout::{Decor, Drag, Layout, WinId, decoration};
+use crate::layout::{self, Decor, Drag, Layout, Rect, WinId, decoration};
 use crate::persist::Store;
+use crate::wallpaper::usable_area;
 
 /// A toplevel navi knows about. It's unmapped until its first commit, when its app ID is known.
 pub struct Managed {
@@ -68,10 +76,13 @@ pub struct Navi {
     pub windows: Vec<Managed>,
     /// A drag in navi's strip or edges, from press to release.
     pub drag: Option<Drag>,
+    /// The layout's outputs, with the area layer surfaces leave for the grid.
+    grid: Vec<layout::Output>,
 
     compositor_state: CompositorState,
     xdg_shell_state: XdgShellState,
     _xdg_decoration_state: XdgDecorationState,
+    layer_shell_state: WlrLayerShellState,
     shm_state: ShmState,
     _output_manager_state: smithay::wayland::output::OutputManagerState,
     seat_state: SeatState<Navi>,
@@ -105,6 +116,7 @@ impl Navi {
                 ],
             ),
             _xdg_decoration_state: XdgDecorationState::new::<Self>(&dh),
+            layer_shell_state: WlrLayerShellState::new::<Self>(&dh),
             shm_state: ShmState::new::<Self>(&dh, vec![]),
             _output_manager_state:
                 smithay::wayland::output::OutputManagerState::new_with_xdg_output::<Self>(&dh),
@@ -116,6 +128,7 @@ impl Navi {
             memory,
             windows: Vec::new(),
             drag: None,
+            grid: Vec::new(),
             seat_state,
             popups: PopupManager::default(),
             seat,
@@ -134,7 +147,7 @@ impl Navi {
             .unwrap_or_default())
     }
 
-    pub fn surface_under(
+    fn window_surface_under(
         &self,
         pos: Point<f64, Logical>,
     ) -> Option<(WlSurface, Point<f64, Logical>)> {
@@ -145,6 +158,36 @@ impl Navi {
                     .surface_under(pos - location.to_f64(), WindowSurfaceType::ALL)
                     .map(|(s, p)| (s, (p + location).to_f64()))
             })
+    }
+
+    /// The topmost layer surface at `pos` on one of `layers`, and the surface under `pos` in it.
+    fn layer_under(
+        &self,
+        pos: Point<f64, Logical>,
+        layers: [Layer; 2],
+    ) -> Option<(LayerSurface, WlSurface, Point<f64, Logical>)> {
+        let output = self.space.output_under(pos).next()?;
+        let origin = self.space.output_geometry(output)?.loc;
+        let map = layer_map_for_output(output);
+        layers.into_iter().find_map(|l| {
+            let layer = map.layer_under(l, pos - origin.to_f64())?;
+            let loc = origin + map.layer_geometry(layer)?.loc;
+            let (s, p) = layer.surface_under(pos - loc.to_f64(), WindowSurfaceType::ALL)?;
+            Some((layer.clone(), s, (p + loc).to_f64()))
+        })
+    }
+
+    /// The layer surface a click at `pos` lands on: one above the grid, or one below it with no
+    /// zone or window in between.
+    pub fn layer_at(&self, pos: Point<f64, Logical>) -> Option<LayerSurface> {
+        let lower = || {
+            let clear =
+                self.layout.hit(px(pos)).is_none() && self.space.element_under(pos).is_none();
+            clear.then(|| self.layer_under(pos, [Layer::Bottom, Layer::Background]))?
+        };
+        self.layer_under(pos, [Layer::Overlay, Layer::Top])
+            .or_else(lower)
+            .map(|(l, ..)| l)
     }
 
     /// Sends every visible tiled window its layout size and state and moves it to its rect;
@@ -203,21 +246,114 @@ impl Navi {
         }
     }
 
-    /// What gets pointer focus at `pos`: nothing over navi's zones or during a drag.
+    /// What gets pointer focus at `pos`, top down: Overlay and Top layers, navi's zones (which
+    /// get nothing), windows, then Bottom and Background layers. Nothing during a drag.
     pub fn pointer_focus(
         &self,
         pos: Point<f64, Logical>,
     ) -> Option<(WlSurface, Point<f64, Logical>)> {
-        match self.drag.is_some() || self.layout.hit(px(pos)).is_some() {
-            true => None,
-            false => self.surface_under(pos),
+        if self.drag.is_some() {
+            return None;
         }
+        let surface =
+            |l: Option<(LayerSurface, WlSurface, Point<f64, Logical>)>| l.map(|(_, s, p)| (s, p));
+        if let Some(upper) = surface(self.layer_under(pos, [Layer::Overlay, Layer::Top])) {
+            return Some(upper);
+        }
+        if self.layout.hit(px(pos)).is_some() {
+            return None;
+        }
+        self.window_surface_under(pos)
+            .or_else(|| surface(self.layer_under(pos, [Layer::Bottom, Layer::Background])))
+    }
+
+    /// Adds an output to the grid, all of it until layer surfaces reserve space.
+    pub fn add_output(&mut self, output: &Output, priority: u32) {
+        self.grid.push(layout::Output {
+            name: output.name(),
+            area: Rect {
+                x: 0,
+                y: 0,
+                w: 0,
+                h: 0,
+            },
+            priority,
+        });
+        self.arrange_layers(output);
+    }
+
+    /// Re-arranges `output`'s layer surfaces, and gives the grid what they leave of it.
+    pub fn arrange_layers(&mut self, output: &Output) {
+        let Some(geo) = self.space.output_geometry(output) else {
+            return;
+        };
+        let zone = {
+            let mut map = layer_map_for_output(output);
+            map.arrange();
+            map.non_exclusive_zone()
+        };
+        let rect = |loc: Point<i32, Logical>, size: Size<i32, Logical>| Rect {
+            x: loc.x,
+            y: loc.y,
+            w: size.w,
+            h: size.h,
+        };
+        let area = usable_area(rect(geo.loc, geo.size), rect(geo.loc + zone.loc, zone.size));
+        let name = output.name();
+        let Some(o) = self.grid.iter_mut().find(|o| o.name == name) else {
+            return;
+        };
+        if o.area == area {
+            return;
+        }
+        o.area = area;
+        info!(output = name, ?area, "grid area");
+        self.layout.set_outputs(self.grid.clone());
+        self.apply_layout();
+    }
+
+    /// The output whose layer map holds `surface`, a layer surface's root.
+    fn layer_output(&self, surface: &WlSurface) -> Option<Output> {
+        self.space
+            .outputs()
+            .find(|o| {
+                layer_map_for_output(o)
+                    .layer_for_surface(surface, WindowSurfaceType::TOPLEVEL)
+                    .is_some()
+            })
+            .cloned()
+    }
+
+    /// A click on a layer surface: it gets the keyboard if it takes keyboard input at all.
+    /// `Exclusive` counts as `OnDemand`, so no layer surface holds the keyboard unasked.
+    pub fn click_layer(&mut self, layer: &LayerSurface) {
+        let Some(kb) = self.seat.get_keyboard() else {
+            return;
+        };
+        let surface = layer.wl_surface().clone();
+        if !layer.can_receive_keyboard_focus() || kb.current_focus().as_ref() == Some(&surface) {
+            return;
+        }
+        self.space.elements().for_each(|w| {
+            w.set_activated(false);
+            if let Some(t) = w.toplevel() {
+                t.send_pending_configure();
+            }
+        });
+        let focus = Some(format!("layer {}", layer.namespace()));
+        info!(?focus, "keyboard focus");
+        kb.set_focus(self, Some(surface), SERIAL_COUNTER.next_serial());
     }
 
     fn is_mapped(&self, s: &WlSurface) -> bool {
         self.space
             .elements()
             .any(|w| w.toplevel().is_some_and(|t| t.wl_surface() == s))
+    }
+
+    /// A toplevel in the space, or a mapped layer surface.
+    fn holds_focus(&self, s: &WlSurface) -> bool {
+        self.is_mapped(s) || self.layer_output(s).is_some()
     }
 
     /// The tile of the toplevel `s`; `None` for dialogs and windows not placed yet.
@@ -269,7 +405,7 @@ impl Navi {
         let Some(focus) = self.seat.get_keyboard().and_then(|kb| kb.current_focus()) else {
             return;
         };
-        if self.is_mapped(&focus) {
+        if self.holds_focus(&focus) {
             return;
         }
         let next = shown
@@ -538,6 +674,29 @@ impl CompositorHandler for Navi {
             self.recenter_dialogs();
         }
 
+        if let Some(output) = self.layer_output(surface) {
+            self.arrange_layers(&output);
+            let initial_sent = with_states(surface, |s| {
+                s.data_map
+                    .get::<LayerSurfaceData>()
+                    .is_some_and(|d| d.lock().is_ok_and(|d| d.initial_configure_sent))
+            });
+            let layer = layer_map_for_output(&output)
+                .layer_for_surface(surface, WindowSurfaceType::TOPLEVEL)
+                .cloned();
+            if let Some(l) = layer {
+                if !initial_sent {
+                    l.layer_surface().send_configure();
+                }
+                // A surface that stops taking keys loses the keyboard.
+                let kb = self.seat.get_keyboard();
+                let focused = kb.is_some_and(|kb| kb.current_focus().as_ref() == Some(surface));
+                if focused && !l.can_receive_keyboard_focus() {
+                    self.focus(None);
+                }
+            }
+        }
+
         self.popups.commit(surface);
         if let Some(PopupKind::Xdg(xdg)) = self.popups.find_popup(surface)
             && !xdg.is_initial_configure_sent()
@@ -687,6 +846,58 @@ impl DataDeviceHandler for Navi {
     }
 }
 
+impl WlrLayerShellHandler for Navi {
+    fn shell_state(&mut self) -> &mut WlrLayerShellState {
+        &mut self.layer_shell_state
+    }
+
+    /// Maps the surface on the output it asked for, else the first. Its first commit arranges it
+    /// and sends the configure.
+    fn new_layer_surface(
+        &mut self,
+        surface: WlrLayerSurface,
+        output: Option<WlOutput>,
+        layer: Layer,
+        namespace: String,
+    ) {
+        let Some(output) = output
+            .as_ref()
+            .and_then(Output::from_resource)
+            .or_else(|| self.space.outputs().next().cloned())
+        else {
+            surface.send_close();
+            return;
+        };
+        let name = output.name();
+        let surface = LayerSurface::new(surface, namespace);
+        let namespace = surface.namespace();
+        match layer_map_for_output(&output).map_layer(&surface) {
+            Ok(()) => info!(namespace, ?layer, output = name, "layer mapped"),
+            Err(e) => {
+                tracing::warn!(namespace, output = name, "layer not mapped, closed: {e}");
+                surface.layer_surface().send_close();
+            }
+        }
+    }
+
+    fn layer_destroyed(&mut self, surface: WlrLayerSurface) {
+        let Some(output) = self.layer_output(surface.wl_surface()) else {
+            return;
+        };
+        {
+            let mut map = layer_map_for_output(&output);
+            let layer = map
+                .layer_for_surface(surface.wl_surface(), WindowSurfaceType::TOPLEVEL)
+                .cloned();
+            if let Some(layer) = layer {
+                info!(namespace = layer.namespace(), "layer unmapped");
+                map.unmap_layer(&layer);
+            }
+        }
+        self.arrange_layers(&output);
+    }
+}
+
 impl ClientDndGrabHandler for Navi {}
 impl ServerDndGrabHandler for Navi {}
 impl OutputHandler for Navi {}
@@ -695,6 +906,7 @@ delegate_compositor!(Navi);
 delegate_shm!(Navi);
 delegate_xdg_shell!(Navi);
 delegate_xdg_decoration!(Navi);
+delegate_layer_shell!(Navi);
 delegate_seat!(Navi);
 delegate_data_device!(Navi);
 delegate_output!(Navi);

@@ -8,11 +8,21 @@ use smithay::{
         renderer::{
             ExportMem, Texture, TextureMapping,
             damage::OutputDamageTracker,
-            element::{Id, Kind, solid::SolidColorRenderElement},
+            element::{
+                Id, Kind,
+                memory::{MemoryRenderBuffer, MemoryRenderBufferRenderElement},
+                render_elements,
+                solid::SolidColorRenderElement,
+                surface::WaylandSurfaceRenderElement,
+            },
             gles::{GlesError, GlesMapping, GlesRenderer},
             utils::CommitCounter,
         },
         winit::{self, WinitEvent},
+    },
+    desktop::{
+        layer_map_for_output,
+        space::{SpaceRenderElements, space_render_elements},
     },
     output::{Mode, Output, PhysicalProperties, Subpixel},
     reexports::calloop::EventLoop,
@@ -20,14 +30,19 @@ use smithay::{
 };
 use tracing::warn;
 
-use crate::{
-    CalloopData,
-    layout::{self, Rect},
-    screenshot::Screenshot,
-    state::Navi,
-};
+use crate::{CalloopData, layout, screenshot::Screenshot, state::Navi, wallpaper};
 
 const NAME: &str = "winit";
+/// `#0B0D12`, the design's near-black: shown where there is no wallpaper.
+const CLEAR: [f32; 4] = [11.0 / 255.0, 13.0 / 255.0, 18.0 / 255.0, 1.0];
+
+render_elements! {
+    /// Everything on screen, top first.
+    Frame<=GlesRenderer>;
+    Overlay=SolidColorRenderElement,
+    Space=SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>,
+    Wallpaper=MemoryRenderBufferRenderElement<GlesRenderer>,
+}
 
 pub fn init(
     event_loop: &mut EventLoop<CalloopData>,
@@ -56,10 +71,26 @@ pub fn init(
     );
     output.set_preferred(mode);
     data.state.space.map_output(&output, (0, 0));
-    set_grid(&mut data.state, mode.size.w, mode.size.h);
+    data.state.add_output(&output, 0);
+
+    // Copied into the buffer, so the decoded image is freed here.
+    let mut wallpaper = wallpaper::open(&[(NAME, 0)])[0].as_ref().map(|img| {
+        let size = (img.w as i32, img.h as i32);
+        let buf = MemoryRenderBuffer::from_slice(
+            &img.rgba,
+            Fourcc::Abgr8888,
+            size,
+            1,
+            Transform::Normal,
+            None,
+        );
+        (buf, size)
+    });
 
     let mut damage_tracker = OutputDamageTracker::from_output(&output);
     let mut shot = Screenshot::from_env();
+    // Logged once, not every frame.
+    let mut space_failed = false;
 
     event_loop
         .handle()
@@ -76,8 +107,7 @@ pub fn init(
                         None,
                         None,
                     );
-                    set_grid(state, size.w, size.h);
-                    state.apply_layout();
+                    state.arrange_layers(&output);
                 }
                 WinitEvent::Input(event) => state.process_input_event(event),
                 WinitEvent::Focus(false) => state.cancel_drag(),
@@ -86,7 +116,7 @@ pub fn init(
                     let damage = Rectangle::from_size(size);
                     // The one output sits at (0, 0) at scale 1, so global logical px are its
                     // physical px.
-                    let overlay: Vec<_> = layout::overlay(
+                    let mut elements: Vec<Frame> = layout::overlay(
                         &state.layout,
                         state.drag.as_ref(),
                         state.pointer_px(),
@@ -96,29 +126,43 @@ pub fn init(
                     .map(|(r, color)| {
                         let geo = Rectangle::new((r.x, r.y).into(), (r.w, r.h).into());
                         let commit = CommitCounter::default();
-                        SolidColorRenderElement::new(
+                        Frame::from(SolidColorRenderElement::new(
                             Id::new(),
                             geo,
                             commit,
                             color,
                             Kind::Unspecified,
-                        )
+                        ))
                     })
                     .collect();
                     let mut copy = None;
                     match backend.bind() {
                         Ok((renderer, mut framebuffer)) => {
-                            if let Err(e) = smithay::desktop::space::render_output(
-                                &output,
+                            match space_render_elements(renderer, [&state.space], &output, 1.0) {
+                                Ok(space) => elements.extend(space.into_iter().map(Frame::from)),
+                                Err(e) if !space_failed => {
+                                    space_failed = true;
+                                    warn!("no space elements: {e:?}");
+                                }
+                                Err(_) => {}
+                            }
+                            if let Some((buffer, img)) = &wallpaper {
+                                match wallpaper_element(renderer, buffer, *img, size.into()) {
+                                    Ok(e) => elements.push(Frame::from(e)),
+                                    Err(e) => {
+                                        warn!("wallpaper not drawn, solid from now on: {e:?}");
+                                        wallpaper = None;
+                                    }
+                                }
+                            }
+                            let rendered = damage_tracker.render_output(
                                 renderer,
                                 &mut framebuffer,
-                                1.0,
                                 0,
-                                [&state.space],
-                                &overlay,
-                                &mut damage_tracker,
-                                [0.05, 0.05, 0.08, 1.0],
-                            ) {
+                                &elements,
+                                CLEAR,
+                            );
+                            if let Err(e) = rendered {
                                 warn!("render failed: {e:?}");
                             } else if shot.as_mut().is_some_and(Screenshot::due) {
                                 // Copied before the swap; mapped after it, since mapping drops
@@ -150,14 +194,18 @@ pub fn init(
                         }
                     }
 
+                    let time = state.start_time.elapsed();
+                    let on_output = |_: &_, _: &_| Some(output.clone());
                     state.space.elements().for_each(|window| {
-                        window.send_frame(
-                            &output,
-                            state.start_time.elapsed(),
-                            Some(Duration::ZERO),
-                            |_, _| Some(output.clone()),
-                        )
+                        window.send_frame(&output, time, Some(Duration::ZERO), on_output)
                     });
+                    {
+                        let mut layers = layer_map_for_output(&output);
+                        for layer in layers.layers() {
+                            layer.send_frame(&output, time, Some(Duration::ZERO), on_output);
+                        }
+                        layers.cleanup();
+                    }
                     state.space.refresh();
                     state.popups.cleanup();
                     let _ = data.display.flush_clients();
@@ -180,10 +228,22 @@ fn upright(renderer: &mut GlesRenderer, copy: &GlesMapping) -> Result<Vec<u8>, G
     })
 }
 
-fn set_grid(state: &mut Navi, w: i32, h: i32) {
-    state.layout.set_outputs(vec![layout::Output {
-        name: NAME.into(),
-        area: Rect { x: 0, y: 0, w, h },
-        priority: 0,
-    }]);
+/// The wallpaper filling a `w`×`h` output, scaled and cropped.
+fn wallpaper_element(
+    renderer: &mut GlesRenderer,
+    buffer: &MemoryRenderBuffer,
+    (img_w, img_h): (i32, i32),
+    (w, h): (i32, i32),
+) -> Result<MemoryRenderBufferRenderElement<GlesRenderer>, GlesError> {
+    let src = wallpaper::cover(img_w, img_h, w, h);
+    let src = Rectangle::new((src.x, src.y).into(), (src.w, src.h).into()).to_f64();
+    MemoryRenderBufferRenderElement::from_buffer(
+        renderer,
+        (0.0, 0.0),
+        buffer,
+        None,
+        Some(src),
+        Some((w, h).into()),
+        Kind::Unspecified,
+    )
 }
