@@ -184,14 +184,17 @@ impl Layout {
                 continue;
             };
             let r = o.cells_rect(t.cells);
+            self.clock += 1;
             let fresh = Memory {
                 output: t.output.clone(),
                 cells: t.cells,
                 size: (r.w, r.h),
+                stamp: self.clock,
             };
             let m = self.memory.entry(t.app.clone()).or_insert(fresh.clone());
             m.output = fresh.output;
             m.cells = fresh.cells;
+            m.stamp = fresh.stamp;
             if resized {
                 m.size = fresh.size;
             }
@@ -717,6 +720,7 @@ pub(super) mod tests {
                     output: "uw".into(),
                     cells,
                     size: (r.w, r.h),
+                    stamp: i as u64,
                 },
             );
             l.tiles.push(Tile {

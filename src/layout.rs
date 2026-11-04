@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 mod bar;
 mod drag;
+mod memory;
 pub use bar::{Decor, decoration};
 pub use drag::{Action, Done, Drag, overlay};
 
@@ -157,6 +158,8 @@ struct Memory {
     output: String,
     cells: Cells,
     size: (i32, i32),
+    /// The layout clock when it was last placed, moved or resized; the save cap keeps the newest.
+    stamp: u64,
 }
 
 /// Which step of the placement order found the spot.
@@ -386,11 +389,12 @@ impl Layout {
             output,
             cells,
             size,
+            stamp: self.clock,
         };
         match step {
             // The cells belong to another tile; only learn the size.
             Step::Tabbed(_) => {
-                self.memory.entry(app.to_string()).or_insert(fresh);
+                self.memory.entry(app.to_string()).or_insert(fresh).stamp = self.clock;
             }
             _ => {
                 self.memory.insert(app.to_string(), fresh);
@@ -829,6 +833,7 @@ mod tests {
                 output: "gone".into(),
                 cells: cells(0, 0, 3, 6),
                 size: (860, 1440),
+                stamp: 0,
             },
         );
 
@@ -852,6 +857,7 @@ mod tests {
             output: "gone".into(),
             cells: cells(0, 0, 1, 1),
             size,
+            stamp: 0,
         };
         l.memory.insert(app.into(), m);
     }

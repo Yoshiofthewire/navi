@@ -2,6 +2,7 @@
 
 mod input;
 mod layout;
+mod persist;
 #[cfg(debug_assertions)]
 mod replay;
 mod screenshot;

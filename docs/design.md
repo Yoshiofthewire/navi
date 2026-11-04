@@ -46,6 +46,10 @@ the app ID, so two terminals share one memory. On any monitor, the size snaps to
 rectangle. A terminal stays about the same physical size everywhere and never inflates to half a
 4K screen (principle 1).
 
+Memory survives restarts. navi keeps it in `$XDG_STATE_HOME/navi/memory` (default
+`~/.local/state/navi/memory`), readable only by the user. It holds at most the 512 most recently
+used apps, and navi ignores a damaged file.
+
 If navi has no memory for an app, it gets half the monitor's width at full height. Wayland gives
 an app no way to ask for a size before it's first placed.
 
