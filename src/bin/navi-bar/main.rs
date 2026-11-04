@@ -915,6 +915,10 @@ impl LayerShellHandler for Bar {
         if layer == &self.layer {
             warn!("layer surface closed by navi");
             self.closed = true;
+        } else if self.cards_layer.as_ref() == Some(layer) {
+            // The next notification makes a new one.
+            self.cards_layer = None;
+            self.cards.clear();
         }
     }
 

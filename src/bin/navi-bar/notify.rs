@@ -87,8 +87,8 @@ impl Notes {
             id: 0,
             sender: sender.to_string(),
             app: sanitize(&r.app_name, APP_CHARS),
-            summary: sanitize(&r.summary, SUMMARY_CHARS),
-            body: sanitize(&r.body, BODY_CHARS),
+            summary: sanitize(&plain(&r.summary), SUMMARY_CHARS),
+            body: sanitize(&plain(&r.body), BODY_CHARS),
             expires_ms: now.saturating_add(timeout_ms(r.expire_timeout)),
         };
         if let Some(at) = replaced {
@@ -149,8 +149,42 @@ fn timeout_ms(t: i32) -> u64 {
     }
 }
 
+/// Markup made readable as plain text: simple tags (`<b>`, `</a>`, `<a href="…">`) removed, then
+/// the five XML entities decoded. Nothing is interpreted, so `&lt;b&gt;` shows as `<b>`.
+pub fn plain(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(at) = rest.find('<') {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + 1..];
+        let named = after
+            .trim_start_matches('/')
+            .starts_with(|c: char| c.is_ascii_alphabetic());
+        let end = after
+            .find('>')
+            .filter(|&e| named && !after[..e].contains('<'));
+        match end {
+            Some(e) => rest = &after[e + 1..],
+            None => {
+                out.push('<');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    [
+        ("&lt;", "<"),
+        ("&gt;", ">"),
+        ("&quot;", "\""),
+        ("&apos;", "'"),
+        ("&amp;", "&"),
+    ]
+    .iter()
+    .fold(out, |s, (from, to)| s.replace(from, to))
+}
+
 /// Plain text: controls except `\n` and bidi overrides removed, at most `max` chars with `…`
-/// last when cut. Markup stays as typed.
+/// last when cut.
 pub fn sanitize(s: &str, max: usize) -> String {
     let kept: Vec<char> = s
         .chars()
@@ -187,7 +221,11 @@ mod tests {
 
     #[test]
     fn ac7_sanitize() {
-        assert_eq!(sanitize("<b>x</b>", 120), "<b>x</b>");
+        assert_eq!(
+            sanitize("<b>x</b>", 120),
+            "<b>x</b>",
+            "sanitize leaves text alone"
+        );
         assert_eq!(sanitize("a\u{202E}b\x07c\nd", 400), "abc\nd");
         assert_eq!(
             sanitize("\u{200E}\u{2066}\u{2069}\u{0085}\u{009F}\r\tx", 400),
@@ -200,6 +238,36 @@ mod tests {
         let cut = sanitize(&"é😀".repeat(100), 5);
         assert_eq!(cut, "é😀é😀…");
         assert_eq!(sanitize("ab", 2), "ab");
+    }
+
+    #[test]
+    fn markup_reads_as_plain_text() {
+        assert_eq!(plain("Hello <b>navi</b>"), "Hello navi");
+        assert_eq!(
+            plain("<a href=\"https://x\">link</a> <i>it</i><br/>"),
+            "link it"
+        );
+        assert_eq!(plain("a < b and c > d"), "a < b and c > d");
+        assert_eq!(plain("1 <2 <b>3</b>"), "1 <2 3");
+        assert_eq!(plain("open <b"), "open <b");
+        assert_eq!(
+            plain("&lt;b&gt; &amp;amp; &quot;q&quot; &apos;s&apos;"),
+            "<b> &amp; \"q\" 's'"
+        );
+        assert_eq!(plain("x &nbsp; y"), "x &nbsp; y");
+        let mut n = Notes::default();
+        n.notify(
+            0,
+            ":1.1",
+            &Request {
+                body: "<b>line</b> one".into(),
+                ..req("Hello <b>navi</b>")
+            },
+        );
+        assert_eq!(
+            (n.shown()[0].summary.as_str(), n.shown()[0].body.as_str()),
+            ("Hello navi", "line one")
+        );
     }
 
     #[test]

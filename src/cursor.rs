@@ -189,6 +189,9 @@ fn check(b: &[u8]) -> Result<(), String> {
     if ntoc > b.len() / 12 {
         return Err("truncated".into());
     }
+    // The parser keeps two copies of every image's pixels, so TOC entries aimed at one image
+    // multiply it: the images may claim no more bytes than the file has.
+    let mut claimed: u64 = 0;
     for k in 0..ntoc {
         let toc = header + 12 * k;
         if u32_at(toc)? != IMAGE {
@@ -198,6 +201,10 @@ fn check(b: &[u8]) -> Result<(), String> {
         let (w, h) = (u32_at(pos + 16)?, u32_at(pos + 20)?);
         if w > MAX_SIDE || h > MAX_SIDE {
             return Err(format!("{w}×{h} image, over {MAX_SIDE} px"));
+        }
+        claimed += 4 * u64::from(w) * u64::from(h);
+        if claimed > b.len() as u64 {
+            return Err("images claim more bytes than the file has".into());
         }
     }
     Ok(())
@@ -374,6 +381,26 @@ mod tests {
         let w = 16 + 12 + 16;
         wide[w..w + 4].copy_from_slice(&0x7fffu32.to_le_bytes());
         assert!(decode(&wide, "t", 24).is_err());
+        // The security review's shape: TOC entries all aimed at one 256 px image (152,000 of
+        // them asked the parser for ~74 GiB). The eighth already claims more than the file holds.
+        let mut aliased = xcursor(&[(256, 256, (0, 0))]);
+        let pos = u32::from_le_bytes(aliased[24..28].try_into().unwrap());
+        let n = 152_000u32;
+        let mut file = Vec::new();
+        for v in [u32::from_le_bytes(*b"Xcur"), 16, 0x1_0000, n] {
+            file.extend(v.to_le_bytes());
+        }
+        let image = aliased.split_off(pos as usize);
+        let at = 16 + 12 * n;
+        for _ in 0..n {
+            file.extend([IMAGE, 256, at].iter().flat_map(|v| v.to_le_bytes()));
+        }
+        file.extend(image);
+        assert!(file.len() < MAX_FILE as usize, "{}", file.len());
+        assert_eq!(
+            check(&file),
+            Err("images claim more bytes than the file has".into())
+        );
         for n in 0..wide.len() {
             let _ = decode(&wide[..n], "t", 24);
         }

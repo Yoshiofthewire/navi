@@ -594,8 +594,8 @@ impl Layout {
 /// Solid rects to draw over the windows: global logical px, premultiplied RGBA, front to back.
 /// During a move, the grid and a preview of the landing tile, more solid once the drop would tab;
 /// otherwise the hovered or pressed zone. Then every bar, the dimmed strip of each minimized
-/// untabbed tile, and last a frame around each shown window: bright around `focused`, dim around
-/// the rest.
+/// untabbed tile, and last a frame around each shown window (and its bar): bright around
+/// `focused`, dim around the rest.
 pub fn overlay(
     l: &Layout,
     drag: Option<&Drag>,
@@ -649,6 +649,8 @@ pub fn overlay(
         _ => None,
     };
     out.extend(lit.map(|z| (z, accent(1.0))));
+    // Where a frame's top goes when it runs along the top of a bar, in front of it.
+    let front = out.len();
     for t in &l.tiles {
         if l.active(t.id) != Some(t.id) || l.covered(t) || t.fullscreen {
             continue;
@@ -668,7 +670,22 @@ pub fn overlay(
             true => (FOCUS_PX, 1.0),
             false => (IDLE_PX, IDLE_ALPHA),
         };
-        out.extend(frame(r, px).map(|f| (f, accent(alpha))));
+        let k = accent(alpha);
+        // A bar is the window's top edge, so the frame takes it in: its top line runs along
+        // the bar's top rows, in front of the bar.
+        match l.bar(t.id) {
+            Some(b) => {
+                let r = Rect {
+                    y: b.rect.y + px,
+                    h: r.y + r.h - b.rect.y - px,
+                    ..r
+                };
+                let [top, rest @ ..] = frame(r, px);
+                out.insert(front, (top, k));
+                out.extend(rest.map(|f| (f, k)));
+            }
+            None => out.extend(frame(r, px).map(|f| (f, k))),
+        }
     }
     out
 }
@@ -1283,6 +1300,29 @@ pub(super) mod tests {
         l.fullscreen(1);
         assert_eq!(frames_of(&l, 1), 0, "fullscreen");
         assert!(overlay(&l, None, (500, 700), 0, Some(1)).is_empty());
+
+        // Round 1: a decorated window's frame takes in its bar; the top line runs along the bar's
+        // top rows in front of it, and the sides start at the bar's top.
+        let mut l = halves();
+        l.set_decorated(0, true);
+        let (bar, win) = (l.bar(0).unwrap().rect, l.rect(0).unwrap());
+        let o = overlay(&l, None, (500, 700), 0, Some(0));
+        let top = Rect {
+            x: win.x - FOCUS_PX,
+            y: bar.y,
+            w: win.w + 2 * FOCUS_PX,
+            h: FOCUS_PX,
+        };
+        let pos = |want: (Rect, [f32; 4])| o.iter().position(|&x| x == want).unwrap();
+        assert!(pos((top, accent(1.0))) < pos((bar, rgba(crate::theme::BAR_BG, 1.0))));
+        let left = Rect {
+            x: win.x - FOCUS_PX,
+            y: bar.y + FOCUS_PX,
+            w: FOCUS_PX,
+            h: win.y + win.h - bar.y - FOCUS_PX,
+        };
+        assert!(o.contains(&(left, accent(1.0))));
+        assert_eq!(o.iter().filter(|&&(_, k)| k == accent(1.0)).count(), 4);
     }
 
     #[test]
