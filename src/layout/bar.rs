@@ -11,8 +11,10 @@ pub const TAB_BG: u32 = 0x262C38;
 pub const ACCENT: u32 = 0x2BA3D8;
 pub const INK: u32 = 0xD0D4DC;
 pub const INK_ON_ACCENT: u32 = 0x0B0D12;
-/// Minimized tiles' strips and tabs are drawn this opaque.
-pub const DIM: f32 = 0.4;
+/// A minimized tile's strip or tab: a dimmed accent, still 3:1 against the bar and background.
+pub const MINIMIZED: u32 = 0x20769E;
+/// Outlines inactive tabs, which can't be 3:1 against both the bar and the active tab.
+pub const OUTLINE: u32 = 0x7A8396;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Button {
@@ -118,6 +120,24 @@ fn glyph(b: Button, r: Rect) -> Vec<Rect> {
     }
 }
 
+/// The 1 px border inside `r`.
+fn outline(r: Rect) -> [Rect; 4] {
+    [
+        Rect { h: 1, ..r },
+        Rect {
+            y: r.y + r.h - 1,
+            h: 1,
+            ..r
+        },
+        Rect { w: 1, ..r },
+        Rect {
+            x: r.x + r.w - 1,
+            w: 1,
+            ..r
+        },
+    ]
+}
+
 /// Front to back: `bar` with `hover` (a tab or button id) lit.
 pub fn draw(l: &Layout, id: WinId, bar: &Bar, hover: Option<Hit>) -> Vec<(Rect, [f32; 4])> {
     let mut out = Vec::new();
@@ -133,11 +153,14 @@ pub fn draw(l: &Layout, id: WinId, bar: &Bar, hover: Option<Hit>) -> Vec<(Rect, 
     for &(t, r) in &bar.tabs {
         let minimized = l.tile(t).is_some_and(|t| t.minimized);
         let color = match (Some(t) == active && !minimized) || hover == Some(Hit::Tab(t)) {
-            true => rgba(ACCENT, 1.0),
-            false if minimized => rgba(TAB_BG, DIM),
-            false => rgba(TAB_BG, 1.0),
+            true => ACCENT,
+            false if minimized => MINIMIZED,
+            false => {
+                out.extend(outline(r).map(|o| (o, rgba(OUTLINE, 1.0))));
+                TAB_BG
+            }
         };
-        out.push((r, color));
+        out.push((r, rgba(color, 1.0)));
     }
     out.push((bar.rect, rgba(BAR_BG, 1.0)));
     out
@@ -483,7 +506,7 @@ mod tests {
         let bar = l.bar(0).unwrap();
         assert!(bar.buttons.is_empty());
         let drawn = overlay(&l, None, (3000, 700), 0);
-        assert_eq!(drawn, vec![(bar.rect, rgba(ACCENT, DIM))]);
+        assert_eq!(drawn, vec![(bar.rect, rgba(MINIMIZED, 1.0))]);
         let mut placed = with(&[HALF_L]);
         placed.tiles[0].minimized = true;
         let (n, _) = placed.place("new", (100, 700)).unwrap();
@@ -502,7 +525,7 @@ mod tests {
         assert_eq!(click_button(&mut l, 1, Button::Minimize), Some("minimized"));
         assert!(l.visible(0) && !l.visible(1));
         let t1 = tab(&l, 1);
-        assert!(overlay(&l, None, (3000, 700), 0).contains(&(t1, rgba(TAB_BG, DIM))));
+        assert!(overlay(&l, None, (3000, 700), 0).contains(&(t1, rgba(MINIMIZED, 1.0))));
         assert_eq!(click(&mut l, mid(t1)), Some("tab switched"));
         assert!(l.visible(1) && !l.tile(1).unwrap().minimized);
         assert_eq!(l.active(0), Some(1));
@@ -552,7 +575,7 @@ mod tests {
         assert!(!l.visible(0));
         assert!(
             overlay(&l, None, (3000, 700), 0)
-                .contains(&(l.zone(Hit::Strip(0)).unwrap(), rgba(ACCENT, DIM)))
+                .contains(&(l.zone(Hit::Strip(0)).unwrap(), rgba(MINIMIZED, 1.0)))
         );
         assert_eq!(click(&mut l, (100, 2)), Some("restored"));
         assert!(!l.tiles[0].minimized);
@@ -646,9 +669,83 @@ mod tests {
         let pos = |want: (Rect, [f32; 4])| lit.iter().position(|&x| x == want).unwrap();
         assert!(pos((close, rgba(ACCENT, 1.0))) < pos((l.bar(1).unwrap().rect, rgba(BAR_BG, 1.0))));
 
+        // Inactive tabs are outlined; minimized ones are the same dimmed accent as a strip.
+        for side in outline(tab(&l, 2)) {
+            assert!(drawn.contains(&(side, rgba(OUTLINE, 1.0))), "{side:?}");
+        }
+        assert!(
+            !drawn
+                .iter()
+                .any(|&(r, k)| k == rgba(OUTLINE, 1.0) && r.x >= tab(&l, 3).x)
+        );
+
         assert!(contrast(INK, BAR_BG) >= 4.5, "{}", contrast(INK, BAR_BG));
         assert!(contrast(INK_ON_ACCENT, ACCENT) >= 4.5);
         assert!(contrast(ACCENT, TAB_BG) >= 3.0);
+        // WCAG 1.4.11, 3:1 for UI: what sits on the bar, and a strip on the empty background.
+        assert!(
+            contrast(OUTLINE, BAR_BG) >= 3.0,
+            "{}",
+            contrast(OUTLINE, BAR_BG)
+        );
+        assert!(contrast(OUTLINE, TAB_BG) >= 3.0);
+        assert!(
+            contrast(MINIMIZED, BAR_BG) >= 3.0,
+            "{}",
+            contrast(MINIMIZED, BAR_BG)
+        );
+        assert!(contrast(MINIMIZED, BACKGROUND) >= 3.0);
+        assert!(contrast(ACCENT, BAR_BG) >= 3.0);
+    }
+
+    /// winit.rs's clear colour, [0.05, 0.05, 0.08].
+    const BACKGROUND: u32 = 0x0D0D14;
+
+    #[test]
+    fn preview_is_where_the_window_lands() {
+        let preview = |l: &Layout, d: &Drag, p| {
+            let rects = overlay(l, Some(d), p, 600);
+            rects
+                .into_iter()
+                .find(|&(_, k)| k == rgba(ACCENT, 0.35) || k == rgba(ACCENT, 0.7))
+                .map(|(r, _)| r)
+        };
+        // A decorated tile moved to free space lands below its bar.
+        let mut l = with(&[HALF_L]);
+        l.set_decorated(0, true);
+        let mut d = Drag::press(&l, (100, 12)).unwrap();
+        d.motion(&mut l, (3000, 700), 0);
+        assert_eq!(
+            preview(&l, &d, (3000, 700)),
+            Some(uw().window_rect(HALF_R, BAR))
+        );
+        d.release(&mut l, (3000, 700), 10);
+        assert_eq!(l.rect(0), Some(uw().window_rect(HALF_R, BAR)));
+
+        // A held tab-in will have a bar; an undecorated untab won't.
+        let mut l = with(&[HALF_L, HALF_L, HALF_R]);
+        let mut d = Drag::press(&l, mid(tab(&l, 1))).unwrap();
+        d.motion(&mut l, (2500, 700), 0);
+        assert_eq!(
+            preview(&l, &d, (2500, 700)),
+            Some(uw().window_rect(HALF_R, BAR))
+        );
+        let mut l = with(&[HALF_L, HALF_L]);
+        let mut d = Drag::press(&l, mid(tab(&l, 1))).unwrap();
+        d.motion(&mut l, (3000, 700), 0);
+        assert_eq!(preview(&l, &d, (3000, 700)), Some(uw().tile_rect(HALF_R)));
+    }
+
+    #[test]
+    fn a_maximized_strip_lights_on_hover() {
+        let mut l = with(&[HALF_L, HALF_R]);
+        assert!(l.maximize(0));
+        let strip = l.zone(Hit::Strip(0)).unwrap();
+        assert_eq!((strip.w, strip.h), (uw().window_rect(FULL, GAP).w, GAP));
+        assert_eq!(
+            overlay(&l, None, (100, 2), 0),
+            vec![(strip, rgba(ACCENT, 1.0))]
+        );
     }
 
     #[test]

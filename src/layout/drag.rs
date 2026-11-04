@@ -2,7 +2,7 @@
 
 use super::{
     COLS, Cells, GAP, Layout, MIN_H, MIN_W, Memory, Output, ROWS, Rect, Tile, WinId,
-    bar::{self, ACCENT, Button, DIM},
+    bar::{self, ACCENT, Button, MINIMIZED},
     dist2,
 };
 
@@ -598,13 +598,20 @@ pub fn overlay(
         Some(State::Armed { hit, .. }) => Some(*hit),
         Some(State::Resize(r)) => Some(Hit::Edge(r.id, r.side)),
         Some(State::Move {
+            id,
             tab,
             output,
             target,
             middle,
-            ..
         }) => {
             let held = held(*middle, now_ms);
+            // The preview is where the window lands: below a bar if it will have one.
+            let bar = match target {
+                Target::Onto(..) if held => true,
+                _ if *tab => l.tile(*id).is_some_and(|t| t.decorated),
+                _ => l.has_bar(*id),
+            };
+            let top = if bar { super::BAR } else { GAP };
             let alpha = if held { TAB_ALPHA } else { PREVIEW_ALPHA };
             // A tab can't swap, so over a tile only a hold that will tab shows where it lands.
             let target = match target {
@@ -612,7 +619,7 @@ pub fn overlay(
                 t => *t,
             };
             if let Some(o) = l.output(output) {
-                out.extend(move_overlay(o, target, alpha));
+                out.extend(move_overlay(o, target, top, alpha));
             }
             None
         }
@@ -637,7 +644,10 @@ pub fn overlay(
         }
         let tabbed = l.group(t.id).len() > 1;
         if t.minimized && !tabbed {
-            out.extend(l.zone(Hit::Strip(t.id)).map(|z| (z, accent(DIM))));
+            out.extend(
+                l.zone(Hit::Strip(t.id))
+                    .map(|z| (z, bar::rgba(MINIMIZED, 1.0))),
+            );
         } else if let Some(b) = l.bar(t.id) {
             out.extend(bar::draw(l, t.id, &b, hover));
         }
@@ -646,7 +656,7 @@ pub fn overlay(
 }
 
 /// The output's interior cell boundaries, 1 px wide, and the preview where the window would go.
-fn move_overlay(o: &Output, target: Target, alpha: f32) -> Vec<(Rect, [f32; 4])> {
+fn move_overlay(o: &Output, target: Target, top: i32, alpha: f32) -> Vec<(Rect, [f32; 4])> {
     let a = o.area;
     let cols = (1..COLS).map(|k| Rect {
         x: o.x_edge(k),
@@ -660,7 +670,11 @@ fn move_overlay(o: &Output, target: Target, alpha: f32) -> Vec<(Rect, [f32; 4])>
     });
     cols.chain(rows)
         .map(|r| (r, accent(GRID_ALPHA)))
-        .chain(target.cells().map(|c| (o.tile_rect(c), accent(alpha))))
+        .chain(
+            target
+                .cells()
+                .map(|c| (o.window_rect(c, top), accent(alpha))),
+        )
         .collect()
 }
 
@@ -1121,7 +1135,12 @@ pub(super) mod tests {
         let preview_at = |t| *overlay(&l, Some(&d), B_MIDDLE, t).last().unwrap();
         assert_eq!(preview_at(1499).1, accent(PREVIEW_ALPHA));
         assert_eq!(preview_at(1500).1, accent(TAB_ALPHA));
-        assert_eq!(preview_at(1500).0, preview_at(1499).0);
+        // Job 003: a tab group has a bar, so the tab-in preview sits below one.
+        assert_eq!(preview_at(1499).0, uw().tile_rect(c(6, 0, 6, 6)));
+        assert_eq!(
+            preview_at(1500).0,
+            uw().window_rect(c(6, 0, 6, 6), super::super::BAR)
+        );
     }
 
     #[test]

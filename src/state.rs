@@ -276,7 +276,13 @@ impl Navi {
 
     /// Applies a client's maximize, unmaximize or minimize request through the same layout calls
     /// as navi's buttons. Dialogs, unplaced and hidden windows are refused.
-    fn app_request(&mut self, s: &ToplevelSurface, what: &str, f: fn(&mut Layout, WinId) -> bool) {
+    /// Returns whether it changed anything; `apply_layout` has then sent the configure.
+    fn app_request(
+        &mut self,
+        s: &ToplevelSurface,
+        what: &str,
+        f: fn(&mut Layout, WinId) -> bool,
+    ) -> bool {
         let id = self.tile_of(s.wl_surface());
         let changed = id.is_some_and(|id| f(&mut self.layout, id));
         if changed {
@@ -285,6 +291,7 @@ impl Navi {
         } else {
             info!(?id, by = "app", refused = what, "request refused");
         }
+        changed
     }
 
     /// Records a toplevel's decoration mode; dialogs always draw their own.
@@ -293,16 +300,22 @@ impl Navi {
             Some(_) => Decoration::ClientSide,
             None => mode,
         };
-        toplevel.with_pending_state(|s| s.decoration_mode = Some(mode));
+        let changed = toplevel.with_pending_state(|s| {
+            let changed = s.decoration_mode != Some(mode);
+            s.decoration_mode = Some(mode);
+            changed
+        });
         let app = app_id(toplevel.wl_surface());
         let id = self.tile_of(toplevel.wl_surface());
         info!(app, ?id, ?mode, "decoration");
         if let Some(id) = id {
             self.layout
                 .set_decorated(id, mode == Decoration::ServerSide);
+            // Sends the new mode with the new size.
             self.apply_layout();
         }
-        if toplevel.is_initial_configure_sent() {
+        // The protocol wants a reply even when nothing changed.
+        if toplevel.is_initial_configure_sent() && (id.is_none() || !changed) {
             toplevel.send_configure();
         }
     }
@@ -591,17 +604,20 @@ impl XdgShellHandler for Navi {
 
     fn grab(&mut self, _surface: PopupSurface, _seat: wl_seat::WlSeat, _serial: Serial) {}
 
-    // xdg-shell needs a configure in reply, with the state as it now is.
+    // xdg-shell needs a configure in reply, with the state as it now is; a refused request
+    // changed nothing, so it gets one here.
     fn maximize_request(&mut self, surface: ToplevelSurface) {
-        self.app_request(&surface, "maximized", Layout::maximize);
-        if surface.is_initial_configure_sent() {
+        if !self.app_request(&surface, "maximized", Layout::maximize)
+            && surface.is_initial_configure_sent()
+        {
             surface.send_configure();
         }
     }
 
     fn unmaximize_request(&mut self, surface: ToplevelSurface) {
-        self.app_request(&surface, "unmaximized", Layout::unmaximize);
-        if surface.is_initial_configure_sent() {
+        if !self.app_request(&surface, "unmaximized", Layout::unmaximize)
+            && surface.is_initial_configure_sent()
+        {
             surface.send_configure();
         }
     }

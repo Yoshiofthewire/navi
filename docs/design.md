@@ -93,7 +93,9 @@ space when you want it.
 ### Tabs
 
 - A tab group shows one window at a time. Above it, a 24 px bar replaces the strip and holds one
-  tab per window, left to right in the order they opened. The active tab is accent blue.
+  tab per window, left to right in the order they opened. The active tab is accent blue, inactive
+  tabs are outlined, and minimized ones are a dimmed blue. Tabs have no titles or icons yet; those
+  come with the Look job, so for now a tab tells you its window only by position.
 - Click a tab to switch to it. Drag a tab out (8 px or more) to untab that window: it lands in the
   nearest free space at its remembered size, or tabs into another tile after a half-second hold.
   Dropping it on another tile without the hold, or back on its own group, cancels.
@@ -109,7 +111,7 @@ space when you want it.
   Clicking a maximized app's strip also undoes it, so navi can always undo a maximize even when
   the app has no button for it.
 - **Minimize** hides the window but keeps its cells, so nothing moves into them. Its strip (or
-  bar) stays, drawn dimmed; click it to bring the window back. A minimized tab stays in the bar,
+  bar) stays, drawn in the same dimmed blue as a minimized tab; click it to bring the window back. A minimized tab stays in the bar,
   dimmed, and clicking it brings it back.
 - An app's own maximize and minimize buttons do exactly what navi's do. Hidden windows can't
   maximize or minimize, so a window nobody can see can't hide the ones they can.
