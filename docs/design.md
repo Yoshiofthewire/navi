@@ -84,17 +84,38 @@ space when you want it.
 - The strip is the 8 px gap above a window; the edges are the 4 px gaps beside and below it.
 - A click on the strip without moving (under 8 px) moves nothing.
 - Once a hold will form tabs, the preview turns more solid, so swap and tab look different.
-- A move takes the whole tab group with it.
+- Dragging a tab moves only that tab; resizing a tab group's edge resizes the group.
 - The "middle" of a tile is the inner half of it, in both directions.
 - The top edge of a tile on the monitor's top border isn't draggable; the strip owns that gap.
 - Drop a window back on itself to cancel a move. A drag also cancels, putting everything back,
   when the pointer leaves every monitor or the nested window loses focus.
 
+### Tabs
+
+- A tab group shows one window at a time. Above it, a 24 px bar replaces the strip and holds one
+  tab per window, left to right in the order they opened. The active tab is accent blue, inactive
+  tabs are outlined, and minimized ones are a dimmed blue. Tabs have no titles or icons yet; those
+  come with the Look job, so for now a tab tells you its window only by position.
+- Click a tab to switch to it. Drag a tab out (8 px or more) to untab that window: it lands in the
+  nearest free space at its remembered size, or tabs into another tile after a half-second hold.
+  Dropping it on another tile without the hold, or back on its own group, cancels.
+
 ### Window controls
 
-Apps that draw their own title bar keep it. Apps that ask the compositor to draw controls get
-minimize, maximize and close buttons inside the grab strip. **Maximize** means "cover every cell
-until clicked again," not fullscreen.
+- Apps that draw their own title bar (Konsole, Firefox) keep it. Apps that ask for server-side
+  decorations get a 24 px bar with **minimize, maximize and close** buttons on the right; the rest
+  of the bar is the grab strip. Close asks the app to close; navi never kills it.
+- **Maximize** covers the monitor's whole grid until clicked again; it isn't fullscreen. The
+  window's cells and remembered size don't change, and the other windows on that monitor hide
+  until it's undone. A new window on that monitor undoes it, so a new window is always visible.
+  Clicking a maximized app's strip also undoes it, so navi can always undo a maximize even when
+  the app has no button for it.
+- **Minimize** hides the window but keeps its cells, so nothing moves into them. Its strip (or
+  bar) stays, drawn in the same dimmed blue as a minimized tab; click it to bring the window
+  back. A minimized tab stays in the bar, dimmed, and clicking it brings it back.
+- An app's own maximize and minimize buttons do exactly what navi's do. Hidden windows can't
+  maximize or minimize, so a window nobody can see can't hide the ones they can.
+- Dialogs stay floating over their parent, hide while it's hidden, and re-centre when it moves.
 
 ## Monitors
 

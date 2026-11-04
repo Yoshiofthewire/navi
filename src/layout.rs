@@ -2,14 +2,19 @@
 
 use std::collections::HashMap;
 
+mod bar;
 mod drag;
-pub use drag::{Drag, overlay};
+pub use bar::{Decor, decoration};
+pub use drag::{Action, Done, Drag, overlay};
 
 pub const COLS: i32 = 12;
 pub const ROWS: i32 = 6;
 /// Space between tiles in logical px. Tiles are inset by half of it, and by all of it at the top,
 /// where the grab strip will go.
 pub const GAP: i32 = 8;
+/// A tab bar's height, which replaces the strip's `GAP` above tabbed and server-decorated tiles.
+/// 24 px is WCAG 2.5.8's minimum target size.
+pub const BAR: i32 = 24;
 pub const MIN_W: i32 = 320;
 pub const MIN_H: i32 = 240;
 
@@ -34,7 +39,7 @@ impl Rect {
 }
 
 /// A rectangle of whole grid cells.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Cells {
     pub col: i32,
     pub row: i32,
@@ -97,12 +102,17 @@ impl Output {
 
     /// Where the window itself goes: `cells_rect` minus the gap.
     pub fn tile_rect(&self, c: Cells) -> Rect {
+        self.window_rect(c, GAP)
+    }
+
+    /// `tile_rect` with `top` px above the window instead of `GAP`.
+    fn window_rect(&self, c: Cells, top: i32) -> Rect {
         let r = self.cells_rect(c);
         Rect {
             x: r.x + GAP / 2,
-            y: r.y + GAP,
+            y: r.y + top,
             w: (r.w - GAP).max(1),
-            h: (r.h - GAP - GAP / 2).max(1),
+            h: (r.h - top - GAP / 2).max(1),
         }
     }
 
@@ -119,12 +129,26 @@ impl Output {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Tile {
     pub id: WinId,
     pub app: String,
     pub output: String,
     pub cells: Cells,
+    /// The app asked navi to draw its controls (xdg-decoration server-side).
+    pub decorated: bool,
+    pub minimized: bool,
+    /// Set on every member of a maximized group.
+    pub maximized: bool,
+    /// When it was last placed, moved or activated; a group shows its most recent member.
+    pub stamp: u64,
+}
+
+impl Tile {
+    /// Same output and cells: tabbed together.
+    fn tabbed(&self, o: &Tile) -> bool {
+        self.output == o.output && self.cells == o.cells
+    }
 }
 
 /// What navi remembers per app ID: where it was, and the size it wants, in px.
@@ -152,6 +176,7 @@ pub struct Layout {
     tiles: Vec<Tile>,
     memory: HashMap<String, Memory>,
     next_id: WinId,
+    clock: u64,
 }
 
 impl Layout {
@@ -170,13 +195,163 @@ impl Layout {
 
     /// The window's rect in global logical px.
     pub fn rect(&self, id: WinId) -> Option<Rect> {
+        Some(self.frame(id)?.1)
+    }
+
+    /// The px of `id`'s cells (the whole grid while maximized) and of its window, which sits below
+    /// a bar if it has one.
+    fn frame(&self, id: WinId) -> Option<(Rect, Rect)> {
         let t = self.tile(id)?;
-        Some(self.output(&t.output)?.tile_rect(t.cells))
+        let o = self.output(&t.output)?;
+        let cells = match self.maximized(t) {
+            true => FULL,
+            false => t.cells,
+        };
+        let top = if self.has_bar(id) { BAR } else { GAP };
+        Some((o.cells_rect(cells), o.window_rect(cells, top)))
     }
 
     /// Closing leaves the cells empty; nothing else moves.
     pub fn remove(&mut self, id: WinId) {
         self.tiles.retain(|t| t.id != id);
+    }
+
+    /// `id` and the tiles tabbed with it, by id.
+    fn group(&self, id: WinId) -> Vec<WinId> {
+        let Some(t) = self.tile(id) else {
+            return Vec::new();
+        };
+        let mut ids: Vec<WinId> = self
+            .tiles
+            .iter()
+            .filter(|u| u.tabbed(t))
+            .map(|u| u.id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// The tile `id`'s group shows: its most recently activated member that isn't minimized,
+    /// else its most recent one.
+    pub fn active(&self, id: WinId) -> Option<WinId> {
+        let t = self.tile(id)?;
+        self.tiles
+            .iter()
+            .filter(|u| u.tabbed(t))
+            .max_by_key(|u| (!u.minimized, u.stamp))
+            .map(|u| u.id)
+    }
+
+    fn maximized(&self, t: &Tile) -> bool {
+        self.tiles.iter().any(|u| u.maximized && u.tabbed(t))
+    }
+
+    /// Another group on its output is maximized over it.
+    fn covered(&self, t: &Tile) -> bool {
+        self.tiles
+            .iter()
+            .any(|u| u.maximized && u.output == t.output && u.cells != t.cells)
+    }
+
+    pub fn is_maximized(&self, id: WinId) -> bool {
+        self.tile(id).is_some_and(|t| self.maximized(t))
+    }
+
+    /// Shown on screen: not minimized, its group's active tile, and not under a maximized group.
+    pub fn visible(&self, id: WinId) -> bool {
+        self.tile(id)
+            .is_some_and(|t| !t.minimized && self.active(id) == Some(id) && !self.covered(t))
+    }
+
+    /// Tabbed, or showing a window that wants navi's controls.
+    pub fn has_bar(&self, id: WinId) -> bool {
+        let decorated = self
+            .active(id)
+            .and_then(|a| self.tile(a))
+            .is_some_and(|a| a.decorated);
+        decorated || self.group(id).len() > 1
+    }
+
+    pub fn set_decorated(&mut self, id: WinId, on: bool) {
+        if let Some(t) = self.tile_mut(id) {
+            t.decorated = on;
+        }
+    }
+
+    fn tile_mut(&mut self, id: WinId) -> Option<&mut Tile> {
+        self.tiles.iter_mut().find(|t| t.id == id)
+    }
+
+    /// Makes `id` the most recent member of its group.
+    fn touch(&mut self, id: WinId) {
+        self.clock += 1;
+        let now = self.clock;
+        if let Some(t) = self.tile_mut(id) {
+            t.stamp = now;
+        }
+    }
+
+    fn set_maximized(&mut self, id: WinId, on: bool) {
+        let group = self.group(id);
+        for t in self.tiles.iter_mut().filter(|t| group.contains(&t.id)) {
+            t.maximized = on;
+        }
+    }
+
+    fn clear_maximized(&mut self, output: &str) {
+        for t in self.tiles.iter_mut().filter(|t| t.output == output) {
+            t.maximized = false;
+        }
+    }
+
+    /// Covers `id`'s whole output with its group, uncovering any other. The cells stay as they
+    /// are. Returns whether anything changed; a hidden or unknown `id` changes nothing.
+    pub fn maximize(&mut self, id: WinId) -> bool {
+        let Some(t) = self.tile(id).filter(|_| self.visible(id)) else {
+            return false;
+        };
+        if self.maximized(t) {
+            return false;
+        }
+        let output = t.output.clone();
+        self.clear_maximized(&output);
+        self.set_maximized(id, true);
+        true
+    }
+
+    pub fn unmaximize(&mut self, id: WinId) -> bool {
+        let changed = self.visible(id) && self.is_maximized(id);
+        if changed {
+            self.set_maximized(id, false);
+        }
+        changed
+    }
+
+    /// Hides `id`, keeping its cells, and ends its group's maximize.
+    pub fn minimize(&mut self, id: WinId) -> bool {
+        if !self.visible(id) {
+            return false;
+        }
+        self.set_maximized(id, false);
+        if let Some(t) = self.tile_mut(id) {
+            t.minimized = true;
+        }
+        true
+    }
+
+    /// Shows `id` in its group, restoring it if minimized.
+    pub fn activate(&mut self, id: WinId) -> bool {
+        let Some(t) = self.tile(id) else {
+            return false;
+        };
+        let changed = t.minimized || self.active(id) != Some(id);
+        if changed {
+            self.touch(id);
+            if let Some(t) = self.tile_mut(id) {
+                t.minimized = false;
+            }
+        }
+        changed
     }
 
     /// Places a new window of `app`, following the order in docs/design.md.
@@ -197,12 +372,16 @@ impl Layout {
 
         let id = self.next_id;
         self.next_id += 1;
+        // A new window must be visible (principle 6).
+        self.clear_maximized(&output);
         self.tiles.push(Tile {
             id,
             app: app.to_string(),
             output: output.clone(),
             cells,
+            ..Tile::default()
         });
+        self.touch(id);
         let fresh = Memory {
             output,
             cells,
@@ -387,6 +566,13 @@ impl Layout {
         Some(gap)
     }
 }
+
+const FULL: Cells = Cells {
+    col: 0,
+    row: 0,
+    cols: COLS,
+    rows: ROWS,
+};
 
 /// Every rect of `cols` x `rows` cells on the grid.
 fn spots(cols: i32, rows: i32) -> impl Iterator<Item = Cells> {

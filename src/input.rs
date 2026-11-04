@@ -13,7 +13,7 @@ use smithay::{
 use tracing::info;
 
 use crate::{
-    layout::Drag,
+    layout::{Action, Done, Drag},
     state::{Navi, px},
 };
 
@@ -111,7 +111,7 @@ impl Navi {
 
     /// A pointer button, from winit or the debug replay.
     pub fn pointer_button(&mut self, button: u32, left: bool, pressed: bool, time: u32) {
-        let (Some(pointer), Some(kb)) = (self.seat.get_pointer(), self.seat.get_keyboard()) else {
+        let Some(pointer) = self.seat.get_pointer() else {
             return;
         };
         let serial = SERIAL_COUNTER.next_serial();
@@ -119,12 +119,32 @@ impl Navi {
         if let Some(drag) = self.drag.take() {
             if left && !pressed {
                 let now = self.now_ms();
-                if let Some((what, tiles)) = drag.release(&mut self.layout, px(pos), now) {
-                    let tiles: Vec<_> = tiles.iter().map(|t| (t.id, &t.cells)).collect();
-                    info!(?tiles, "{what}");
+                let done = drag.release(&mut self.layout, px(pos), now);
+                match &done {
+                    Some(Done::Layout(what, tiles)) => {
+                        let tiles: Vec<_> = tiles.iter().map(|t| (t.id, &t.cells)).collect();
+                        info!(?tiles, "{what}");
+                    }
+                    Some(Done::Click(action, id)) => info!(id, by = "navi", "{}", action.log()),
+                    None => {}
                 }
                 // Also hands the pointer back to whatever is under it now.
                 self.apply_layout();
+                match done {
+                    // The app decides; navi never kills it.
+                    Some(Done::Click(Action::Close, id)) => {
+                        if let Some(t) = self.window_of(id).as_ref().and_then(|w| w.toplevel()) {
+                            t.send_close();
+                        }
+                    }
+                    Some(Done::Click(Action::Activate | Action::Restore, id)) => {
+                        let shown = self.window_of(id).filter(|_| self.layout.visible(id));
+                        if shown.is_some() {
+                            self.focus(shown);
+                        }
+                    }
+                    _ => {}
+                }
             } else {
                 self.drag = Some(drag);
             }
@@ -132,30 +152,16 @@ impl Navi {
         }
         if pressed && !pointer.is_grabbed() {
             let hit = self.layout.hit(px(pos));
-            // Keyboard focus follows click, in a tile's zones too.
+            // Keyboard focus follows click, in a tile's zones too, to the window shown there.
             let clicked = match hit {
                 Some(h) => self
-                    .windows
-                    .iter()
-                    .find(|m| m.tile == Some(h.id()))
-                    .map(|m| m.window.clone()),
+                    .layout
+                    .active(h.id())
+                    .filter(|&id| self.layout.visible(id))
+                    .and_then(|id| self.window_of(id)),
                 None => self.space.element_under(pos).map(|(w, _)| w.clone()),
             };
-            let focus = clicked.as_ref().and_then(|w| {
-                self.space.raise_element(w, true);
-                w.toplevel().map(|t| t.wl_surface().clone())
-            });
-            if clicked.is_none() {
-                self.space.elements().for_each(|w| {
-                    w.set_activated(false);
-                });
-            }
-            kb.set_focus(self, focus, serial);
-            self.space.elements().for_each(|w| {
-                if let Some(t) = w.toplevel() {
-                    t.send_pending_configure();
-                }
-            });
+            self.focus(clicked);
             // Other buttons go on with no pointer focus over a zone, so neither the press nor
             // its release reaches a client.
             if hit.is_some() && left {
