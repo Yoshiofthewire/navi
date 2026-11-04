@@ -57,9 +57,13 @@ These steps are tried in order. The first one that fits wins.
 2. **The nearest empty rectangle** of the remembered size on the monitor with the pointer.
 3. **Open smaller.** The nearest empty rectangle at less than the remembered size, but no
    smaller than the minimum (about 320×240 logical px, rounded up to whole cells).
-4. **Shrink the neighbours.** Tiles give back columns, largest first, until the new window fits
-   at its minimum. Tiles larger than their remembered size go first. No tile shrinks below the
-   minimum. Shrinking never changes what navi remembers for an app.
+4. **Shrink the neighbours.** The new window's target width is an equal share of the monitor's
+   columns (12 ÷ the number of tiles in that row, counting the new one), or its remembered width
+   if that is smaller, and never below the minimum. Tiles give back one column at a time, largest
+   first, until the target fits. Tiles larger than their remembered size go first. Tiles may
+   slide sideways, keeping their order, so the freed columns form one gap. No tile shrinks below
+   the minimum. Shrinking never changes what navi remembers for an app. On the ultrawide, two
+   half-width apps plus a third become 4 + 4 + 4 columns, and a fourth makes 3 + 3 + 3 + 3.
 5. **Another monitor** that has room, by monitor priority (see *Monitors*).
 6. **Tab with the nearest tile.** This happens only when every tile is already at its minimum
    (principle 3).
