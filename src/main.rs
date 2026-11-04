@@ -11,6 +11,7 @@ mod replay;
 mod screenshot;
 mod shell;
 mod state;
+mod theme;
 mod toplevels;
 mod wallpaper;
 mod winit;

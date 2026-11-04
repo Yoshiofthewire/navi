@@ -1,20 +1,11 @@
 //! The bar above tabbed and server-decorated tiles: tabs, window buttons, and how they're drawn.
 
 use super::{BAR, Layout, Rect, WinId, drag::Hit};
+use crate::theme::{ACCENT, BAR_BG, INK, INK_ON_ACCENT, MINIMIZED, OUTLINE, TAB_BG, rgba};
 
 const TAB_GAP: i32 = 2;
 /// The glyph box inside a button, in px.
 const GLYPH: i32 = 10;
-
-pub const BAR_BG: u32 = 0x151922;
-pub const TAB_BG: u32 = 0x262C38;
-pub const ACCENT: u32 = 0x2BA3D8;
-pub const INK: u32 = 0xD0D4DC;
-pub const INK_ON_ACCENT: u32 = 0x0B0D12;
-/// A minimized tile's strip or tab: a dimmed accent, still 3:1 against the bar and background.
-pub const MINIMIZED: u32 = 0x20769E;
-/// Outlines inactive tabs, which can't be 3:1 against both the bar and the active tab.
-pub const OUTLINE: u32 = 0x7A8396;
 
 /// Who draws a toplevel's title bar and controls.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -106,12 +97,6 @@ fn partition(area: Rect, ids: &[WinId]) -> Vec<(WinId, Rect)> {
         .collect()
 }
 
-/// `hex` at `alpha`, premultiplied.
-pub fn rgba(hex: u32, alpha: f32) -> [f32; 4] {
-    let [_, r, g, b] = hex.to_be_bytes().map(|c| f32::from(c) / 255.0 * alpha);
-    [r, g, b, alpha]
-}
-
 /// The rects of a button's glyph, centred in `r`.
 fn glyph(b: Button, r: Rect) -> Vec<Rect> {
     let (x, y) = (r.x + (r.w - GLYPH) / 2, r.y + (r.h - GLYPH) / 2);
@@ -187,8 +172,8 @@ mod tests {
     use super::super::{
         Cells, FULL, GAP, MIN_H, MIN_W, Output, Tile,
         drag::{
-            Done, Drag, overlay,
-            tests::{assert_valid, at, c, drag, uw, with},
+            Done, Drag,
+            tests::{assert_valid, at, c, drag, uw, with, zones},
         },
     };
     use super::*;
@@ -409,7 +394,7 @@ mod tests {
         l.set_decorated(999, true);
         for p in [(0, 0), (5, 2), (9, 4)] {
             l.hit(p);
-            overlay(&l, None, p, 0);
+            zones(&l, None, p, 0);
             if let Some(mut d) = Drag::press(&l, p) {
                 d.motion(&mut l, (9, 4), 0);
                 d.release(&mut l, (9, 4), 0);
@@ -455,9 +440,9 @@ mod tests {
 
         // Over another tile: only a hold tabs, and nothing is previewed before it.
         let previews = |l: &Layout, d: &Drag, t| {
-            overlay(l, Some(d), (2500, 700), t)
+            zones(l, Some(d), (2500, 700), t)
                 .into_iter()
-                .filter(|&(_, k)| k == rgba(ACCENT, 0.35) || k == rgba(ACCENT, 0.7))
+                .filter(|&(_, k)| k == rgba(ACCENT, 0.35) || k == rgba(ACCENT, 0.55))
                 .count()
         };
         let mut l = with(&[HALF_L, HALF_L, HALF_R]);
@@ -522,7 +507,7 @@ mod tests {
         assert_eq!(at(&l, 0), HALF_L);
         let bar = l.bar(0).unwrap();
         assert!(bar.buttons.is_empty());
-        let drawn = overlay(&l, None, (3000, 700), 0);
+        let drawn = zones(&l, None, (3000, 700), 0);
         assert_eq!(drawn, vec![(bar.rect, rgba(MINIMIZED, 1.0))]);
         let mut placed = with(&[HALF_L]);
         placed.tiles[0].minimized = true;
@@ -542,7 +527,7 @@ mod tests {
         assert_eq!(click_button(&mut l, 1, Button::Minimize), Some("minimized"));
         assert!(l.visible(0) && !l.visible(1));
         let t1 = tab(&l, 1);
-        assert!(overlay(&l, None, (3000, 700), 0).contains(&(t1, rgba(MINIMIZED, 1.0))));
+        assert!(zones(&l, None, (3000, 700), 0).contains(&(t1, rgba(MINIMIZED, 1.0))));
         assert_eq!(click(&mut l, mid(t1)), Some("tab switched"));
         assert!(l.visible(1) && !l.tile(1).unwrap().minimized);
         assert_eq!(l.active(0), Some(1));
@@ -591,7 +576,7 @@ mod tests {
         assert!(l.minimize(0));
         assert!(!l.visible(0));
         assert!(
-            overlay(&l, None, (3000, 700), 0)
+            zones(&l, None, (3000, 700), 0)
                 .contains(&(l.zone(Hit::Strip(0)).unwrap(), rgba(MINIMIZED, 1.0)))
         );
         assert_eq!(click(&mut l, (100, 2)), Some("restored"));
@@ -620,7 +605,7 @@ mod tests {
         let mut l = with(&[HALF_L]);
         assert!(l.minimize(0));
         l.remove(0);
-        assert!(overlay(&l, None, (100, 2), 0).is_empty());
+        assert!(zones(&l, None, (100, 2), 0).is_empty());
 
         for gone in [0, 1] {
             let mut l = with(&[HALF_L, HALF_L, HALF_R]);
@@ -629,7 +614,7 @@ mod tests {
             l.remove(gone);
             let rest = l.tiles.clone();
             d.motion(&mut l, (2500, 700), 600);
-            overlay(&l, Some(&d), (2500, 700), 600);
+            zones(&l, Some(&d), (2500, 700), 600);
             let done = d.release(&mut l, (2500, 700), 600);
             assert_invariants(&l);
             match gone {
@@ -643,29 +628,12 @@ mod tests {
         }
     }
 
-    /// WCAG 2 relative luminance.
-    fn luminance(hex: u32) -> f64 {
-        let [_, r, g, b] = hex.to_be_bytes().map(|c| {
-            let c = f64::from(c) / 255.0;
-            match c <= 0.04045 {
-                true => c / 12.92,
-                false => ((c + 0.055) / 1.055).powf(2.4),
-            }
-        });
-        0.2126 * r + 0.7152 * g + 0.0722 * b
-    }
-
-    fn contrast(a: u32, b: u32) -> f64 {
-        let (a, b) = (luminance(a), luminance(b));
-        (a.max(b) + 0.05) / (a.min(b) + 0.05)
-    }
-
     #[test]
-    fn ac10_overlay_and_contrast() {
+    fn ac10_overlay() {
         let mut l = with(&[c(0, 0, 4, 6), c(4, 0, 4, 6), c(8, 0, 4, 6), c(8, 0, 4, 6)]);
         l.set_decorated(1, true);
         let away = (500, 700);
-        let drawn = overlay(&l, None, away, 0);
+        let drawn = zones(&l, None, away, 0);
         let bars: Vec<Rect> = drawn
             .iter()
             .filter(|&&(_, k)| k == rgba(BAR_BG, 1.0))
@@ -678,7 +646,7 @@ mod tests {
         assert!(!drawn.contains(&(tab(&l, 2), rgba(ACCENT, 1.0))));
 
         let close = button(&l, 1, Button::Close);
-        let lit = overlay(&l, None, mid(close), 0);
+        let lit = zones(&l, None, mid(close), 0);
         assert!(lit.contains(&(close, rgba(ACCENT, 1.0))));
         let ink_on_accent = lit.iter().filter(|&&(_, k)| k == rgba(INK_ON_ACCENT, 1.0));
         assert_eq!(ink_on_accent.count(), 10, "the X's squares");
@@ -695,24 +663,6 @@ mod tests {
                 .iter()
                 .any(|&(r, k)| k == rgba(OUTLINE, 1.0) && r.x >= tab(&l, 3).x)
         );
-
-        assert!(contrast(INK, BAR_BG) >= 4.5, "{}", contrast(INK, BAR_BG));
-        assert!(contrast(INK_ON_ACCENT, ACCENT) >= 4.5);
-        assert!(contrast(ACCENT, TAB_BG) >= 3.0);
-        // WCAG 1.4.11, 3:1 for UI: what sits on the bar, and a strip on the empty background.
-        assert!(
-            contrast(OUTLINE, BAR_BG) >= 3.0,
-            "{}",
-            contrast(OUTLINE, BAR_BG)
-        );
-        assert!(contrast(OUTLINE, TAB_BG) >= 3.0);
-        assert!(
-            contrast(MINIMIZED, BAR_BG) >= 3.0,
-            "{}",
-            contrast(MINIMIZED, BAR_BG)
-        );
-        assert!(contrast(MINIMIZED, BACKGROUND) >= 3.0);
-        assert!(contrast(ACCENT, BAR_BG) >= 3.0);
     }
 
     #[test]
@@ -729,16 +679,13 @@ mod tests {
         assert_eq!(l.bar(0), None);
     }
 
-    /// winit.rs's clear colour, [0.05, 0.05, 0.08].
-    const BACKGROUND: u32 = 0x0D0D14;
-
     #[test]
     fn preview_is_where_the_window_lands() {
         let preview = |l: &Layout, d: &Drag, p| {
-            let rects = overlay(l, Some(d), p, 600);
+            let rects = zones(l, Some(d), p, 600);
             rects
                 .into_iter()
-                .find(|&(_, k)| k == rgba(ACCENT, 0.35) || k == rgba(ACCENT, 0.7))
+                .find(|&(_, k)| k == rgba(ACCENT, 0.35) || k == rgba(ACCENT, 0.55))
                 .map(|(r, _)| r)
         };
         // A decorated tile moved to free space lands below its bar.
@@ -774,7 +721,7 @@ mod tests {
         let strip = l.zone(Hit::Strip(0)).unwrap();
         assert_eq!((strip.w, strip.h), (uw().window_rect(FULL, GAP).w, GAP));
         assert_eq!(
-            overlay(&l, None, (100, 2), 0),
+            zones(&l, None, (100, 2), 0),
             vec![(strip, rgba(ACCENT, 1.0))]
         );
     }

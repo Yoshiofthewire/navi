@@ -28,11 +28,9 @@ use smithay::{
 };
 use tracing::warn;
 
-use crate::{CalloopData, layout, screenshot::Screenshot, state::Navi, wallpaper};
+use crate::{CalloopData, layout, screenshot::Screenshot, state::Navi, theme, wallpaper};
 
 const NAME: &str = "winit";
-/// `#0B0D12`, the design's near-black: shown where there is no wallpaper.
-const CLEAR: [f32; 4] = [11.0 / 255.0, 13.0 / 255.0, 18.0 / 255.0, 1.0];
 
 render_elements! {
     /// Everything on screen, top first.
@@ -117,6 +115,7 @@ pub fn init(
                         state.drag.as_ref(),
                         state.pointer_px(),
                         state.now_ms(),
+                        state.focused_tile(),
                     )
                     .into_iter()
                     .map(|(r, color)| {
@@ -150,7 +149,7 @@ pub fn init(
                                 &mut framebuffer,
                                 0,
                                 &elements,
-                                CLEAR,
+                                theme::rgba(theme::BG, 1.0),
                             );
                             if let Err(e) = rendered {
                                 warn!("render failed: {e:?}");

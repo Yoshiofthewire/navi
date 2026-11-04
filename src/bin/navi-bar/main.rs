@@ -7,6 +7,8 @@
 mod files;
 #[path = "../../image.rs"]
 mod image;
+#[path = "../../theme.rs"]
+mod theme;
 
 mod desktop;
 mod exec;
@@ -67,8 +69,9 @@ use tracing::{error, info, warn};
 
 use desktop::Entry;
 use icons::{Icons, Themes};
-use layout::{BAR_H, DIM, INK, IconOf, Item, Layout, Rect, Slot};
+use layout::{BAR_H, IconOf, Item, Layout, Rect, Slot};
 use menu::Menu;
+use theme::{DIM, INK};
 
 const BTN_LEFT: u32 = 0x110;
 const TEXT_PX: f32 = 15.0;
