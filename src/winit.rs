@@ -80,6 +80,7 @@ pub fn init(
                     state.apply_layout();
                 }
                 WinitEvent::Input(event) => state.process_input_event(event),
+                WinitEvent::Focus(false) => state.cancel_drag(),
                 WinitEvent::Redraw => {
                     let size = backend.window_size();
                     let damage = Rectangle::from_size(size);

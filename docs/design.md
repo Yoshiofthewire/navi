@@ -87,7 +87,8 @@ space when you want it.
 - A move takes the whole tab group with it.
 - The "middle" of a tile is the inner half of it, in both directions.
 - The top edge of a tile on the monitor's top border isn't draggable; the strip owns that gap.
-- Drop a window back on itself to cancel a move.
+- Drop a window back on itself to cancel a move. A drag also cancels, putting everything back,
+  when the pointer leaves every monitor or the nested window loses focus.
 
 ### Window controls
 
@@ -189,6 +190,10 @@ session.
 - **Screenshots for testing:** `NAVI_SCREENSHOT=<path>` in navi's own environment writes its
   rendered frame there as a PNG (mode 0600), on the first frame and then once a second. Unset, it
   costs nothing. No client or config can turn it on.
+- **Input replay for testing (debug builds only):** `NAVI_INPUT_REPLAY=<file>` plays a pointer
+  script through the same handlers as real input: one step per line, `wait <ms>`,
+  `move <x> <y>` (global logical px), `press`, `release` (left button), `#` comments. A bad line
+  logs one error and nothing is replayed. Release builds don't contain it.
 - The shell (taskbar, corners, launcher) runs as separate `layer-shell` clients, so a taskbar
   crash can't take your windows down.
 

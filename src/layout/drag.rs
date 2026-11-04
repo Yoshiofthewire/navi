@@ -86,6 +86,20 @@ impl Layout {
         })
     }
 
+    /// Puts the tiles still here back in their `before` cells. Returns whether any moved.
+    fn restore(&mut self, before: &[Tile]) -> bool {
+        let mut changed = false;
+        for t in &mut self.tiles {
+            if let Some(b) = before.iter().find(|b| b.id == t.id)
+                && b.cells != t.cells
+            {
+                t.cells = b.cells;
+                changed = true;
+            }
+        }
+        changed
+    }
+
     /// `id` and the tiles tabbed with it: same output, same cells.
     fn group(&self, id: WinId) -> Vec<WinId> {
         let Some(t) = self.tile(id) else {
@@ -401,15 +415,7 @@ impl Drag {
             },
             State::Resize(r) if l.tile(r.id).is_none() => {
                 // Undo, so a window closing mid-drag leaves the rest as they were.
-                let mut changed = false;
-                for t in &mut l.tiles {
-                    if let Some(b) = r.before.iter().find(|b| b.id == t.id)
-                        && b.cells != t.cells
-                    {
-                        t.cells = b.cells;
-                        changed = true;
-                    }
-                }
+                let changed = l.restore(&r.before);
                 self.0 = State::Cancelled;
                 return changed;
             }
@@ -417,6 +423,14 @@ impl Drag {
             _ => {}
         }
         false
+    }
+
+    /// Ends the drag without a drop: a resize puts every tile back. Returns whether cells changed.
+    pub fn cancel(self, l: &mut Layout) -> bool {
+        match self.0 {
+            State::Resize(r) => l.restore(&r.before),
+            _ => false,
+        }
     }
 
     /// Ends the drag at `p`. Returns what happened and the tiles that changed, `None` if nothing
@@ -903,6 +917,25 @@ mod tests {
         d.motion(&mut l, A_STRIP, 0);
         assert!(overlay(&l, Some(&d), A_STRIP, 0).is_empty());
         assert!(d.release(&mut l, B_RIM, 0).is_none());
+    }
+
+    #[test]
+    fn cancel_puts_everything_back() {
+        // A resize mid-way: both tiles return to where they were.
+        let mut l = halves();
+        let tiles = l.tiles.clone();
+        let mut d = Drag::press(&l, (1714, 700)).unwrap();
+        d.motion(&mut l, col(9), 0);
+        assert_eq!(at(&l, 1), c(9, 0, 3, 6));
+        assert!(d.cancel(&mut l));
+        assert_eq!(l.tiles, tiles);
+
+        // A move changes nothing until the drop, so cancelling one changes nothing.
+        let memory = l.memory.clone();
+        let mut d = Drag::press(&l, A_STRIP).unwrap();
+        d.motion(&mut l, B_MIDDLE, 0);
+        assert!(!d.cancel(&mut l));
+        assert_eq!((l.tiles.clone(), l.memory.clone()), (tiles, memory));
     }
 
     #[test]

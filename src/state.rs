@@ -6,7 +6,10 @@ use smithay::{
         PopupKind, PopupManager, Space, Window, WindowSurfaceType, find_popup_root_surface,
         get_popup_toplevel_coords,
     },
-    input::{Seat, SeatHandler, SeatState, pointer::CursorImageStatus},
+    input::{
+        Seat, SeatHandler, SeatState,
+        pointer::{CursorImageStatus, MotionEvent},
+    },
     reexports::{
         calloop::LoopSignal,
         wayland_protocols::xdg::shell::server::xdg_toplevel,
@@ -139,6 +142,29 @@ impl Navi {
                 toplevel.send_pending_configure();
             }
             self.space.map_element(m.window.clone(), (r.x, r.y), false);
+        }
+        // Tiles moved: refocus a still pointer, so a click can't land in the window that left.
+        if let Some(pointer) = self.seat.get_pointer() {
+            let pos = pointer.current_location();
+            let under = self.pointer_focus(pos);
+            let motion = MotionEvent {
+                location: pos,
+                serial: SERIAL_COUNTER.next_serial(),
+                time: self.now_ms() as u32,
+            };
+            pointer.motion(self, under, &motion);
+            pointer.frame(self);
+        }
+    }
+
+    /// What gets pointer focus at `pos`: nothing over navi's zones or during a drag.
+    pub fn pointer_focus(
+        &self,
+        pos: Point<f64, Logical>,
+    ) -> Option<(WlSurface, Point<f64, Logical>)> {
+        match self.drag.is_some() || self.layout.hit(px(pos)).is_some() {
+            true => None,
+            false => self.surface_under(pos),
         }
     }
 

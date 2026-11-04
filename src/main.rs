@@ -2,6 +2,8 @@
 
 mod input;
 mod layout;
+#[cfg(debug_assertions)]
+mod replay;
 mod screenshot;
 mod state;
 mod winit;
@@ -57,6 +59,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut data = CalloopData { state, display };
     winit::init(&mut event_loop, &mut data)?;
+    #[cfg(debug_assertions)]
+    replay::start(&event_loop.handle());
     event_loop.run(None, &mut data, |_| {})?;
     Ok(())
 }
