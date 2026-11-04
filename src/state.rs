@@ -413,6 +413,13 @@ impl Navi {
             .tile
     }
 
+    /// The tile whose window holds the keyboard; `None` while a layer surface, a dialog or
+    /// nothing does.
+    pub fn focused_tile(&self) -> Option<WinId> {
+        let focus = self.seat.get_keyboard()?.current_focus()?;
+        self.tile_of(&focus)
+    }
+
     /// The output layer surfaces go on when they name none: the main one, priority 0.
     fn main_output(&self) -> Option<Output> {
         let priority = |o: &&Output| {

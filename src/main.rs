@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod activation;
+mod cursor;
 mod files;
 mod image;
 mod input;
@@ -11,6 +12,7 @@ mod replay;
 mod screenshot;
 mod shell;
 mod state;
+mod theme;
 mod toplevels;
 mod wallpaper;
 mod winit;
@@ -66,9 +68,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     let mut data = CalloopData { state, display };
-    winit::init(&mut event_loop, &mut data)?;
+    let cursor = cursor::from_env(1.0);
+    let theme = cursor
+        .as_ref()
+        .map(|c| (c.theme.clone(), cursor::SIZE.round() as u32));
+    winit::init(&mut event_loop, &mut data, cursor)?;
     // After the first output exists, so the bar lands on it.
-    shell::start_bar(&mut data.state.display_handle, &socket_name);
+    shell::start_bar(&mut data.state.display_handle, &socket_name, theme);
     #[cfg(debug_assertions)]
     replay::start(&event_loop.handle());
     event_loop.run(None, &mut data, |_| {})?;

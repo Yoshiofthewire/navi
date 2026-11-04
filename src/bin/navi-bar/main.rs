@@ -7,33 +7,40 @@
 mod files;
 #[path = "../../image.rs"]
 mod image;
+#[path = "../../theme.rs"]
+mod theme;
 
+mod cards;
+mod dbus;
 mod desktop;
 mod exec;
 mod font;
 mod icons;
 mod layout;
 mod menu;
+mod notify;
+mod status;
 #[cfg(test)]
 mod testutil;
 
 use std::fs::File;
 use std::os::fd::AsFd;
 use std::os::unix::{net::UnixStream, process::CommandExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use resvg::tiny_skia::{self, Color, Paint, Pixmap, PixmapPaint, PremultipliedColorU8, Transform};
 use smithay_client_toolkit::{
     activation::{ActivationHandler, ActivationState, RequestData, RequestDataExt},
-    compositor::{CompositorHandler, CompositorState},
+    compositor::{CompositorHandler, CompositorState, Region},
     delegate_activation, delegate_compositor, delegate_keyboard, delegate_layer, delegate_output,
     delegate_pointer, delegate_registry, delegate_seat, delegate_shm,
     output::{OutputHandler, OutputState},
     reexports::{
         calloop::{
             EventLoop, LoopHandle,
+            channel::{self, Channel},
             timer::{TimeoutAction, Timer},
         },
         calloop_wayland_source::WaylandSource,
@@ -63,17 +70,27 @@ use smithay_client_toolkit::{
     },
     shm::{Shm, ShmHandler, slot::SlotPool},
 };
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
+use cards::Card;
+use dbus::Call;
 use desktop::Entry;
 use icons::{Icons, Themes};
-use layout::{BAR_H, DIM, INK, IconOf, Item, Layout, Rect, Slot};
+use layout::{BAR_H, IconOf, Item, Layout, Rect, Slot};
 use menu::Menu;
+use notify::{Closed, Notes};
+use theme::{BG, DIM, INK};
 
 const BTN_LEFT: u32 = 0x110;
 const TEXT_PX: f32 = 15.0;
 /// How long a launch waits for its activation token.
 const TOKEN_WAIT: Duration = Duration::from_secs(1);
+/// The status band across the top of the main output.
+const BAND_H: i32 = 24;
+/// Between the status text and the band's right edge, and the cards and the output's edges.
+const EDGE: i32 = 8;
+const BAND_ALPHA: f32 = 0.85;
+const POWER: &str = "/sys/class/power_supply";
 
 fn main() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -130,6 +147,18 @@ fn run() -> Result<(), String> {
     layer.set_size(l.w as u32, l.h as u32);
     layer.commit();
 
+    // Takes no clicks: its input region is empty.
+    let surface = compositor.create_surface(&qh);
+    let band =
+        layer_shell.create_layer_surface(&qh, surface, Layer::Top, Some("navi-status"), None);
+    band.set_anchor(Anchor::TOP | Anchor::LEFT | Anchor::RIGHT);
+    band.set_size(0, BAND_H as u32);
+    band.set_exclusive_zone(BAND_H);
+    band.set_keyboard_interactivity(KeyboardInteractivity::None);
+    let none = Region::new(&compositor).map_err(|e| e.to_string())?;
+    band.wl_surface().set_input_region(Some(none.wl_region()));
+    band.commit();
+
     let mut event_loop: EventLoop<Bar> = EventLoop::try_new().map_err(|e| e.to_string())?;
     let var = std::env::var_os;
     let data_dirs = desktop::data_dirs(
@@ -147,7 +176,37 @@ fn run() -> Result<(), String> {
     if font.is_none() {
         warn!("no font found: menu rows show icons only");
     }
+    let (tx, rx): (_, Channel<Call>) = channel::channel();
+    event_loop
+        .handle()
+        .insert_source(rx, |event, _, bar| {
+            if let channel::Event::Msg(call) = event {
+                bar.call(call);
+            }
+        })
+        .map_err(|e| e.to_string())?;
+    let tick = Timer::from_duration(status::next_tick(&jiff::Zoned::now()));
+    event_loop
+        .handle()
+        .insert_source(tick, |_, _, bar| {
+            bar.refresh_status();
+            TimeoutAction::ToDuration(status::next_tick(&jiff::Zoned::now()))
+        })
+        .map_err(|e| e.to_string())?;
     let mut bar = Bar {
+        dbus: dbus::serve(tx),
+        notes: Notes::default(),
+        start: Instant::now(),
+        band,
+        band_w: 0,
+        status: String::new(),
+        cards_layer: None,
+        cards_size: (0, 0),
+        cards_configured: false,
+        cards: Vec::new(),
+        compositor,
+        layer_shell,
+        qh: qh.clone(),
         registry: RegistryState::new(&globals),
         seat_state: SeatState::new(&globals, &qh),
         output_state: OutputState::new(&globals, &qh),
@@ -173,6 +232,7 @@ fn run() -> Result<(), String> {
         pending: Vec::new(),
         closed: false,
     };
+    bar.refresh_status();
     WaylandSource::new(conn, queue)
         .insert(event_loop.handle())
         .map_err(|e| e.to_string())?;
@@ -195,6 +255,23 @@ struct Win {
 }
 
 struct Bar {
+    qh: QueueHandle<Bar>,
+    compositor: CompositorState,
+    layer_shell: LayerShell,
+    /// The status band and its width, 0 until configured.
+    band: LayerSurface,
+    band_w: i32,
+    status: String,
+    /// The notification cards' surface, while any are shown.
+    cards_layer: Option<LayerSurface>,
+    cards_size: (i32, i32),
+    cards_configured: bool,
+    cards: Vec<Card>,
+    notes: Notes,
+    /// The bus connection, while serving notifications.
+    dbus: Option<zbus::blocking::Connection>,
+    /// The notifications' clock.
+    start: Instant,
     registry: RegistryState,
     seat_state: SeatState,
     output_state: OutputState,
@@ -396,7 +473,7 @@ impl Bar {
         let items = l.draw(&slots, query, &rows, scroll);
         for item in items {
             match item {
-                Item::Fill(r, rgb) => fill(&mut canvas, scaled(r, s), rgb),
+                Item::Fill(..) | Item::Text(..) => paint(&mut canvas, self.font.as_ref(), item, s),
                 Item::Icon(of, r, alpha) => {
                     let r = scaled(r, s);
                     let size = r.w as u32;
@@ -426,12 +503,6 @@ impl Bar {
                         None => placeholder(&mut canvas, r),
                     }
                 }
-                Item::Text(text, r, rgb) => {
-                    if let Some(font) = &self.font {
-                        let px = TEXT_PX * s as f32;
-                        draw_text(&mut canvas, font, &text, scaled(r, s), px, rgb);
-                    }
-                }
                 Item::Field(query, r) => {
                     let r = scaled(r, s);
                     let px = TEXT_PX * s as f32;
@@ -447,7 +518,7 @@ impl Bar {
                         w: s,
                         h,
                     };
-                    fill(&mut canvas, caret, INK);
+                    fill(&mut canvas, caret, INK, 1.0);
                     if let (Some(font), true) = (&self.font, query.is_empty()) {
                         let rest = Rect {
                             x: caret.x + 4 * s,
@@ -459,26 +530,188 @@ impl Bar {
                 }
             }
         }
-        let (w, h) = (canvas.width() as i32, canvas.height() as i32);
-        let (buffer, data) = match self
-            .pool
-            .create_buffer(w, h, w * 4, wl_shm::Format::Argb8888)
-        {
-            Ok(b) => b,
-            Err(e) => return warn!("no buffer: {e}"),
-        };
-        // Premultiplied RGBA to little-endian ARGB, which is BGRA in memory.
-        for (d, p) in data.as_chunks_mut::<4>().0.iter_mut().zip(canvas.pixels()) {
-            *d = [p.blue(), p.green(), p.red(), p.alpha()];
-        }
-        let surface = self.layer.wl_surface();
-        surface.set_buffer_scale(s);
-        surface.damage_buffer(0, 0, w, h);
-        if let Err(e) = buffer.attach_to(surface) {
-            return warn!("attach: {e}");
-        }
-        self.layer.commit();
+        present(&mut self.pool, &self.layer, &canvas, s);
     }
+
+    fn now_ms(&self) -> u64 {
+        self.start.elapsed().as_millis() as u64
+    }
+
+    fn refresh_status(&mut self) {
+        let status = status::format(&jiff::Zoned::now(), status::battery(Path::new(POWER)));
+        if status != self.status {
+            self.status = status;
+            self.draw_band();
+        }
+    }
+
+    /// The status text flush right on a dim box just big enough for it; the rest transparent.
+    fn draw_band(&mut self) {
+        let s = self.scale.max(1);
+        let Some(mut canvas) = Pixmap::new((self.band_w * s) as u32, (BAND_H * s) as u32) else {
+            return;
+        };
+        if let Some(font) = &self.font {
+            let w = text_w(font, &self.status, TEXT_PX).ceil() as i32 + 2 * EDGE;
+            let r = Rect {
+                x: self.band_w - w,
+                y: 0,
+                w,
+                h: BAND_H,
+            };
+            fill(&mut canvas, scaled(r, s), BG, BAND_ALPHA);
+            let text = Rect {
+                x: r.x + EDGE,
+                w: r.w - EDGE,
+                ..r
+            };
+            let item = Item::Text(self.status.clone(), text, INK);
+            paint(&mut canvas, Some(font), item, s);
+        }
+        present(&mut self.pool, &self.band, &canvas, s);
+    }
+
+    fn call(&mut self, call: Call) {
+        let now = self.now_ms();
+        match call {
+            Call::Notify(sender, r, reply) => {
+                let (id, closed) = self.notes.notify(now, &sender, &r);
+                let _ = reply.send(id);
+                let Some(closed) = closed else {
+                    return debug!(id, sender, "notification rate limited");
+                };
+                let lens = (r.app_name.len(), r.summary.len(), r.body.len());
+                info!(id, sender, ?lens, "notification");
+                self.emit(closed);
+                let at = self.notes.shown().iter().find(|n| n.id == id);
+                let wait = Duration::from_millis(at.map_or(0, |n| n.expires_ms - now));
+                let timer =
+                    self.loop_handle
+                        .insert_source(Timer::from_duration(wait), |_, _, bar| {
+                            let closed = bar.notes.expire(bar.now_ms());
+                            if !closed.is_empty() {
+                                bar.emit(closed);
+                            }
+                            TimeoutAction::Drop
+                        });
+                if let Err(e) = timer {
+                    warn!("notification timer: {e}");
+                }
+            }
+            Call::Close(sender, id) => {
+                let closed = self.notes.close(&sender, id);
+                self.emit(closed.into_iter().collect());
+            }
+        }
+    }
+
+    /// Sends `NotificationClosed` for each, and shows what is left.
+    fn emit(&mut self, closed: Vec<Closed>) {
+        if let Some(conn) = &self.dbus {
+            for c in closed {
+                dbus::emit(conn, c);
+            }
+        }
+        self.show_cards();
+    }
+
+    /// Lays out the shown notifications, creating, resizing or destroying their surface.
+    fn show_cards(&mut self) {
+        let font = self.font.as_ref();
+        let advance = |c: char| match font {
+            Some(f) => (f.lookup_glyph_index(c) != 0).then(|| f.metrics(c, TEXT_PX).advance_width),
+            None => Some(TEXT_PX / 2.0),
+        };
+        let cards = cards::layout(self.notes.shown(), &advance);
+        if cards == self.cards && self.cards_layer.is_some() {
+            return;
+        }
+        self.cards = cards;
+        if self.cards.is_empty() {
+            // Dropping it destroys the surface.
+            self.cards_layer = None;
+            return;
+        }
+        let size = cards::size(&self.cards);
+        let layer = match &self.cards_layer {
+            Some(l) if size == self.cards_size => return self.draw_cards(),
+            Some(l) => l.clone(),
+            None => {
+                let qh = &self.qh;
+                let surface = self.compositor.create_surface(qh);
+                let ns = Some("navi-notifications");
+                let l = self
+                    .layer_shell
+                    .create_layer_surface(qh, surface, Layer::Top, ns, None);
+                l.set_anchor(Anchor::TOP | Anchor::LEFT);
+                l.set_margin(EDGE, 0, 0, EDGE);
+                l.set_exclusive_zone(0);
+                l.set_keyboard_interactivity(KeyboardInteractivity::None);
+                self.cards_configured = false;
+                self.cards_layer = Some(l.clone());
+                l
+            }
+        };
+        self.cards_size = size;
+        layer.set_size(size.0 as u32, size.1 as u32);
+        // Drawn on the configure that follows.
+        layer.commit();
+    }
+
+    fn draw_cards(&mut self) {
+        let (Some(layer), true) = (&self.cards_layer, self.cards_configured) else {
+            return;
+        };
+        let s = self.scale.max(1);
+        let (w, h) = self.cards_size;
+        let Some(mut canvas) = Pixmap::new((w * s) as u32, (h * s) as u32) else {
+            return;
+        };
+        for item in cards::draw(&self.cards) {
+            paint(&mut canvas, self.font.as_ref(), item, s);
+        }
+        present(&mut self.pool, layer, &canvas, s);
+    }
+}
+
+/// Draws `canvas` on `layer`'s surface at buffer scale `s`.
+fn present(pool: &mut SlotPool, layer: &LayerSurface, canvas: &Pixmap, s: i32) {
+    let (w, h) = (canvas.width() as i32, canvas.height() as i32);
+    let (buffer, data) = match pool.create_buffer(w, h, w * 4, wl_shm::Format::Argb8888) {
+        Ok(b) => b,
+        Err(e) => return warn!("no buffer: {e}"),
+    };
+    // Premultiplied RGBA to little-endian ARGB, which is BGRA in memory.
+    for (d, p) in data.as_chunks_mut::<4>().0.iter_mut().zip(canvas.pixels()) {
+        *d = [p.blue(), p.green(), p.red(), p.alpha()];
+    }
+    let surface = layer.wl_surface();
+    surface.set_buffer_scale(s);
+    surface.damage_buffer(0, 0, w, h);
+    if let Err(e) = buffer.attach_to(surface) {
+        return warn!("attach: {e}");
+    }
+    layer.commit();
+}
+
+/// A fill or a line of text; other items are the taskbar's.
+fn paint(canvas: &mut Pixmap, font: Option<&fontdue::Font>, item: Item, s: i32) {
+    match item {
+        Item::Fill(r, rgb) => fill(canvas, scaled(r, s), rgb, 1.0),
+        Item::Text(text, r, rgb) => {
+            if let Some(font) = font {
+                draw_text(canvas, font, &text, scaled(r, s), TEXT_PX * s as f32, rgb);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn text_w(font: &fontdue::Font, text: &str, px: f32) -> f32 {
+    text.chars()
+        .filter(|&c| font.lookup_glyph_index(c) != 0)
+        .map(|c| font.metrics(c, px).advance_width)
+        .sum()
 }
 
 fn scaled(r: Rect, s: i32) -> Rect {
@@ -497,13 +730,13 @@ fn color(rgb: u32, alpha: f32) -> Color {
     c
 }
 
-fn fill(canvas: &mut Pixmap, r: Rect, rgb: u32) {
+fn fill(canvas: &mut Pixmap, r: Rect, rgb: u32, alpha: f32) {
     let Some(rect) = tiny_skia::Rect::from_xywh(r.x as f32, r.y as f32, r.w as f32, r.h as f32)
     else {
         return;
     };
     let mut paint = Paint::default();
-    paint.set_color(color(rgb, 1.0));
+    paint.set_color(color(rgb, alpha));
     canvas.fill_rect(rect, &paint, Transform::identity(), None);
 }
 
@@ -516,7 +749,7 @@ fn placeholder(canvas: &mut Pixmap, r: Rect) {
         (r.x + i, r.y + i, 2, r.h - 2 * i),
         (r.x + r.w - i - 2, r.y + i, 2, r.h - 2 * i),
     ] {
-        fill(canvas, Rect { x, y, w, h }, DIM);
+        fill(canvas, Rect { x, y, w, h }, DIM, 1.0);
     }
 }
 
@@ -678,21 +911,35 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for Bar {
 }
 
 impl LayerShellHandler for Bar {
-    fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &LayerSurface) {
-        warn!("layer surface closed by navi");
-        self.closed = true;
+    fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, layer: &LayerSurface) {
+        if layer == &self.layer {
+            warn!("layer surface closed by navi");
+            self.closed = true;
+        } else if self.cards_layer.as_ref() == Some(layer) {
+            // The next notification makes a new one.
+            self.cards_layer = None;
+            self.cards.clear();
+        }
     }
 
     fn configure(
         &mut self,
         _: &Connection,
         _: &QueueHandle<Self>,
-        _: &LayerSurface,
-        _: LayerSurfaceConfigure,
+        layer: &LayerSurface,
+        configure: LayerSurfaceConfigure,
         _: u32,
     ) {
-        self.configured = true;
-        self.draw();
+        if layer == &self.layer {
+            self.configured = true;
+            self.draw();
+        } else if layer == &self.band {
+            self.band_w = configure.new_size.0 as i32;
+            self.draw_band();
+        } else if self.cards_layer.as_ref() == Some(layer) {
+            self.cards_configured = true;
+            self.draw_cards();
+        }
     }
 }
 
@@ -707,6 +954,8 @@ impl CompositorHandler for Bar {
         if factor != self.scale {
             self.scale = factor;
             self.draw();
+            self.draw_band();
+            self.draw_cards();
         }
     }
 
@@ -863,6 +1112,19 @@ impl PointerHandler for Bar {
         events: &[PointerEvent],
     ) {
         for e in events {
+            let on_cards = self.cards_layer.as_ref().map(|l| l.wl_surface()) == Some(&e.surface);
+            if on_cards {
+                if let PointerEventKind::Press {
+                    button: BTN_LEFT, ..
+                } = e.kind
+                {
+                    let (x, y) = (e.position.0 as i32, e.position.1 as i32);
+                    let dismissed =
+                        cards::hit(&self.cards, x, y).and_then(|id| self.notes.dismiss(id));
+                    self.emit(dismissed.into_iter().collect());
+                }
+                continue;
+            }
             if &e.surface != self.layer.wl_surface() {
                 continue;
             }

@@ -2,6 +2,7 @@
 //! anchored to the bottom edge only, so navi centres it on the output.
 
 use crate::menu::ROWS;
+use crate::theme::{ACCENT, BG, DIM, INK, SELECTED};
 
 pub const BAR_H: i32 = 48;
 /// A slot per icon: the button, then one per window.
@@ -16,12 +17,6 @@ pub const ROW_H: i32 = 32;
 pub const ROW_ICON: i32 = 24;
 pub const PANEL_H: i32 = PAD + SEARCH_H + ROWS as i32 * ROW_H + PAD;
 
-pub const BG: u32 = 0x0B0D12;
-pub const SELECTED: u32 = 0x262C38;
-pub const ACCENT: u32 = 0x2BA3D8;
-pub const INK: u32 = 0xD0D4DC;
-/// Placeholder text and missing icons: 5:1 on `BG`.
-pub const DIM: u32 = 0x7A8396;
 pub const MINIMIZED_ALPHA: f32 = 0.45;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

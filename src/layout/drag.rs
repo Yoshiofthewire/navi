@@ -2,9 +2,10 @@
 
 use super::{
     COLS, Cells, GAP, Layout, MIN_H, MIN_W, Memory, Output, ROWS, Rect, Tile, WinId,
-    bar::{self, ACCENT, Button, MINIMIZED},
+    bar::{self, Button},
     dist2,
 };
+use crate::theme::{ACCENT, MINIMIZED, rgba};
 
 /// A press on a strip becomes a move once the pointer travels this far, in px.
 const ARM_PX: u64 = 8;
@@ -13,7 +14,12 @@ const HOLD_MS: u64 = 500;
 const GRID_ALPHA: f32 = 0.2;
 const PREVIEW_ALPHA: f32 = 0.35;
 /// Once a hold over a tile's middle will tab, the preview turns this solid.
-const TAB_ALPHA: f32 = 0.7;
+const TAB_ALPHA: f32 = 0.55;
+/// The frame around the window with the keyboard, in px, at full accent.
+const FOCUS_PX: i32 = 2;
+/// The frame around every other shown tile, so the gaps read as dim neon lines.
+const IDLE_PX: i32 = 1;
+const IDLE_ALPHA: f32 = 0.3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Side {
@@ -338,7 +344,7 @@ fn middle(r: Rect) -> Rect {
 }
 
 fn accent(alpha: f32) -> [f32; 4] {
-    bar::rgba(ACCENT, alpha)
+    rgba(ACCENT, alpha)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -587,13 +593,15 @@ impl Layout {
 
 /// Solid rects to draw over the windows: global logical px, premultiplied RGBA, front to back.
 /// During a move, the grid and a preview of the landing tile, more solid once the drop would tab;
-/// otherwise the hovered or pressed zone. Then every bar, and the dimmed strip of each minimized
-/// untabbed tile.
+/// otherwise the hovered or pressed zone. Then every bar, the dimmed strip of each minimized
+/// untabbed tile, and last a frame around each shown window (and its bar): bright around
+/// `focused`, dim around the rest.
 pub fn overlay(
     l: &Layout,
     drag: Option<&Drag>,
     p: (i32, i32),
     now_ms: u64,
+    focused: Option<WinId>,
 ) -> Vec<(Rect, [f32; 4])> {
     let mut out = Vec::new();
     let hover = match drag.map(|d| &d.0) {
@@ -641,21 +649,70 @@ pub fn overlay(
         _ => None,
     };
     out.extend(lit.map(|z| (z, accent(1.0))));
+    // Where a frame's top goes when it runs along the top of a bar, in front of it.
+    let front = out.len();
     for t in &l.tiles {
         if l.active(t.id) != Some(t.id) || l.covered(t) || t.fullscreen {
             continue;
         }
         let tabbed = l.group(t.id).len() > 1;
         if t.minimized && !tabbed {
-            out.extend(
-                l.zone(Hit::Strip(t.id))
-                    .map(|z| (z, bar::rgba(MINIMIZED, 1.0))),
-            );
+            out.extend(l.zone(Hit::Strip(t.id)).map(|z| (z, rgba(MINIMIZED, 1.0))));
         } else if let Some(b) = l.bar(t.id) {
             out.extend(bar::draw(l, t.id, &b, hover));
         }
     }
+    for t in &l.tiles {
+        let Some(r) = l.rect(t.id).filter(|_| l.visible(t.id) && !t.fullscreen) else {
+            continue;
+        };
+        let (px, alpha) = match focused == Some(t.id) {
+            true => (FOCUS_PX, 1.0),
+            false => (IDLE_PX, IDLE_ALPHA),
+        };
+        let k = accent(alpha);
+        // A bar is the window's top edge, so the frame takes it in: its top line runs along
+        // the bar's top rows, in front of the bar.
+        match l.bar(t.id) {
+            Some(b) => {
+                let r = Rect {
+                    y: b.rect.y + px,
+                    h: r.y + r.h - b.rect.y - px,
+                    ..r
+                };
+                let [top, rest @ ..] = frame(r, px);
+                out.insert(front, (top, k));
+                out.extend(rest.map(|f| (f, k)));
+            }
+            None => out.extend(frame(r, px).map(|f| (f, k))),
+        }
+    }
     out
+}
+
+/// `px` wide rects around `r`, just outside it: top, bottom, left, right.
+fn frame(r: Rect, px: i32) -> [Rect; 4] {
+    let (x, w) = (r.x - px, r.w + 2 * px);
+    [
+        Rect {
+            x,
+            y: r.y - px,
+            w,
+            h: px,
+        },
+        Rect {
+            x,
+            y: r.y + r.h,
+            w,
+            h: px,
+        },
+        Rect { x, w: px, ..r },
+        Rect {
+            x: r.x + r.w,
+            w: px,
+            ..r
+        },
+    ]
 }
 
 /// The output's interior cell boundaries, 1 px wide, and the preview where the window would go.
@@ -684,6 +741,18 @@ fn move_overlay(o: &Output, target: Target, top: i32, alpha: f32) -> Vec<(Rect, 
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+
+    /// The overlay with no focus and without the dim frames every shown tile has.
+    pub(in crate::layout) fn zones(
+        l: &Layout,
+        drag: Option<&Drag>,
+        p: (i32, i32),
+        now_ms: u64,
+    ) -> Vec<(Rect, [f32; 4])> {
+        let mut out = overlay(l, drag, p, now_ms, None);
+        out.retain(|&(_, k)| k != accent(IDLE_ALPHA));
+        out
+    }
 
     pub(in crate::layout) fn c(col: i32, row: i32, cols: i32, rows: i32) -> Cells {
         Cells {
@@ -973,7 +1042,7 @@ pub(super) mod tests {
         d.motion(&mut l, gap, 0);
         assert_eq!(preview(&d), None);
         assert_eq!(
-            overlay(&l, Some(&d), gap, 0).len(),
+            zones(&l, Some(&d), gap, 0).len(),
             (COLS - 1 + ROWS - 1) as usize
         );
         assert!(d.release(&mut l, gap, 10).is_none());
@@ -1087,7 +1156,7 @@ pub(super) mod tests {
         let mut d = Drag::press(&l, A_STRIP).unwrap();
         l.remove(0);
         d.motion(&mut l, A_STRIP, 0);
-        assert!(overlay(&l, Some(&d), A_STRIP, 0).is_empty());
+        assert!(zones(&l, Some(&d), A_STRIP, 0).is_empty());
         assert!(d.release(&mut l, B_RIM, 0).is_none());
     }
 
@@ -1113,14 +1182,14 @@ pub(super) mod tests {
     #[test]
     fn ac13_overlay() {
         let mut l = halves();
-        assert!(overlay(&l, None, (500, 700), 0).is_empty());
+        assert!(zones(&l, None, (500, 700), 0).is_empty());
         let strip = Rect {
             x: 4,
             y: 0,
             w: 1708,
             h: GAP,
         };
-        assert_eq!(overlay(&l, None, A_STRIP, 0), vec![(strip, accent(1.0))]);
+        assert_eq!(zones(&l, None, A_STRIP, 0), vec![(strip, accent(1.0))]);
         assert_eq!(
             accent(1.0),
             [
@@ -1132,12 +1201,9 @@ pub(super) mod tests {
         );
 
         let mut d = Drag::press(&l, A_STRIP).unwrap();
-        assert_eq!(
-            overlay(&l, Some(&d), A_STRIP, 0),
-            vec![(strip, accent(1.0))]
-        );
+        assert_eq!(zones(&l, Some(&d), A_STRIP, 0), vec![(strip, accent(1.0))]);
         d.motion(&mut l, B_RIM, 0);
-        let rects = overlay(&l, Some(&d), B_RIM, 0);
+        let rects = zones(&l, Some(&d), B_RIM, 0);
         assert_eq!(rects.len(), (COLS - 1 + ROWS - 1 + 1) as usize);
         let lines = &rects[..rects.len() - 1];
         assert!(lines.iter().all(|(r, _)| r.w == 1 || r.h == 1));
@@ -1148,15 +1214,115 @@ pub(super) mod tests {
 
         // Swap and tab previews look different: more solid once the hold has elapsed.
         d.motion(&mut l, B_MIDDLE, 1000);
-        let preview_at = |t| *overlay(&l, Some(&d), B_MIDDLE, t).last().unwrap();
+        let preview_at = |t| *zones(&l, Some(&d), B_MIDDLE, t).last().unwrap();
         assert_eq!(preview_at(1499).1, accent(PREVIEW_ALPHA));
         assert_eq!(preview_at(1500).1, accent(TAB_ALPHA));
+        // Job 007 AC3: 0.55 keeps the text under a tab preview readable.
+        assert_eq!(preview_at(1499).1, rgba(ACCENT, 0.35));
+        assert_eq!(preview_at(1500).1, rgba(ACCENT, 0.55));
         // Job 003: a tab group has a bar, so the tab-in preview sits below one.
         assert_eq!(preview_at(1499).0, uw().tile_rect(c(6, 0, 6, 6)));
         assert_eq!(
             preview_at(1500).0,
             uw().window_rect(c(6, 0, 6, 6), super::super::BAR)
         );
+    }
+
+    /// Job 007 AC2: a bright frame around the focused window and a dim one around the rest, just
+    /// outside each window and behind the zones.
+    #[test]
+    fn ac2_focus_and_idle_frames() {
+        let framed = |o: &[(Rect, [f32; 4])], win: Rect, px: i32, alpha: f32| {
+            let sides: Vec<Rect> = o
+                .iter()
+                .filter(|&&(_, k)| k == accent(alpha))
+                .map(|&(r, _)| r)
+                .filter(|r| r.x <= win.x + win.w && win.x <= r.x + r.w)
+                .filter(|r| r.y <= win.y + win.h && win.y <= r.y + r.h)
+                .collect();
+            assert_eq!(sides.len(), 4, "{sides:?}");
+            let inter = |a: Rect, b: Rect| {
+                a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h
+            };
+            for r in &sides {
+                assert!(!inter(*r, win), "{r:?} overlaps {win:?}");
+                assert_eq!(r.w.min(r.h), px, "{r:?}");
+            }
+            let grown = Rect {
+                x: win.x - px,
+                y: win.y - px,
+                w: win.w + 2 * px,
+                h: win.h + 2 * px,
+            };
+            let area: i32 = sides.iter().map(|r| r.w * r.h).sum();
+            assert_eq!(
+                area,
+                grown.w * grown.h - win.w * win.h,
+                "the sides touch the window"
+            );
+            assert!(sides.iter().all(|&r| inter(r, grown)));
+        };
+        let mut l = halves();
+        let (left, right) = (l.rect(0).unwrap(), l.rect(1).unwrap());
+        let o = overlay(&l, None, (500, 700), 0, Some(0));
+        assert_eq!(o.len(), 8);
+        framed(&o, left, FOCUS_PX, 1.0);
+        framed(&o, right, IDLE_PX, IDLE_ALPHA);
+        assert_eq!(accent(IDLE_ALPHA), rgba(ACCENT, 0.3));
+
+        let o = overlay(&l, None, (500, 700), 0, None);
+        assert!(o.iter().all(|&(_, k)| k == accent(IDLE_ALPHA)));
+        framed(&o, left, IDLE_PX, IDLE_ALPHA);
+        framed(&o, right, IDLE_PX, IDLE_ALPHA);
+
+        // A hovered strip is in front of its tile's frame.
+        let o = overlay(&l, None, A_STRIP, 0, Some(0));
+        let strip = o.iter().position(|&(r, _)| r.h == GAP).unwrap();
+        let frame = o
+            .iter()
+            .position(|&(r, _)| r.w.min(r.h) == FOCUS_PX)
+            .unwrap();
+        assert!(strip < frame);
+
+        // Minimized, under a maximize and fullscreen: no frame.
+        let frames_of = |l: &Layout, id: WinId| {
+            let o = overlay(l, None, (500, 700), 0, Some(id));
+            o.iter().filter(|&&(_, k)| k == accent(1.0)).count()
+        };
+        assert_eq!(frames_of(&l, 1), 4);
+        l.minimize(1);
+        assert_eq!(frames_of(&l, 1), 0, "minimized");
+        let mut l = halves();
+        l.maximize(0);
+        assert_eq!(frames_of(&l, 1), 0, "under a maximize");
+        assert_eq!(frames_of(&l, 0), 4, "the maximized window itself");
+        let mut l = halves();
+        l.fullscreen(1);
+        assert_eq!(frames_of(&l, 1), 0, "fullscreen");
+        assert!(overlay(&l, None, (500, 700), 0, Some(1)).is_empty());
+
+        // Round 1: a decorated window's frame takes in its bar; the top line runs along the bar's
+        // top rows in front of it, and the sides start at the bar's top.
+        let mut l = halves();
+        l.set_decorated(0, true);
+        let (bar, win) = (l.bar(0).unwrap().rect, l.rect(0).unwrap());
+        let o = overlay(&l, None, (500, 700), 0, Some(0));
+        let top = Rect {
+            x: win.x - FOCUS_PX,
+            y: bar.y,
+            w: win.w + 2 * FOCUS_PX,
+            h: FOCUS_PX,
+        };
+        let pos = |want: (Rect, [f32; 4])| o.iter().position(|&x| x == want).unwrap();
+        assert!(pos((top, accent(1.0))) < pos((bar, rgba(crate::theme::BAR_BG, 1.0))));
+        let left = Rect {
+            x: win.x - FOCUS_PX,
+            y: bar.y + FOCUS_PX,
+            w: FOCUS_PX,
+            h: win.y + win.h - bar.y - FOCUS_PX,
+        };
+        assert!(o.contains(&(left, accent(1.0))));
+        assert_eq!(o.iter().filter(|&&(_, k)| k == accent(1.0)).count(), 4);
     }
 
     #[test]
@@ -1186,10 +1352,10 @@ pub(super) mod tests {
             (i32::MIN, i32::MIN),
             (i32::MAX, i32::MAX),
         ] {
-            overlay(&l, None, p, 0);
+            zones(&l, None, p, 0);
             if let Some(mut d) = Drag::press(&l, p) {
                 d.motion(&mut l, (i32::MAX, i32::MIN), 0);
-                overlay(&l, Some(&d), p, 0);
+                zones(&l, Some(&d), p, 0);
                 d.release(&mut l, (i32::MIN, i32::MAX), u64::MAX);
             }
         }
