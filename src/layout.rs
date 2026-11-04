@@ -137,6 +137,7 @@ struct Memory {
 pub enum Step {
     Remembered,
     Nearest,
+    Smaller,
     Shrunk,
     OtherOutput,
     Tabbed(WinId),
@@ -232,6 +233,9 @@ impl Layout {
         if let Some(c) = self.nearest_free(here, size, pointer) {
             return (here.name.clone(), c, Step::Nearest);
         }
+        if let Some(c) = self.smaller_free(here, size, pointer) {
+            return (here.name.clone(), c, Step::Smaller);
+        }
         if let Some(c) = self.shrink_for(here, size, pointer) {
             return (here.name.clone(), c, Step::Shrunk);
         }
@@ -282,48 +286,115 @@ impl Layout {
     /// The empty rect of `size` whose centre is closest to `pointer`.
     fn nearest_free(&self, o: &Output, size: (i32, i32), pointer: (i32, i32)) -> Option<Cells> {
         let (cols, rows) = o.span_for(size);
-        (0..=ROWS - rows)
-            .flat_map(|row| {
-                (0..=COLS - cols).map(move |col| Cells {
-                    col,
-                    row,
-                    cols,
-                    rows,
-                })
-            })
+        spots(cols, rows)
             .filter(|&c| self.is_free(&o.name, c))
             .min_by_key(|&c| dist2(o.cells_rect(c).center(), pointer))
     }
 
-    /// Takes columns from tiles wider than their remembered size, largest first, until `size`
-    /// fits. Leaves every tile untouched if it never fits.
-    fn shrink_for(&mut self, o: &Output, size: (i32, i32), pointer: (i32, i32)) -> Option<Cells> {
-        let saved = self.tiles.clone();
-        loop {
-            if let Some(c) = self.nearest_free(o, size, pointer) {
-                return Some(c);
-            }
-            let memory = &self.memory;
-            let Some(victim) = self
-                .tiles
-                .iter_mut()
-                .filter(|t| t.output == o.name)
-                .filter(|t| {
-                    let want = memory.get(&t.app).map_or(COLS, |m| o.span_for(m.size).0);
-                    t.cells.cols > want
-                })
-                .max_by_key(|t| t.cells.cols * t.cells.rows)
-            else {
-                self.tiles = saved;
-                return None;
-            };
-            // Free the column on the side nearer the pointer.
-            if pointer.0 < o.cells_rect(victim.cells).center().0 {
-                victim.cells.col += 1;
-            }
-            victim.cells.cols -= 1;
-        }
+    /// The largest empty rect between the minimum and `size`; ties go to the one nearest
+    /// `pointer`.
+    fn smaller_free(&self, o: &Output, size: (i32, i32), pointer: (i32, i32)) -> Option<Cells> {
+        let (want_c, want_r) = o.span_for(size);
+        let (min_c, min_r) = o.span_for((MIN_W, MIN_H));
+        (min_r..=want_r)
+            .flat_map(|rows| (min_c..=want_c).flat_map(move |cols| spots(cols, rows)))
+            .filter(|&c| self.is_free(&o.name, c))
+            .min_by_key(|&c| (-c.cols * c.rows, dist2(o.cells_rect(c).center(), pointer)))
     }
+
+    /// Takes columns from the tiles in the new window's rows until it gets an equal share, then
+    /// slides them apart, in order, to open one gap near `pointer`. Moves nothing on failure.
+    fn shrink_for(&mut self, o: &Output, size: (i32, i32), pointer: (i32, i32)) -> Option<Cells> {
+        let (want_c, rows) = o.span_for(size);
+        let (min_c, _) = o.span_for((MIN_W, MIN_H));
+        let band = (0..=ROWS - rows)
+            .map(|row| Cells {
+                col: 0,
+                row,
+                cols: COLS,
+                rows,
+            })
+            .min_by_key(|&b| (o.cells_rect(b).center().1 - pointer.1).abs())?;
+        let (mut row, others): (Vec<usize>, Vec<usize>) = (0..self.tiles.len())
+            .filter(|&i| self.tiles[i].output == o.name)
+            .partition(|&i| self.tiles[i].cells.overlaps(&band));
+        row.sort_by_key(|&i| self.tiles[i].cells.col);
+        let cells: Vec<Cells> = row.iter().map(|&i| self.tiles[i].cells).collect();
+        // Stacked tiles aren't a row of side-by-side tiles.
+        if cells.windows(2).any(|p| p[0].col + p[0].cols > p[1].col) {
+            return None;
+        }
+
+        let n = cells.len();
+        let target = (COLS / (n as i32 + 1)).min(want_c).max(min_c);
+        let wants: Vec<i32> = row
+            .iter()
+            .map(|&i| {
+                let app = &self.tiles[i].app;
+                self.memory.get(app).map_or(COLS, |m| o.span_for(m.size).0)
+            })
+            .collect();
+        let mut widths: Vec<i32> = cells.iter().map(|c| c.cols).collect();
+        while COLS - widths.iter().sum::<i32>() < target {
+            let v = (0..n)
+                .filter(|&k| widths[k] > min_c)
+                .max_by_key(|&k| (widths[k] > wants[k], widths[k]))?;
+            widths[v] -= 1;
+        }
+
+        // Tiles left of the gap pack to the left edge, the rest to the right edge.
+        let (gap, slot) = (0..=n)
+            .flat_map(|k| {
+                let left: i32 = widths[..k].iter().sum();
+                let right = COLS - widths[k..].iter().sum::<i32>();
+                (left..=right - target).map(move |col| {
+                    let c = Cells {
+                        col,
+                        cols: target,
+                        ..band
+                    };
+                    (c, k)
+                })
+            })
+            .min_by_key(|&(c, _)| dist2(o.cells_rect(c).center(), pointer))?;
+        let moved: Vec<Cells> = cells
+            .iter()
+            .enumerate()
+            .map(|(k, c)| {
+                let col = match k < slot {
+                    true => widths[..k].iter().sum(),
+                    false => COLS - widths[k..].iter().sum::<i32>(),
+                };
+                Cells {
+                    col,
+                    cols: widths[k],
+                    ..*c
+                }
+            })
+            .collect();
+        if moved
+            .iter()
+            .any(|m| others.iter().any(|&i| self.tiles[i].cells.overlaps(m)))
+        {
+            return None;
+        }
+        for (&i, m) in row.iter().zip(moved) {
+            self.tiles[i].cells = m;
+        }
+        Some(gap)
+    }
+}
+
+/// Every rect of `cols` x `rows` cells on the grid.
+fn spots(cols: i32, rows: i32) -> impl Iterator<Item = Cells> {
+    (0..=ROWS - rows).flat_map(move |row| {
+        (0..=COLS - cols).map(move |col| Cells {
+            col,
+            row,
+            cols,
+            rows,
+        })
+    })
 }
 
 fn dist2((ax, ay): (i32, i32), (bx, by): (i32, i32)) -> i64 {
@@ -578,35 +649,173 @@ mod tests {
         assert_eq!(cells_of(&l, term), cells(6, 0, 6, 6));
     }
 
-    #[test]
-    fn full_output_with_nothing_to_shrink_tabs_and_moves_nothing() {
-        let mut l = layout(vec![ultrawide()]);
+    /// Places unknown `a` at the left and `b` at the right: two half-width tiles.
+    fn two_halves(l: &mut Layout) -> (WinId, WinId) {
         let (a, _) = l.place("a", (10, 10)).unwrap();
         let (b, _) = l.place("b", (3400, 10)).unwrap();
+        (a, b)
+    }
 
-        let (c, step) = l.place("c", (3000, 10)).unwrap();
-        assert_eq!(step, Step::Tabbed(b));
-        assert_eq!(cells_of(&l, c), cells_of(&l, b));
-        assert_eq!(cells_of(&l, a), cells(0, 0, 6, 6));
-        assert_eq!(cells_of(&l, b), cells(6, 0, 6, 6));
+    /// Makes `app` remember `size` without a usable spot.
+    fn remember(l: &mut Layout, app: &str, size: (i32, i32)) {
+        let m = Memory {
+            output: "gone".into(),
+            cells: cells(0, 0, 1, 1),
+            size,
+        };
+        l.memory.insert(app.into(), m);
+    }
+
+    /// No overlap, inside the grid, and left-to-right in `order`.
+    fn assert_row(l: &Layout, order: &[WinId], min_cols: i32) {
+        let cs: Vec<Cells> = order.iter().map(|&id| cells_of(l, id)).collect();
+        for (i, c) in cs.iter().enumerate() {
+            assert!(c.col >= 0 && c.col + c.cols <= COLS, "{c:?} off the grid");
+            assert_eq!((c.row, c.rows), (0, ROWS), "{c:?} not full height");
+            assert!(c.cols >= min_cols, "{c:?} below the minimum");
+            for d in &cs[i + 1..] {
+                assert!(!c.overlaps(d), "{c:?} overlaps {d:?}");
+                assert!(c.col < d.col, "{c:?} not left of {d:?}");
+            }
+        }
     }
 
     #[test]
-    fn full_output_overflows_to_next_output_by_priority() {
+    fn third_window_shares_the_row_by_pointer() {
+        // AC1-AC3: the gap opens on the pointer's side.
+        for (x, order) in [(3400, [0, 1, 2]), (1720, [0, 2, 1]), (10, [2, 0, 1])] {
+            let mut l = layout(vec![ultrawide()]);
+            let (a, b) = two_halves(&mut l);
+            let (c, step) = l.place("c", (x, 10)).unwrap();
+            assert_eq!(step, Step::Shrunk);
+            let ids = [a, b, c];
+            for (slot, &k) in order.iter().enumerate() {
+                assert_eq!(
+                    cells_of(&l, ids[k]),
+                    cells(slot as i32 * 4, 0, 4, 6),
+                    "x={x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fourth_window_makes_quarters() {
+        let mut l = layout(vec![ultrawide()]);
+        let (a, b) = two_halves(&mut l);
+        let (c, _) = l.place("c", (3400, 10)).unwrap();
+        let (d, step) = l.place("d", (3400, 10)).unwrap();
+        assert_eq!(step, Step::Shrunk);
+        for (slot, id) in [a, b, c, d].into_iter().enumerate() {
+            assert_eq!(cells_of(&l, id), cells(slot as i32 * 3, 0, 3, 6));
+        }
+    }
+
+    #[test]
+    fn tabs_only_when_every_tile_is_at_minimum() {
+        let mut l = layout(vec![ultrawide()]);
+        let mut order = Vec::new();
+        for n in 1..=6 {
+            let (id, step) = l.place(&format!("app{n}"), (3400, 10)).unwrap();
+            if n >= 3 {
+                assert_eq!(step, Step::Shrunk, "window {n}");
+            }
+            // The 1st lands on the right, the 2nd left of it, the rest at the right end.
+            match n {
+                2 => order.insert(0, id),
+                _ => order.push(id),
+            }
+            assert_row(&l, &order, 2);
+        }
+        assert!(order.iter().all(|&id| cells_of(&l, id).cols == 2));
+        let (_, step) = l.place("app7", (3400, 10)).unwrap();
+        assert!(matches!(step, Step::Tabbed(_)));
+    }
+
+    #[test]
+    fn laptop_minimum_stops_at_thirds_and_failure_moves_nothing() {
+        // AC6 and AC11: 4 laptop columns are the minimum.
+        let mut l = layout(vec![laptop()]);
+        let (a, _) = l.place("a", (10, 10)).unwrap();
+        let (b, _) = l.place("b", (1100, 10)).unwrap();
+        let (c, step) = l.place("c", (1100, 10)).unwrap();
+        assert_eq!(step, Step::Shrunk);
+        for (slot, id) in [a, b, c].into_iter().enumerate() {
+            assert_eq!(cells_of(&l, id), cells(slot as i32 * 4, 0, 4, 6));
+        }
+
+        let before: Vec<Cells> = l.tiles().iter().map(|t| t.cells).collect();
+        let (_, step) = l.place("d", (1100, 10)).unwrap();
+        assert!(matches!(step, Step::Tabbed(_)));
+        let after: Vec<Cells> = l.tiles()[..3].iter().map(|t| t.cells).collect();
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn shrinks_before_overflowing_to_next_output_by_priority() {
         let mut l = layout(vec![
-            out("laptop", -1125, 0, 1125, 703, 2),
             out("4k", 0, -2160, 3840, 2160, 1),
             out("uw", 0, 0, 3440, 1440, 0),
         ]);
-        l.place("a", (10, 10)).unwrap();
-        l.place("b", (3400, 10)).unwrap();
-
+        two_halves(&mut l);
         let (c, step) = l.place("c", (100, 100)).unwrap();
+        assert_eq!(step, Step::Shrunk);
+        assert_eq!(l.tile(c).unwrap().output, "uw");
+
+        for n in 4..=6 {
+            let (_, step) = l.place(&format!("app{n}"), (100, 100)).unwrap();
+            assert_eq!(step, Step::Shrunk);
+        }
+        let (g, step) = l.place("app7", (100, 100)).unwrap();
         assert_eq!(step, Step::OtherOutput);
-        let t = l.tile(c).unwrap();
+        let t = l.tile(g).unwrap();
         assert_eq!(t.output, "4k");
         // Half the ultrawide (1720x1440 px) is 5x4 4K cells, as near the centre as they go.
         assert_eq!(t.cells, cells(3, 1, 5, 4));
+    }
+
+    #[test]
+    fn opens_smaller_in_a_gap_before_shrinking() {
+        let mut l = layout(vec![ultrawide()]);
+        let (a, _) = l.place("a", (10, 10)).unwrap();
+        remember(&mut l, "b", (1144, 1440));
+        let (b, _) = l.place("b", (3400, 10)).unwrap();
+        assert_eq!(cells_of(&l, a), cells(0, 0, 6, 6));
+        assert_eq!(cells_of(&l, b), cells(8, 0, 4, 6));
+
+        let (c, step) = l.place("c", (3400, 10)).unwrap();
+        assert_eq!(step, Step::Smaller);
+        assert_eq!(cells_of(&l, c), cells(6, 0, 2, 6));
+        assert_eq!(cells_of(&l, a), cells(0, 0, 6, 6));
+        assert_eq!(cells_of(&l, b), cells(8, 0, 4, 6));
+        // AC10
+        assert_eq!(l.memory["a"].size, (1720, 1440));
+        assert_eq!(l.memory["b"].size, (1144, 1440));
+        assert_eq!(l.memory["c"].size, (1720, 1440));
+    }
+
+    #[test]
+    fn gap_below_minimum_is_not_used_smaller() {
+        let mut l = layout(vec![ultrawide()]);
+        let (a, _) = l.place("a", (10, 10)).unwrap();
+        remember(&mut l, "b", (1430, 1440));
+        let (b, _) = l.place("b", (3400, 10)).unwrap();
+        assert_eq!(cells_of(&l, b), cells(7, 0, 5, 6));
+
+        let (c, step) = l.place("c", (3400, 10)).unwrap();
+        assert_eq!(step, Step::Shrunk);
+        assert_eq!(cells_of(&l, c).cols, 4);
+        assert_row(&l, &[a, b, c], 2);
+    }
+
+    #[test]
+    fn shrinking_never_changes_memory() {
+        let mut l = layout(vec![ultrawide()]);
+        two_halves(&mut l);
+        l.place("c", (3400, 10)).unwrap();
+        for app in ["a", "b", "c"] {
+            assert_eq!(l.memory[app].size, (1720, 1440), "{app}");
+        }
     }
 
     #[test]
