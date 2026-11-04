@@ -86,9 +86,9 @@ impl Notes {
         let mut note = Note {
             id: 0,
             sender: sender.to_string(),
-            app: sanitize(&r.app_name, APP_CHARS),
-            summary: sanitize(&plain(&r.summary), SUMMARY_CHARS),
-            body: sanitize(&plain(&r.body), BODY_CHARS),
+            app: text(&r.app_name, APP_CHARS, false),
+            summary: text(&r.summary, SUMMARY_CHARS, true),
+            body: text(&r.body, BODY_CHARS, true),
             expires_ms: now.saturating_add(timeout_ms(r.expire_timeout)),
         };
         if let Some(at) = replaced {
@@ -149,7 +149,17 @@ fn timeout_ms(t: i32) -> u64 {
     }
 }
 
-/// Markup made readable as plain text: simple tags (`<b>`, `</a>`, `<a href="…">`) removed, then
+/// What is shown of a field: only its first `4 × max` chars are read, so the work per call is
+/// bounded whatever the message size; markup is made `plain`, then the text sanitised.
+fn text(s: &str, max: usize, markup: bool) -> String {
+    let head = s.char_indices().nth(4 * max).map_or(s, |(at, _)| &s[..at]);
+    match markup {
+        true => sanitize(&plain(head), max),
+        false => sanitize(head, max),
+    }
+}
+
+/// Markup made readable as plain text, in one pass: simple tags (`<b>`, `</a>`, `<a href="…">`) removed, then
 /// the five XML entities decoded. Nothing is interpreted, so `&lt;b&gt;` shows as `<b>`.
 pub fn plain(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -160,9 +170,10 @@ pub fn plain(s: &str) -> String {
         let named = after
             .trim_start_matches('/')
             .starts_with(|c: char| c.is_ascii_alphabetic());
+        // The scan stops at the next `<`, which is where the loop resumes: linear overall.
         let end = after
-            .find('>')
-            .filter(|&e| named && !after[..e].contains('<'));
+            .find(['<', '>'])
+            .filter(|&e| named && after.as_bytes()[e] == b'>');
         match end {
             Some(e) => rest = &after[e + 1..],
             None => {
@@ -268,6 +279,41 @@ mod tests {
             (n.shown()[0].summary.as_str(), n.shown()[0].body.as_str()),
             ("Hello navi", "line one")
         );
+    }
+
+    /// Round 2: one huge `Notify` can't stall navi-bar's loop. The old `plain` took 9.3 s on a
+    /// 1 MiB summary (release build).
+    #[test]
+    fn huge_markup_is_linear_and_capped() {
+        let t = std::time::Instant::now();
+        for s in [
+            "<".repeat(1 << 20),
+            "<a".repeat(1 << 19),
+            "</".repeat(1 << 19),
+        ] {
+            let out = plain(&s);
+            assert_eq!(out.len(), s.len(), "no tag closes, so all is kept");
+        }
+        // Linear: ~13 ms in release, ~0.6 s in a debug build; the quadratic version took minutes.
+        let plain_ms = t.elapsed().as_millis();
+        assert!(plain_ms < 2_000, "plain on 3 MiB took {plain_ms} ms");
+
+        let t = std::time::Instant::now();
+        let mut n = Notes::default();
+        let flood = Request {
+            app_name: "<".repeat(1 << 20),
+            body: "<a".repeat(1 << 19),
+            ..req(&"<".repeat(1 << 20))
+        };
+        n.notify(0, ":1.1", &flood);
+        let notify_ms = t.elapsed().as_millis();
+        assert!(notify_ms < 50, "notify took {notify_ms} ms");
+        let shown = &n.shown()[0];
+        assert_eq!(shown.app.chars().count(), APP_CHARS);
+        assert_eq!(shown.summary.chars().count(), SUMMARY_CHARS);
+        assert_eq!(shown.body.chars().count(), BODY_CHARS);
+        assert!(shown.body.ends_with('…'));
+        assert_eq!(text("<b>bold</b> text", 120, true), "bold text");
     }
 
     #[test]
