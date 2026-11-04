@@ -620,6 +620,53 @@ pub mod tests {
         }
     }
 
+    /// AC3: this machine's monitors against KWin's identities. Read-only; skipped without them.
+    #[test]
+    #[ignore = "reads this machine's monitors"]
+    fn host_edid() {
+        let Some(home) = std::env::var_os("HOME") else {
+            return println!("no HOME: skipped");
+        };
+        let kwin = std::path::Path::new(&home).join(".config/kwinoutputconfig.json");
+        let Ok(json) = std::fs::read_to_string(&kwin) else {
+            return println!("no {}: skipped", kwin.display());
+        };
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let outputs = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == "outputs")
+            .unwrap()["data"]
+            .as_array()
+            .unwrap();
+        let Ok(dirs) = std::fs::read_dir("/sys/class/drm") else {
+            return println!("no /sys/class/drm: skipped");
+        };
+        let mut checked = 0;
+        for d in dirs.flatten() {
+            let name = d.file_name().to_string_lossy().into_owned();
+            let Some((_, connector)) = name.split_once('-') else {
+                continue;
+            };
+            let status = std::fs::read_to_string(d.path().join("status")).unwrap_or_default();
+            let edid = std::fs::read(d.path().join("edid")).unwrap_or_default();
+            if status.trim() != "connected" || edid.is_empty() {
+                continue;
+            }
+            let id = identity(&edid).expect("a valid EDID");
+            let theirs = outputs
+                .iter()
+                .find(|o| o["connectorName"] == connector)
+                .and_then(|o| o["edidIdentifier"].as_str())
+                .map(|s| s.replace(' ', "_"));
+            println!("{connector}: navi {id}, KWin {theirs:?}");
+            assert_eq!(Some(id), theirs, "{connector}");
+            checked += 1;
+        }
+        println!("{checked} monitors match");
+    }
+
     #[test]
     fn laptop_connectors() {
         for c in ["eDP-1", "LVDS-1", "DSI-1"] {

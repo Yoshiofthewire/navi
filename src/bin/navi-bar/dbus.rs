@@ -1,7 +1,11 @@
 //! The `org.freedesktop.Notifications` server on the session bus, only while no other server
 //! holds the name. zbus answers on its own thread; each call is handed to navi-bar's loop.
+//!
+//! On real hardware only, navi-bar also makes the one call out: it tells the bus and systemd's
+//! user manager the session's display variables, so portals and D-Bus-activated apps find navi.
 
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -113,6 +117,56 @@ pub fn serve(tx: Sender<Call>) -> Option<Connection> {
     Some(conn)
 }
 
+/// The variables exported, and nothing else.
+const EXPORTED: [&str; 3] = ["WAYLAND_DISPLAY", "XDG_CURRENT_DESKTOP", "XDG_SESSION_TYPE"];
+
+/// navi sets `NAVI_EXPORT_ENV=1` on real hardware only; nested it's removed.
+pub fn wants_export(v: Option<&OsStr>) -> bool {
+    v == Some(OsStr::new("1"))
+}
+
+/// The exported variables that are set, as `get` reads them.
+fn exported(get: impl Fn(&str) -> Option<String>) -> Vec<(&'static str, String)> {
+    EXPORTED
+        .iter()
+        .filter_map(|&k| Some((k, get(k).filter(|v| !v.is_empty())?)))
+        .collect()
+}
+
+/// `UpdateActivationEnvironment` on the bus and `SetEnvironment` on systemd's user manager. A
+/// failure is a warning: apps started from the taskbar still get the variables.
+pub fn export_env() {
+    let vars = exported(|k| std::env::var(k).ok());
+    let names: Vec<&str> = vars.iter().map(|(k, _)| *k).collect();
+    let conn = match Connection::session() {
+        Ok(c) => c,
+        Err(e) => return warn!("environment not exported, no session bus: {e}"),
+    };
+    let map: HashMap<&str, &str> = vars.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let bus = conn.call_method(
+        Some("org.freedesktop.DBus"),
+        "/org/freedesktop/DBus",
+        Some("org.freedesktop.DBus"),
+        "UpdateActivationEnvironment",
+        &(map,),
+    );
+    if let Err(e) = bus {
+        warn!("environment not exported to the bus: {e}");
+    }
+    let list: Vec<String> = vars.iter().map(|(k, v)| format!("{k}={v}")).collect();
+    let systemd = conn.call_method(
+        Some("org.freedesktop.systemd1"),
+        "/org/freedesktop/systemd1",
+        Some("org.freedesktop.systemd1.Manager"),
+        "SetEnvironment",
+        &(list,),
+    );
+    if let Err(e) = systemd {
+        warn!("environment not exported to systemd: {e}");
+    }
+    info!(?names, "environment exported");
+}
+
 pub fn emit(conn: &Connection, (id, reason): Closed) {
     let sent = conn.emit_signal(
         None::<&str>,
@@ -124,5 +178,31 @@ pub fn emit(conn: &Connection, (id, reason): Closed) {
     match sent {
         Ok(()) => info!(id, reason, "notification closed"),
         Err(e) => warn!(id, "NotificationClosed not sent: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exports_only_on_request_and_only_three_names() {
+        assert!(wants_export(Some(OsStr::new("1"))));
+        for v in [None, Some(""), Some("0"), Some("yes")] {
+            assert!(!wants_export(v.map(OsStr::new)), "{v:?}");
+        }
+        let env = |k: &str| match k {
+            "WAYLAND_DISPLAY" => Some("wayland-2".to_string()),
+            "XDG_CURRENT_DESKTOP" => Some("navi".into()),
+            "XDG_SESSION_TYPE" => Some(String::new()),
+            _ => Some("leak".into()),
+        };
+        assert_eq!(
+            exported(env),
+            [
+                ("WAYLAND_DISPLAY", "wayland-2".to_string()),
+                ("XDG_CURRENT_DESKTOP", "navi".into()),
+            ]
+        );
     }
 }

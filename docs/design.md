@@ -130,14 +130,35 @@ space when you want it.
 ## Monitors
 
 - **Identity is the EDID** (make, model, serial), not the port name. `DP-11` changes from one
-  dock to the next. Everything navi remembers is tied to the EDID.
+  dock to the next. Everything navi remembers is tied to the EDID. The identity is KWin's
+  `edidIdentifier` with `_` for spaces, from the EDID's base block:
+  `<PNP id>_<product>_<serial>_<week>_<year>_<model year>`, e.g. `ACR_1359_4294967295_0_0_2016`.
+  A monitor with no valid EDID is known by its connector name (`DP-3`), with a warning, and two
+  identical monitors get `_2`, `_3`… in connector-name order. It names the Wayland output, so
+  memory, wallpapers and the taskbar follow the monitor. The output's description is Smithay's
+  `<make> - <model> - <identity>` (Smithay 0.7 has no way to set it).
+- **Arrangement:** `~/.config/navi/monitors`, a `navi-monitors 1` line, then
+  `<identity> <x> <y> <scale>` per monitor (logical px within ±65535, scale 0.5–4.0) and an
+  optional `main <identity>`. Any bad line makes navi ignore the whole file, with one warning,
+  and it is never rewritten while it's bad. A monitor not in the file, or one overlapping a
+  monitor listed before it, goes right of everything, top-aligned with the main monitor, at
+  scale 1, and is saved there. The first start on real hardware, with no file yet, imports
+  KWin's `kwinoutputconfig.json`: the setup whose enabled outputs are exactly the connected
+  monitors, lid open preferred. With no such setup, monitors go in one row at scale 1, the laptop
+  panel leftmost. Later KWin changes aren't followed.
 - **The main monitor** is the one in the middle of the layout: the one bordering the most other
-  monitors, with ties broken by size. You can override this, and the override is remembered.
-- **Priority:** the main monitor first, then the others by size. The built-in laptop panel comes
-  last whenever anything else is connected.
+  monitors (sharing an edge of positive length; corners don't count), with ties broken by size,
+  then connector name. The `main` line overrides this. The laptop panel is never main while
+  another monitor is connected.
+- **Priority:** the main monitor first, then the others by size. The built-in laptop panel
+  (`eDP`, `LVDS`, `DSI`) comes last whenever anything else is connected.
+- **The pointer** never sits between monitors: it stops at the nearest edge of the monitors it
+  can reach. It starts in the middle of the main monitor.
 - **Unplugging** moves that monitor's windows to the remaining ones using the placement steps
-  above. **Replugging** returns each window to its remembered cells on that monitor, as long as
-  you haven't moved it since.
+  above, from the main monitor's centre, a tab group at a time; memory doesn't change. Each
+  window remembers its `home` (monitor and cells). **Replugging** returns each window to its home
+  cells, if they're free, as long as you haven't moved it since: a drag move, swap, tab, untab or
+  edge resize forgets its home.
 
 ## Shell
 
@@ -154,12 +175,15 @@ The screen shows a wallpaper, a taskbar and your apps. There are no desktop icon
   icon per running window, in the order they opened; the focused one is underlined, minimized
   ones are dimmed. Click a running app to focus or restore it: it's un-minimized, shown in its
   tab group, and any maximized or fullscreen window covering it steps back. Hover the bottom
-  edge of another monitor for about 300 ms, and the taskbar moves there and stays. Where it last
-  was is remembered. A fullscreen app hides it.
+  edge of another monitor (its bottom 2 logical px) for 300 ms, and the taskbar moves there and
+  stays. Where it last was is remembered in `~/.local/state/navi/bar` (one monitor identity),
+  and used while that monitor is connected; otherwise it's on the main one. A fullscreen app
+  hides it.
 - **App menu:** the button opens a list of installed apps (`.desktop` files) with a search line:
   type to filter by name, Up/Down to select, Enter or a click to launch, Escape or a click
   elsewhere to close.
-- **Corners:** on the main monitor, and they stay there when the taskbar moves. A 24 px status
+- **Corners:** on the main monitor, and they stay there when the taskbar moves or the main
+  monitor changes. A 24 px status
   band runs across the top and takes space from the grid, like the taskbar; it takes no clicks
   and a fullscreen app hides it. Status is top-right: the battery (`BAT 87%`, `+` while charging,
   the mean of the system's batteries, read every 30 s; mice and headsets don't count) and the
@@ -247,8 +271,8 @@ session.
   over a socket pair it made. Only that connection sees layer shell and the window list
   (`wlr-foreign-toplevel-management`); other clients don't find them in the registry at all. A
   layer surface gets the keyboard only when clicked (`exclusive` is treated as on-demand), and
-  can't shrink the grid below half the monitor. If `navi-bar` crashes, navi keeps running without
-  a bar until it restarts.
+  can't shrink the grid below half the monitor. If `navi-bar` exits, navi starts it again after
+  1 s, at most 5 times in any minute; past that it runs without a bar.
 - **Activation tokens** (`xdg-activation`) are made only for a request from the surface holding
   the keyboard, with a serial from its current focus (no older than its keyboard enter, no newer
   than navi's latest). Each works once, within 10 s, and only while the keyboard is still on the
@@ -263,12 +287,23 @@ session.
   without navi-bar's socket. Running each app in its own `app-*.scope` comes later (it needs
   D-Bus).
 - **The session bus** reaches navi-bar only through the notification server: one name, one
-  object, no calls out. Every field a notification carries is untrusted and is never logged;
+  object. Its one call out is on real hardware only: at start it sets `WAYLAND_DISPLAY`,
+  `XDG_CURRENT_DESKTOP` and `XDG_SESSION_TYPE` (nothing else) through the bus's
+  `UpdateActivationEnvironment` and systemd's `SetEnvironment`, so portals and D-Bus-started
+  apps reach navi. Nested it never does, so the host's user services keep pointing at the host. Every field a notification carries is untrusted and is never logged;
   only ids, senders and text lengths are. zbus reads a whole message before navi-bar's caps apply,
   so a hostile local app can make navi-bar allocate up to the bus's message limit per call; such
   an app already runs as the user. A D-Bus bug takes the taskbar down with it, since there is one
   privileged client.
 - **Config** is plain data. A config file can never run a command.
+- **Real hardware:** navi gets the GPU and input devices only through the seat session
+  (libseat, so logind), never by opening `/dev` itself, and needs no root. On a VT switch the
+  session revokes them and navi pauses. **Ctrl+Alt+Backspace** quits navi (back to the login
+  screen) and Ctrl+Alt+F1…F12 switch VTs; navi keeps these keys before any client sees them, so
+  no app can swallow the way out. Every startup failure (no session, no GPU, no monitor) exits 1
+  with a message; the log is `~/.local/state/navi/navi.log`. EDID is untrusted device data:
+  parsed in safe Rust, base block only, at most 32 KiB read, and turned into a single safe
+  token.
 
 ## Build
 
@@ -287,12 +322,18 @@ session.
 - **Input replay for testing (debug builds only):** `NAVI_INPUT_REPLAY=<file>` plays a pointer
   and keyboard script through the same handlers as real input: one step per line, `wait <ms>`,
   `move <x> <y>` (global logical px), `press`, `release` (left button), `key <evdev keycode>`
-  (press and release), `#` comments. A bad line logs one error and nothing is replayed. Release
+  (press and release), `down <code>` and `up <code>` (to hold a modifier), `#` comments. A bad line logs one error and nothing is replayed. Release
   builds don't contain it.
 - The shell (taskbar, corners, launcher) runs as separate `layer-shell` clients, so a taskbar
   crash can't take your windows down.
 
+- **Backends:** nested (a window in another compositor) when `WAYLAND_DISPLAY` or `DISPLAY` is
+  set, else real hardware: DRM/KMS on the seat's primary GPU only, libinput, libseat. Both draw
+  each output from the same element list (`src/render.rs`). See `docs/session.md`.
+
 ## Open questions
+
+- **XWayland** is the next job: X11-only apps don't start yet.
 
 - Grid size: hard-coded at 12 × 6, or configurable? Leaning hard-coded.
 - More look references, beyond the logo.

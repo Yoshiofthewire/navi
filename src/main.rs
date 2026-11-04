@@ -181,4 +181,24 @@ mod tests {
         assert_eq!(backend(s(""), s("")), Backend::Drm);
         assert_eq!(backend(s(""), None), Backend::Drm);
     }
+
+    /// AC14: `desktop-file-validate` rejects `DesktopNames`, a session-file key (Plasma's own
+    /// session file fails it the same way), so the keys a display manager reads are checked here.
+    #[test]
+    fn ac14_session_file() {
+        let text = include_str!("../dist/navi.desktop");
+        let mut lines = text.lines();
+        assert_eq!(lines.next(), Some("[Desktop Entry]"));
+        let keys: Vec<(&str, &str)> = lines.filter_map(|l| l.split_once('=')).collect();
+        for want in [
+            ("Name", "navi"),
+            ("Exec", "/usr/local/bin/navi"),
+            ("TryExec", "/usr/local/bin/navi"),
+            ("Type", "Application"),
+            ("DesktopNames", "navi"),
+        ] {
+            assert!(keys.contains(&want), "{want:?}");
+        }
+        assert_eq!(keys.len(), 6);
+    }
 }

@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=navi
+Comment=Tiling Wayland desktop
+Exec=/usr/local/bin/navi
+TryExec=/usr/local/bin/navi
+Type=Application
+DesktopNames=navi
