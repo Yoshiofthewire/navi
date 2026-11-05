@@ -358,9 +358,11 @@ session.
   each output from the same element list (`src/render.rs`). See `docs/session.md`.
 
 - **XWayland:** Smithay's rootless server and XWM manage X11 windows in the same layout as
-  native apps. Embedded NULs in `WM_CLASS` and window titles become U+FFFD before layout or
-  Wayland window-list events use them. This metadata reaches the dock; X11 keyboard focus is
-  set as well as Wayland focus. Transient dialogs follow their parents and hide with them; override-redirect
+  native apps. Embedded NULs in `WM_CLASS` and window titles become U+FFFD; the resulting text
+  is capped at 2048 bytes at a UTF-8 boundary before layout or Wayland window-list events use it.
+  This keeps complete events within the backend's 4096-byte buffer. The metadata reaches the
+  dock. X11 keyboard focus is set as well as Wayland focus. Transient dialogs follow their
+  parents and hide with them; override-redirect
   menus keep their X11 geometry and require an X11 parent. Clipboard transfers are bridged,
   with X11 access gated on keyboard focus. Primary selection, cross-protocol drag-and-drop,
   and automatic XWayland crash recovery remain unimplemented. Install the `Xwayland` executable

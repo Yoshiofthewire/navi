@@ -944,10 +944,17 @@ impl Navi {
 pub fn window_surface(w: &Window) -> Option<WlSurface> {
     w.wl_surface().map(std::borrow::Cow::into_owned)
 }
-// X11 metadata may contain NULs; replace them before layout, memory, or Wayland events use it.
+/// Keep X11 text valid and small enough for Wayland's 4096-byte event buffer, including
+/// the string length, terminator, padding, and event header.
+fn x11_text(text: String) -> String {
+    let mut text = text.replace('\0', "\u{fffd}");
+    text.truncate(text.floor_char_boundary(2048));
+    text
+}
+
 pub fn window_app(w: &Window) -> String {
     match w.x11_surface() {
-        Some(x) => x.class().replace('\0', "\u{fffd}"),
+        Some(x) => x11_text(x.class()),
         None => w
             .toplevel()
             .map(|t| app_id(t.wl_surface()))
@@ -956,7 +963,7 @@ pub fn window_app(w: &Window) -> String {
 }
 pub fn window_title(w: &Window) -> String {
     match w.x11_surface() {
-        Some(x) => x.title().replace('\0', "\u{fffd}"),
+        Some(x) => x11_text(x.title()),
         None => w
             .toplevel()
             .map(|t| title(t.wl_surface()))

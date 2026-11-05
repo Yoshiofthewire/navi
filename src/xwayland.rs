@@ -667,6 +667,39 @@ mod tests {
                 .last()
                 .is_some_and(|title| title == "a\u{fffd}b")
         });
+        // Oversized events must not disconnect the window-list client. Count bytes after
+        // sanitizing, and keep complete characters even when UTF-8 or NUL replacement expands.
+        for (raw, expected) in [
+            ("x".repeat(5000), "x".repeat(2048)),
+            ("\u{20ac}".repeat(2000), "\u{20ac}".repeat(682)),
+            (format!("{}\0tail", "y".repeat(2047)), "y".repeat(2047)),
+        ] {
+            conn.change_property8(PropMode::REPLACE, window, name, utf8, raw.as_bytes())
+                .unwrap();
+            conn.flush().unwrap();
+            pump(&mut event_loop, &mut data, |_| {
+                metadata.read(&mut queue);
+                metadata.titles.last() == Some(&expected)
+            });
+        }
+        // WM_CLASS is decoded from Windows-1252: each 0x80 becomes a three-byte euro sign.
+        let mut raw_class = b"navi-test\0".to_vec();
+        raw_class.extend([0x80; 2000]);
+        raw_class.push(0);
+        conn.change_property8(
+            PropMode::REPLACE,
+            window,
+            AtomEnum::WM_CLASS,
+            AtomEnum::STRING,
+            &raw_class,
+        )
+        .unwrap();
+        conn.flush().unwrap();
+        let expected_class = "\u{20ac}".repeat(682);
+        pump(&mut event_loop, &mut data, |_| {
+            metadata.read(&mut queue);
+            metadata.apps.last() == Some(&expected_class)
+        });
         // The test client and XWM use separate X11 connections. Mapping in Navi doesn't mean
         // the server has processed the XWM's focus request yet; wait for actual X input focus.
         pump(&mut event_loop, &mut data, |_| {
