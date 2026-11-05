@@ -9,13 +9,12 @@ use smithay::{
         renderer::{
             ImportAll, ImportMem, Renderer, Texture,
             element::{
-                AsRenderElements, Id, Kind,
+                AsRenderElements, Kind,
                 memory::{MemoryRenderBuffer, MemoryRenderBufferRenderElement},
                 render_elements,
-                solid::SolidColorRenderElement,
+                solid::{SolidColorBuffer, SolidColorRenderElement},
                 surface::WaylandSurfaceRenderElement,
             },
-            utils::CommitCounter,
         },
     },
     desktop::{LayerMap, layer_map_for_output},
@@ -40,6 +39,27 @@ render_elements! {
     Surface=WaylandSurfaceRenderElement<R>,
     /// The wallpaper and the pointer.
     Memory=MemoryRenderBufferRenderElement<R>,
+}
+
+/// Stable decoration identities let the damage tracker recognize an unchanged desktop.
+#[derive(Default)]
+pub struct Solids(Vec<SolidColorBuffer>);
+
+impl Solids {
+    fn elements(
+        &mut self,
+        rects: Vec<(Rectangle<i32, smithay::utils::Physical>, [f32; 4])>,
+    ) -> Vec<SolidColorRenderElement> {
+        self.0.resize_with(rects.len(), SolidColorBuffer::default);
+        self.0
+            .iter_mut()
+            .zip(rects)
+            .map(|(buffer, (rect, color))| {
+                buffer.update((rect.size.w, rect.size.h), color);
+                SolidColorRenderElement::from_buffer(buffer, rect.loc, 1.0, 1.0, Kind::Unspecified)
+            })
+            .collect()
+    }
 }
 
 /// navi's own arrow, at a whole-number buffer scale.
@@ -106,6 +126,7 @@ pub fn elements<R>(
     output: &Output,
     arrow: Arrow,
     wallpaper: &mut Option<Wallpaper>,
+    solids: &mut Solids,
 ) -> Vec<Frame<R>>
 where
     R: Renderer + ImportAll + ImportMem,
@@ -120,17 +141,9 @@ where
         let r = monitors::to_local(r, origin, scale);
         Rectangle::new((r.x, r.y).into(), (r.w, r.h).into())
     };
-    let solid = |r: layout::Rect, color: [f32; 4]| {
-        Frame::from(SolidColorRenderElement::new(
-            Id::new(),
-            rect(r),
-            CommitCounter::default(),
-            color,
-            Kind::Unspecified,
-        ))
-    };
     let pointer = state.pointer_px();
     let mut out: Vec<Frame<R>> = Vec::new();
+    let mut decorations = Vec::new();
     let full = layout::Rect {
         x: geo.loc.x,
         y: geo.loc.y,
@@ -165,11 +178,11 @@ where
                 w: 8,
                 h: 8,
             };
-            out.push(solid(r, theme::rgba(theme::ACCENT, 1.0)));
+            decorations.push((rect(r), theme::rgba(theme::ACCENT, 1.0)));
         }
         _ => {}
     }
-    out.extend(
+    decorations.extend(
         layout::overlay(
             &state.layout,
             state.drag.as_ref(),
@@ -179,8 +192,9 @@ where
         )
         .into_iter()
         .filter(|(r, _)| overlaps(*r, full))
-        .map(|(r, color)| solid(r, color)),
+        .map(|(r, color)| (rect(r), color)),
     );
+    out.extend(solids.elements(decorations).into_iter().map(Frame::from));
     out.extend(
         surfaces(renderer, state, output, geo, scale)
             .into_iter()
@@ -307,4 +321,31 @@ where
         Some((w, h).into()),
         Kind::Unspecified,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use smithay::backend::renderer::damage::OutputDamageTracker;
+
+    #[test]
+    fn static_decorations_have_no_damage_but_moves_colors_and_removal_do() {
+        let mut solids = Solids::default();
+        let mut tracker = OutputDamageTracker::new((100, 100), 1.0, Transform::Normal);
+        let rect = Rectangle::new((10, 10).into(), (30, 20).into());
+        let elements = solids.elements(vec![(rect, [1.0, 0.0, 0.0, 1.0])]);
+        assert!(tracker.damage_output(1, &elements).unwrap().0.is_some());
+        let elements = solids.elements(vec![(rect, [1.0, 0.0, 0.0, 1.0])]);
+        assert!(tracker.damage_output(1, &elements).unwrap().0.is_none());
+        let elements = solids.elements(vec![(rect, [0.0, 1.0, 0.0, 1.0])]);
+        assert!(tracker.damage_output(1, &elements).unwrap().0.is_some());
+        let elements = solids.elements(vec![(
+            Rectangle::new((50, 10).into(), rect.size),
+            [0.0, 1.0, 0.0, 1.0],
+        )]);
+        assert!(tracker.damage_output(1, &elements).unwrap().0.is_some());
+        let elements = solids.elements(Vec::new());
+        assert!(tracker.damage_output(1, &elements).unwrap().0.is_some());
+        assert!(tracker.damage_output(1, &elements).unwrap().0.is_none());
+    }
 }

@@ -17,6 +17,7 @@ use smithay::{
     reexports::{
         calloop::{
             LoopHandle, LoopSignal, RegistrationToken,
+            ping::Ping,
             timer::{TimeoutAction, Timer},
         },
         wayland_protocols::xdg::{
@@ -95,6 +96,8 @@ pub struct Navi {
     pub display_handle: DisplayHandle,
     pub space: Space<Window>,
     pub loop_signal: LoopSignal,
+    /// Nested repaint signal; hardware keeps its DRM/vblank scheduling.
+    pub redraw: Option<Ping>,
     pub layout: Layout,
     pub memory: Store,
     pub xwm: Option<X11Wm>,
@@ -169,6 +172,7 @@ impl Navi {
             display_handle: dh.clone(),
             space: Space::default(),
             loop_signal,
+            redraw: None,
             layout,
             memory,
             xwm: None,
@@ -188,6 +192,12 @@ impl Navi {
             popups: PopupManager::default(),
             seat,
         })
+    }
+
+    pub fn request_redraw(&self) {
+        if let Some(ping) = &self.redraw {
+            ping.ping();
+        }
     }
 
     pub fn now_ms(&self) -> u64 {
@@ -256,6 +266,7 @@ impl Navi {
     /// Sends every visible tiled window its layout size and state and moves it to its rect;
     /// unmaps hidden ones, and their dialogs.
     pub fn apply_layout(&mut self) {
+        self.request_redraw();
         let (mut hidden, mut shown) = (Vec::new(), Vec::new());
         for m in &self.windows {
             let Some(id) = m.tile else {
@@ -425,6 +436,7 @@ impl Navi {
 
     /// Re-arranges `output`'s layer surfaces, and gives the grid what they leave of it.
     pub fn arrange_layers(&mut self, output: &Output) {
+        self.request_redraw();
         let Some(geo) = self.space.output_geometry(output) else {
             return;
         };
@@ -713,6 +725,7 @@ impl Navi {
 
     /// Gives `window` keyboard focus and activates it, or nobody.
     pub fn focus(&mut self, window: Option<Window>) {
+        self.request_redraw();
         let Some(kb) = self.seat.get_keyboard() else {
             return;
         };
@@ -1060,7 +1073,12 @@ impl CompositorHandler for Navi {
         }
     }
 
+    fn destroyed(&mut self, _: &WlSurface) {
+        self.request_redraw();
+    }
+
     fn commit(&mut self, surface: &WlSurface) {
+        self.request_redraw();
         on_commit_buffer_handler::<Self>(surface);
         if !is_sync_subsurface(surface) {
             let mut root = surface.clone();
@@ -1159,6 +1177,7 @@ impl XdgShellHandler for Navi {
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
+        self.request_redraw();
         let Some(idx) = self.windows.iter().position(|m| {
             m.window
                 .toplevel()
@@ -1378,6 +1397,7 @@ impl WlrLayerShellHandler for Navi {
     }
 
     fn layer_destroyed(&mut self, surface: WlrLayerSurface) {
+        self.request_redraw();
         let Some(output) = self.layer_output(surface.wl_surface()) else {
             return;
         };
