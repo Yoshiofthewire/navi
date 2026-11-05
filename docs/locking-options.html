@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Navi locking choices</title>
+<style>
+:root{color-scheme:light dark;--ink:#17202a;--sub:#445266;--link:#005f87;--line:#8290a0}
+@media(prefers-color-scheme:dark){:root{--ink:#e7edf4;--sub:#b4becb;--link:#70ccf5;--line:#8290a0}}
+body{margin:0;color:var(--foreground,var(--ink));font:1rem/1.55 system-ui,sans-serif}main{max-width:76ch}h1{font-size:1.35rem;line-height:1.25;margin:0 0 .8rem}h2{font-size:1rem;margin:1.3rem 0 .4rem}p{margin:.6rem 0}a{color:var(--link);text-underline-offset:.18em}a:focus-visible,summary:focus-visible{outline:2px solid var(--link);outline-offset:4px}small,.note{font-size:.875rem;color:var(--foreground,var(--sub))}table{width:100%;border-collapse:collapse;font-size:.94rem;margin:1rem 0}th,td{text-align:left;vertical-align:top;padding:.75rem .6rem;border-bottom:1px solid var(--line);overflow-wrap:anywhere}th:first-child,td:first-child{padding-left:0;width:23%}th:last-child,td:last-child{padding-right:0}thead{color:var(--foreground,var(--sub))}td p{margin:.2rem 0}summary{cursor:pointer;color:var(--foreground,var(--link));padding:.25rem 0}details{margin:1rem 0}ul{padding-left:1.25rem;margin:.4rem 0}li+li{margin-top:.35rem}code{font-size:.88em}footer{border-top:1px solid var(--line);padding-top:.6rem;margin-top:1rem}button,input,select{font:inherit}@media(max-width:420px){th,td{padding:.65rem .4rem}table{font-size:.9rem}h1{font-size:1.2rem}}
+</style></head><body><main>
+<h1>Locking choices for Navi</h1>
+<p><strong>My pick for the first prototype: swaylock.</strong> It fits Navi’s shared-memory rendering. Keep the identity backend separate: the permanent choice depends on the required SSO unlock conversation.</p>
+<table><thead><tr><th scope="col">Option</th><th scope="col">What you get / trade-off for Navi</th></tr></thead><tbody>
+<tr><th scope="row">swaylock<p><small>Default</small></p></th><td><p>Plain color or image, configurable colors and password feedback. PAM authentication.</p><p><strong>Trade-off:</strong> Least additional integration beyond session-lock. Cairo/shared-memory rendering; simple PAM responses, not a general device-code or multi-step prompt UI.</p></td></tr>
+<tr><th scope="row">waylock<p><small>Plain</small></p></th><td><p>Three-color feedback and PAM. No image toolkit or GPU renderer in its manifest.</p><p><strong>Trade-off:</strong> Current upstream also requires viewporter and single-pixel-buffer protocols. Navi must add those; no images, clock or widgets.</p></td></tr>
+<tr><th scope="row">gtklock<p><small>GTK</small></p></th><td><p>GTK3 widgets, CSS and optional modules. Uses the real session-lock protocol.</p><p><strong>Trade-off:</strong> Adds GTK and gtk-session-lock. Its PAM conversation reuses the same password, despite richer widgets. Upstream is seeking a maintainer.</p></td></tr>
+<tr><th scope="row">hyprlock<p><small>Rich</small></p></th><td><p>Blur, images, widgets, animations, PAM and native fprintd support. Not restricted to Hyprland’s private lock API.</p><p><strong>Trade-off:</strong> Larger graphics/library stack. Supports changing PAM prompts, but device-code/broker flows remain untested. Client EGL and screenshot capture need validation.</p></td></tr>
+</tbody></table>
+<p><strong>For central provisioning and SSO:</strong> SCIM manages accounts; an identity/PAM bridge handles authentication. Browser SSO at the login screen can coexist with a fresh local credential at unlock. If every unlock needs IdP MFA or device codes, validate that exact flow before selecting the permanent locker.</p>
+<details><summary>What about KDE, GNOME, COSMIC, Rust and other lockers?</summary><ul>
+<li><strong>KDE / GNOME:</strong> desktop-integrated lock architectures, not drop-in password windows for Navi.</li>
+<li><strong>COSMIC:</strong> a real Rust session-lock client, but its libcosmic/services dependencies need a separate compatibility trial.</li>
+<li><strong>Quickshell:</strong> provides QtQuick session-lock primitives; a chosen shell still owns authentication and unlock correctness.</li>
+<li><strong>Custom Navi Rust locker:</strong> full control, with the greatest credential-handling and UI maintenance burden.</li>
+<li><strong>Rust alternatives:</strong> swaywardlock is beta; Amorphis warns that it is early-stage. Not the default recommendation.</li>
+<li><strong>swaylock-effects:</strong> the familiar upstream forks are stale or explicitly unmaintained; newer forks need review rather than assumed safety.</li>
+<li><strong>X11-only lockers:</strong> cannot secure native Wayland clients. Current XScreenSaver Wayland support was not verified.</li>
+<li><strong>loginctl / swayidle / wayidle:</strong> coordinate locking or idle events; they do not supply the secure lock and password UI themselves.</li>
+</ul></details>
+<h2>Shared work required for every choice</h2>
+<p>Navi must protect every monitor and route input only to the locker, stay locked after a locker crash, and wait for confirmed lock coverage before Sleep or Switch User. Smithay already provides the protocol plumbing; Navi still needs the policy and tests.</p>
+<p class="note">Research checked 5 Nov 2026. Source review only: no candidate has been installed or run as Navi’s locker. No measured CPU/RAM ranking is available. Launching the locker on demand avoids a permanently running locker process.</p>
+<footer class="note">Sources: upstream project READMEs, manifests and code, the session-lock specification, and Smithay 0.7.0 documentation. Full citations and source-level details are in <code>docs/locking-options.md</code>.</footer>
+</main></body></html>
