@@ -13,7 +13,7 @@ use smithay::{
                 memory::{MemoryRenderBuffer, MemoryRenderBufferRenderElement},
                 render_elements,
                 solid::{SolidColorBuffer, SolidColorRenderElement},
-                surface::WaylandSurfaceRenderElement,
+                surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree},
             },
         },
     },
@@ -136,6 +136,24 @@ where
         return Vec::new();
     };
     let scale = output.current_scale().fractional_scale();
+    if state.lock.active {
+        return state
+            .lock
+            .surfaces
+            .iter()
+            .filter(|(o, s)| o == output && s.alive())
+            .flat_map(|(_, s)| {
+                render_elements_from_surface_tree::<R, Frame<R>>(
+                    renderer,
+                    s.wl_surface(),
+                    (0, 0),
+                    scale,
+                    1.0,
+                    Kind::Unspecified,
+                )
+            })
+            .collect();
+    }
     let origin = (geo.loc.x, geo.loc.y);
     let rect = |r: layout::Rect| {
         let r = monitors::to_local(r, origin, scale);
@@ -227,6 +245,20 @@ pub fn clear() -> [f32; 4] {
 /// Frame callbacks for what `output` shows, after a frame.
 pub fn send_frames(state: &mut Navi, output: &Output) {
     let time = state.start_time.elapsed();
+    if state.lock.active {
+        for (o, s) in &state.lock.surfaces {
+            if o == output && s.alive() {
+                smithay::desktop::utils::send_frames_surface_tree(
+                    s.wl_surface(),
+                    output,
+                    time,
+                    Some(Duration::ZERO),
+                    |_, _| Some(output.clone()),
+                );
+            }
+        }
+        return;
+    }
     let on_output = |_: &_, _: &_| Some(output.clone());
     for window in state.space.elements_for_output(output) {
         window.send_frame(output, time, Some(Duration::ZERO), on_output);

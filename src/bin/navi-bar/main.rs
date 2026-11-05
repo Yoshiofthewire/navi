@@ -11,6 +11,8 @@ mod image;
 mod theme;
 
 mod cards;
+#[path = "../../control.rs"]
+mod control;
 mod dbus;
 mod desktop;
 mod dock;
@@ -97,7 +99,10 @@ const POWER: &str = "/sys/class/power_supply";
 fn main() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .init();
     if let Err(e) = run() {
         error!("navi-bar: {e}");
         std::process::exit(1);
@@ -123,6 +128,22 @@ fn connect() -> Result<Connection, String> {
 }
 
 fn run() -> Result<(), String> {
+    let control = if std::env::var("NAVI_CONTROL_FD").as_deref() == Ok("1") {
+        let fd = std::io::stdout()
+            .as_fd()
+            .try_clone_to_owned()
+            .map_err(|e| e.to_string())?;
+        let null = File::options()
+            .write(true)
+            .open("/dev/null")
+            .map_err(|e| e.to_string())?;
+        rustix::stdio::dup2_stdout(&null).map_err(|e| e.to_string())?;
+        Some(std::sync::Arc::new(std::sync::Mutex::new(
+            UnixStream::from(fd),
+        )))
+    } else {
+        None
+    };
     let conn = connect()?;
     let (globals, queue) = registry_queue_init::<Bar>(&conn).map_err(|e| e.to_string())?;
     let qh = queue.handle();
@@ -207,6 +228,7 @@ fn run() -> Result<(), String> {
         status: String::new(),
         battery: None,
         session: session::Menu::default(),
+        control,
         band_hover: false,
         session_tx,
         full_session: dbus::wants_export(var("NAVI_EXPORT_ENV").as_deref()),
@@ -320,6 +342,7 @@ struct Bar {
     status: String,
     battery: Option<status::Battery>,
     session: session::Menu,
+    control: Option<std::sync::Arc<std::sync::Mutex<UnixStream>>>,
     band_hover: bool,
     session_tx: channel::Sender<session::Reply>,
     full_session: bool,
@@ -789,9 +812,13 @@ impl Bar {
                 self.full_session,
                 std::env::var("XDG_SEAT_PATH").ok(),
             );
+            let control = self.control.clone();
             std::thread::spawn(move || {
+                let can_lock = control
+                    .as_ref()
+                    .is_some_and(|c| c.lock().is_ok_and(|s| control::request(&s, false).is_ok()));
                 let _ = tx.send(session::Reply::Capabilities(session::capabilities(
-                    full, seat,
+                    full, seat, can_lock,
                 )));
             });
         }
@@ -812,8 +839,14 @@ impl Bar {
                 self.full_session,
                 self.session.capabilities.clone(),
             );
+            let control = self.control.clone();
             std::thread::spawn(move || {
-                let _ = tx.send(session::Reply::Done(session::perform(action, full, &caps)));
+                let result = session::perform_locked(action, full, &caps, || {
+                    let c = control.as_ref().ok_or("Lock channel unavailable")?;
+                    let s = c.lock().map_err(|_| "Lock channel unavailable")?;
+                    control::request(&s, true)
+                });
+                let _ = tx.send(session::Reply::Done(result));
             });
         }
         self.draw_band();
@@ -826,8 +859,11 @@ impl Bar {
             session::Reply::Done(Ok(())) => self.close_session(),
             session::Reply::Done(Err(e)) => {
                 warn!(error = %e, "session action failed");
-                self.session.message =
-                    "Request failed. See the session log,\nthen try again.".into();
+                self.session.message = if e.contains("lock") || e.contains("Lock") {
+                    "Could not lock. Install swaylock;\ncheck the Navi log and try again.".into()
+                } else {
+                    "Request failed. See the session log,\nthen try again.".into()
+                };
             }
         }
         self.draw_band();
@@ -1325,6 +1361,7 @@ fn spawn(e: &Entry, token: Option<&str>) {
     let mut cmd = Command::new(program);
     cmd.args(args)
         .env_remove("WAYLAND_SOCKET")
+        .env_remove("NAVI_CONTROL_FD")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

@@ -29,6 +29,7 @@ use crate::{
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Binding {
     Quit,
+    Lock,
     Vt(i32),
     Move(Side),
     Expand(Side),
@@ -37,6 +38,9 @@ pub enum Binding {
 /// Quit/VT bindings, Alt+Arrow to move, and Super+Arrow to expand. Extra modifiers on the
 /// window shortcuts are left for apps, including Ctrl+Alt+Arrow and Alt+Shift+Arrow.
 pub fn binding(mods: &ModifiersState, sym: Keysym) -> Option<Binding> {
+    if mods.logo && !mods.ctrl && !mods.alt && !mods.shift && sym == Keysym::l {
+        return Some(Binding::Lock);
+    }
     if mods.ctrl && mods.alt {
         let vt = sym.raw().wrapping_sub(Keysym::XF86_Switch_VT_1.raw());
         match sym {
@@ -160,8 +164,16 @@ impl Navi {
                     };
                 }
                 let binding = binding(mods, key.modified_sym());
-                // Once a press is ours, repeats and its release stay ours even when the user
-                // releases the modifier first. Keep one entry per held key.
+                if navi.lock.active && !matches!(binding, Some(Binding::Vt(_) | Binding::Lock)) {
+                    if binding.is_some() || navi.suppressed.contains(&code) {
+                        if !navi.suppressed.contains(&code) {
+                            navi.suppressed.push(code);
+                        }
+                        return FilterResult::Intercept(None);
+                    }
+                    return FilterResult::Forward;
+                }
+                // Once a press is ours, repeats and release remain ours.
                 if navi.suppressed.contains(&code) {
                     return FilterResult::Intercept(binding);
                 }
@@ -181,6 +193,7 @@ impl Navi {
             },
         );
         match kept.flatten() {
+            Some(Binding::Lock) => self.request_lock(None),
             Some(Binding::Quit) => {
                 info!("quit: Ctrl+Alt+Backspace");
                 self.loop_signal.stop();
@@ -237,7 +250,14 @@ impl Navi {
         };
         pointer.motion(self, under, &motion);
         pointer.frame(self);
-        self.bar_hover(pos);
+        if self.lock.active {
+            let s = self.pointer_focus(pos).map(|(s, _)| s);
+            if s.is_some() {
+                self.focus_lock_surface(s);
+            }
+        } else {
+            self.bar_hover(pos);
+        }
     }
 
     /// A pointer button, from winit or the debug replay.
@@ -290,12 +310,13 @@ impl Navi {
             }
             return;
         }
-        if pressed
+        if !self.lock.active
+            && pressed
             && !pointer.is_grabbed()
             && let Some(layer) = self.layer_at(pos)
         {
             self.click_layer(&layer);
-        } else if pressed && !pointer.is_grabbed() {
+        } else if !self.lock.active && pressed && !pointer.is_grabbed() {
             let hit = self.layout.hit(px(pos));
             // Keyboard focus follows click, in a tile's zones too, to the window shown there.
             let clicked = match hit {

@@ -23,7 +23,7 @@ jobs:
           persist-credentials: false
       # Xwayland's software-rendering path still probes libEGL.so.1.
       - name: System dependencies
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libxkbcommon-dev libwayland-dev pkg-config libudev-dev libinput-dev libseat-dev libgbm-dev libdrm-dev xwayland libegl1
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libxkbcommon-dev libwayland-dev pkg-config libudev-dev libinput-dev libseat-dev libgbm-dev libdrm-dev xwayland libegl1 swaylock
       - name: Rust toolchain
         id: toolchain
         run: |
@@ -42,6 +42,8 @@ jobs:
       - run: cargo test --release --locked
       - name: XWayland integration (release, no host display or GPU)
         run: cargo test --release --locked xwayland::tests::x11_lifecycle_and_input -- --ignored
+      - name: Swaylock protocol handshake (no host display or authentication)
+        run: cargo test --release --locked locking::tests::swaylock_real_client_handshake -- --ignored
       - run: cargo build --release --locked
       - name: Fail-safe smoke (release)
         run: |

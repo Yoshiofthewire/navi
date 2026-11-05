@@ -7,6 +7,7 @@ mod focus;
 mod image;
 mod input;
 mod layout;
+mod locking;
 mod monitors;
 mod persist;
 mod render;
@@ -156,6 +157,9 @@ fn run(backend: Backend) -> Result<(), Box<dyn Error>> {
         }
         Backend::Drm => udev::init(&mut event_loop, &mut data)?,
     };
+    if backend == Backend::Drm {
+        locking::logind::watch(&mut data.state);
+    }
     // After the first output exists, so the bar lands on it.
     let xdisplay = xwayland::start(&handle, &data.state);
     shell::start_bar(

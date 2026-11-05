@@ -82,6 +82,7 @@ struct Screen {
     solids: render::Solids,
     /// A frame is queued and its vblank not yet seen.
     queued: bool,
+    queued_lock: Option<u64>,
     /// A re-check for damage is timed.
     timed: bool,
     /// The last frame failed; logged once until one works.
@@ -424,6 +425,7 @@ fn scan(data: &mut CalloopData) -> Result<usize, String> {
             wallpaper: None,
             solids: render::Solids::default(),
             queued: false,
+            queued_lock: None,
             timed: false,
             failing: false,
         });
@@ -580,8 +582,16 @@ fn vblank(data: &mut CalloopData, crtc: crtc::Handle) {
         return;
     };
     s.queued = false;
-    if let Err(e) = s.drm.frame_submitted() {
-        warn!(output = identity(&s.output), "frame not submitted: {e}");
+    match s.drm.frame_submitted() {
+        Ok(_) => {
+            if let Some(epoch) = s.queued_lock.take() {
+                data.state.lock_presented(&s.output, epoch);
+            }
+        }
+        Err(e) => {
+            s.queued_lock = None;
+            warn!(output = identity(&s.output), "frame not submitted: {e}");
+        }
     }
     render(data, crtc);
 }
@@ -600,6 +610,10 @@ fn render(data: &mut CalloopData, crtc: crtc::Handle) {
     };
     if s.queued {
         return;
+    }
+    if data.state.lock_needs_present(&s.output) {
+        // Force presentation even if the new protected frame has identical pixels.
+        s.drm.reset_buffers();
     }
     let mut renderer = match udev.gpus.single_renderer(&udev.render_node) {
         Ok(r) => r,
@@ -638,6 +652,7 @@ fn render(data: &mut CalloopData, crtc: crtc::Handle) {
     match frame {
         Ok(queued) => {
             s.queued = queued;
+            s.queued_lock = (queued && data.state.lock.active).then_some(data.state.lock.epoch);
             s.failing = false;
         }
         Err(e) => {
