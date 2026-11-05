@@ -1,5 +1,11 @@
 //! Nested backend: navi runs as a window inside another compositor, as one output.
 
+use std::{
+    cell::RefCell,
+    rc::Rc,
+    time::{Duration, Instant},
+};
+
 use smithay::{
     backend::{
         allocator::Fourcc,
@@ -11,10 +17,14 @@ use smithay::{
         winit::{self, WinitEvent},
     },
     output::{Mode, Output, PhysicalProperties, Subpixel},
-    reexports::calloop::EventLoop,
+    reexports::calloop::{
+        EventLoop,
+        ping::make_ping,
+        timer::{TimeoutAction, Timer},
+    },
     utils::{Rectangle, Transform},
 };
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     CalloopData,
@@ -26,6 +36,22 @@ use crate::{
 };
 
 const NAME: &str = "winit";
+const FRAME_TIME: Duration = Duration::from_nanos(1_000_000_000 / 60);
+
+/// Coalesce change notifications; no timer exists when the desktop is idle.
+struct FrameClock {
+    last: Instant,
+    pending: bool,
+}
+impl FrameClock {
+    fn request(&mut self, now: Instant) -> Option<Duration> {
+        if self.pending {
+            return None;
+        }
+        self.pending = true;
+        Some((self.last + FRAME_TIME).saturating_duration_since(now))
+    }
+}
 
 /// With a `cursor`, navi hides the host's pointer over its window and draws its own.
 pub fn init(
@@ -33,7 +59,7 @@ pub fn init(
     data: &mut CalloopData,
     cursor: Option<Cursor>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (mut backend, winit) = winit::init::<GlesRenderer>()?;
+    let (backend, winit) = winit::init::<GlesRenderer>()?;
     // Winit drops `CursorLeft`, so this arrow stays where the pointer left the window.
     let cursor = cursor.map(|c| {
         // Winit sends the host `wl_pointer.set_cursor` with no surface on every pointer enter.
@@ -73,6 +99,40 @@ pub fn init(
     let mut damage_tracker = OutputDamageTracker::from_output(&output);
     let mut shot = Screenshot::from_env();
 
+    let mut solids = render::Solids::default();
+    let backend = Rc::new(RefCell::new(backend));
+    let clock = Rc::new(RefCell::new(FrameClock {
+        last: Instant::now() - FRAME_TIME,
+        pending: false,
+    }));
+    let (ping, source) = make_ping()?;
+    data.state.redraw = Some(ping.clone());
+    let (draw, pacing, handle) = (backend.clone(), clock.clone(), event_loop.handle());
+    event_loop.handle().insert_source(source, move |_, _, _| {
+        let Some(delay) = pacing.borrow_mut().request(Instant::now()) else {
+            return;
+        };
+        let (draw, timed_clock) = (draw.clone(), pacing.clone());
+        if let Err(e) = handle.insert_source(Timer::from_duration(delay), move |_, _, _| {
+            timed_clock.borrow_mut().pending = false;
+            draw.borrow().window().request_redraw();
+            TimeoutAction::Drop
+        }) {
+            pacing.borrow_mut().pending = false;
+            warn!("redraw timer: {e}");
+        }
+    })?;
+    // Capture instrumentation can request a fresh image each second; ordinary runs don't.
+    if shot.is_some() {
+        event_loop.handle().insert_source(
+            Timer::from_duration(Duration::from_secs(1)),
+            move |_, _, _| {
+                ping.ping();
+                TimeoutAction::ToDuration(Duration::from_secs(1))
+            },
+        )?;
+    }
+
     event_loop
         .handle()
         .insert_source(winit, move |event, _, data| {
@@ -93,14 +153,24 @@ pub fn init(
                 WinitEvent::Input(event) => state.process_input_event(event),
                 WinitEvent::Focus(false) => state.cancel_drag(),
                 WinitEvent::Redraw => {
+                    debug!("nested frame");
+                    clock.borrow_mut().last = Instant::now();
+                    let mut backend = backend.borrow_mut();
                     let size = backend.window_size();
                     let damage = Rectangle::from_size(size);
                     let mut copy = None;
+                    let mut failed = false;
                     match backend.bind() {
                         Ok((renderer, mut framebuffer)) => {
                             let arrow = cursor.as_ref().map_or(Arrow::None, Arrow::Image);
-                            let elements =
-                                render::elements(renderer, state, &output, arrow, &mut wallpaper);
+                            let elements = render::elements(
+                                renderer,
+                                state,
+                                &output,
+                                arrow,
+                                &mut wallpaper,
+                                &mut solids,
+                            );
                             let rendered = damage_tracker.render_output(
                                 renderer,
                                 &mut framebuffer,
@@ -109,6 +179,7 @@ pub fn init(
                                 render::clear(),
                             );
                             if let Err(e) = rendered {
+                                failed = true;
                                 warn!("render failed: {e:?}");
                             } else if shot.as_mut().is_some_and(Screenshot::due) {
                                 // Copied before the swap; mapped after it, since mapping drops
@@ -128,9 +199,13 @@ pub fn init(
                                 }
                             }
                         }
-                        Err(e) => warn!("bind failed: {e:?}"),
+                        Err(e) => {
+                            failed = true;
+                            warn!("bind failed: {e:?}");
+                        }
                     }
                     if let Err(e) = backend.submit(Some(&[damage])) {
+                        failed = true;
                         warn!("submit failed: {e:?}");
                     }
                     if let (Some(shot), Some(copy)) = (shot.as_mut(), copy) {
@@ -141,11 +216,10 @@ pub fn init(
                     }
 
                     render::send_frames(state, &output);
-                    state.space.refresh();
-                    state.popups.cleanup();
-                    state.refresh_toplevels();
                     let _ = data.display.flush_clients();
-                    backend.window().request_redraw();
+                    if failed || state.drag.is_some() {
+                        state.request_redraw();
+                    }
                 }
                 WinitEvent::CloseRequested => state.loop_signal.stop(),
                 _ => (),
@@ -162,4 +236,24 @@ fn upright(renderer: &mut GlesRenderer, copy: &GlesMapping) -> Result<Vec<u8>, G
         true => px.chunks_exact(row).rev().flatten().copied().collect(),
         false => px.to_vec(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn changes_coalesce_and_callbacks_cannot_spin_faster_than_the_output() {
+        let now = Instant::now();
+        let mut clock = FrameClock {
+            last: now,
+            pending: false,
+        };
+        assert_eq!(clock.request(now), Some(FRAME_TIME));
+        assert_eq!(clock.request(now + FRAME_TIME), None);
+        clock.pending = false;
+        assert_eq!(clock.request(now + FRAME_TIME * 2), Some(Duration::ZERO));
+        clock.last = now + FRAME_TIME * 2;
+        clock.pending = false;
+        assert_eq!(clock.request(clock.last), Some(FRAME_TIME));
+    }
 }

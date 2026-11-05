@@ -137,6 +137,7 @@ impl Navi {
 
     /// A key (an xkb keycode), from a backend or the debug replay.
     pub fn keyboard_key(&mut self, code: Keycode, state: KeyState, time: u32) {
+        self.request_redraw();
         let Some(kb) = self.seat.get_keyboard() else {
             return;
         };
@@ -209,6 +210,7 @@ impl Navi {
 
     /// Pointer motion to `pos`, from winit or the debug replay.
     pub fn pointer_motion(&mut self, pos: Point<f64, Logical>, time: u32) {
+        self.request_redraw();
         let Some(pointer) = self.seat.get_pointer() else {
             return;
         };
@@ -240,6 +242,7 @@ impl Navi {
 
     /// A pointer button, from winit or the debug replay.
     pub fn pointer_button(&mut self, button: u32, left: bool, pressed: bool, time: u32) {
+        self.request_redraw();
         let Some(pointer) = self.seat.get_pointer() else {
             return;
         };
@@ -330,6 +333,7 @@ impl Navi {
 
     /// The window losing focus mid-drag may swallow the release: cancel the drag.
     pub fn cancel_drag(&mut self) {
+        self.request_redraw();
         self.edge_clicks = Default::default();
         if let Some(d) = self.drag.take() {
             info!("drag cancelled");

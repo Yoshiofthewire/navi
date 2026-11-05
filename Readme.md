@@ -149,8 +149,8 @@ Extract the archive, keep both binaries together, and run `./navi` from an exist
 - XWayland primary selection, cross-protocol drag-and-drop, and automatic XWayland restart
   are not implemented.
 - Accessibility integration, virtual desktops, and volume/network/system-tray controls are pending.
-- The nested backend continuously requests redraws; idle power/performance tuning and
-  full-session benchmarks remain pending.
+- Nested rendering sleeps between changes; hardware idle CPU and full-session benchmarks
+  remain unverified. See [performance measurements](docs/performance.md).
 
 ## License
 

@@ -170,6 +170,9 @@ fn run(backend: Backend) -> Result<(), Box<dyn Error>> {
     replay::start(&handle);
     // Clients must receive replies even while the host throttles an obscured nested window.
     event_loop.run(None, &mut data, |data| {
+        data.state.space.refresh();
+        data.state.popups.cleanup();
+        data.state.refresh_toplevels();
         let _ = data.display.flush_clients();
     })?;
     Ok(())

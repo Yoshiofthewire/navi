@@ -79,6 +79,7 @@ struct Screen {
     global: GlobalId,
     drm: DrmOutput<Allocator, Exporter, (), DrmDeviceFd>,
     wallpaper: Option<Wallpaper>,
+    solids: render::Solids,
     /// A frame is queued and its vblank not yet seen.
     queued: bool,
     /// A re-check for damage is timed.
@@ -421,6 +422,7 @@ fn scan(data: &mut CalloopData) -> Result<usize, String> {
             global,
             drm,
             wallpaper: None,
+            solids: render::Solids::default(),
             queued: false,
             timed: false,
             failing: false,
@@ -613,6 +615,7 @@ fn render(data: &mut CalloopData, crtc: crtc::Handle) {
         &s.output,
         arrow,
         &mut s.wallpaper,
+        &mut s.solids,
     );
     let frame = s
         .drm
