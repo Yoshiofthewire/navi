@@ -1,7 +1,7 @@
 //! Dock and launcher geometry in logical pixels; transparent margins stay outside input regions.
 
 use crate::{
-    desktop::Entry,
+    desktop::{Category, Entry},
     menu::{Menu, ROWS, Row},
     theme::{ACCENT, BAR_BG, BG, DIM, INK, SELECTED},
 };
@@ -33,7 +33,7 @@ pub struct Rect {
     pub h: i32,
 }
 impl Rect {
-    fn contains(&self, x: i32, y: i32) -> bool {
+    pub fn contains(&self, x: i32, y: i32) -> bool {
         x >= self.x && x < self.x + self.w && y >= self.y && y < self.y + self.h
     }
 }
@@ -57,7 +57,8 @@ pub enum IconOf {
     Button,
     Window(usize),
     Entry(usize),
-    Folder,
+    Folder(Category),
+    Session(&'static str),
 }
 #[derive(Clone, Debug, PartialEq)]
 pub enum Item {
@@ -254,7 +255,7 @@ impl Layout {
                         (
                             c.name(),
                             format!("{n} {}", if n == 1 { "app" } else { "apps" }),
-                            IconOf::Folder,
+                            IconOf::Folder(c),
                         )
                     }
                     Row::App(e) => (entries[e].name.as_str(), String::new(), IconOf::Entry(e)),
@@ -452,7 +453,7 @@ mod tests {
         assert!(
             items
                 .iter()
-                .any(|i| matches!(i, Item::Icon(IconOf::Folder, _, _)))
+                .any(|i| matches!(i, Item::Icon(IconOf::Folder(Category::System), _, _)))
         );
         assert!(
             items

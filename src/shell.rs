@@ -85,7 +85,8 @@ pub fn start_bar(
             return;
         }
     };
-    let (tx, rx) = channel::channel::<()>();
+    // Only a successful exit from our own shell means the user confirmed Log Out.
+    let (tx, rx) = channel::channel::<bool>();
     let bar = Rc::new(RefCell::new(Bar {
         path,
         wayland_display: wayland_display.to_os_string(),
@@ -97,10 +98,15 @@ pub fn start_bar(
     }));
     bar.borrow_mut().start(dh, &tx);
     let h = handle.clone();
-    let restart = handle.insert_source(rx, move |event, _, _| {
-        let Event::Msg(()) = event else {
+    let restart = handle.insert_source(rx, move |event, _, data| {
+        let Event::Msg(logout) = event else {
             return;
         };
+        if logout {
+            info!("logout requested by navi-bar");
+            data.state.loop_signal.stop();
+            return;
+        }
         let (bar, tx) = (bar.clone(), tx.clone());
         let timer = Timer::from_duration(RESTART_DELAY);
         let queued = h.insert_source(timer, move |_, _, data| {
@@ -118,7 +124,7 @@ pub fn start_bar(
 
 impl Bar {
     /// Starts navi-bar if the respawn limit allows; `exited` hears when it exits.
-    fn start(&mut self, dh: &mut DisplayHandle, exited: &channel::Sender<()>) {
+    fn start(&mut self, dh: &mut DisplayHandle, exited: &channel::Sender<bool>) {
         if !self.respawn.allow(self.clock.elapsed().as_millis() as u64) {
             warn!("navi-bar keeps crashing, running without a bar");
             return;
@@ -128,7 +134,7 @@ impl Bar {
         }
     }
 
-    fn spawn(&self, dh: &mut DisplayHandle, exited: channel::Sender<()>) -> io::Result<()> {
+    fn spawn(&self, dh: &mut DisplayHandle, exited: channel::Sender<bool>) -> io::Result<()> {
         let (ours, theirs) = UnixStream::pair()?;
         let mut cmd = Command::new(&self.path);
         // Without a theme navi drew nothing either, so apps keep their own default.
@@ -162,12 +168,18 @@ impl Bar {
             Err(e) => warn!(pid, "navi-bar's connection refused: {e}"),
         }
         std::thread::spawn(move || {
-            match child.wait() {
-                Ok(status) => info!(pid, %status, "navi-bar exited"),
-                Err(e) => warn!(pid, "navi-bar not reaped: {e}"),
-            }
+            let logout = match child.wait() {
+                Ok(status) => {
+                    info!(pid, %status, "navi-bar exited");
+                    status.success()
+                }
+                Err(e) => {
+                    warn!(pid, "navi-bar not reaped: {e}");
+                    false
+                }
+            };
             // Fails only once navi is shutting down.
-            let _ = exited.send(());
+            let _ = exited.send(logout);
         });
         Ok(())
     }

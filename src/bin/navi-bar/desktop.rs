@@ -43,6 +43,24 @@ pub enum Category {
 }
 
 impl Category {
+    /// KDE's category icon names, resolved through the user's icon theme.
+    pub fn icon(self) -> &'static str {
+        match self {
+            Self::Internet => "applications-internet",
+            Self::Development => "applications-development",
+            Self::Office => "applications-office",
+            Self::Graphics => "applications-graphics",
+            Self::Media => "applications-multimedia",
+            Self::Games => "applications-games",
+            Self::Education => "applications-education",
+            Self::Science => "applications-science",
+            Self::Settings => "preferences-system",
+            Self::System => "applications-system",
+            Self::Utilities => "applications-utilities",
+            Self::Other => "applications-other",
+        }
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Self::Internet => "Internet",
