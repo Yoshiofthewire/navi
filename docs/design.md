@@ -349,6 +349,23 @@ session.
   Full sessions listen for logind Lock and PrepareForSleep with a delay inhibitor, and report
   ordered LockedHint changes. A failed before-sleep lock retains protection/inhibitor until
   logind’s own timeout; listener failure is logged. Idle locking remains future work.
+  The lock backdrop is the configured per-monitor wallpaper with the desktop's centered crop,
+  darkened to 27% brightness and blurred. No Navi logo, name, avatar or clock is displayed.
+  Small “Session locked”, password and Enter prompts remain. The circle is eight clockwise
+  slices from 12 o’clock: blue to green over characters 1–8, green to purple over 9–16, then
+  amber, pink and cyan, repeating. Backspace reverses and clear resets. A rendering-only patch
+  reads the existing swaylock input-buffer length in Unicode codepoints, never copies/logs its
+  contents, and leaves upstream storage/PAM unchanged. Verification/error/Caps Lock feedback
+  remains native. Cargo builds the helper from pinned SHA-256-verified upstream source; only
+  build-time Meson/Ninja/Cairo/PAM headers are added. Wallpaper decoding, a bounded 960 px thumbnail
+  blur and PNG preparation run on a worker; input and rendering protection begin immediately.
+  Three separable box passes approximate a soft Gaussian with linear cost, then the existing
+  graphics library scales the backdrop and composites crisp prompt art at output size. Output
+  images use the existing image-size limits. No screenshot protocol, additional process beyond
+  the one locker, or font parsing in the compositor is added. Missing wallpaper falls back to BG.
+  Per-output private 0600 images last until swaylock exits; a newly connected output uses the
+  first blurred image until the next lock. The static prompt art is regenerated during
+  development with `scripts/render-lock-prompts.sh` and is embedded in the binary.
   See [session validation limits](session.md).
 - **No network access**, no plugins, and no shell commands anywhere in the compositor or shell.
   navi-bar, not navi, launches apps, so `.desktop` files, icon themes and fonts (all untrusted)

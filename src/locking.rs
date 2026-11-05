@@ -43,6 +43,7 @@ use crate::{
     state::{ClientState, Navi},
 };
 
+mod background;
 pub mod logind;
 
 pub const SWAYLOCK: &str = "/usr/bin/swaylock";
@@ -56,24 +57,91 @@ pub fn executable() -> std::path::PathBuf {
             return path;
         }
     }
+    if let Ok(exe) = std::env::current_exe() {
+        let helper = exe.with_file_name("navi-swaylock");
+        if helper.is_file() && std::path::Path::new(SWAYLOCK).is_file() {
+            return helper;
+        }
+    }
     SWAYLOCK.into()
 }
 
-fn command(path: &std::path::Path) -> Command {
+fn command(path: &std::path::Path, backgrounds: &[background::Background]) -> Command {
     let mut cmd = Command::new(path);
     cmd.args([
         "--config",
         "/dev/null",
         "--color",
         "0b0d12",
+        "--scaling",
+        "fill",
         "--indicator-idle-visible",
+        "--indicator-radius",
+        "52",
+        "--indicator-thickness",
+        "6",
+        "--indicator-caps-lock",
+        "--font",
+        "Noto Sans",
+        "--font-size",
+        "16",
+        "--inside-caps-lock-color",
+        "151922",
+        "--ring-caps-lock-color",
+        "f0c674",
+        "--text-caps-lock-color",
+        "f0c674",
+        "--line-caps-lock-color",
+        "00000000",
+        "--inside-color",
+        "151922",
+        "--inside-clear-color",
+        "151922",
+        "--inside-ver-color",
+        "151922",
+        "--inside-wrong-color",
+        "151922",
         "--ring-color",
         "2ba3d8",
+        "--ring-clear-color",
+        "2ba3d8",
+        "--ring-ver-color",
+        "2ba3d8",
+        "--ring-wrong-color",
+        "f07886",
+        "--key-hl-color",
+        "2ba3d8",
+        "--bs-hl-color",
+        "d0d4dc",
+        "--line-color",
+        "00000000",
+        "--line-clear-color",
+        "00000000",
+        "--line-ver-color",
+        "00000000",
+        "--line-wrong-color",
+        "00000000",
+        "--text-clear-color",
+        "d0d4dc",
+        "--text-color",
+        "d0d4dc",
+        "--text-ver-color",
+        "d0d4dc",
+        "--text-wrong-color",
+        "f07886",
         "--ignore-empty-password",
     ])
     .env("WAYLAND_SOCKET", "0")
     .env_remove("DISPLAY")
     .stdout(Stdio::null());
+    if let Some(first) = backgrounds.first() {
+        // A newly connected output gets a protected, blurred default too.
+        cmd.arg("--image").arg(&first.path);
+    }
+    for bg in backgrounds.iter().skip(1) {
+        cmd.arg("--image")
+            .arg(format!("{}:{}", bg.name, bg.path.display()));
+    }
     cmd
 }
 
@@ -124,10 +192,48 @@ impl Navi {
         if !self.lock.starts.allow(self.now_ms()) {
             return Err("swaylock restarted too often; session stays protected".into());
         }
+        if !executable().is_file() {
+            return Err("Install the swaylock package first".into());
+        }
+        let outputs = self
+            .space
+            .outputs()
+            .filter_map(|o| {
+                let geo = self.space.output_geometry(o)?;
+                Some((
+                    o.name(),
+                    self.priority_of(&crate::state::identity(o)),
+                    geo.size.w,
+                    geo.size.h,
+                ))
+            })
+            .collect();
+        let (tx, rx) = channel::channel();
+        self.loop_handle.insert_source(rx, |event, _, data| {
+            if let channel::Event::Msg(backgrounds) = event
+                && let Err(e) = data.state.spawn_locker_ready(backgrounds)
+            {
+                data.state.lock.spawning = false;
+                data.state.lock_reply(false);
+                warn!("swaylock not started; protection remains active: {e}");
+            }
+        })?;
+        self.lock.spawning = true;
+        // Protect immediately while decoding/blur/PNG work happens off the event loop.
+        self.protect_session();
+        std::thread::spawn(move || {
+            let _ = tx.send(background::prepare(outputs));
+        });
+        Ok(())
+    }
+
+    fn spawn_locker_ready(
+        &mut self,
+        backgrounds: Vec<background::Background>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let (ours, theirs) = UnixStream::pair()?;
-        let mut child = command(&executable())
-            .stdin(Stdio::from(OwnedFd::from(theirs)))
-            .spawn()?;
+        let mut cmd = command(&executable(), &backgrounds);
+        let mut child = cmd.stdin(Stdio::from(OwnedFd::from(theirs))).spawn()?;
         let client = match self.display_handle.insert_client(
             ours,
             Arc::new(ClientState {
@@ -192,6 +298,7 @@ impl Navi {
         })?;
         std::thread::spawn(move || {
             let status = child.wait();
+            drop(backgrounds);
             info!(?status, "swaylock exited");
             let _ = tx.send(());
         });

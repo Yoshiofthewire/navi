@@ -22,7 +22,7 @@ jobs:
         with:
           persist-credentials: false
       # Xwayland probes EGL even when the headless integration test uses software rendering.
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libxkbcommon-dev libwayland-dev pkg-config libudev-dev libinput-dev libseat-dev libgbm-dev libdrm-dev xwayland libegl1 swaylock
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libxkbcommon-dev libwayland-dev pkg-config libudev-dev libinput-dev libseat-dev libgbm-dev libdrm-dev xwayland libegl1 swaylock meson ninja-build wayland-protocols libcairo2-dev libpam0g-dev curl patch
       - name: Rust toolchain
         id: toolchain
         run: |
@@ -45,6 +45,8 @@ jobs:
         run: cargo test --locked xwayland::tests::x11_lifecycle_and_input -- --ignored
       - name: Swaylock protocol handshake (no host display or authentication)
         run: cargo test --locked locking::tests::swaylock_real_client_handshake -- --ignored
+      - name: Eight-slice locker protocol handshake
+        run: NAVI_TEST_SWAYLOCK="$PWD/target/debug/navi-swaylock" cargo test --locked locking::tests::swaylock_real_client_handshake -- --ignored
       - run: cargo build --locked
       # No display and no seat: navi must take the real-hardware path and exit 1 with its
       # message, not hang (124), panic (101) or succeed.

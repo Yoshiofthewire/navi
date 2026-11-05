@@ -5,14 +5,14 @@
 From the repo, build as yourself and install with sudo:
 
 ```sh
-cargo build --release --locked && sudo install -Dm755 -t /usr/local/bin target/release/navi target/release/navi-bar && sudo install -Dm644 -t /usr/share/wayland-sessions dist/navi.desktop && sudo install -Dm644 -t /usr/share/xdg-desktop-portal dist/navi-portals.conf
+cargo build --release --locked && sudo install -Dm755 -t /usr/local/bin target/release/navi target/release/navi-bar target/release/navi-swaylock && sudo install -Dm644 -t /usr/share/wayland-sessions dist/navi.desktop && sudo install -Dm644 -t /usr/share/xdg-desktop-portal dist/navi-portals.conf
 ```
 
 The same, a step at a time, with the build capped so it can't take the desktop down with it:
 
 ```sh
 systemd-run --user --scope -p MemoryMax=6G -p MemorySwapMax=0 -- cargo build --release --locked
-sudo install -Dm755 -t /usr/local/bin target/release/navi target/release/navi-bar
+sudo install -Dm755 -t /usr/local/bin target/release/navi target/release/navi-bar target/release/navi-swaylock
 sudo install -Dm644 -t /usr/share/wayland-sessions dist/navi.desktop
 sudo install -Dm644 -t /usr/share/xdg-desktop-portal dist/navi-portals.conf
 ```
@@ -20,7 +20,7 @@ sudo install -Dm644 -t /usr/share/xdg-desktop-portal dist/navi-portals.conf
 Uninstall:
 
 ```sh
-sudo rm /usr/local/bin/navi /usr/local/bin/navi-bar /usr/share/wayland-sessions/navi.desktop /usr/share/xdg-desktop-portal/navi-portals.conf
+sudo rm /usr/local/bin/navi /usr/local/bin/navi-bar /usr/local/bin/navi-swaylock /usr/share/wayland-sessions/navi.desktop /usr/share/xdg-desktop-portal/navi-portals.conf
 ```
 
 Your settings in `~/.config/navi` and `~/.local/state/navi` stay; delete them for a fresh start.
@@ -65,8 +65,10 @@ Actions requiring an authorization prompt are unavailable until Navi has an auth
 Switch User requires a display manager that advertises `CanSwitch` at this session's
 `XDG_SEAT_PATH`; without that exact seat it is disabled.
 
-Lock Screen uses the distro's PAM-enabled `/usr/bin/swaylock`. Install `swaylock` with your
-package manager; Navi does not install or alter PAM configuration. **Super+L** locks immediately;
+Lock Screen uses the adjacent `navi-swaylock` helper, built from pinned upstream swaylock with
+a rendering-only patch. Keep the distro `swaylock` package installed for its PAM service; Navi
+does not install or alter PAM configuration. If the helper is absent, the distro binary remains
+a functional fallback with its stock random highlight. **Super+L** locks immediately;
 the upper-left Navi menu also offers Lock Screen with confirmation. Nested, Lock Screen and
 Log Out are available; the lock protects Navi's window only, never the host desktop.
 
@@ -82,8 +84,19 @@ If swaylock crashes, every output stays protected, and Navi retries it (at most 
 minute). **Super+L** retries after that limit has elapsed. No app connection can take over the
 lock. Ctrl+Alt+Backspace is disabled while locked; VT switching remains available for recovery.
 If recovery fails, use another VT to repair/install swaylock, then return and retry; ending Navi
-from that VT ends the session and loses unsaved work. Navi uses a fixed solid background and
-blue ring and ignores swaylock's per-user config to keep the supervised process in the foreground.
+from that VT ends the session and loses unsaved work. Navi uses a darkened, softly blurred version of each monitor's configured wallpaper, with no
+Navi logo or name. Small password/Enter prompts remain visible. The circle has eight clockwise slices starting at
+12 o’clock. It starts blue; each character changes one slice to green. After eight characters it
+is all green; character nine starts a purple lap. Later laps use amber, pink and cyan before the
+palette repeats. Backspace reverses progress; clearing resets it. Unicode codepoints, rather than
+UTF-8 bytes, are counted. Verification/error/Caps Lock messages still come from swaylock.
+The wallpaper uses the same centered crop as the desktop. Preparation runs off the event loop;
+Navi protects the screen immediately while it works. Missing or unreadable wallpaper falls back
+to the solid protected background. Nothing captures open windows or their contents.
+
+Navi contains the prompt art and image processing; the small helper uses the same Cairo/PAM
+libraries as swaylock. Cargo builds it using Meson/Ninja and a verified upstream source archive.
+Navi still ignores swaylock's per-user config to keep the supervised process in the foreground.
 
 Authentication stays entirely in swaylock/PAM. No fresh browser SSO, SCIM provisioning or IdP
 configuration is added here. Central identities can use the OS identity/PAM bridge later; test
@@ -92,9 +105,9 @@ any multi-step SSO/MFA unlock flow separately against swaylock's conversation su
 Validation: protocol tests cover output coverage, rejected/early unlock, hotplug, password-key
 routing and crash protection. The isolated real-swaylock test starts a private compositor,
 maps its SHM buffers and kills only that child; it never submits a password or touches the host
-session. DRM, PAM authentication, real logind suspend and physical multi-monitor behavior still
-require hardware validation. Debug builds accept an absolute `NAVI_TEST_SWAYLOCK` path solely
-for testing an extracted package with input replay; release Navi always uses `/usr/bin/swaylock`.
+session. The user verified a real password unlock in nested Navi on 2026-11-05. DRM, real
+logind suspend and physical multi-monitor behavior still require hardware validation. Debug builds accept an absolute `NAVI_TEST_SWAYLOCK` path solely
+for testing an extracted package with input replay; release Navi prefers its adjacent `navi-swaylock`, with the distro binary as fallback.
 Failed menu requests show an error; details go to the session log.
 
 ## When it fails
