@@ -1,0 +1,66 @@
+name: Release build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Xwayland's software-rendering path still probes libEGL.so.1.
+      - name: System dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libxkbcommon-dev libwayland-dev pkg-config libudev-dev libinput-dev libseat-dev libgbm-dev libdrm-dev xwayland libegl1
+      - name: Rust toolchain
+        id: toolchain
+        run: |
+          rustup show
+          echo "version=$(rustc -V | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+      - name: Cargo cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target/release
+          key: ${{ runner.os }}-${{ runner.arch }}-release-${{ steps.toolchain.outputs.version }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml') }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-release-${{ steps.toolchain.outputs.version }}-
+      - run: cargo test --release --locked
+      - name: XWayland integration (release, no host display or GPU)
+        run: cargo test --release --locked xwayland::tests::x11_lifecycle_and_input -- --ignored
+      - run: cargo build --release --locked
+      - name: Fail-safe smoke (release)
+        run: |
+          test "$(id -u)" -ne 0
+          code=0
+          env -u WAYLAND_DISPLAY -u DISPLAY timeout 20 target/release/navi 2> err.txt || code=$?
+          cat err.txt
+          echo "exit status $code, uid $(id -u)"
+          test "$code" = 1
+          grep -F 'navi: cannot start on real hardware:' err.txt
+      - name: Package binaries and session files
+        run: |
+          tar -czf navi-linux-x86_64.tar.gz \
+            -C target/release navi navi-bar \
+            -C "$GITHUB_WORKSPACE" dist docs assets/icons Readme.md LICENSE.txt
+      - name: Upload release build
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          path: navi-linux-x86_64.tar.gz
+          archive: false
+          if-no-files-found: error
+          retention-days: 14

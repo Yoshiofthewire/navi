@@ -4,19 +4,40 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       # Xwayland probes EGL even when the headless integration test uses software rendering.
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libxkbcommon-dev libwayland-dev pkg-config libudev-dev libinput-dev libseat-dev libgbm-dev libdrm-dev xwayland libegl1
+      - name: Rust toolchain
+        id: toolchain
+        run: |
+          rustup show
+          echo "version=$(rustc -V | awk '{print $2}')" >> "$GITHUB_OUTPUT"
+      - name: Cargo cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target/debug
+          key: ${{ runner.os }}-${{ runner.arch }}-check-${{ steps.toolchain.outputs.version }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml') }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-check-${{ steps.toolchain.outputs.version }}-
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
@@ -30,7 +51,6 @@ jobs:
           test "$(id -u)" -ne 0
           code=0
           env -u WAYLAND_DISPLAY -u DISPLAY timeout 20 target/debug/navi 2> err.txt || code=$?
-          echo "$code" > code.txt
           cat err.txt
           echo "exit status $code, uid $(id -u)"
           test "$code" = 1

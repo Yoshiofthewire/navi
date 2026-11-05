@@ -3,7 +3,8 @@
 navi is a tiling Wayland desktop for people with several big monitors who don't want to learn
 Hyprland. Tiling is the product, not a mode. The mouse is enough; the keyboard is optional.
 
-Status: draft, 2026-11-03. Nothing is built yet.
+Status: implemented prototype. [Readme.md](../Readme.md) and [the session guide](session.md)
+describe current capabilities and validation limits; this document also records planned behavior.
 
 ## Principles
 
@@ -316,8 +317,8 @@ session.
   than navi's latest). Each works once, within 10 s, and only while the keyboard is still on the
   surface that asked or on the one being activated, so an app can't stash tokens and take focus
   back after you've moved on.
-- **Locking** uses `ext-session-lock`. If the lock screen crashes, the screen stays locked with a
-  solid colour; it never unlocks.
+- **Locking** is planned with `ext-session-lock`; there is no integrated lock yet. Its intended
+  behavior is to stay locked with a solid colour if the lock screen crashes.
 - **No network access**, no plugins, and no shell commands anywhere in the compositor or shell.
   navi-bar, not navi, launches apps, so `.desktop` files, icon themes and fonts (all untrusted)
   are parsed outside the compositor. Launching runs the `Exec=` line broken into arguments (any
