@@ -41,6 +41,18 @@ there, and Ctrl+Alt+Backspace brings the console back. Then pick "navi" on the l
   machine, and `kill` navi; else hold the power button. Ctrl+Alt+SysRq+R, E, I, S, U, B is the
   last resort, where SysRq is enabled.
 
+## Moving and resizing with the keyboard
+
+- **Alt + Left/Right/Up/Down:** move the focused tile one grid cell, preserving its size and
+  stopping at occupied cells or the current monitor's usable edge.
+- **Super + Left/Right/Up/Down:** expand that side to the next window or usable monitor edge.
+  Other windows stay put. Panels keep their space.
+
+These work for native Wayland and X11 tiles and move/resize a tab group together. Changes are
+remembered. Maximized/fullscreen windows keep their geometry. Floating dialogs and launcher
+surfaces keep their app shortcuts. When testing nested, the host compositor may reserve these
+chords before Navi receives them; a full Navi session receives them directly.
+
 ## When it fails
 
 If navi can't start (no seat session, no GPU, no monitor), it exits with

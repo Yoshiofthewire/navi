@@ -1,5 +1,5 @@
-//! Input from either backend. navi keeps two bindings for itself, before any client sees them:
-//! Ctrl+Alt+Backspace quits, and Ctrl+Alt+F1…F12 switch VTs on real hardware.
+//! Input from either backend. navi keeps quit/VT bindings and focused-window move/expand
+//! shortcuts before clients see them.
 
 use smithay::{
     backend::{
@@ -20,7 +20,7 @@ use smithay::{
 use tracing::{info, warn};
 
 use crate::{
-    layout::{Action, Done, Drag, Rect},
+    layout::{Action, Done, Drag, Rect, Side},
     monitors,
     state::{Navi, identity, px},
 };
@@ -30,17 +30,31 @@ use crate::{
 pub enum Binding {
     Quit,
     Vt(i32),
+    Move(Side),
+    Expand(Side),
 }
 
-/// navi's own bindings: Ctrl+Alt+Backspace, and Ctrl+Alt+F1…F12 as xkb gives them.
+/// Quit/VT bindings, Alt+Arrow to move, and Super+Arrow to expand. Extra modifiers on the
+/// window shortcuts are left for apps, including Ctrl+Alt+Arrow and Alt+Shift+Arrow.
 pub fn binding(mods: &ModifiersState, sym: Keysym) -> Option<Binding> {
-    if !(mods.ctrl && mods.alt) {
-        return None;
+    if mods.ctrl && mods.alt {
+        let vt = sym.raw().wrapping_sub(Keysym::XF86_Switch_VT_1.raw());
+        match sym {
+            Keysym::BackSpace | Keysym::Terminate_Server => return Some(Binding::Quit),
+            _ if vt < 12 => return Some(Binding::Vt(vt as i32 + 1)),
+            _ => {}
+        }
     }
-    let vt = sym.raw().wrapping_sub(Keysym::XF86_Switch_VT_1.raw());
-    match sym {
-        Keysym::BackSpace | Keysym::Terminate_Server => Some(Binding::Quit),
-        _ if vt < 12 => Some(Binding::Vt(vt as i32 + 1)),
+    let side = match sym {
+        Keysym::Left => Side::Left,
+        Keysym::Right => Side::Right,
+        Keysym::Up => Side::Top,
+        Keysym::Down => Side::Bottom,
+        _ => return None,
+    };
+    match (mods.ctrl, mods.alt, mods.logo, mods.shift) {
+        (false, true, false, false) => Some(Binding::Move(side)),
+        (false, false, true, false) => Some(Binding::Expand(side)),
         _ => None,
     }
 }
@@ -144,8 +158,19 @@ impl Navi {
                         None => FilterResult::Forward,
                     };
                 }
-                match binding(mods, key.modified_sym()) {
+                let binding = binding(mods, key.modified_sym());
+                // Once a press is ours, repeats and its release stay ours even when the user
+                // releases the modifier first. Keep one entry per held key.
+                if navi.suppressed.contains(&code) {
+                    return FilterResult::Intercept(binding);
+                }
+                match binding {
                     Some(Binding::Vt(_)) if !vt => FilterResult::Forward,
+                    Some(Binding::Move(_) | Binding::Expand(_))
+                        if navi.focused_tile().is_none() || navi.drag.is_some() =>
+                    {
+                        FilterResult::Forward
+                    }
                     Some(b) => {
                         navi.suppressed.push(code);
                         FilterResult::Intercept(Some(b))
@@ -162,6 +187,20 @@ impl Navi {
             Some(Binding::Vt(n)) => {
                 if let Some(Err(e)) = self.session.as_mut().map(|s| s.change_vt(n)) {
                     warn!(vt = n, "VT switch failed: {e}");
+                }
+            }
+            Some(b @ (Binding::Move(side) | Binding::Expand(side))) => {
+                if self.drag.is_none()
+                    && let Some(id) = self.focused_tile()
+                    && let Some(Done::Layout(what, tiles)) =
+                        self.layout
+                            .keyboard_adjust(id, side, matches!(b, Binding::Expand(_)))
+                {
+                    let cells: Vec<_> = tiles.iter().map(|t| (t.id, t.cells)).collect();
+                    info!(id, by = "keyboard", ?cells, "{what}");
+                    self.edge_clicks = Default::default();
+                    self.memory.sync(&self.layout);
+                    self.apply_layout();
                 }
             }
             None => {}
@@ -329,6 +368,32 @@ mod tests {
         assert_eq!(binding(&mods(false, false), Keysym::XF86_Switch_VT_3), None);
         for other in [Keysym::F3, Keysym::Delete, Keysym::a, Keysym::XF86_Ungrab] {
             assert_eq!(binding(&ca, other), None, "{other:?}");
+        }
+    }
+
+    #[test]
+    fn window_shortcuts_use_only_alt_or_super_and_all_four_arrows() {
+        for (sym, side) in [
+            (Keysym::Left, Side::Left),
+            (Keysym::Right, Side::Right),
+            (Keysym::Up, Side::Top),
+            (Keysym::Down, Side::Bottom),
+        ] {
+            for mask in 0..16 {
+                let mods = ModifiersState {
+                    ctrl: mask & 1 != 0,
+                    alt: mask & 2 != 0,
+                    logo: mask & 4 != 0,
+                    shift: mask & 8 != 0,
+                    ..Default::default()
+                };
+                let expected = match mask {
+                    2 => Some(Binding::Move(side)),
+                    4 => Some(Binding::Expand(side)),
+                    _ => None,
+                };
+                assert_eq!(binding(&mods, sym), expected, "{sym:?}, mask {mask}");
+            }
         }
     }
 }

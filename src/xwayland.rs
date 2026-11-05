@@ -645,7 +645,9 @@ mod tests {
             0,
             &CreateWindowAux::new()
                 .background_pixel(0x224466)
-                .event_mask(EventMask::KEY_PRESS | EventMask::BUTTON_PRESS),
+                .event_mask(
+                    EventMask::KEY_PRESS | EventMask::KEY_RELEASE | EventMask::BUTTON_PRESS,
+                ),
         )
         .unwrap();
         conn.change_property8(
@@ -779,6 +781,51 @@ mod tests {
             }
             key
         });
+        let cells = data.state.layout.tile(id).unwrap().cells;
+        // Alt+Right moves one cell per press/repeat. Releasing Alt first must not leak a
+        // later repeat or release to the X11 client, or leave a stale suppressed-key entry.
+        for (code, state) in [
+            (64u32, KeyState::Pressed),
+            (114, KeyState::Pressed),
+            (114, KeyState::Pressed),
+            (64, KeyState::Released),
+            (114, KeyState::Pressed),
+            (114, KeyState::Released),
+        ] {
+            data.state.keyboard_key(code.into(), state, 3);
+        }
+        assert_eq!(data.state.layout.tile(id).unwrap().cells.col, cells.col + 2);
+        assert_eq!(data.state.layout.tile(id).unwrap().cells.cols, cells.cols);
+        assert!(data.state.suppressed.is_empty());
+        for (code, state) in [
+            (133u32, KeyState::Pressed),
+            (114, KeyState::Pressed),
+            (114, KeyState::Released),
+            (133, KeyState::Released),
+        ] {
+            data.state.keyboard_key(code.into(), state, 3);
+        }
+        let expanded = data.state.layout.tile(id).unwrap().cells;
+        assert_eq!(expanded.col, cells.col + 2);
+        assert_eq!(expanded.col + expanded.cols, crate::layout::COLS);
+        assert_eq!(data.state.focused_tile(), Some(id));
+        assert_eq!(
+            surface.geometry().size.w,
+            data.state.layout.rect(id).unwrap().w
+        );
+        // With no tiled keyboard target, the compositor doesn't claim window shortcuts.
+        data.state.focus(None);
+        for (code, state) in [
+            (64u32, KeyState::Pressed),
+            (114, KeyState::Pressed),
+            (114, KeyState::Released),
+            (64, KeyState::Released),
+        ] {
+            data.state.keyboard_key(code.into(), state, 3);
+        }
+        assert_eq!(data.state.layout.tile(id).unwrap().cells, expanded);
+        assert!(data.state.suppressed.is_empty());
+        data.state.focus(data.state.window_of(id));
         let rect = data.state.layout.rect(id).unwrap();
         data.state
             .pointer_motion((f64::from(rect.x + 80), f64::from(rect.y + 80)).into(), 3);
@@ -787,8 +834,15 @@ mod tests {
         let mut click = false;
         pump(&mut event_loop, &mut data, |_| {
             while let Some(event) = conn.poll_for_event().unwrap() {
-                if let Event::ButtonPress(event) = event {
-                    click |= event.detail == 1;
+                match event {
+                    Event::ButtonPress(event) => click |= event.detail == 1,
+                    Event::KeyPress(event) | Event::KeyRelease(event) => {
+                        assert!(
+                            ![111, 113, 114, 116].contains(&event.detail),
+                            "shortcut arrow leaked to client"
+                        );
+                    }
+                    _ => {}
                 }
             }
             click
