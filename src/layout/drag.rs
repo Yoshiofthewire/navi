@@ -1,4 +1,4 @@
-//! Moving and resizing tiles with the mouse, as docs/design.md "Dragging" says.
+//! Moving and resizing tiles with the mouse and keyboard, as docs/design.md describes.
 
 use super::{
     COLS, Cells, GAP, Layout, MIN_H, MIN_W, Memory, Output, ROWS, Rect, Tile, WinId,
@@ -361,6 +361,58 @@ impl Layout {
         };
         self.resize_to(&r, &r.edges[0], p);
         self.finish_resize(&r.before, "expanded")
+    }
+
+    /// Move the focused group one cell, or expand its selected side through free cells.
+    /// Other groups (including minimized windows' reserved cells) keep their positions and sizes.
+    pub fn keyboard_adjust(&mut self, id: WinId, side: Side, expand: bool) -> Option<Done> {
+        let t = self.tile(id)?;
+        if !self.visible(id) || self.maximized(t) || t.fullscreen {
+            return None;
+        }
+        self.output(&t.output)?;
+        let output = t.output.clone();
+        let before = t.cells;
+        let group = self.group(id);
+        let mut cells = before;
+        for _ in 0..if expand { COLS.max(ROWS) } else { 1 } {
+            let mut next = cells;
+            match side {
+                Side::Left => next.col -= 1,
+                Side::Right if !expand => next.col += 1,
+                Side::Top => next.row -= 1,
+                Side::Bottom if !expand => next.row += 1,
+                _ => {}
+            }
+            if expand {
+                match side {
+                    Side::Left | Side::Right => next.cols += 1,
+                    Side::Top | Side::Bottom => next.rows += 1,
+                }
+            }
+            if next.col < 0
+                || next.row < 0
+                || next.col + next.cols > COLS
+                || next.row + next.rows > ROWS
+                || self.tiles.iter().any(|u| {
+                    u.output == output && !group.contains(&u.id) && next.overlaps(&u.cells)
+                })
+            {
+                break;
+            }
+            cells = next;
+        }
+        if cells == before {
+            return None;
+        }
+        self.put(&group, &output, cells);
+        self.stay(&group);
+        let tiles = self.tiles_in(&group);
+        self.learn(&tiles, expand);
+        Some(Done::Layout(
+            if expand { "expanded" } else { "moved" },
+            tiles,
+        ))
     }
 }
 
@@ -1448,6 +1500,146 @@ pub(super) mod tests {
             assert_eq!(at(&l, 0), expected, "{side:?}");
             assert_eq!(l.memory["a0"].cells, expected);
             assert_valid(&l);
+        }
+    }
+
+    #[test]
+    fn keyboard_moves_one_cell_and_preserves_the_remembered_size() {
+        for (side, expected) in [
+            (Side::Left, c(2, 1, 6, 4)),
+            (Side::Right, c(4, 1, 6, 4)),
+            (Side::Top, c(3, 0, 6, 4)),
+            (Side::Bottom, c(3, 2, 6, 4)),
+        ] {
+            let mut l = with(&[c(3, 1, 6, 4)]);
+            let size = l.memory["a0"].size;
+            l.tile_mut(0).unwrap().home = Some(("unplugged".into(), c(0, 0, 6, 6)));
+            assert_eq!(what(l.keyboard_adjust(0, side, false)), Some("moved"));
+            assert_eq!(at(&l, 0), expected);
+            assert_eq!(l.memory["a0"].cells, expected);
+            assert_eq!(l.memory["a0"].size, size);
+            assert!(l.tile(0).unwrap().home.is_none());
+            assert_valid(&l);
+        }
+    }
+
+    #[test]
+    fn keyboard_expands_to_each_usable_monitor_edge_and_remembers_size() {
+        for (side, expected) in [
+            (Side::Left, c(0, 1, 9, 4)),
+            (Side::Right, c(3, 1, 9, 4)),
+            (Side::Top, c(3, 0, 6, 5)),
+            (Side::Bottom, c(3, 1, 6, 5)),
+        ] {
+            let mut l = with(&[c(3, 1, 6, 4)]);
+            let mut output = uw();
+            output.area.x = -3440;
+            output.area.y = -1408;
+            output.area.h = 1344;
+            l.set_outputs(vec![output.clone()]);
+            assert_eq!(what(l.keyboard_adjust(0, side, true)), Some("expanded"));
+            assert_eq!(at(&l, 0), expected);
+            assert_eq!(l.memory["a0"].cells, expected);
+            let size = output.cells_rect(expected);
+            assert_eq!(l.memory["a0"].size, (size.w, size.h));
+            let rect = l.rect(0).unwrap();
+            assert!(rect.x >= output.area.x && rect.y >= output.area.y);
+            assert!(rect.x + rect.w <= output.area.x + output.area.w);
+            assert!(rect.y + rect.h <= output.area.y + output.area.h);
+            assert!(l.keyboard_adjust(0, side, true).is_none());
+            assert_valid(&l);
+        }
+    }
+
+    #[test]
+    fn keyboard_expansion_stops_at_partial_neighbors_without_shrinking_them() {
+        for (side, neighbor, expected) in [
+            (Side::Left, c(1, 3, 2, 2), c(3, 2, 5, 2)),
+            (Side::Right, c(10, 3, 2, 2), c(4, 2, 6, 2)),
+            (Side::Top, c(6, 0, 2, 1), c(4, 1, 4, 3)),
+            (Side::Bottom, c(6, 5, 2, 1), c(4, 2, 4, 3)),
+        ] {
+            let mut l = with(&[c(4, 2, 4, 2), neighbor]);
+            let other = l.tile(1).unwrap().clone();
+            let memory = l.memory["a1"].clone();
+            assert!(l.keyboard_adjust(0, side, true).is_some());
+            assert_eq!(at(&l, 0), expected);
+            assert_eq!(l.tile(1), Some(&other));
+            assert_eq!(l.memory["a1"], memory);
+            assert_valid(&l);
+        }
+    }
+
+    #[test]
+    fn keyboard_blocked_moves_and_expansion_do_not_change_layout_or_memory() {
+        let mut l = halves();
+        for minimized in [false, true] {
+            if minimized {
+                l.minimize(1);
+            }
+            let tiles = l.tiles.clone();
+            let memory = l.memory.clone();
+            for side in [Side::Left, Side::Right, Side::Top, Side::Bottom] {
+                for expand in [false, true] {
+                    assert!(l.keyboard_adjust(0, side, expand).is_none());
+                }
+            }
+            assert_eq!(l.tiles, tiles);
+            assert_eq!(l.memory, memory);
+        }
+    }
+
+    #[test]
+    fn keyboard_adjusts_the_active_tab_group_and_keeps_other_outputs_separate() {
+        let mut l = with(&[c(2, 1, 4, 3), c(2, 1, 4, 3), c(8, 0, 4, 6)]);
+        assert!(l.keyboard_adjust(0, Side::Right, false).is_none());
+        assert!(l.keyboard_adjust(1, Side::Right, false).is_some());
+        assert_eq!(at(&l, 0), c(3, 1, 4, 3));
+        assert_eq!(at(&l, 1), c(3, 1, 4, 3));
+        assert!(l.keyboard_adjust(1, Side::Right, true).is_some());
+        assert_eq!(at(&l, 0), c(3, 1, 5, 3));
+        assert_eq!(at(&l, 1), c(3, 1, 5, 3));
+        assert_eq!(at(&l, 2), c(8, 0, 4, 6));
+        assert!(l.visible(1));
+        assert_valid(&l);
+        let mut second = uw();
+        second.name = "other".into();
+        second.area.x = 3440;
+        l.set_outputs(vec![uw(), second]);
+        l.tile_mut(2).unwrap().output = "other".into();
+        assert!(l.keyboard_adjust(1, Side::Right, true).is_some());
+        assert_eq!(at(&l, 1), c(3, 1, 9, 3));
+        assert_eq!(l.tile(2).unwrap().output, "other");
+        assert_eq!(at(&l, 2), c(8, 0, 4, 6));
+    }
+
+    #[test]
+    fn keyboard_leaves_hidden_maximized_fullscreen_and_missing_windows_alone() {
+        for mode in 0..5 {
+            let mut l = with(&[c(3, 1, 6, 4)]);
+            match mode {
+                0 => {
+                    l.minimize(0);
+                }
+                1 => {
+                    l.maximize(0);
+                }
+                2 => {
+                    l.fullscreen(0);
+                }
+                3 => {
+                    l.set_outputs(Vec::new());
+                }
+                _ => {}
+            }
+            let tiles = l.tiles.clone();
+            let memory = l.memory.clone();
+            let id = if mode == 4 { 99 } else { 0 };
+            for expand in [false, true] {
+                assert!(l.keyboard_adjust(id, Side::Right, expand).is_none());
+            }
+            assert_eq!(l.tiles, tiles);
+            assert_eq!(l.memory, memory);
         }
     }
 

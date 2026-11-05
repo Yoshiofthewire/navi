@@ -101,6 +101,18 @@ space when you want it.
 - Drop a window back on itself to cancel a move. A drag also cancels, putting everything back,
   when the pointer leaves every monitor or the nested window loses focus.
 
+### Keyboard window controls
+
+- **Alt + Arrow** moves the focused tile one grid cell in that direction, preserving its size.
+  It stops at another tile or the current monitor's usable edge.
+- **Super + Arrow** expands only that side through free cells until another tile or the
+  monitor's usable edge. It keeps the opposite side and neighboring windows fixed.
+- Both act on the active tab group, keep keyboard focus, reserve minimized windows' cells,
+  and remember successful changes. Moves preserve remembered size; expansion updates it.
+- Maximized/fullscreen windows keep their mode and geometry. Floating dialogs and shell
+  surfaces keep their app shortcuts; window shortcuts apply only to a focused tile. A mouse
+  drag takes precedence. Adding Ctrl, Shift, or the other modifier leaves the chord to apps.
+
 ### Tabs
 
 - A tab group shows one window at a time. Above it, a 24 px bar replaces the strip and holds one
