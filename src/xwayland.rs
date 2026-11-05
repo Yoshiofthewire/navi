@@ -399,7 +399,91 @@ mod tests {
             },
         },
     };
+    use smithay_client_toolkit::reexports::{
+        client::{
+            Connection as WaylandConnection, Dispatch as ClientDispatch, EventQueue, QueueHandle,
+            backend::WaylandError, event_created_child, protocol::wl_registry,
+        },
+        protocols_wlr::foreign_toplevel::v1::client::{
+            zwlr_foreign_toplevel_handle_v1::{self as handle, ZwlrForeignToplevelHandleV1},
+            zwlr_foreign_toplevel_manager_v1::{self as manager, ZwlrForeignToplevelManagerV1},
+        },
+    };
     use std::time::{Duration, Instant};
+
+    #[derive(Default)]
+    struct Metadata {
+        manager: Option<ZwlrForeignToplevelManagerV1>,
+        titles: Vec<String>,
+        apps: Vec<String>,
+    }
+
+    impl Metadata {
+        fn read(&mut self, queue: &mut EventQueue<Self>) {
+            if let Some(read) = queue.prepare_read() {
+                match read.read() {
+                    Ok(_) => {}
+                    Err(WaylandError::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(e) => panic!("window-list client: {e}"),
+                }
+            }
+            queue.dispatch_pending(self).unwrap();
+            queue.flush().unwrap();
+        }
+    }
+
+    impl ClientDispatch<wl_registry::WlRegistry, ()> for Metadata {
+        fn event(
+            state: &mut Self,
+            registry: &wl_registry::WlRegistry,
+            event: wl_registry::Event,
+            _: &(),
+            _: &WaylandConnection,
+            qh: &QueueHandle<Self>,
+        ) {
+            if let wl_registry::Event::Global {
+                name,
+                interface,
+                version,
+            } = event
+                && interface == "zwlr_foreign_toplevel_manager_v1"
+            {
+                state.manager = Some(registry.bind(name, version.min(3), qh, ()));
+            }
+        }
+    }
+
+    impl ClientDispatch<ZwlrForeignToplevelManagerV1, ()> for Metadata {
+        fn event(
+            _: &mut Self,
+            _: &ZwlrForeignToplevelManagerV1,
+            _: manager::Event,
+            _: &(),
+            _: &WaylandConnection,
+            _: &QueueHandle<Self>,
+        ) {
+        }
+        event_created_child!(Metadata, ZwlrForeignToplevelManagerV1, [
+            manager::EVT_TOPLEVEL_OPCODE => (ZwlrForeignToplevelHandleV1, ()),
+        ]);
+    }
+
+    impl ClientDispatch<ZwlrForeignToplevelHandleV1, ()> for Metadata {
+        fn event(
+            state: &mut Self,
+            _: &ZwlrForeignToplevelHandleV1,
+            event: handle::Event,
+            _: &(),
+            _: &WaylandConnection,
+            _: &QueueHandle<Self>,
+        ) {
+            match event {
+                handle::Event::Title { title } => state.titles.push(title),
+                handle::Event::AppId { app_id } => state.apps.push(app_id),
+                _ => {}
+            }
+        }
+    }
 
     #[track_caller]
     fn pump(
@@ -463,6 +547,23 @@ mod tests {
             display,
             udev: None,
         };
+        // Bind the same privileged window list that navi-bar uses, over a real Wayland socket.
+        let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
+        data.state
+            .display_handle
+            .insert_client(
+                server,
+                std::sync::Arc::new(crate::state::ClientState {
+                    privileged: true,
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        let shell = WaylandConnection::from_socket(client).unwrap();
+        let mut queue = shell.new_event_queue::<Metadata>();
+        let _registry = shell.display().get_registry(&queue.handle(), ());
+        let mut metadata = Metadata::default();
+        queue.flush().unwrap();
         let xdisplay = start(&event_loop.handle(), &data.state).expect("spawn Xwayland");
         pump(&mut event_loop, &mut data, |d| d.state.xwm.is_some());
         let (conn, screen) = smithay::reexports::x11rb::connect(Some(&xdisplay)).unwrap();
@@ -527,6 +628,45 @@ mod tests {
             surface.geometry().size.w,
             data.state.layout.rect(id).unwrap().w
         );
+        data.state.refresh_toplevels();
+        pump(&mut event_loop, &mut data, |_| {
+            metadata.read(&mut queue);
+            metadata.apps.last().is_some_and(|app| app == "NaviTest")
+                && metadata
+                    .titles
+                    .last()
+                    .is_some_and(|title| title == "X11 integration test")
+        });
+        // X11 strings can contain NUL bytes; Wayland strings cannot. Exercise real wire events
+        // for both metadata fields, including updates after the window list is already bound.
+        conn.change_property8(
+            PropMode::REPLACE,
+            window,
+            AtomEnum::WM_CLASS,
+            AtomEnum::STRING,
+            b"navi-test\0Navi\0Test\0",
+        )
+        .unwrap();
+        conn.flush().unwrap();
+        pump(&mut event_loop, &mut data, |_| {
+            metadata.read(&mut queue);
+            metadata
+                .apps
+                .last()
+                .is_some_and(|app| app == "Navi\u{fffd}Test")
+        });
+        let name = atom(b"_NET_WM_NAME");
+        let utf8 = atom(b"UTF8_STRING");
+        conn.change_property8(PropMode::REPLACE, window, name, utf8, b"a\0b")
+            .unwrap();
+        conn.flush().unwrap();
+        pump(&mut event_loop, &mut data, |_| {
+            metadata.read(&mut queue);
+            metadata
+                .titles
+                .last()
+                .is_some_and(|title| title == "a\u{fffd}b")
+        });
         // The test client and XWM use separate X11 connections. Mapping in Navi doesn't mean
         // the server has processed the XWM's focus request yet; wait for actual X input focus.
         pump(&mut event_loop, &mut data, |_| {

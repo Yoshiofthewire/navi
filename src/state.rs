@@ -944,9 +944,10 @@ impl Navi {
 pub fn window_surface(w: &Window) -> Option<WlSurface> {
     w.wl_surface().map(std::borrow::Cow::into_owned)
 }
+// X11 metadata may contain NULs; replace them before layout, memory, or Wayland events use it.
 pub fn window_app(w: &Window) -> String {
     match w.x11_surface() {
-        Some(x) => x.class(),
+        Some(x) => x.class().replace('\0', "\u{fffd}"),
         None => w
             .toplevel()
             .map(|t| app_id(t.wl_surface()))
@@ -955,7 +956,7 @@ pub fn window_app(w: &Window) -> String {
 }
 pub fn window_title(w: &Window) -> String {
     match w.x11_surface() {
-        Some(x) => x.title(),
+        Some(x) => x.title().replace('\0', "\u{fffd}"),
         None => w
             .toplevel()
             .map(|t| title(t.wl_surface()))
