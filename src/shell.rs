@@ -5,7 +5,7 @@ use std::{
     cell::RefCell,
     collections::VecDeque,
     ffi::{OsStr, OsString},
-    io,
+    io::{self, Read, Write},
     os::{fd::OwnedFd, unix::net::UnixStream},
     path::PathBuf,
     process::{Command, Stdio},
@@ -96,13 +96,13 @@ pub fn start_bar(
         respawn: Respawn::default(),
         clock: Instant::now(),
     }));
-    bar.borrow_mut().start(dh, &tx);
+    bar.borrow_mut().start(dh, &tx, handle);
     let h = handle.clone();
     let restart = handle.insert_source(rx, move |event, _, data| {
         let Event::Msg(logout) = event else {
             return;
         };
-        if logout {
+        if logout && !data.state.lock.active {
             info!("logout requested by navi-bar");
             data.state.loop_signal.stop();
             return;
@@ -110,7 +110,8 @@ pub fn start_bar(
         let (bar, tx) = (bar.clone(), tx.clone());
         let timer = Timer::from_duration(RESTART_DELAY);
         let queued = h.insert_source(timer, move |_, _, data| {
-            bar.borrow_mut().start(&mut data.state.display_handle, &tx);
+            bar.borrow_mut()
+                .start(&mut data.state.display_handle, &tx, &data.state.loop_handle);
             TimeoutAction::Drop
         });
         if let Err(e) = queued {
@@ -124,18 +125,54 @@ pub fn start_bar(
 
 impl Bar {
     /// Starts navi-bar if the respawn limit allows; `exited` hears when it exits.
-    fn start(&mut self, dh: &mut DisplayHandle, exited: &channel::Sender<bool>) {
+    fn start(
+        &mut self,
+        dh: &mut DisplayHandle,
+        exited: &channel::Sender<bool>,
+        handle: &LoopHandle<'static, CalloopData>,
+    ) {
         if !self.respawn.allow(self.clock.elapsed().as_millis() as u64) {
             warn!("navi-bar keeps crashing, running without a bar");
             return;
         }
-        if let Err(e) = self.spawn(dh, exited.clone()) {
+        if let Err(e) = self.spawn(dh, exited.clone(), handle) {
             warn!(path = %self.path.display(), "navi-bar not started, running without a bar: {e}");
         }
     }
 
-    fn spawn(&self, dh: &mut DisplayHandle, exited: channel::Sender<bool>) -> io::Result<()> {
+    fn spawn(
+        &self,
+        dh: &mut DisplayHandle,
+        exited: channel::Sender<bool>,
+        handle: &LoopHandle<'static, CalloopData>,
+    ) -> io::Result<()> {
         let (ours, theirs) = UnixStream::pair()?;
+        let (mut control, child_control) = UnixStream::pair()?;
+        let (requests, events) = channel::channel::<(bool, std::sync::mpsc::Sender<bool>)>();
+        handle
+            .insert_source(events, |event, _, data| {
+                if let Event::Msg((lock, reply)) = event {
+                    if lock {
+                        data.state.request_lock(Some(reply));
+                    } else {
+                        let _ = reply.send(crate::locking::executable().is_file());
+                    }
+                }
+            })
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        std::thread::spawn(move || {
+            let mut request = [0];
+            while control.read_exact(&mut request).is_ok() {
+                let (tx, rx) = std::sync::mpsc::channel();
+                if request[0] > 1 || requests.send((request[0] == 1, tx)).is_err() {
+                    break;
+                }
+                let ok = rx.recv_timeout(Duration::from_secs(12)).unwrap_or(false);
+                if control.write_all(&[u8::from(ok)]).is_err() {
+                    break;
+                }
+            }
+        });
         let mut cmd = Command::new(&self.path);
         // Without a theme navi drew nothing either, so apps keep their own default.
         if let Some((theme, size)) = &self.cursor {
@@ -154,6 +191,8 @@ impl Bar {
         let mut child = cmd
             // Its stdin is the socket; navi-bar moves it off fd 0 as it connects.
             .stdin(Stdio::from(OwnedFd::from(theirs)))
+            .stdout(Stdio::from(OwnedFd::from(child_control)))
+            .env("NAVI_CONTROL_FD", "1")
             .env("WAYLAND_SOCKET", "0")
             .env("WAYLAND_DISPLAY", &self.wayland_display)
             .spawn()?;

@@ -215,6 +215,9 @@ pub fn init(
                         }
                     }
 
+                    if !failed && state.lock.active {
+                        state.lock_presented(&output, state.lock.epoch);
+                    }
                     render::send_frames(state, &output);
                     let _ = data.display.flush_clients();
                     if failed || state.drag.is_some() {

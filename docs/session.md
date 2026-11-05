@@ -59,15 +59,43 @@ Click **Navi** at the upper left of the status bar for **Sleep**, **Lock Screen*
 **Log Out**, **Restart**, and **Shutdown**. Use the pointer, Up/Down or Tab, and Enter. Each enabled
 action opens a confirmation with **Cancel** selected; Escape cancels or closes the menu.
 
-In a nested window only **Log Out** is enabled, and it closes that Navi instance. A full session
+In a nested window **Log Out** closes that Navi instance; **Lock Screen** protects its window. A full session
 uses login1 for sleep, restart, and shutdown, preserving its authorization and inhibitor checks.
 Actions requiring an authorization prompt are unavailable until Navi has an authentication agent.
 Switch User requires a display manager that advertises `CanSwitch` at this session's
 `XDG_SEAT_PATH`; without that exact seat it is disabled.
 
-Lock Screen is disabled because Navi has no session-lock implementation. Sleep and Switch User
-do not lock Navi, as their confirmations explain. A failed request keeps the session running and
-shows an error in the menu; details go to the session log.
+Lock Screen uses the distro's PAM-enabled `/usr/bin/swaylock`. Install `swaylock` with your
+package manager; Navi does not install or alter PAM configuration. **Super+L** locks immediately;
+the upper-left Navi menu also offers Lock Screen with confirmation. Nested, Lock Screen and
+Log Out are available; the lock protects Navi's window only, never the host desktop.
+
+Sleep and Switch User wait until all Navi outputs have presented protected content. A failed
+lock aborts those menu actions. Full sessions also listen for their login1 session's `Lock`
+signal (`loginctl lock-session`) and `PrepareForSleep`, retaining a sleep delay inhibitor until
+coverage is confirmed. On failure, Navi keeps its input/rendering shield and logs the problem;
+logind may still enforce its configured maximum delay. Resume never unlocks automatically.
+Listener/DBus failures are logged; verify them on your actual login session before relying on
+lid-close or external suspend locking. There is no idle timer yet.
+
+If swaylock crashes, every output stays protected, and Navi retries it (at most five starts per
+minute). **Super+L** retries after that limit has elapsed. No app connection can take over the
+lock. Ctrl+Alt+Backspace is disabled while locked; VT switching remains available for recovery.
+If recovery fails, use another VT to repair/install swaylock, then return and retry; ending Navi
+from that VT ends the session and loses unsaved work. Navi uses a fixed solid background and
+blue ring and ignores swaylock's per-user config to keep the supervised process in the foreground.
+
+Authentication stays entirely in swaylock/PAM. No fresh browser SSO, SCIM provisioning or IdP
+configuration is added here. Central identities can use the OS identity/PAM bridge later; test
+any multi-step SSO/MFA unlock flow separately against swaylock's conversation support.
+
+Validation: protocol tests cover output coverage, rejected/early unlock, hotplug, password-key
+routing and crash protection. The isolated real-swaylock test starts a private compositor,
+maps its SHM buffers and kills only that child; it never submits a password or touches the host
+session. DRM, PAM authentication, real logind suspend and physical multi-monitor behavior still
+require hardware validation. Debug builds accept an absolute `NAVI_TEST_SWAYLOCK` path solely
+for testing an extracted package with input replay; release Navi always uses `/usr/bin/swaylock`.
+Failed menu requests show an error; details go to the session log.
 
 ## When it fails
 

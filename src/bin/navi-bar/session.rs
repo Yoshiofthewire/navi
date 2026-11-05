@@ -76,8 +76,9 @@ impl Action {
     }
     fn warning(self, full: bool) -> &'static str {
         match self {
-            Self::Sleep => "Navi does not lock the screen on wake.",
-            Self::SwitchUser => "Navi stays running without locking.",
+            Self::Sleep => "Lock the screen, then put Navi to sleep.",
+            Self::SwitchUser => "Lock Navi, then open the login screen.",
+            Self::Lock => "Enter your password to unlock Navi.",
             Self::Logout if !full => "Close this nested Navi window.",
             _ => "Open apps may lose unsaved work.",
         }
@@ -308,9 +309,9 @@ impl Menu {
                 self.message.as_str()
             } else if self.busy {
                 "Checking session services…"
-            } else if self.selected == 1 {
-                "Screen locking is not\nimplemented yet."
-            } else if !full && self.selected != 3 {
+            } else if self.selected == 1 && !self.capabilities.available[1] {
+                "Install swaylock to enable\nscreen locking."
+            } else if !full && self.selected != 3 && self.selected != 1 {
                 "Available in a full Navi session."
             } else if !self.capabilities.available[self.selected] {
                 "Not available from the\nsession services."
@@ -343,8 +344,9 @@ fn connection() -> Result<Connection, String> {
         .map_err(|e| e.to_string())
 }
 
-pub fn capabilities(full: bool, seat: Option<String>) -> Capabilities {
+pub fn capabilities(full: bool, seat: Option<String>, can_lock: bool) -> Capabilities {
     let mut caps = Capabilities::default();
+    caps.available[1] = can_lock;
     if !full {
         return caps;
     }
@@ -354,9 +356,10 @@ pub fn capabilities(full: bool, seat: Option<String>) -> Capabilities {
     if let Ok(proxy) = Proxy::new(&conn, LOGIN, LOGIN_PATH, MANAGER) {
         for (i, action) in ACTIONS.into_iter().enumerate() {
             if let Some((can, _)) = action.method() {
-                caps.available[i] = proxy
-                    .call::<_, _, String>(can, &())
-                    .is_ok_and(|v| v == "yes");
+                caps.available[i] = (action != Action::Sleep || can_lock)
+                    && proxy
+                        .call::<_, _, String>(can, &())
+                        .is_ok_and(|v| v == "yes");
             }
         }
     }
@@ -364,7 +367,7 @@ pub fn capabilities(full: bool, seat: Option<String>) -> Capabilities {
         && let Ok(proxy) = Proxy::new(&conn, DM, seat.as_str(), SEAT)
         && proxy.get_property::<bool>("CanSwitch").unwrap_or(false)
     {
-        caps.available[2] = true;
+        caps.available[2] = can_lock;
         caps.seat = Some(seat.clone());
     }
     caps
@@ -385,7 +388,30 @@ fn guarded(
     call()
 }
 
-pub fn perform(action: Action, full: bool, caps: &Capabilities) -> Result<(), String> {
+/// The lock callback completes only after every output has presented protected content.
+/// A failed lock must never invoke a power or display-manager action.
+pub fn perform_locked(
+    action: Action,
+    full: bool,
+    caps: &Capabilities,
+    lock: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    if matches!(action, Action::Lock | Action::Sleep | Action::SwitchUser) {
+        if !caps.available[1] {
+            return Err("Screen locking unavailable".into());
+        }
+        if action != Action::Lock && !full {
+            return Err("Full session required".into());
+        }
+        lock()?;
+        if action == Action::Lock {
+            return Ok(());
+        }
+    }
+    perform(action, full, caps)
+}
+
+fn perform(action: Action, full: bool, caps: &Capabilities) -> Result<(), String> {
     guarded(action, full, || {
         let i = ACTIONS
             .iter()
@@ -418,7 +444,7 @@ mod tests {
     #[test]
     fn nested_actions_never_reach_the_system_and_logout_is_available() {
         assert_eq!(
-            capabilities(false, None).available,
+            capabilities(false, None, false).available,
             [false, false, false, true, false, false]
         );
         for action in ACTIONS {
@@ -447,6 +473,30 @@ mod tests {
         assert_eq!(m.activate(Hit::Confirm), None);
         m.busy = true;
         assert_eq!(m.activate(Hit::Row(3)), None);
+    }
+    #[test]
+    fn failed_lock_aborts_sleep_and_switch_before_any_system_call() {
+        let caps = Capabilities {
+            available: [true; 6],
+            seat: None,
+        };
+        for action in [Action::Lock, Action::Sleep, Action::SwitchUser] {
+            assert_eq!(
+                perform_locked(action, true, &caps, || Err("injected lock failure".into())),
+                Err("injected lock failure".into())
+            );
+        }
+        assert!(perform_locked(Action::Lock, false, &caps, || Ok(())).is_ok());
+        assert!(
+            perform_locked(Action::Sleep, false, &caps, || panic!(
+                "nested power action"
+            ))
+            .is_err()
+        );
+        assert_eq!(
+            capabilities(false, None, true).available,
+            [false, true, false, true, false, false]
+        );
     }
     #[test]
     fn menu_geometry_keyboard_and_hit_targets_match() {

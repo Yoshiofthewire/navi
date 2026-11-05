@@ -243,9 +243,10 @@ The screen shows a wallpaper, a taskbar and your apps. There are no desktop icon
   Sleep/Restart/Shutdown use login1 and its normal permissions/inhibitors; actions needing
   interactive authorization are disabled because there is no authentication agent yet.
   Switch User uses the display manager's `SwitchToGreeter` only for `XDG_SEAT_PATH` and only
-  when its `CanSwitch` is true. Neither switching user nor sleeping locks Navi; confirmations
-  say so. Lock Screen is disabled until a real session lock exists. Nested, only Log Out is
-  enabled, and it closes just Navi. A confirmed logout exits navi-bar successfully; Navi treats
+  when its `CanSwitch` is true. Switching user and sleeping first wait for Navi to confirm
+  protected presentation on every output. Lock Screen and Super+L use a privately connected swaylock, with PAM authentication.
+  Nested, Lock Screen protects only Navi’s window and Log Out closes just Navi. A confirmed
+  logout exits navi-bar successfully; Navi treats
   that private child exit as a graceful quit, while failed/crashed bars still respawn.
 - **Notifications:** navi-bar serves `org.freedesktop.Notifications` (spec 1.2) only if no other
   server holds the name when it starts. It asks with `DoNotQueue` and neither replace flag, so
@@ -335,8 +336,20 @@ session.
   than navi's latest). Each works once, within 10 s, and only while the keyboard is still on the
   surface that asked or on the one being activated, so an app can't stash tokens and take focus
   back after you've moved on.
-- **Locking** is planned with `ext-session-lock`; there is no integrated lock yet. Its intended
-  behavior is to stay locked with a solid colour if the lock screen crashes.
+- **Locking** uses `ext-session-lock`, advertised only on the dedicated socket Navi gives its
+  swaylock child. Applications, including the bar, cannot bind it. Normal windows, layers,
+  wallpaper, decorations and cursors are excluded from locked output frames; normal keyboard,
+  pointer, activation and X11 clipboard paths are isolated. Each output must present protected
+  content before `locked` or a menu readiness reply. DRM waits for successful vblank submission;
+  nested mode waits for a successful window swap. Output changes invalidate queued evidence.
+  A crashed/disconnected locker leaves a solid protected screen, with bounded automatic restart
+  and Super+L recovery. Only the active, confirmed lock resource can unlock; rejected and early
+  unlock requests are guarded before Smithay dispatch. The distro PAM-enabled swaylock handles
+  passwords; Navi never reads them. Its user config is bypassed to prevent daemonization.
+  Full sessions listen for logind Lock and PrepareForSleep with a delay inhibitor, and report
+  ordered LockedHint changes. A failed before-sleep lock retains protection/inhibitor until
+  logind’s own timeout; listener failure is logged. Idle locking remains future work.
+  See [session validation limits](session.md).
 - **No network access**, no plugins, and no shell commands anywhere in the compositor or shell.
   navi-bar, not navi, launches apps, so `.desktop` files, icon themes and fonts (all untrusted)
   are parsed outside the compositor. Launching runs the `Exec=` line broken into arguments (any
@@ -344,7 +357,7 @@ session.
   without navi-bar's socket. Running each app in its own `app-*.scope` comes later (it needs
   D-Bus).
 - **The session bus** reaches navi-bar only through the notification server: one name, one
-  object. Its one call out is on real hardware only: at start it sets `WAYLAND_DISPLAY`, `DISPLAY`,
+  object. Its environment export is on real hardware only: at start it sets `WAYLAND_DISPLAY`, `DISPLAY`,
   `XDG_CURRENT_DESKTOP` and `XDG_SESSION_TYPE` (nothing else) through the bus's
   `UpdateActivationEnvironment` and systemd's `SetEnvironment`, so portals and D-Bus-started
   apps reach navi. Nested it never does, so the host's user services keep pointing at the host. Every field a notification carries is untrusted and is never logged;
@@ -352,13 +365,14 @@ session.
   so a hostile local app can make navi-bar allocate up to the bus's message limit per call; such
   an app already runs as the user. A D-Bus bug takes the taskbar down with it, since there is one
   privileged client.
-- **System bus:** session-menu capability queries and confirmed power/switch-user requests
+- **System bus:** the full-session compositor listens for logind locking/sleep and reports lock
+  state off the rendering thread. Session-menu capability queries and confirmed power/switch-user requests
   run in navi-bar, off the UI thread. Nested mode refuses system actions before connecting.
   Navi never forces past inhibitors, runs a system command, or terminates a login1 session.
 - **Config** is plain data. A config file can never run a command.
 - **Real hardware:** navi gets the GPU and input devices only through the seat session
   (libseat, so logind), never by opening `/dev` itself, and needs no root. On a VT switch the
-  session revokes them and navi pauses. **Ctrl+Alt+Backspace** quits navi (back to the login
+  session revokes them and navi pauses. **Ctrl+Alt+Backspace** quits unlocked navi (back to the login
   screen) and Ctrl+Alt+F1…F12 switch VTs; navi keeps these keys before any client sees them, so
   no app can swallow the way out. Every startup failure (no session, no GPU, no monitor) exits 1
   with a message; the log is `~/.local/state/navi/navi.log`. EDID is untrusted device data:

@@ -20,6 +20,7 @@ and physical input still need hardware validation. See [limitations](#limitation
 - A rounded dock with persistent app pins, categorized app folders, search, and scrolling.
 - A top status bar with a clock and battery indicator, plus basic notifications.
 - Native Wayland apps and X11 apps through XWayland, including clipboard text transfer.
+- Swaylock screen locking from the session menu or Super+L, including lock-before-sleep.
 - Nested operation inside another desktop and a DRM/libinput/libseat hardware backend.
 
 The layout and monitor policies are described in [the design document](docs/design.md).
@@ -30,20 +31,22 @@ The layout and monitor policies are described in [the design document](docs/desi
 - Wayland, xkbcommon, udev, libinput, libseat, GBM, DRM, and an EGL implementation.
 - A supported font: Noto Sans, DejaVu Sans, or Liberation Sans.
 - The `Xwayland` executable for X11 apps and the XWayland integration test.
+- A PAM-enabled `swaylock` package at `/usr/bin/swaylock` for screen locking; install your
+  distro package so its PAM service is configured. Navi never handles your password.
 
 On Debian/Ubuntu:
 
 ```sh
 sudo apt-get update
 sudo apt-get install -y build-essential git pkg-config libwayland-dev libxkbcommon-dev \
-  libudev-dev libinput-dev libseat-dev libgbm-dev libdrm-dev libegl1 xwayland fonts-noto-core
+  libudev-dev libinput-dev libseat-dev libgbm-dev libdrm-dev libegl1 xwayland swaylock fonts-noto-core
 ```
 
 On Arch Linux/CachyOS:
 
 ```sh
 sudo pacman -S --needed base-devel git pkgconf wayland libxkbcommon systemd-libs \
-  libinput seatd mesa libglvnd libdrm xorg-xwayland noto-fonts
+  libinput seatd mesa libglvnd libdrm xorg-xwayland swaylock noto-fonts
 ```
 
 ## Build and try it
@@ -70,7 +73,8 @@ Build as your normal user. For a debug build, use `cargo build --locked` and `./
 | Make a tab group | Hold a dragged tile over another tile's middle, then drop |
 | Move one grid cell | **Alt + Left / Right / Up / Down** |
 | Expand to the next window or usable monitor edge | **Super + Left / Right / Up / Down** |
-| Quit Navi | **Ctrl + Alt + Backspace** |
+| Lock screen / retry a crashed locker | **Super + L** |
+| Quit Navi while unlocked | **Ctrl + Alt + Backspace** |
 | Switch VT in a hardware session | **Ctrl + Alt + F1…F12** |
 
 Alt+Arrow preserves size and stops at occupied cells. Super+Arrow expands the selected side
@@ -127,6 +131,7 @@ cargo fmt --check
 cargo clippy --all-targets --locked -- -D warnings
 cargo test --locked
 cargo test --locked xwayland::tests::x11_lifecycle_and_input -- --ignored
+cargo test --locked locking::tests::swaylock_real_client_handshake -- --ignored
 cargo build --locked
 ```
 
@@ -144,7 +149,9 @@ Extract the archive, keep both binaries together, and run `./navi` from an exist
 
 - Real login sessions, multi-monitor hotplug, VT switching, and physical touchpad behavior
   remain unverified on hardware.
-- Screen-sharing/screenshot portals and an integrated screen lock are not implemented.
+- Screen-sharing/screenshot portals and idle-time automatic locking are not implemented.
+- Locking, PAM unlock, sleep/resume and logind handling still need hardware validation.
+  Nested locking protects only Navi’s window; your host desktop manages the rest.
 - One GPU, preferred display modes, and no HDR, VRR, rotation, or mirroring.
 - XWayland primary selection, cross-protocol drag-and-drop, and automatic XWayland restart
   are not implemented.

@@ -175,6 +175,9 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, WinId> for Navi {
         _: &DisplayHandle,
         _: &mut DataInit<'_, Self>,
     ) {
+        if state.lock.active {
+            return;
+        }
         match request {
             handle::Request::Activate { .. } => {
                 info!(id, by = "bar", "activate");

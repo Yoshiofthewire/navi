@@ -300,7 +300,8 @@ impl XwmHandler for Navi {
     fn resize_request(&mut self, _: XwmId, _: X11Surface, _: u32, _: ResizeEdge) {}
     fn move_request(&mut self, _: XwmId, _: X11Surface, _: u32) {}
     fn allow_selection_access(&mut self, xwm: XwmId, ty: SelectionTarget) -> bool {
-        ty == SelectionTarget::Clipboard
+        !self.lock.active
+            && ty == SelectionTarget::Clipboard
             && matches!(
             self.seat.get_keyboard().and_then(|kb| kb.current_focus()),
             Some(crate::focus::Focus::X11(x)) if x.xwm_id() == Some(xwm))

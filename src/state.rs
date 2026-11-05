@@ -92,6 +92,8 @@ pub struct Managed {
 }
 
 pub struct Navi {
+    pub lock: crate::locking::Lock,
+    pub session_lock_state: smithay::wayland::session_lock::SessionLockManagerState,
     pub start_time: std::time::Instant,
     pub display_handle: DisplayHandle,
     pub space: Space<Window>,
@@ -149,6 +151,13 @@ impl Navi {
         dh.create_global::<Self, ZwlrForeignToplevelManagerV1, _>(3, toplevels::Filter);
 
         Ok(Self {
+            lock: Default::default(),
+            session_lock_state: smithay::wayland::session_lock::SessionLockManagerState::new::<
+                Self,
+                _,
+            >(&dh, |c| {
+                c.get_data::<ClientState>().is_some_and(|s| s.locker)
+            }),
             start_time: std::time::Instant::now(),
             compositor_state: CompositorState::new::<Self>(&dh),
             // Only what navi does: clients hide window-menu entries.
@@ -372,6 +381,16 @@ impl Navi {
         &self,
         pos: Point<f64, Logical>,
     ) -> Option<(WlSurface, Point<f64, Logical>)> {
+        if self.lock.active {
+            let o = self.space.output_under(pos).next()?;
+            let loc = self.space.output_geometry(o)?.loc.to_f64();
+            return self
+                .lock
+                .surfaces
+                .iter()
+                .find(|(out, s)| out == o && s.alive())
+                .map(|(_, s)| (s.wl_surface().clone(), loc));
+        }
         if self.drag.is_some() {
             return None;
         }
@@ -416,6 +435,7 @@ impl Navi {
             }
         }
         self.space.unmap_output(output);
+        self.lock_outputs_changed();
         self.grid.retain(|o| o.name != name);
         self.layout.remove_output(&name);
         info!(output = name, "output removed");
@@ -461,6 +481,7 @@ impl Navi {
             return;
         }
         (o.area, o.full) = (area, full);
+        self.lock_outputs_changed();
         info!(output = name, ?area, "grid area");
         self.layout.set_outputs(self.grid.clone());
         self.apply_layout();
@@ -481,6 +502,9 @@ impl Navi {
     /// A click on a layer surface: it gets the keyboard if it takes keyboard input at all.
     /// `Exclusive` counts as `OnDemand`, so no layer surface holds the keyboard unasked.
     pub fn click_layer(&mut self, layer: &LayerSurface) {
+        if self.lock.active {
+            return;
+        }
         let Some(kb) = self.seat.get_keyboard() else {
             return;
         };
@@ -553,6 +577,9 @@ impl Navi {
     /// Feeds the taskbar's hover band at `pos`; after a rest on another output's bottom edge the
     /// taskbar moves there.
     pub fn bar_hover(&mut self, pos: Point<f64, Logical>) {
+        if self.lock.active {
+            return;
+        }
         let Some(bar) = self.bar_on() else {
             return;
         };
@@ -656,6 +683,9 @@ impl Navi {
     /// Focus or restore, from the bar or an activation token: `id` is shown in its group,
     /// restored, uncovered, and gets keyboard focus.
     pub fn focus_or_restore(&mut self, id: WinId) {
+        if self.lock.active {
+            return;
+        }
         if self.layout.activate(id) {
             self.apply_layout();
         }
@@ -666,6 +696,9 @@ impl Navi {
 
     /// Sends the window list what changed: tiled windows in open order.
     pub fn refresh_toplevels(&mut self) {
+        if self.lock.active {
+            return;
+        }
         let focus = self
             .seat
             .get_keyboard()
@@ -725,6 +758,9 @@ impl Navi {
 
     /// Gives `window` keyboard focus and activates it, or nobody.
     pub fn focus(&mut self, window: Option<Window>) {
+        if self.lock.active {
+            return;
+        }
         self.request_redraw();
         let Some(kb) = self.seat.get_keyboard() else {
             return;
@@ -1045,6 +1081,8 @@ pub struct ClientState {
     pub compositor_state: CompositorClientState,
     /// Set only on the connection navi made for navi-bar; never for the listening socket.
     pub privileged: bool,
+    /// Only the dedicated connection passed to the swaylock child.
+    pub locker: bool,
 }
 
 /// The filter on privileged globals: layer shell and the window list.
@@ -1141,6 +1179,15 @@ impl CompositorHandler for Navi {
             }
         }
 
+        if self.lock.active
+            && self
+                .lock
+                .surfaces
+                .iter()
+                .any(|(_, s)| s.alive() && s.wl_surface() == surface)
+        {
+            self.focus_lock_surface(Some(surface.clone()));
+        }
         self.popups.commit(surface);
         if let Some(PopupKind::Xdg(xdg)) = self.popups.find_popup(surface)
             && !xdg.is_initial_configure_sent()
@@ -1311,7 +1358,9 @@ impl SeatHandler for Navi {
 
     fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&Focus>) {
         let dh = &self.display_handle;
-        let client = focused
+        let client = (!self.lock.active)
+            .then_some(focused)
+            .flatten()
             .and_then(Focus::surface)
             .and_then(|s| dh.get_client(s.id()).ok());
         set_data_device_focus(dh, seat, client);
@@ -1327,7 +1376,8 @@ impl SelectionHandler for Navi {
         source: Option<smithay::wayland::selection::SelectionSource>,
         _: Seat<Self>,
     ) {
-        if ty == smithay::wayland::selection::SelectionTarget::Clipboard
+        if !self.lock.active
+            && ty == smithay::wayland::selection::SelectionTarget::Clipboard
             && let Some(wm) = self.xwm.as_mut()
             && let Err(e) = wm.new_selection(ty, source.map(|s| s.mime_types()))
         {
@@ -1343,7 +1393,8 @@ impl SelectionHandler for Navi {
         _: Seat<Self>,
         owner: &Self::SelectionUserData,
     ) {
-        if ty == smithay::wayland::selection::SelectionTarget::Clipboard
+        if !self.lock.active
+            && ty == smithay::wayland::selection::SelectionTarget::Clipboard
             && let Some(wm) = self.xwm.as_mut().filter(|wm| wm.id() == *owner)
             && let Err(e) = wm.send_selection(ty, mime, fd, self.loop_handle.clone())
         {
@@ -1421,6 +1472,9 @@ impl XdgActivationHandler for Navi {
     }
 
     fn token_created(&mut self, _: XdgActivationToken, data: XdgActivationTokenData) -> bool {
+        if self.lock.active {
+            return false;
+        }
         self.xdg_activation_state
             .retain_tokens(|_, d| d.timestamp.elapsed() <= activation::TTL);
         let kb = self.seat.get_keyboard();
@@ -1452,6 +1506,9 @@ impl XdgActivationHandler for Navi {
         surface: WlSurface,
     ) {
         let first_use = self.xdg_activation_state.remove_token(&token);
+        if self.lock.active {
+            return;
+        }
         let id = self.tile_of(&surface);
         let focus = self
             .seat
