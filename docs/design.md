@@ -364,7 +364,8 @@ session.
   dock. X11 keyboard focus is set as well as Wayland focus. Transient dialogs follow their
   parents and hide with them; override-redirect
   menus keep their X11 geometry and require an X11 parent. Clipboard transfers are bridged,
-  with X11 access gated on keyboard focus. Primary selection, cross-protocol drag-and-drop,
+  with X11 access gated on keyboard focus. Clipboard MIME names containing NULs or exceeding
+  2048 bytes are rejected; accepted names are preserved exactly. Primary selection, cross-protocol drag-and-drop,
   and automatic XWayland crash recovery remain unimplemented. Install the `Xwayland` executable
   to enable it; native apps still work without it. The headless integration check is
   `cargo test --locked xwayland::tests::x11_lifecycle_and_input -- --ignored`.

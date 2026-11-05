@@ -312,8 +312,11 @@ impl XwmHandler for Navi {
             warn!("Wayland clipboard transfer: {e}");
         }
     }
-    fn new_selection(&mut self, id: XwmId, ty: SelectionTarget, mime_types: Vec<String>) {
+    fn new_selection(&mut self, id: XwmId, ty: SelectionTarget, mut mime_types: Vec<String>) {
         if XwmHandler::allow_selection_access(self, id, ty) {
+            // MIME names identify the transfer target: reject unsafe names rather than altering
+            // them. Leave room for the complete Wayland offer event in the 4096-byte buffer.
+            mime_types.retain(|mime| mime.len() <= 2048 && !mime.contains('\0'));
             set_data_device_selection(&self.display_handle, &self.seat, mime_types, id);
         }
     }
@@ -401,8 +404,14 @@ mod tests {
     };
     use smithay_client_toolkit::reexports::{
         client::{
-            Connection as WaylandConnection, Dispatch as ClientDispatch, EventQueue, QueueHandle,
-            backend::WaylandError, event_created_child, protocol::wl_registry,
+            Connection as WaylandConnection, Dispatch as ClientDispatch, EventQueue, Proxy,
+            QueueHandle,
+            backend::WaylandError,
+            delegate_noop, event_created_child,
+            protocol::{
+                wl_compositor, wl_data_device, wl_data_device_manager, wl_data_offer, wl_registry,
+                wl_seat, wl_surface,
+            },
         },
         protocols_wlr::foreign_toplevel::v1::client::{
             zwlr_foreign_toplevel_handle_v1::{self as handle, ZwlrForeignToplevelHandleV1},
@@ -416,6 +425,11 @@ mod tests {
         manager: Option<ZwlrForeignToplevelManagerV1>,
         titles: Vec<String>,
         apps: Vec<String>,
+        compositor: Option<wl_compositor::WlCompositor>,
+        seat: Option<wl_seat::WlSeat>,
+        data_manager: Option<wl_data_device_manager::WlDataDeviceManager>,
+        offers: Vec<String>,
+        selection_received: bool,
     }
 
     impl Metadata {
@@ -446,9 +460,20 @@ mod tests {
                 interface,
                 version,
             } = event
-                && interface == "zwlr_foreign_toplevel_manager_v1"
             {
-                state.manager = Some(registry.bind(name, version.min(3), qh, ()));
+                match interface.as_str() {
+                    "zwlr_foreign_toplevel_manager_v1" => {
+                        state.manager = Some(registry.bind(name, version.min(3), qh, ()))
+                    }
+                    "wl_compositor" => {
+                        state.compositor = Some(registry.bind(name, version.min(4), qh, ()))
+                    }
+                    "wl_seat" => state.seat = Some(registry.bind(name, version.min(7), qh, ())),
+                    "wl_data_device_manager" => {
+                        state.data_manager = Some(registry.bind(name, version.min(3), qh, ()))
+                    }
+                    _ => {}
+                }
             }
         }
     }
@@ -481,6 +506,44 @@ mod tests {
                 handle::Event::Title { title } => state.titles.push(title),
                 handle::Event::AppId { app_id } => state.apps.push(app_id),
                 _ => {}
+            }
+        }
+    }
+
+    delegate_noop!(Metadata: ignore wl_compositor::WlCompositor);
+    delegate_noop!(Metadata: ignore wl_surface::WlSurface);
+    delegate_noop!(Metadata: ignore wl_seat::WlSeat);
+    delegate_noop!(Metadata: ignore wl_data_device_manager::WlDataDeviceManager);
+
+    impl ClientDispatch<wl_data_device::WlDataDevice, ()> for Metadata {
+        fn event(
+            state: &mut Self,
+            _: &wl_data_device::WlDataDevice,
+            event: wl_data_device::Event,
+            _: &(),
+            _: &WaylandConnection,
+            _: &QueueHandle<Self>,
+        ) {
+            if let wl_data_device::Event::Selection { id } = event {
+                state.selection_received = id.is_some();
+            }
+        }
+        event_created_child!(Metadata, wl_data_device::WlDataDevice, [
+            wl_data_device::EVT_DATA_OFFER_OPCODE => (wl_data_offer::WlDataOffer, ()),
+        ]);
+    }
+
+    impl ClientDispatch<wl_data_offer::WlDataOffer, ()> for Metadata {
+        fn event(
+            state: &mut Self,
+            _: &wl_data_offer::WlDataOffer,
+            event: wl_data_offer::Event,
+            _: &(),
+            _: &WaylandConnection,
+            _: &QueueHandle<Self>,
+        ) {
+            if let wl_data_offer::Event::Offer { mime_type } = event {
+                state.offers.push(mime_type);
             }
         }
     }
@@ -775,6 +838,9 @@ mod tests {
         let clipboard = atom(b"CLIPBOARD");
         let targets = atom(b"TARGETS");
         let utf8 = atom(b"UTF8_STRING");
+        let oversized_mime = format!("application/{}", "x".repeat(5000));
+        let oversized = atom(oversized_mime.as_bytes());
+        let valid = atom(b"application/x-navi-test");
         let respond = || {
             while let Some(event) = conn.poll_for_event().unwrap() {
                 if let Event::SelectionRequest(e) = event {
@@ -784,7 +850,7 @@ mod tests {
                             e.requestor,
                             e.property,
                             AtomEnum::ATOM,
-                            &[utf8],
+                            &[utf8, oversized, valid],
                         )
                         .unwrap();
                     } else {
@@ -847,6 +913,70 @@ mod tests {
             }
         });
         assert_eq!(bytes, b"navi clipboard");
+
+        // A separate, unprivileged native client must receive valid clipboard offers even
+        // when the X11 owner advertises a target too large for Wayland's event buffer.
+        let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
+        let native_client = data
+            .state
+            .display_handle
+            .insert_client(
+                server,
+                std::sync::Arc::new(crate::state::ClientState::default()),
+            )
+            .unwrap();
+        let native_connection = WaylandConnection::from_socket(client).unwrap();
+        let mut native_queue = native_connection.new_event_queue::<Metadata>();
+        let _registry = native_connection
+            .display()
+            .get_registry(&native_queue.handle(), ());
+        let mut native = Metadata::default();
+        native_queue.flush().unwrap();
+        pump(&mut event_loop, &mut data, |_| {
+            native.read(&mut native_queue);
+            native.compositor.is_some() && native.seat.is_some() && native.data_manager.is_some()
+        });
+        assert!(
+            native.manager.is_none(),
+            "unprivileged client saw the window list"
+        );
+        let surface = native
+            .compositor
+            .as_ref()
+            .unwrap()
+            .create_surface(&native_queue.handle(), ());
+        let _device = native.data_manager.as_ref().unwrap().get_data_device(
+            native.seat.as_ref().unwrap(),
+            &native_queue.handle(),
+            (),
+        );
+        native_queue.flush().unwrap();
+        let mut server_surface = None;
+        pump(&mut event_loop, &mut data, |d| {
+            server_surface = native_client
+                .object_from_protocol_id::<WlSurface>(
+                    &d.state.display_handle,
+                    surface.id().protocol_id(),
+                )
+                .ok();
+            server_surface.is_some()
+        });
+        let keyboard = data.state.seat.get_keyboard().unwrap();
+        keyboard.set_focus(
+            &mut data.state,
+            Some(crate::focus::Focus::Wayland(server_surface.unwrap())),
+            smithay::utils::SERIAL_COUNTER.next_serial(),
+        );
+        data.display.flush_clients().unwrap();
+        pump(&mut event_loop, &mut data, |_| {
+            native.read(&mut native_queue);
+            native.selection_received
+        });
+        assert_eq!(
+            native.offers,
+            ["text/plain;charset=utf-8", "application/x-navi-test"]
+        );
+        data.state.focus(data.state.window_of(id));
 
         let dialog = conn.generate_id().unwrap();
         conn.create_window(
