@@ -39,14 +39,15 @@ On Debian/Ubuntu:
 ```sh
 sudo apt-get update
 sudo apt-get install -y build-essential git pkg-config libwayland-dev libxkbcommon-dev \
-  libudev-dev libinput-dev libseat-dev libgbm-dev libdrm-dev libegl1 xwayland swaylock fonts-noto-core
+  libudev-dev libinput-dev libseat-dev libgbm-dev libdrm-dev libegl1 xwayland swaylock fonts-noto-core \
+  meson ninja-build wayland-protocols libcairo2-dev libpam0g-dev curl patch
 ```
 
 On Arch Linux/CachyOS:
 
 ```sh
 sudo pacman -S --needed base-devel git pkgconf wayland libxkbcommon systemd-libs \
-  libinput seatd mesa libglvnd libdrm xorg-xwayland swaylock noto-fonts
+  libinput seatd mesa libglvnd libdrm xorg-xwayland swaylock noto-fonts meson ninja wayland-protocols cairo pam
 ```
 
 ## Build and try it
@@ -59,7 +60,10 @@ cargo build --release --locked
 ```
 
 Run that last command from an existing Wayland or X11 desktop to open Navi as a nested window.
-Navi starts `navi-bar` from the same directory as its own executable, so keep both binaries together.
+Navi starts `navi-bar` and `navi-swaylock` from its own directory, so keep all three binaries together.
+Cargo also builds the small locker helper from pinned swaylock 1.8.6 source, verified by SHA-256,
+with a rendering-only patch for the eight-slice indicator. The first build needs network access;
+the verified source and native build are cached under `target/navi-locker`.
 Build as your normal user. For a debug build, use `cargo build --locked` and `./target/debug/navi`.
 
 ## Controls
@@ -90,7 +94,7 @@ Pin/Unpin controls to customize the dock, and scroll with a wheel or touchpad.
 After building the release binaries:
 
 ```sh
-sudo install -Dm755 -t /usr/local/bin target/release/navi target/release/navi-bar
+sudo install -Dm755 -t /usr/local/bin target/release/navi target/release/navi-bar target/release/navi-swaylock
 sudo install -Dm644 -t /usr/share/wayland-sessions dist/navi.desktop
 sudo install -Dm644 -t /usr/share/xdg-desktop-portal dist/navi-portals.conf
 ```
@@ -123,7 +127,7 @@ imported from Plasma. Original KDE configuration files are left intact.
 The [CI workflow](https://github.com/Yoshiofthewire/navi/blob/main/.github/workflows/ci.yml) checks formatting, Clippy, debug tests/build,
 real headless XWayland integration, and startup failure without a display or seat.
 The [release workflow](https://github.com/Yoshiofthewire/navi/blob/main/.github/workflows/release.yml) runs release-profile tests and the same
-integration/fail-safe checks, then builds both binaries and uploads `navi-linux-x86_64.tar.gz`.
+integration/fail-safe checks, then builds all three binaries and uploads `navi-linux-x86_64.tar.gz`.
 Both workflows run for pull requests and pushes to `main`, and support manual runs.
 
 ```sh
@@ -141,9 +145,9 @@ The monitor-probe test remains manual because it reads the host's hardware.
 
 Release artifacts are built on Ubuntu 24.04 for Linux x86_64 and require compatible system
 libraries. Download them from successful **Release build** runs in GitHub Actions. The archive
-contains `navi`, `navi-bar`, the `dist/` session files, `docs/`, icons, this README, and the license. Workflows
+contains `navi`, `navi-bar`, `navi-swaylock`, the `dist/` session files, `docs/`, icons, this README, and the license. Workflows
 cache compiled dependencies; tests still execute on every run. CI does not publish GitHub releases.
-Extract the archive, keep both binaries together, and run `./navi` from an existing desktop.
+Extract the archive, keep all three binaries together, and run `./navi` from an existing desktop.
 
 ## Limitations
 

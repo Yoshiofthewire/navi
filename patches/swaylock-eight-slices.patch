@@ -1,0 +1,121 @@
+--- a/render.c
++++ b/render.c
+@@ -6,6 +6,7 @@
+ #include "background-image.h"
+ #include "swaylock.h"
+ #include "log.h"
++#include "navi-indicator.h"
+ 
+ #define M_PI 3.14159265358979323846
+ const float TYPE_INDICATOR_RANGE = M_PI / 3.0f;
+@@ -270,12 +271,23 @@
+ 		cairo_fill_preserve(cairo);
+ 		cairo_stroke(cairo);
+ 
+-		// Draw ring
++		// Eight clockwise slices; a completed lap becomes the next lap's base.
++		cairo_new_path(cairo);
+ 		cairo_set_line_width(cairo, arc_thickness);
+-		cairo_arc(cairo, buffer_width / 2, buffer_diameter / 2, arc_radius,
+-				0, 2 * M_PI);
+-		set_color_for_state(cairo, state, &state->args.colors.ring);
+-		cairo_stroke(cairo);
++		if (state->auth_state == AUTH_STATE_IDLE) {
++			size_t characters = navi_character_count(state->password.buffer, state->password.len);
++			for (size_t slice = 0; slice < 8; ++slice) {
++				double start = -M_PI / 2.0 + slice * M_PI / 4.0;
++				cairo_set_source_u32(cairo, navi_slice_color(characters, slice));
++				cairo_arc(cairo, buffer_width / 2, buffer_diameter / 2,
++					arc_radius, start + 0.035, start + M_PI / 4.0 - 0.035);
++				cairo_stroke(cairo);
++			}
++		} else {
++			set_color_for_state(cairo, state, &state->args.colors.ring);
++			cairo_arc(cairo, buffer_width / 2, buffer_diameter / 2, arc_radius, 0, 2 * M_PI);
++			cairo_stroke(cairo);
++		}
+ 
+ 		// Draw a message
+ 		configure_font_drawing(cairo, state, surface->subpixel, arc_radius);
+@@ -298,54 +310,6 @@
+ 			cairo_new_sub_path(cairo);
+ 		}
+ 
+-		// Typing indicator: Highlight random part on keypress
+-		if (state->input_state == INPUT_STATE_LETTER ||
+-				state->input_state == INPUT_STATE_BACKSPACE) {
+-			double highlight_start = state->highlight_start * (M_PI / 1024.0);
+-			cairo_arc(cairo, buffer_width / 2, buffer_diameter / 2,
+-					arc_radius, highlight_start,
+-					highlight_start + TYPE_INDICATOR_RANGE);
+-			if (state->input_state == INPUT_STATE_LETTER) {
+-				if (state->xkb.caps_lock && state->args.show_caps_lock_indicator) {
+-					cairo_set_source_u32(cairo, state->args.colors.caps_lock_key_highlight);
+-				} else {
+-					cairo_set_source_u32(cairo, state->args.colors.key_highlight);
+-				}
+-			} else {
+-				if (state->xkb.caps_lock && state->args.show_caps_lock_indicator) {
+-					cairo_set_source_u32(cairo, state->args.colors.caps_lock_bs_highlight);
+-				} else {
+-					cairo_set_source_u32(cairo, state->args.colors.bs_highlight);
+-				}
+-			}
+-			cairo_stroke(cairo);
+-
+-			// Draw borders
+-			double inner_radius = buffer_diameter / 2.0 - arc_thickness * 1.5;
+-			double outer_radius = buffer_diameter / 2.0 - arc_thickness / 2.0;
+-
+-			cairo_set_line_width(cairo, 2.0 * surface->scale);
+-			cairo_set_source_u32(cairo, state->args.colors.separator);
+-			cairo_move_to(cairo,
+-				buffer_width / 2.0 + cos(highlight_start) * inner_radius,
+-				buffer_diameter / 2.0 + sin(highlight_start) * inner_radius
+-			);
+-			cairo_line_to(cairo,
+-				buffer_width / 2.0 + cos(highlight_start) * outer_radius,
+-				buffer_diameter / 2.0 + sin(highlight_start) * outer_radius
+-			);
+-			cairo_stroke(cairo);
+-
+-			cairo_move_to(cairo,
+-				buffer_width / 2.0 + cos(highlight_start + TYPE_INDICATOR_RANGE) * inner_radius,
+-				buffer_diameter / 2.0 + sin(highlight_start + TYPE_INDICATOR_RANGE) * inner_radius
+-			);
+-			cairo_line_to(cairo,
+-				buffer_width / 2.0 + cos(highlight_start + TYPE_INDICATOR_RANGE) * outer_radius,
+-				buffer_diameter / 2.0 + sin(highlight_start + TYPE_INDICATOR_RANGE) * outer_radius
+-			);
+-			cairo_stroke(cairo);
+-		}
+ 
+ 		// Draw inner + outer border of the circle
+ 		set_color_for_state(cairo, state, &state->args.colors.line);
+--- a/include/navi-indicator.h
++++ b/include/navi-indicator.h
+@@ -0,0 +1,24 @@
++/* Navi indicator only. Password storage and authentication remain upstream. */
++#ifndef NAVI_INDICATOR_H
++#define NAVI_INDICATOR_H
++#include <stddef.h>
++#include <stdint.h>
++
++static size_t navi_character_count(const char *buffer, size_t bytes) {
++    size_t count = 0;
++    for (size_t i = 0; i < bytes; ++i) {
++        if (((unsigned char)buffer[i] & 0xc0) != 0x80) { ++count; }
++    }
++    return count;
++}
++
++static uint32_t navi_slice_color(size_t characters, size_t slice) {
++    static const uint32_t colors[] = {
++        0x2ba3d8ff, 0x5bd6a2ff, 0xb69cffff,
++        0xf0c674ff, 0xf08cb7ff, 0x6bd9e7ff,
++    };
++    size_t lap = characters / 8;
++    size_t filled = characters % 8;
++    return colors[(lap + (slice < filled ? 1 : 0)) % (sizeof(colors) / sizeof(colors[0]))];
++}
++#endif

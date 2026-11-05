@@ -23,7 +23,7 @@ jobs:
           persist-credentials: false
       # Xwayland's software-rendering path still probes libEGL.so.1.
       - name: System dependencies
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libxkbcommon-dev libwayland-dev pkg-config libudev-dev libinput-dev libseat-dev libgbm-dev libdrm-dev xwayland libegl1 swaylock
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libxkbcommon-dev libwayland-dev pkg-config libudev-dev libinput-dev libseat-dev libgbm-dev libdrm-dev xwayland libegl1 swaylock meson ninja-build wayland-protocols libcairo2-dev libpam0g-dev curl patch
       - name: Rust toolchain
         id: toolchain
         run: |
@@ -44,6 +44,8 @@ jobs:
         run: cargo test --release --locked xwayland::tests::x11_lifecycle_and_input -- --ignored
       - name: Swaylock protocol handshake (no host display or authentication)
         run: cargo test --release --locked locking::tests::swaylock_real_client_handshake -- --ignored
+      - name: Eight-slice locker protocol handshake
+        run: NAVI_TEST_SWAYLOCK="$PWD/target/release/navi-swaylock" cargo test --release --locked locking::tests::swaylock_real_client_handshake -- --ignored
       - run: cargo build --release --locked
       - name: Fail-safe smoke (release)
         run: |
@@ -57,7 +59,7 @@ jobs:
       - name: Package binaries and session files
         run: |
           tar -czf navi-linux-x86_64.tar.gz \
-            -C target/release navi navi-bar \
+            -C target/release navi navi-bar navi-swaylock \
             -C "$GITHUB_WORKSPACE" dist docs assets/icons Readme.md LICENSE.txt
       - name: Upload release build
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

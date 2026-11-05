@@ -421,8 +421,11 @@ fn swaylock_real_client_handshake() {
     let path = std::env::var_os("NAVI_TEST_SWAYLOCK")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| SWAYLOCK.into());
-    let mut child = command(&path)
+    let backgrounds = vec![background::create("isolated".into(), None, 800, 600).unwrap()];
+    let mut cmd = command(&path, &backgrounds);
+    let mut child = cmd
         .stdin(Stdio::from(OwnedFd::from(theirs)))
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -460,6 +463,12 @@ fn swaylock_real_client_handshake() {
     }));
     let _ = child.kill();
     let _ = child.wait();
+    let mut diagnostics = String::new();
+    std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut diagnostics).unwrap();
+    assert!(
+        !diagnostics.contains("Failed to load background"),
+        "{diagnostics}"
+    );
     h.data.display.dispatch_clients(&mut h.data.state).unwrap();
     assert!(
         h.data.state.lock.active,
