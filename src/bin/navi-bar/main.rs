@@ -20,6 +20,7 @@ mod icons;
 mod layout;
 mod menu;
 mod notify;
+mod session;
 mod status;
 #[cfg(test)]
 mod testutil;
@@ -88,7 +89,7 @@ const TEXT_PX: f32 = 14.0;
 /// How long a launch waits for its activation token.
 const TOKEN_WAIT: Duration = Duration::from_secs(1);
 /// The status band across the top of the main output.
-const BAND_H: i32 = 32;
+const BAND_H: i32 = session::BAND_H;
 /// Between the status text and the band's right edge, and the cards and the output's edges.
 const EDGE: i32 = 8;
 const POWER: &str = "/sys/class/power_supply";
@@ -154,10 +155,16 @@ fn run() -> Result<(), String> {
         var("HOME").as_deref(),
         var("XDG_DATA_DIRS").as_deref(),
     );
+    let config = files::xdg_dir(
+        var("XDG_CONFIG_HOME").as_deref(),
+        var("HOME").as_deref(),
+        ".config",
+    );
+    let preferred = icons::preferred(config.as_deref());
     let themes = Themes::new(
         icons::bases(&data_dirs, var("HOME").as_deref()),
         Some(PathBuf::from("/usr/share/pixmaps")),
-        icons::PREFERRED,
+        &preferred,
     );
     info!(themes = ?themes.chain(), "icon themes");
     let font = font::load();
@@ -170,6 +177,15 @@ fn run() -> Result<(), String> {
         .insert_source(rx, |event, _, bar| {
             if let channel::Event::Msg(call) = event {
                 bar.call(call);
+            }
+        })
+        .map_err(|e| e.to_string())?;
+    let (session_tx, session_rx) = channel::channel();
+    event_loop
+        .handle()
+        .insert_source(session_rx, |event, _, bar| {
+            if let channel::Event::Msg(reply) = event {
+                bar.session_reply(reply);
             }
         })
         .map_err(|e| e.to_string())?;
@@ -190,6 +206,11 @@ fn run() -> Result<(), String> {
         band_w: 0,
         status: String::new(),
         battery: None,
+        session: session::Menu::default(),
+        band_hover: false,
+        session_tx,
+        full_session: dbus::wants_export(var("NAVI_EXPORT_ENV").as_deref()),
+        logout: false,
         cards_layer: None,
         cards_size: (0, 0),
         cards_configured: false,
@@ -235,7 +256,12 @@ fn run() -> Result<(), String> {
             .dispatch(None, &mut bar)
             .map_err(|e| format!("connection lost: {e}"))?;
     }
-    Ok(())
+    // A successful shell exit is the private logout request to Navi. Failures respawn the bar.
+    if bar.logout {
+        Ok(())
+    } else {
+        Err("Shell surfaces were closed unexpectedly".into())
+    }
 }
 
 /// The taskbar's layer surface, on whatever output navi picks.
@@ -255,8 +281,7 @@ fn bar_layer(
     layer
 }
 
-/// The status band across the top of the main output. Takes no clicks: its input region is
-/// empty.
+/// The status band on the main output. Only the Navi button and open menu accept clicks.
 fn band_layer(
     compositor: &CompositorState,
     layer_shell: &LayerShell,
@@ -267,7 +292,7 @@ fn band_layer(
     band.set_anchor(Anchor::TOP | Anchor::LEFT | Anchor::RIGHT);
     band.set_size(0, BAND_H as u32);
     band.set_exclusive_zone(BAND_H);
-    band.set_keyboard_interactivity(KeyboardInteractivity::None);
+    band.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
     let none = Region::new(compositor).map_err(|e| e.to_string())?;
     band.wl_surface().set_input_region(Some(none.wl_region()));
     band.commit();
@@ -294,6 +319,11 @@ struct Bar {
     band_w: i32,
     status: String,
     battery: Option<status::Battery>,
+    session: session::Menu,
+    band_hover: bool,
+    session_tx: channel::Sender<session::Reply>,
+    full_session: bool,
+    logout: bool,
     /// The notification cards' surface, while any are shown.
     cards_layer: Option<LayerSurface>,
     cards_size: (i32, i32),
@@ -379,6 +409,7 @@ impl Bar {
     }
 
     fn toggle_menu(&mut self) {
+        self.close_session();
         self.pin_message.clear();
         self.menu = match self.menu {
             Some(_) => None,
@@ -550,6 +581,23 @@ impl Bar {
     }
 
     fn key(&mut self, event: KeyEvent, serial: u32, qh: &QueueHandle<Self>) {
+        if self.session.open {
+            match event.keysym {
+                Keysym::Escape => {
+                    if self.session.confirm.is_some() {
+                        self.session.activate(session::Hit::Cancel);
+                        self.draw_band();
+                    } else {
+                        self.close_session();
+                    }
+                }
+                Keysym::Return | Keysym::KP_Enter => {
+                    self.session_click(self.session.selected_hit())
+                }
+                _ => self.edit(event),
+            }
+            return;
+        }
         let Some(menu) = self.menu.as_ref() else {
             return;
         };
@@ -577,6 +625,15 @@ impl Bar {
 
     /// Typing and moving in the menu; the keys that repeat while held.
     fn edit(&mut self, event: KeyEvent) {
+        if self.session.open {
+            match event.keysym {
+                Keysym::Up | Keysym::Left => self.session.step(-1),
+                Keysym::Down | Keysym::Right | Keysym::Tab => self.session.step(1),
+                _ => return,
+            }
+            self.draw_band();
+            return;
+        }
         let Some(menu) = self.menu.as_mut() else {
             return;
         };
@@ -656,7 +713,8 @@ impl Bar {
                             };
                             self.icons.get(&format!("app:{}", app.app_id), &names, size)
                         }
-                        IconOf::Folder => self.icons.get("folder", &["folder".into()], size),
+                        IconOf::Folder(category) => self.icons.category(category, size),
+                        IconOf::Session(name) => self.icons.get(name, &[name.into()], size),
                         IconOf::Entry(e) => {
                             let entry = &self.entries[e];
                             let names: Vec<String> = entry.icon.iter().cloned().collect();
@@ -710,6 +768,71 @@ impl Bar {
         self.start.elapsed().as_millis() as u64
     }
 
+    fn close_session(&mut self) {
+        if self.session.open {
+            self.session.close();
+            self.draw_band();
+        }
+    }
+
+    fn toggle_session(&mut self) {
+        if self.session.open {
+            return self.close_session();
+        }
+        self.close_menu();
+        self.session.open = true;
+        self.session.selected = 0;
+        if !self.session.busy {
+            self.session.busy = true;
+            let (tx, full, seat) = (
+                self.session_tx.clone(),
+                self.full_session,
+                std::env::var("XDG_SEAT_PATH").ok(),
+            );
+            std::thread::spawn(move || {
+                let _ = tx.send(session::Reply::Capabilities(session::capabilities(
+                    full, seat,
+                )));
+            });
+        }
+        self.draw_band();
+    }
+
+    fn session_click(&mut self, hit: session::Hit) {
+        if let Some(action) = self.session.activate(hit) {
+            if action == session::Action::Logout {
+                self.logout = true;
+                self.closed = true;
+                return;
+            }
+            self.session.busy = true;
+            self.session.message = format!("Requesting {}…", action.label());
+            let (tx, full, caps) = (
+                self.session_tx.clone(),
+                self.full_session,
+                self.session.capabilities.clone(),
+            );
+            std::thread::spawn(move || {
+                let _ = tx.send(session::Reply::Done(session::perform(action, full, &caps)));
+            });
+        }
+        self.draw_band();
+    }
+
+    fn session_reply(&mut self, reply: session::Reply) {
+        self.session.busy = false;
+        match reply {
+            session::Reply::Capabilities(caps) => self.session.capabilities = caps,
+            session::Reply::Done(Ok(())) => self.close_session(),
+            session::Reply::Done(Err(e)) => {
+                warn!(error = %e, "session action failed");
+                self.session.message =
+                    "Request failed. See the session log,\nthen try again.".into();
+            }
+        }
+        self.draw_band();
+    }
+
     fn refresh_status(&mut self) {
         let battery = status::battery(Path::new(POWER));
         let status = status::format(&jiff::Zoned::now(), battery);
@@ -726,7 +849,20 @@ impl Bar {
             return;
         }
         let s = self.scale.max(1);
-        let Some(mut canvas) = Pixmap::new((self.band_w * s) as u32, (BAND_H * s) as u32) else {
+        let h = self.session.height();
+        self.band.set_size(0, h as u32);
+        if let Ok(region) = Region::new(&self.compositor) {
+            let r = session::BUTTON;
+            region.add(r.x, r.y, r.w, r.h);
+            if self.session.open {
+                let r = self.session.panel();
+                region.add(r.x, r.y, r.w, r.h);
+            }
+            self.band
+                .wl_surface()
+                .set_input_region(Some(region.wl_region()));
+        }
+        let Some(mut canvas) = Pixmap::new((self.band_w * s) as u32, (h * s) as u32) else {
             return;
         };
         fill(
@@ -740,6 +876,14 @@ impl Bar {
             theme::BAR_BG,
             1.0,
         );
+        if self.session.open || self.band_hover {
+            paint(
+                &mut canvas,
+                self.font.as_ref(),
+                Item::Round(session::BUTTON, 8, theme::SELECTED),
+                s,
+            );
+        }
         fill(
             &mut canvas,
             Rect {
@@ -858,6 +1002,31 @@ impl Bar {
                     if b.charging { theme::ACCENT } else { INK },
                     1.0,
                 );
+            }
+        }
+        for item in self.session.draw(self.full_session) {
+            if let Item::Icon(IconOf::Session(name), r, alpha) = item {
+                let r = scaled(r, s);
+                if let Some(icon) =
+                    self.icons
+                        .get(name, &[name.into(), format!("{name}-symbolic")], r.w as u32)
+                {
+                    canvas.draw_pixmap(
+                        r.x,
+                        r.y,
+                        icon.as_ref(),
+                        &PixmapPaint {
+                            opacity: alpha,
+                            ..Default::default()
+                        },
+                        Transform::identity(),
+                        None,
+                    );
+                } else {
+                    placeholder(&mut canvas, r);
+                }
+            } else {
+                paint(&mut canvas, self.font.as_ref(), item, s);
             }
         }
         present(&mut self.pool, &self.band, &canvas, s);
@@ -1269,6 +1438,7 @@ impl LayerShellHandler for Bar {
             self.configured = false;
         } else if layer == &self.band {
             info!("status band closed by navi, making a new one");
+            self.session.close();
             match band_layer(&self.compositor, &self.layer_shell, &self.qh) {
                 Ok(b) => {
                     self.band = b;
@@ -1429,10 +1599,15 @@ impl KeyboardHandler for Bar {
         _: &Connection,
         _: &QueueHandle<Self>,
         _: &wl_keyboard::WlKeyboard,
-        _: &wl_surface::WlSurface,
+        surface: &wl_surface::WlSurface,
         _: u32,
     ) {
-        self.close_menu();
+        if surface == self.band.wl_surface() {
+            self.close_session();
+        }
+        if surface == self.layer.wl_surface() {
+            self.close_menu();
+        }
     }
 
     fn press_key(
@@ -1477,6 +1652,43 @@ impl PointerHandler for Bar {
         events: &[PointerEvent],
     ) {
         for e in events {
+            if &e.surface == self.band.wl_surface() {
+                let (x, y) = (e.position.0 as i32, e.position.1 as i32);
+                match e.kind {
+                    PointerEventKind::Press {
+                        button: BTN_LEFT, ..
+                    } => {
+                        if session::BUTTON.contains(x, y) {
+                            self.toggle_session();
+                        } else if let Some(hit) = self.session.hit(x, y) {
+                            self.session_click(hit);
+                        }
+                    }
+                    PointerEventKind::Motion { .. }
+                    | PointerEventKind::Enter { .. }
+                    | PointerEventKind::Leave { .. } => {
+                        let hover = !matches!(e.kind, PointerEventKind::Leave { .. })
+                            && session::BUTTON.contains(x, y);
+                        if self.band_hover != hover {
+                            self.band_hover = hover;
+                            self.draw_band();
+                        }
+                        if let Some(hit) = self.session.hit(x, y) {
+                            let selected = match hit {
+                                session::Hit::Row(i) => i,
+                                session::Hit::Cancel => 0,
+                                session::Hit::Confirm => 1,
+                            };
+                            if selected != self.session.selected {
+                                self.session.selected = selected;
+                                self.draw_band();
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
+            }
             let on_cards = self.cards_layer.as_ref().map(|l| l.wl_surface()) == Some(&e.surface);
             if on_cards {
                 if let PointerEventKind::Press {

@@ -53,6 +53,22 @@ remembered. Maximized/fullscreen windows keep their geometry. Floating dialogs a
 surfaces keep their app shortcuts. When testing nested, the host compositor may reserve these
 chords before Navi receives them; a full Navi session receives them directly.
 
+## Power and session menu
+
+Click **Navi** at the upper left of the status bar for **Sleep**, **Lock Screen**, **Switch User**,
+**Log Out**, **Restart**, and **Shutdown**. Use the pointer, Up/Down or Tab, and Enter. Each enabled
+action opens a confirmation with **Cancel** selected; Escape cancels or closes the menu.
+
+In a nested window only **Log Out** is enabled, and it closes that Navi instance. A full session
+uses login1 for sleep, restart, and shutdown, preserving its authorization and inhibitor checks.
+Actions requiring an authorization prompt are unavailable until Navi has an authentication agent.
+Switch User requires a display manager that advertises `CanSwitch` at this session's
+`XDG_SEAT_PATH`; without that exact seat it is disabled.
+
+Lock Screen is disabled because Navi has no session-lock implementation. Sleep and Switch User
+do not lock Navi, as their confirmations explain. A failed request keeps the session running and
+shows an error in the menu; details go to the session log.
+
 ## When it fails
 
 If navi can't start (no seat session, no GPU, no monitor), it exits with
@@ -61,7 +77,8 @@ If navi can't start (no seat session, no GPU, no monitor), it exits with
 previous log to `navi.log.old`, so after one more failed login the first one's log is still
 there.
 
-navi itself never launches apps; the taskbar (navi-bar) does. If navi-bar crashes, navi starts it
+navi itself never launches apps; the taskbar (navi-bar) does. A confirmed Log Out closes navi;
+if navi-bar crashes, navi starts it
 again, up to 5 times a minute. Past that the log says `navi-bar keeps crashing, running without
 a bar`, and there's no taskbar: press Ctrl+Alt+Backspace to get back to the login screen.
 

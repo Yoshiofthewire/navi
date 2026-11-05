@@ -15,6 +15,29 @@ use crate::files::{read_bytes, xdg_dir};
 use crate::image;
 
 pub const PREFERRED: &str = "candy-icons";
+
+/// Use the explicit KDE icon choice when present, otherwise Navi's default.
+pub fn preferred(config: Option<&Path>) -> String {
+    let chosen = config
+        .and_then(|dir| {
+            read_bytes(&dir.join("kdeglobals"), MAX_INDEX)
+                .ok()
+                .flatten()
+        })
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|text| kde_theme(&text));
+    chosen.unwrap_or_else(|| PREFERRED.into())
+}
+
+fn kde_theme(text: &str) -> Option<String> {
+    ini(text).into_iter().find_map(|(group, entries)| {
+        (group == "Icons").then(|| {
+            entries.into_iter().find_map(|(key, value)| {
+                (key == "Theme" && valid_name(value)).then(|| value.to_string())
+            })
+        })?
+    })
+}
 const FALLBACK: &str = "hicolor";
 const MAX_INDEX: u64 = 256 << 10;
 const MAX_INHERITS: usize = 8;
@@ -86,7 +109,10 @@ pub fn bases(data_dirs: &[PathBuf], home: Option<&OsStr>) -> Vec<PathBuf> {
 }
 
 fn valid_name(name: &str) -> bool {
-    !name.is_empty() && !name.contains('/') && !name.contains("..")
+    !name.is_empty()
+        && !name.contains('/')
+        && !name.contains("..")
+        && !name.chars().any(char::is_control)
 }
 
 impl Themes {
@@ -348,6 +374,15 @@ impl Icons {
         self.cache[&k].as_ref()
     }
 
+    pub fn category(&mut self, category: crate::desktop::Category, size: u32) -> Option<&Pixmap> {
+        let name = category.icon();
+        self.get(
+            name,
+            &[format!("{name}-symbolic"), name.into(), "folder".into()],
+            size,
+        )
+    }
+
     /// The menu button's icon: `navi` from the theme, else the embedded one.
     pub fn navi(&mut self, size: u32) -> Option<&Pixmap> {
         let k = ("\0navi".to_string(), size);
@@ -368,6 +403,40 @@ mod tests {
     use crate::testutil::Tmp;
 
     const SVG_RED: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><rect width="16" height="16" fill="#ff0000"/></svg>"##;
+
+    #[test]
+    fn kde_choice_and_category_icons_use_the_selected_theme() {
+        let tmp = Tmp::new("kde-icons");
+        assert_eq!(preferred(Some(&tmp.0)), PREFERRED);
+        fs::write(
+            tmp.0.join("kdeglobals"),
+            "[Sounds]\nTheme=other\n[Icons]\nTheme=test-theme\n",
+        )
+        .unwrap();
+        assert_eq!(preferred(Some(&tmp.0)), "test-theme");
+        assert_eq!(kde_theme("[Icons]\nTheme=../../bad\n"), None);
+        assert_eq!(kde_theme("[Sounds]\nTheme=other\n"), None);
+        theme(
+            &tmp.0,
+            "test-theme",
+            "[Icon Theme]\nDirectories=24\n[24]\nSize=24\nType=Fixed\n",
+            &[
+                "24/applications-office-symbolic.svg",
+                "24/applications-internet.svg",
+                "24/folder.svg",
+            ],
+        );
+        let mut icons = Icons::new(Themes::new(vec![tmp.0.clone()], None, "test-theme"));
+        for category in [
+            crate::desktop::Category::Office,
+            crate::desktop::Category::Internet,
+            crate::desktop::Category::Other,
+        ] {
+            assert!(icons.category(category, 24).is_some());
+        }
+        fs::write(tmp.0.join("kdeglobals"), vec![b'x'; MAX_INDEX as usize + 1]).unwrap();
+        assert_eq!(preferred(Some(&tmp.0)), PREFERRED);
+    }
 
     fn theme(base: &Path, name: &str, index: &str, icons: &[&str]) {
         let dir = base.join(name);

@@ -220,17 +220,33 @@ The screen shows a wallpaper, a taskbar and your apps. There are no desktop icon
   gesture end, pointer leave or navigation clears any remainder. Short result lists shrink the
   launcher to fit. The search, rows and pin buttons have distinct targets, and transparent space
   around the dock and launcher takes no clicks.
+  Folder rows use KDE's per-category icons (`applications-internet-symbolic`,
+  `applications-development-symbolic`, `preferences-system-symbolic`, and the other matching
+  category names), falling back to their non-symbolic name and then a generic folder.
 - **Corners:** on the main monitor, and they stay there when the taskbar moves or the main
   monitor changes. A 32 px status
   bar runs across the top, with the same opaque dark surface and outline as the dock. Navi's logo
   and name align left, the local date and 24-hour clock sit in the center, and a battery glyph
   and percentage align right, labeled while charging. Battery capacity is the mean of the
   system's batteries, read every 30 s; mice and headsets don't count. The bar takes space from
-  the grid, takes no clicks, and hides in fullscreen.
+  the grid and hides in fullscreen. Only the Navi button and its open session menu take clicks;
+  the rest of the band is transparent to input.
   Notifications are top-left, below the band. Volume, network and tray come later. Volume has no
   small route: PipeWire's native API is C (`libpipewire`, which needs `unsafe` and a new system
   library), pipewire-pulse has no D-Bus volume interface, and running `wpctl` would break the
   no-shell rule.
+- **Session menu:** click Navi at the upper left to open Sleep, Lock Screen, Switch User,
+  Log Out, Restart, and Shutdown. Up/Down or Tab selects, Enter opens a confirmation with Cancel
+  selected, and Escape cancels or closes. Clicking elsewhere closes the menu. All actions need
+  explicit confirmation; holding Enter never accepts one. Errors appear in the menu and are
+  logged. System services are queried off the UI thread with bounded method timeouts.
+  Sleep/Restart/Shutdown use login1 and its normal permissions/inhibitors; actions needing
+  interactive authorization are disabled because there is no authentication agent yet.
+  Switch User uses the display manager's `SwitchToGreeter` only for `XDG_SEAT_PATH` and only
+  when its `CanSwitch` is true. Neither switching user nor sleeping locks Navi; confirmations
+  say so. Lock Screen is disabled until a real session lock exists. Nested, only Log Out is
+  enabled, and it closes just Navi. A confirmed logout exits navi-bar successfully; Navi treats
+  that private child exit as a graceful quit, while failed/crashed bars still respawn.
 - **Notifications:** navi-bar serves `org.freedesktop.Notifications` (spec 1.2) only if no other
   server holds the name when it starts. It asks with `DoNotQueue` and neither replace flag, so
   it never takes the name from Plasma or anyone else, never queues for it, and can't have it
@@ -271,7 +287,9 @@ don't affect navi's MIT licence.
 | Boot splash | Plymouth | not navi's job; it runs before login and works with any desktop |
 
 - **Default icon theme:** `candy-icons` if it's installed, otherwise `hicolor`. An icon theme the
-  user explicitly chose in KDE wins over this default.
+  user explicitly chose in KDE wins over this default: navi-bar reads `[Icons] Theme` from
+  `$XDG_CONFIG_HOME/kdeglobals` (default `~/.config/kdeglobals`) on each start. The same theme and
+  inheritance chain is used for apps, category icons, and session actions.
 - **Default cursor theme:** `Sweet-cursors` if it's installed (it has a `cursors` dir in one of
   the places above), otherwise `Adwaita`, otherwise none, and the nested host's pointer stays.
   navi draws the `default` arrow (else `left_ptr`), found in the theme or what it inherits
@@ -283,10 +301,10 @@ don't affect navi's MIT licence.
   the apps it launches. Still to come: apps' own cursors (`cursor-shape-v1`, cursor surfaces),
   importing the cursor chosen in KDE, and animated cursors. Nested, the arrow stays at the edge
   where the pointer left the window, since the winit backend doesn't report leaving.
-- **First run imports the KDE settings** if they exist: icons from `kdeglobals` `[Icons]`, sounds
+- **Planned theme imports:** sounds
   from `kdeglobals` `[Sounds]`, cursor from `kcminputrc` `[Mouse]`. This is a one-time copy into
-  navi's config, so Plasma users keep the look they chose. After that, navi doesn't follow
-  changes made in Plasma.
+  navi's config, so Plasma users keep the look they chose. Icons already read KDE's explicit
+  choice on each startup, as described above.
 - **Other apps match:** navi passes the chosen themes to apps through `XCURSOR_THEME`,
   `XCURSOR_SIZE` and the portal's appearance settings.
 - **No KDE login splash.** KDE's splash themes are QML programs. Running them would pull in Qt,
@@ -310,8 +328,8 @@ session.
   over a socket pair it made. Only that connection sees layer shell and the window list
   (`wlr-foreign-toplevel-management`); other clients don't find them in the registry at all. A
   layer surface gets the keyboard only when clicked (`exclusive` is treated as on-demand), and
-  can't shrink the grid below half the monitor. If `navi-bar` exits, navi starts it again after
-  1 s, at most 5 times in any minute; past that it runs without a bar.
+  can't shrink the grid below half the monitor. A successful `navi-bar` exit requests logout;
+  other exits restart it after 1 s, at most 5 times in any minute; past that Navi runs without a bar.
 - **Activation tokens** (`xdg-activation`) are made only for a request from the surface holding
   the keyboard, with a serial from its current focus (no older than its keyboard enter, no newer
   than navi's latest). Each works once, within 10 s, and only while the keyboard is still on the
@@ -334,6 +352,9 @@ session.
   so a hostile local app can make navi-bar allocate up to the bus's message limit per call; such
   an app already runs as the user. A D-Bus bug takes the taskbar down with it, since there is one
   privileged client.
+- **System bus:** session-menu capability queries and confirmed power/switch-user requests
+  run in navi-bar, off the UI thread. Nested mode refuses system actions before connecting.
+  Navi never forces past inhibitors, runs a system command, or terminates a login1 session.
 - **Config** is plain data. A config file can never run a command.
 - **Real hardware:** navi gets the GPU and input devices only through the seat session
   (libseat, so logind), never by opening `/dev` itself, and needs no root. On a VT switch the
