@@ -5,14 +5,14 @@
 From the repo, build as yourself and install with sudo:
 
 ```sh
-cargo build --release --locked && sudo install -Dm755 -t /usr/local/bin target/release/navi target/release/navi-bar target/release/navi-swaylock && sudo install -Dm644 -t /usr/share/wayland-sessions dist/navi.desktop && sudo install -Dm644 -t /usr/share/xdg-desktop-portal dist/navi-portals.conf
+cargo build --release --locked && sudo install -Dm755 -t /usr/local/bin target/release/navi target/release/navi-bar target/release/navi-swaylock target/release/navi-settings && sudo install -Dm644 -t /usr/share/wayland-sessions dist/navi.desktop && sudo install -Dm644 -t /usr/share/xdg-desktop-portal dist/navi-portals.conf
 ```
 
 The same, a step at a time, with the build capped so it can't take the desktop down with it:
 
 ```sh
 systemd-run --user --scope -p MemoryMax=6G -p MemorySwapMax=0 -- cargo build --release --locked
-sudo install -Dm755 -t /usr/local/bin target/release/navi target/release/navi-bar target/release/navi-swaylock
+sudo install -Dm755 -t /usr/local/bin target/release/navi target/release/navi-bar target/release/navi-swaylock target/release/navi-settings
 sudo install -Dm644 -t /usr/share/wayland-sessions dist/navi.desktop
 sudo install -Dm644 -t /usr/share/xdg-desktop-portal dist/navi-portals.conf
 ```
@@ -20,7 +20,7 @@ sudo install -Dm644 -t /usr/share/xdg-desktop-portal dist/navi-portals.conf
 Uninstall:
 
 ```sh
-sudo rm /usr/local/bin/navi /usr/local/bin/navi-bar /usr/local/bin/navi-swaylock /usr/share/wayland-sessions/navi.desktop /usr/share/xdg-desktop-portal/navi-portals.conf
+sudo rm /usr/local/bin/navi /usr/local/bin/navi-bar /usr/local/bin/navi-swaylock /usr/local/bin/navi-settings /usr/share/wayland-sessions/navi.desktop /usr/share/xdg-desktop-portal/navi-portals.conf
 ```
 
 Your settings in `~/.config/navi` and `~/.local/state/navi` stay; delete them for a fresh start.

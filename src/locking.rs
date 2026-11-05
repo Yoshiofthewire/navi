@@ -491,4 +491,4 @@ delegate_dispatch!(Navi: [ExtSessionLockManagerV1: ()] => SessionLockManagerStat
 delegate_dispatch!(Navi: [ExtSessionLockSurfaceV1: ExtLockSurfaceUserData] => SessionLockManagerState);
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

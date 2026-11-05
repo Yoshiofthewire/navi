@@ -22,7 +22,7 @@ jobs:
         with:
           persist-credentials: false
       # Xwayland probes EGL even when the headless integration test uses software rendering.
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libxkbcommon-dev libwayland-dev pkg-config libudev-dev libinput-dev libseat-dev libgbm-dev libdrm-dev xwayland libegl1 swaylock meson ninja-build wayland-protocols libcairo2-dev libpam0g-dev curl patch
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libxkbcommon-dev libwayland-dev pkg-config libudev-dev libinput-dev libseat-dev libgbm-dev libdrm-dev xwayland libegl1 swaylock meson ninja-build wayland-protocols libcairo2-dev libpam0g-dev curl patch python3-gi gir1.2-gtk-4.0
       - name: Rust toolchain
         id: toolchain
         run: |
@@ -38,6 +38,8 @@ jobs:
             target/debug
           key: ${{ runner.os }}-${{ runner.arch }}-check-${{ steps.toolchain.outputs.version }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml') }}
           restore-keys: ${{ runner.os }}-${{ runner.arch }}-check-${{ steps.toolchain.outputs.version }}-
+      - name: Settings model checks
+        run: python3 -m unittest discover -s src/settings -p 'test_*.py'
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked

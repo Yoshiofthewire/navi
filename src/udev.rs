@@ -66,6 +66,8 @@ pub struct Udev {
     render_node: DrmNode,
     manager: DrmOutputManager<Allocator, Exporter, (), DrmDeviceFd>,
     screens: Vec<Screen>,
+    input_devices: Vec<smithay::reexports::input::Device>,
+    wallpaper_epoch: u64,
     pointer: Option<Pointer>,
     /// The session is active (not switched away).
     active: bool,
@@ -147,6 +149,8 @@ pub fn init(
         render_node,
         manager,
         screens: Vec::new(),
+        input_devices: Vec::new(),
+        wallpaper_epoch: 0,
         pointer: None,
         active: true,
     });
@@ -161,10 +165,19 @@ pub fn init(
         .insert_source(
             LibinputInputBackend::new(libinput.clone()),
             |mut ev, _, data| {
-                if let InputEvent::DeviceAdded { device } = &mut ev
-                    && device.config_tap_finger_count() > 0
-                {
-                    let _ = device.config_tap_set_enabled(true);
+                match &mut ev {
+                    InputEvent::DeviceAdded { device } => {
+                        configure_input(device, &data.state.preferences);
+                        if let Some(udev) = data.udev.as_mut() {
+                            udev.input_devices.push(device.clone());
+                        }
+                    }
+                    InputEvent::DeviceRemoved { device } => {
+                        if let Some(udev) = data.udev.as_mut() {
+                            udev.input_devices.retain(|d| d != device);
+                        }
+                    }
+                    _ => {}
                 }
                 data.state.process_input_event(ev);
             },
@@ -345,6 +358,7 @@ fn scan(data: &mut CalloopData) -> Result<usize, String> {
     let held: Vec<String> = udev.screens.iter().map(|s| identity(&s.output)).collect();
     let ids = monitors::identities(&names, &held);
 
+    let saved = crate::settings::saved_arrangement();
     let mut added = Vec::new();
     for (c, (id, fallback)) in new.into_iter().zip(&ids) {
         if *fallback {
@@ -359,9 +373,18 @@ fn scan(data: &mut CalloopData) -> Result<usize, String> {
             continue;
         };
         let modes = c.info.modes();
+        let wanted = saved.as_ref().and_then(|a| a.modes.get(id));
         let mode = modes
             .iter()
-            .find(|m| m.mode_type().contains(ModeTypeFlags::PREFERRED))
+            .find(|m| {
+                let m = Mode::from(**m);
+                wanted == Some(&(m.size.w, m.size.h, m.refresh))
+            })
+            .or_else(|| {
+                modes
+                    .iter()
+                    .find(|m| m.mode_type().contains(ModeTypeFlags::PREFERRED))
+            })
             .unwrap_or(&modes[0]);
         let (make, model) = c
             .edid
@@ -380,8 +403,15 @@ fn scan(data: &mut CalloopData) -> Result<usize, String> {
             },
         );
         set_identity(&output, id.clone());
-        let wl_mode = Mode::from(*mode);
-        output.set_preferred(wl_mode);
+        for mode in modes {
+            output.add_mode(Mode::from(*mode));
+        }
+        let preferred = modes
+            .iter()
+            .find(|m| m.mode_type().contains(ModeTypeFlags::PREFERRED))
+            .unwrap_or(&modes[0]);
+        let mut wl_mode = Mode::from(*mode);
+        output.set_preferred(Mode::from(*preferred));
         output.change_current_state(Some(wl_mode), None, None, None);
         let mut renderer = udev
             .gpus
@@ -398,6 +428,27 @@ fn scan(data: &mut CalloopData) -> Result<usize, String> {
                 &mut renderer,
                 &DrmOutputRenderElements::default(),
             );
+        let drm = drm.or_else(|error| {
+            if mode == preferred {
+                return Err(error);
+            }
+            warn!(
+                connector = c.name,
+                "saved mode failed; trying preferred mode"
+            );
+            wl_mode = Mode::from(*preferred);
+            output.change_current_state(Some(wl_mode), None, None, None);
+            udev.manager
+                .initialize_output::<_, Frame<UdevRenderer<'_>>>(
+                    crtc,
+                    *preferred,
+                    &[c.handle],
+                    &output,
+                    None,
+                    &mut renderer,
+                    &DrmOutputRenderElements::default(),
+                )
+        });
         let drm = match drm {
             Ok(d) => d,
             Err(e) => {
@@ -605,6 +656,23 @@ fn render(data: &mut CalloopData, crtc: crtc::Handle) {
     if !udev.active {
         return;
     }
+    if udev.wallpaper_epoch != data.state.wallpaper_epoch {
+        let outputs: Vec<_> = udev
+            .screens
+            .iter()
+            .map(|s| {
+                (
+                    identity(&s.output),
+                    data.state.priority_of(&identity(&s.output)),
+                )
+            })
+            .collect();
+        let named: Vec<_> = outputs.iter().map(|(n, p)| (n.as_str(), *p)).collect();
+        for (screen, image) in udev.screens.iter_mut().zip(wallpaper::open(&named)) {
+            screen.wallpaper = image.map(|i| Wallpaper::new(&i));
+        }
+        udev.wallpaper_epoch = data.state.wallpaper_epoch;
+    }
     let Some(s) = udev.screens.iter_mut().find(|s| s.crtc == crtc) else {
         return;
     };
@@ -687,4 +755,75 @@ fn render(data: &mut CalloopData, crtc: crtc::Handle) {
     data.state.popups.cleanup();
     data.state.refresh_toplevels();
     let _ = data.display.flush_clients();
+}
+
+fn configure_input(
+    device: &mut smithay::reexports::input::Device,
+    p: &crate::settings::Preferences,
+) {
+    let _ = device.config_accel_set_speed(p.pointer_speed);
+    let _ = device.config_scroll_set_natural_scroll_enabled(p.natural_scroll);
+    if device.config_tap_finger_count() > 0 {
+        let _ = device.config_tap_set_enabled(p.tap_to_click);
+    }
+}
+pub fn apply_input_preferences(data: &mut CalloopData) {
+    if let Some(udev) = data.udev.as_mut() {
+        for device in &mut udev.input_devices {
+            configure_input(device, &data.state.preferences);
+        }
+    }
+}
+
+/// Apply only a connector-advertised KMS mode. The settings transaction owns rollback.
+pub fn set_mode(data: &mut CalloopData, output: &Output, mode: Mode) -> Result<(), String> {
+    let Some(udev) = data.udev.as_mut() else {
+        return Err("The host controls nested resolution".into());
+    };
+    let screen = udev
+        .screens
+        .iter_mut()
+        .find(|s| s.output == *output)
+        .ok_or("Display disconnected")?;
+    let info = udev
+        .manager
+        .device()
+        .get_connector(screen.connector, false)
+        .map_err(|e| e.to_string())?;
+    let native = info
+        .modes()
+        .iter()
+        .find(|m| Mode::from(**m) == mode)
+        .ok_or("Mode is no longer supported")?;
+    let mut renderer = udev
+        .gpus
+        .single_renderer(&udev.render_node)
+        .map_err(|e| e.to_string())?;
+    screen
+        .drm
+        .use_mode::<_, Frame<UdevRenderer<'_>>>(
+            *native,
+            &mut renderer,
+            &DrmOutputRenderElements::default(),
+        )
+        .map_err(|e| e.to_string())?;
+    screen.drm.reset_buffers();
+    screen.queued = false;
+    screen.queued_lock = None;
+    Ok(())
+}
+
+pub fn input_capabilities(data: &CalloopData) -> serde_json::Value {
+    let devices = data
+        .udev
+        .as_ref()
+        .map(|u| u.input_devices.as_slice())
+        .unwrap_or_default();
+    serde_json::json!({"pointer_speed": devices.iter().any(|d| d.config_accel_is_available()),
+        "natural_scroll": devices.iter().any(|d| d.config_scroll_has_natural_scroll()),
+        "tap_to_click": devices.iter().any(|d| d.config_tap_finger_count()>0)})
+}
+
+pub fn redraw(data: &mut CalloopData) {
+    render_all(data);
 }

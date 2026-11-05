@@ -96,6 +96,7 @@ pub fn init(
         .as_ref()
         .map(|img| Wallpaper::new(img));
 
+    let mut wallpaper_epoch = data.state.wallpaper_epoch;
     let mut damage_tracker = OutputDamageTracker::from_output(&output);
     let mut shot = Screenshot::from_env();
 
@@ -153,6 +154,12 @@ pub fn init(
                 WinitEvent::Input(event) => state.process_input_event(event),
                 WinitEvent::Focus(false) => state.cancel_drag(),
                 WinitEvent::Redraw => {
+                    if wallpaper_epoch != state.wallpaper_epoch {
+                        wallpaper = wallpaper::open(&[(NAME, 0)])[0]
+                            .as_ref()
+                            .map(|img| Wallpaper::new(img));
+                        wallpaper_epoch = state.wallpaper_epoch;
+                    }
                     debug!("nested frame");
                     clock.borrow_mut().last = Instant::now();
                     let mut backend = backend.borrow_mut();

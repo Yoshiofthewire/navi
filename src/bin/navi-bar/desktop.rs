@@ -154,6 +154,20 @@ pub fn scan(data_dirs: &[PathBuf]) -> Vec<Entry> {
             parse(id, &String::from_utf8(bytes).ok()?)
         })
         .collect();
+    if let Ok(exe) = std::env::current_exe() {
+        let settings = exe.with_file_name("navi-settings");
+        if settings.is_file() {
+            out.retain(|e| e.id != "navi-settings.desktop");
+            out.push(Entry {
+                id: "navi-settings.desktop".into(),
+                name: "Navi Settings".into(),
+                icon: Some("preferences-system".into()),
+                argv: vec![settings.to_string_lossy().into_owned()],
+                wm_class: Some("io.github.Yoshiofthewire.Navi.Settings".into()),
+                category: Category::Settings,
+            });
+        }
+    }
     out.sort_by(|a, b| {
         let key = |e: &Entry| e.name.to_lowercase();
         key(a).cmp(&key(b)).then_with(|| a.id.cmp(&b.id))

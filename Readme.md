@@ -60,7 +60,7 @@ cargo build --release --locked
 ```
 
 Run that last command from an existing Wayland or X11 desktop to open Navi as a nested window.
-Navi starts `navi-bar` and `navi-swaylock` from its own directory, so keep all three binaries together.
+Keep `navi`, `navi-bar`, `navi-swaylock` and `navi-settings` together. Navi starts the bar automatically; Settings opens on demand.
 Cargo also builds the small locker helper from pinned swaylock 1.8.6 source, verified by SHA-256,
 with a rendering-only patch for the eight-slice indicator. The first build needs network access;
 the verified source and native build are cached under `target/navi-locker`.
@@ -94,7 +94,7 @@ Pin/Unpin controls to customize the dock, and scroll with a wheel or touchpad.
 After building the release binaries:
 
 ```sh
-sudo install -Dm755 -t /usr/local/bin target/release/navi target/release/navi-bar target/release/navi-swaylock
+sudo install -Dm755 -t /usr/local/bin target/release/navi target/release/navi-bar target/release/navi-swaylock target/release/navi-settings
 sudo install -Dm644 -t /usr/share/wayland-sessions dist/navi.desktop
 sudo install -Dm644 -t /usr/share/xdg-desktop-portal dist/navi-portals.conf
 ```
@@ -127,7 +127,7 @@ imported from Plasma. Original KDE configuration files are left intact.
 The [CI workflow](https://github.com/Yoshiofthewire/navi/blob/main/.github/workflows/ci.yml) checks formatting, Clippy, debug tests/build,
 real headless XWayland integration, and startup failure without a display or seat.
 The [release workflow](https://github.com/Yoshiofthewire/navi/blob/main/.github/workflows/release.yml) runs release-profile tests and the same
-integration/fail-safe checks, then builds all three binaries and uploads `navi-linux-x86_64.tar.gz`.
+integration/fail-safe checks, then builds all four binaries and uploads `navi-linux-x86_64.tar.gz`.
 Both workflows run for pull requests and pushes to `main`, and support manual runs.
 
 ```sh
@@ -145,24 +145,37 @@ The monitor-probe test remains manual because it reads the host's hardware.
 
 Release artifacts are built on Ubuntu 24.04 for Linux x86_64 and require compatible system
 libraries. Download them from successful **Release build** runs in GitHub Actions. The archive
-contains `navi`, `navi-bar`, `navi-swaylock`, the `dist/` session files, `docs/`, icons, this README, and the license. Workflows
+contains `navi`, `navi-bar`, `navi-swaylock`, `navi-settings`, the `dist/` session files, `docs/`, icons, this README, and the license. Workflows
 cache compiled dependencies; tests still execute on every run. CI does not publish GitHub releases.
-Extract the archive, keep all three binaries together, and run `./navi` from an existing desktop.
+Extract the archive, keep all four binaries together, and run `./navi` from an existing desktop.
 
 ## Limitations
 
 - Real login sessions, multi-monitor hotplug, VT switching, and physical touchpad behavior
   remain unverified on hardware.
-- Screen-sharing/screenshot portals and idle-time automatic locking are not implemented.
+- Screen-sharing/screenshot portals are not implemented.
 - Locking, PAM unlock, sleep/resume and logind handling still need hardware validation.
   Nested locking protects only Navi’s window; your host desktop manages the rest.
-- One GPU, preferred display modes, and no HDR, VRR, rotation, or mirroring.
+- One GPU, connector-advertised display modes, and no HDR, VRR, rotation, or mirroring.
 - XWayland primary selection, cross-protocol drag-and-drop, and automatic XWayland restart
   are not implemented.
-- Accessibility integration, virtual desktops, and volume/network/system-tray controls are pending.
+- Shell accessibility integration, virtual desktops, and volume/network/system-tray indicators
+  are pending. Network, Bluetooth and sound controls are available in Settings.
 - Nested rendering sleeps between changes; hardware idle CPU and full-session benchmarks
   remain unverified. See [performance measurements](docs/performance.md).
 
 ## License
 
 [MIT](LICENSE.txt).
+
+## Settings
+
+Open **Navi Settings** in the launcher's Settings folder. It runs on demand and uses native
+GTK 4 controls. Install runtime dependencies on Debian/Ubuntu with
+`sudo apt-get install python3-gi gir1.2-gtk-4.0`, or on Arch with
+`sudo pacman -S python-gobject gtk4`. Python/GTK are not compositor runtime dependencies.
+Install `dist/navi-settings.desktop` into `/usr/local/share/applications` for other launchers.
+See [Settings](docs/settings.md) for built-in controls, advanced feature limits and validation.
+
+Built-in network and Bluetooth controls need NetworkManager and BlueZ. Sound controls need
+PipeWire-Pulse or PulseAudio and `pactl` (`pulseaudio-utils` on Debian/Ubuntu, `libpulse` on Arch).
