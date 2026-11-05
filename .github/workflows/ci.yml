@@ -15,10 +15,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libxkbcommon-dev libwayland-dev pkg-config libudev-dev libinput-dev libseat-dev libgbm-dev libdrm-dev
+      # Xwayland probes EGL even when the headless integration test uses software rendering.
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libxkbcommon-dev libwayland-dev pkg-config libudev-dev libinput-dev libseat-dev libgbm-dev libdrm-dev xwayland libegl1
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
+      - name: XWayland integration (no host display or GPU)
+        run: cargo test --locked xwayland::tests::x11_lifecycle_and_input -- --ignored
       - run: cargo build --locked
       # No display and no seat: navi must take the real-hardware path and exit 1 with its
       # message, not hang (124), panic (101) or succeed.

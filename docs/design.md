@@ -313,7 +313,7 @@ session.
   without navi-bar's socket. Running each app in its own `app-*.scope` comes later (it needs
   D-Bus).
 - **The session bus** reaches navi-bar only through the notification server: one name, one
-  object. Its one call out is on real hardware only: at start it sets `WAYLAND_DISPLAY`,
+  object. Its one call out is on real hardware only: at start it sets `WAYLAND_DISPLAY`, `DISPLAY`,
   `XDG_CURRENT_DESKTOP` and `XDG_SESSION_TYPE` (nothing else) through the bus's
   `UpdateActivationEnvironment` and systemd's `SetEnvironment`, so portals and D-Bus-started
   apps reach navi. Nested it never does, so the host's user services keep pointing at the host. Every field a notification carries is untrusted and is never logged;
@@ -357,9 +357,20 @@ session.
   set, else real hardware: DRM/KMS on the seat's primary GPU only, libinput, libseat. Both draw
   each output from the same element list (`src/render.rs`). See `docs/session.md`.
 
-## Open questions
+- **XWayland:** Smithay's rootless server and XWM manage X11 windows in the same layout as
+  native apps. Embedded NULs in `WM_CLASS` and window titles become U+FFFD; the resulting text
+  is capped at 2048 bytes at a UTF-8 boundary before layout or Wayland window-list events use it.
+  This keeps complete events within the backend's 4096-byte buffer. The metadata reaches the
+  dock. X11 keyboard focus is set as well as Wayland focus. Transient dialogs follow their
+  parents and hide with them; override-redirect
+  menus keep their X11 geometry and require an X11 parent. Clipboard transfers are bridged,
+  with X11 access gated on keyboard focus. Clipboard MIME names containing NULs or exceeding
+  2048 bytes are rejected; accepted names are preserved exactly. Primary selection, cross-protocol drag-and-drop,
+  and automatic XWayland crash recovery remain unimplemented. Install the `Xwayland` executable
+  to enable it; native apps still work without it. The headless integration check is
+  `cargo test --locked xwayland::tests::x11_lifecycle_and_input -- --ignored`.
 
-- **XWayland** is the next job: X11-only apps don't start yet.
+## Open questions
 
 - Grid size: hard-coded at 12 × 6, or configurable? Leaning hard-coded.
 - More look references, beyond the logo.

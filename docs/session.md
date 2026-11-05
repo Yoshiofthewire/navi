@@ -74,7 +74,15 @@ a bar`, and there's no taskbar: press Ctrl+Alt+Backspace to get back to the logi
   `navi-portals.conf` picks the KDE portal, then GTK's, for file pickers.
 - Apps see each monitor by its connector (`DP-11`), never its serial number.
 - Screen sharing and screenshots through portals don't work: navi has no capture protocol yet.
-- XWayland isn't in yet: X11-only apps won't start.
+- X11 apps run through XWayland when the `Xwayland` executable is installed (Arch:
+  `xorg-xwayland`, Debian/Ubuntu: `xwayland`). Missing or failed XWayland leaves native Wayland
+  apps available; the reason is logged. X11 apps share Navi's tiling, controls, and dock.
+- Clipboard text transfers between X11 and native Wayland apps. X11 clipboard access requires
+  an X11 window to hold keyboard focus. Primary selection and cross-protocol drag-and-drop
+  are not implemented. X11 apps share one X server and its usual mutual access.
+- Navi gives apps its own `DISPLAY`, including when nested; it exports that display to D-Bus
+  and systemd only in a real session. Nested runs leave the host's activation environment alone.
+- XWayland isn't automatically restarted after a crash. Restart Navi to use X11 apps again.
 - One GPU only, each monitor at its preferred mode. No VRR, HDR, rotation or mirroring.
 
 ## Unproven until Yoshi tries it

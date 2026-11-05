@@ -69,20 +69,25 @@ use tracing::{info, warn};
 
 use crate::CalloopData;
 use crate::activation::{self, may_issue, may_redeem};
+use crate::focus::Focus;
 use crate::layout::{self, Decor, Drag, Layout, Rect, WinId, decoration};
 use crate::monitors::{BarHover, Hover};
 use crate::persist::{self, Store};
 use crate::toplevels::{self, Toplevels};
 use crate::wallpaper::usable_area;
+use smithay::wayland::seat::WaylandFocus;
+use smithay::wayland::xwayland_shell::XWaylandShellState;
+use smithay::xwayland::{X11Wm, XWaylandClientData};
 
 /// A toplevel navi knows about. It's unmapped until its first commit, when its app ID is known.
 pub struct Managed {
     pub window: Window,
     /// `None` for dialogs, which float over their parent.
     pub tile: Option<WinId>,
-    last_size: Size<i32, Logical>,
+    pub(crate) last_size: Size<i32, Logical>,
     /// Asked for fullscreen before it was placed.
-    want_fullscreen: bool,
+    pub(crate) want_fullscreen: bool,
+    pub(crate) x11_parent: Option<u32>,
 }
 
 pub struct Navi {
@@ -92,6 +97,8 @@ pub struct Navi {
     pub loop_signal: LoopSignal,
     pub layout: Layout,
     pub memory: Store,
+    pub xwm: Option<X11Wm>,
+    pub xwayland_shell: XWaylandShellState,
     pub windows: Vec<Managed>,
     /// A drag in navi's strip or edges, from press to release.
     pub drag: Option<Drag>,
@@ -159,11 +166,13 @@ impl Navi {
             _output_manager_state:
                 smithay::wayland::output::OutputManagerState::new_with_xdg_output::<Self>(&dh),
             data_device_state: DataDeviceState::new::<Self>(&dh),
-            display_handle: dh,
+            display_handle: dh.clone(),
             space: Space::default(),
             loop_signal,
             layout,
             memory,
+            xwm: None,
+            xwayland_shell: XWaylandShellState::new::<Self>(&dh),
             windows: Vec::new(),
             drag: None,
             edge_clicks: layout::EdgeClicks::default(),
@@ -249,7 +258,32 @@ impl Navi {
     pub fn apply_layout(&mut self) {
         let (mut hidden, mut shown) = (Vec::new(), Vec::new());
         for m in &self.windows {
-            let (Some(id), Some(toplevel)) = (m.tile, m.window.toplevel()) else {
+            let Some(id) = m.tile else {
+                continue;
+            };
+            if let Some(x) = m.window.x11_surface() {
+                let visible = self.layout.visible(id);
+                let _ = x.set_maximized(self.layout.is_maximized(id));
+                let _ = x.set_fullscreen(self.layout.is_fullscreen(id));
+                let _ = x.set_suspended(self.layout.tile(id).is_some_and(|t| t.minimized));
+                if let Some(r) = self.layout.rect(id).filter(|_| visible) {
+                    if let Err(e) =
+                        x.configure(Rectangle::new((r.x, r.y).into(), (r.w, r.h).into()))
+                    {
+                        warn!(id, "X11 configure: {e}");
+                    }
+                    if self.space.element_location(&m.window).is_none() {
+                        shown.push(id);
+                    }
+                    self.space.map_element(m.window.clone(), (r.x, r.y), false);
+                } else if self.space.element_location(&m.window).is_some() {
+                    self.space.unmap_elem(&m.window);
+                    m.window.set_activated(false);
+                    hidden.push(id);
+                }
+                continue;
+            }
+            let Some(toplevel) = m.window.toplevel() else {
                 continue;
             };
             let mapped = self.space.element_location(&m.window).is_some();
@@ -305,6 +339,7 @@ impl Navi {
             info!(?shown, "shown");
         }
         self.recenter_dialogs();
+        self.recenter_x11();
         self.keep_focus_mapped(&shown);
         // Tiles moved: refocus a still pointer, so a click can't land in the window that left.
         if let Some(pointer) = self.seat.get_pointer() {
@@ -438,7 +473,9 @@ impl Navi {
             return;
         };
         let surface = layer.wl_surface().clone();
-        if !layer.can_receive_keyboard_focus() || kb.current_focus().as_ref() == Some(&surface) {
+        if !layer.can_receive_keyboard_focus()
+            || kb.current_focus().and_then(|f| f.surface()).as_ref() == Some(&surface)
+        {
             return;
         }
         self.space.elements().for_each(|w| {
@@ -449,13 +486,17 @@ impl Navi {
         });
         let focus = Some(format!("layer {}", layer.namespace()));
         info!(?focus, "keyboard focus");
-        kb.set_focus(self, Some(surface), SERIAL_COUNTER.next_serial());
+        kb.set_focus(
+            self,
+            Some(Focus::Wayland(surface)),
+            SERIAL_COUNTER.next_serial(),
+        );
     }
 
     fn is_mapped(&self, s: &WlSurface) -> bool {
         self.space
             .elements()
-            .any(|w| w.toplevel().is_some_and(|t| t.wl_surface() == s))
+            .any(|w| window_surface(w).as_ref() == Some(s))
     }
 
     /// A toplevel in the space, or a mapped layer surface.
@@ -467,14 +508,14 @@ impl Navi {
     fn tile_of(&self, s: &WlSurface) -> Option<WinId> {
         self.windows
             .iter()
-            .find(|m| m.window.toplevel().is_some_and(|t| t.wl_surface() == s))?
+            .find(|m| window_surface(&m.window).as_ref() == Some(s))?
             .tile
     }
 
     /// The tile whose window holds the keyboard; `None` while a layer surface, a dialog or
     /// nothing does.
     pub fn focused_tile(&self) -> Option<WinId> {
-        let focus = self.seat.get_keyboard()?.current_focus()?;
+        let focus = self.seat.get_keyboard()?.current_focus()?.surface()?;
         self.tile_of(&focus)
     }
 
@@ -613,23 +654,27 @@ impl Navi {
 
     /// Sends the window list what changed: tiled windows in open order.
     pub fn refresh_toplevels(&mut self) {
-        let focus = self.seat.get_keyboard().and_then(|kb| kb.current_focus());
+        let focus = self
+            .seat
+            .get_keyboard()
+            .and_then(|kb| kb.current_focus())
+            .and_then(|f| f.surface());
         let now = self
             .windows
             .iter()
             .filter_map(|m| {
                 let id = m.tile?;
-                let surface = m.window.toplevel()?.wl_surface();
+                let surface = window_surface(&m.window)?;
                 let tile = self.layout.tile(id)?;
                 let states = [
                     (ListState::Maximized, self.layout.is_maximized(id)),
                     (ListState::Minimized, tile.minimized),
-                    (ListState::Activated, focus.as_ref() == Some(surface)),
+                    (ListState::Activated, focus.as_ref() == Some(&surface)),
                     (ListState::Fullscreen, tile.fullscreen),
                 ];
                 let info = toplevels::Info {
-                    title: title(surface),
-                    app_id: app_id(surface),
+                    title: window_title(&m.window),
+                    app_id: window_app(&m.window),
                     output: self
                         .space
                         .outputs()
@@ -646,7 +691,7 @@ impl Navi {
     fn managed_mut(&mut self, s: &WlSurface) -> Option<&mut Managed> {
         self.windows
             .iter_mut()
-            .find(|m| m.window.toplevel().is_some_and(|t| t.wl_surface() == s))
+            .find(|m| window_surface(&m.window).as_ref() == Some(s))
     }
 
     pub fn window_of(&self, id: WinId) -> Option<Window> {
@@ -654,28 +699,47 @@ impl Navi {
         Some(m.window.clone())
     }
 
+    pub fn close_window(&self, id: WinId) {
+        if let Some(w) = self.window_of(id) {
+            if let Some(t) = w.toplevel() {
+                t.send_close();
+            } else if let Some(x) = w.x11_surface()
+                && let Err(e) = x.close()
+            {
+                warn!("X11 close: {e}");
+            }
+        }
+    }
+
     /// Gives `window` keyboard focus and activates it, or nobody.
     pub fn focus(&mut self, window: Option<Window>) {
         let Some(kb) = self.seat.get_keyboard() else {
             return;
         };
-        let surface = window
-            .as_ref()
-            .and_then(|w| w.toplevel())
-            .map(|t| t.wl_surface().clone());
+        let target = window.as_ref().and_then(|w| match w.x11_surface() {
+            Some(x) => Some(Focus::X11(x.clone())),
+            None => window_surface(w).map(Focus::Wayland),
+        });
+        let surface = target.as_ref().and_then(Focus::surface);
+        if let Some(x) = window.as_ref().and_then(|w| w.x11_surface())
+            && let Some(wm) = self.xwm.as_mut()
+            && let Err(e) = wm.raise_window(x)
+        {
+            warn!("X11 raise: {e}");
+        }
         match &window {
             Some(w) => self.space.raise_element(w, true),
             None => self.space.elements().for_each(|w| {
                 w.set_activated(false);
             }),
         }
-        if kb.current_focus() != surface {
+        if kb.current_focus() != target {
             let focus = surface.as_ref().map(|s| match self.tile_of(s) {
                 Some(id) => id.to_string(),
                 None => "dialog".into(),
             });
             info!(?focus, "keyboard focus");
-            kb.set_focus(self, surface, SERIAL_COUNTER.next_serial());
+            kb.set_focus(self, target, SERIAL_COUNTER.next_serial());
         }
         self.space.elements().for_each(|w| {
             if let Some(t) = w.toplevel() {
@@ -687,7 +751,12 @@ impl Navi {
     /// Keyboard focus never rests on an unmapped window: it moves to the most recent of the
     /// windows just `shown`, or to nobody.
     fn keep_focus_mapped(&mut self, shown: &[WinId]) {
-        let Some(focus) = self.seat.get_keyboard().and_then(|kb| kb.current_focus()) else {
+        let Some(focus) = self
+            .seat
+            .get_keyboard()
+            .and_then(|kb| kb.current_focus())
+            .and_then(|f| f.surface())
+        else {
             return;
         };
         if self.holds_focus(&focus) {
@@ -872,6 +941,36 @@ impl Navi {
     }
 }
 
+pub fn window_surface(w: &Window) -> Option<WlSurface> {
+    w.wl_surface().map(std::borrow::Cow::into_owned)
+}
+/// Keep X11 text valid and small enough for Wayland's 4096-byte event buffer, including
+/// the string length, terminator, padding, and event header.
+fn x11_text(text: String) -> String {
+    let mut text = text.replace('\0', "\u{fffd}");
+    text.truncate(text.floor_char_boundary(2048));
+    text
+}
+
+pub fn window_app(w: &Window) -> String {
+    match w.x11_surface() {
+        Some(x) => x11_text(x.class()),
+        None => w
+            .toplevel()
+            .map(|t| app_id(t.wl_surface()))
+            .unwrap_or_default(),
+    }
+}
+pub fn window_title(w: &Window) -> String {
+    match w.x11_surface() {
+        Some(x) => x11_text(x.title()),
+        None => w
+            .toplevel()
+            .map(|t| title(t.wl_surface()))
+            .unwrap_or_default(),
+    }
+}
+
 fn decor(m: Decoration) -> Decor {
     match m {
         Decoration::ServerSide => Decor::Server,
@@ -951,10 +1050,14 @@ impl CompositorHandler for Navi {
     }
 
     fn client_compositor_state<'a>(&self, client: &'a Client) -> &'a CompositorClientState {
-        &client
-            .get_data::<ClientState>()
-            .expect("every client is inserted with ClientState")
-            .compositor_state
+        if let Some(data) = client.get_data::<ClientState>() {
+            &data.compositor_state
+        } else {
+            &client
+                .get_data::<XWaylandClientData>()
+                .expect("known client type")
+                .compositor_state
+        }
     }
 
     fn commit(&mut self, surface: &WlSurface) {
@@ -967,13 +1070,13 @@ impl CompositorHandler for Navi {
             if let Some(m) = self
                 .windows
                 .iter_mut()
-                .find(|m| m.window.toplevel().is_some_and(|t| t.wl_surface() == &root))
+                .find(|m| window_surface(&m.window).as_ref() == Some(&root))
             {
                 m.window.on_commit();
                 let size = m.window.geometry().size;
                 if m.tile.is_some() && size != m.last_size {
                     m.last_size = size;
-                    let app = app_id(&root);
+                    let app = window_app(&m.window);
                     info!(app, w = size.w, h = size.h, "client committed size");
                 }
             }
@@ -1011,7 +1114,9 @@ impl CompositorHandler for Navi {
                 }
                 // A surface that stops taking keys loses the keyboard.
                 let kb = self.seat.get_keyboard();
-                let focused = kb.is_some_and(|kb| kb.current_focus().as_ref() == Some(surface));
+                let focused = kb.is_some_and(|kb| {
+                    kb.current_focus().and_then(|f| f.surface()).as_ref() == Some(surface)
+                });
                 if focused && !l.can_receive_keyboard_focus() {
                     self.focus(None);
                 }
@@ -1049,6 +1154,7 @@ impl XdgShellHandler for Navi {
             tile: None,
             last_size: Size::default(),
             want_fullscreen: false,
+            x11_parent: None,
         });
     }
 
@@ -1174,7 +1280,7 @@ impl XdgDecorationHandler for Navi {
 }
 
 impl SeatHandler for Navi {
-    type KeyboardFocus = WlSurface;
+    type KeyboardFocus = Focus;
     type PointerFocus = WlSurface;
     type TouchFocus = WlSurface;
 
@@ -1184,15 +1290,47 @@ impl SeatHandler for Navi {
 
     fn cursor_image(&mut self, _seat: &Seat<Self>, _image: CursorImageStatus) {}
 
-    fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
+    fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&Focus>) {
         let dh = &self.display_handle;
-        let client = focused.and_then(|s| dh.get_client(s.id()).ok());
+        let client = focused
+            .and_then(Focus::surface)
+            .and_then(|s| dh.get_client(s.id()).ok());
         set_data_device_focus(dh, seat, client);
     }
 }
 
 impl SelectionHandler for Navi {
-    type SelectionUserData = ();
+    type SelectionUserData = smithay::xwayland::xwm::XwmId;
+
+    fn new_selection(
+        &mut self,
+        ty: smithay::wayland::selection::SelectionTarget,
+        source: Option<smithay::wayland::selection::SelectionSource>,
+        _: Seat<Self>,
+    ) {
+        if ty == smithay::wayland::selection::SelectionTarget::Clipboard
+            && let Some(wm) = self.xwm.as_mut()
+            && let Err(e) = wm.new_selection(ty, source.map(|s| s.mime_types()))
+        {
+            warn!("X11 clipboard offer: {e}");
+        }
+    }
+
+    fn send_selection(
+        &mut self,
+        ty: smithay::wayland::selection::SelectionTarget,
+        mime: String,
+        fd: std::os::fd::OwnedFd,
+        _: Seat<Self>,
+        owner: &Self::SelectionUserData,
+    ) {
+        if ty == smithay::wayland::selection::SelectionTarget::Clipboard
+            && let Some(wm) = self.xwm.as_mut().filter(|wm| wm.id() == *owner)
+            && let Err(e) = wm.send_selection(ty, mime, fd, self.loop_handle.clone())
+        {
+            warn!("X11 clipboard transfer: {e}");
+        }
+    }
 }
 
 impl DataDeviceHandler for Navi {
@@ -1266,7 +1404,10 @@ impl XdgActivationHandler for Navi {
         self.xdg_activation_state
             .retain_tokens(|_, d| d.timestamp.elapsed() <= activation::TTL);
         let kb = self.seat.get_keyboard();
-        let focus = kb.as_ref().and_then(|kb| kb.current_focus());
+        let focus = kb
+            .as_ref()
+            .and_then(|kb| kb.current_focus())
+            .and_then(|f| f.surface());
         let since = kb
             .and_then(|kb| kb.last_enter())
             .filter(|_| data.surface.is_some() && data.surface == focus)
@@ -1292,7 +1433,11 @@ impl XdgActivationHandler for Navi {
     ) {
         let first_use = self.xdg_activation_state.remove_token(&token);
         let id = self.tile_of(&surface);
-        let focus = self.seat.get_keyboard().and_then(|kb| kb.current_focus());
+        let focus = self
+            .seat
+            .get_keyboard()
+            .and_then(|kb| kb.current_focus())
+            .and_then(|f| f.surface());
         let focus_kept =
             focus.is_some() && (focus == data.surface || focus.as_ref() == Some(&surface));
         let age = data.timestamp.elapsed();

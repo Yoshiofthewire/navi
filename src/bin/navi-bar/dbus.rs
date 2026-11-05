@@ -118,7 +118,12 @@ pub fn serve(tx: Sender<Call>) -> Option<Connection> {
 }
 
 /// The variables exported, and nothing else.
-const EXPORTED: [&str; 3] = ["WAYLAND_DISPLAY", "XDG_CURRENT_DESKTOP", "XDG_SESSION_TYPE"];
+const EXPORTED: [&str; 4] = [
+    "WAYLAND_DISPLAY",
+    "DISPLAY",
+    "XDG_CURRENT_DESKTOP",
+    "XDG_SESSION_TYPE",
+];
 
 /// navi sets `NAVI_EXPORT_ENV=1` on real hardware only; nested it's removed.
 pub fn wants_export(v: Option<&OsStr>) -> bool {
@@ -186,13 +191,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn exports_only_on_request_and_only_three_names() {
+    fn exports_only_session_display_names() {
         assert!(wants_export(Some(OsStr::new("1"))));
         for v in [None, Some(""), Some("0"), Some("yes")] {
             assert!(!wants_export(v.map(OsStr::new)), "{v:?}");
         }
         let env = |k: &str| match k {
             "WAYLAND_DISPLAY" => Some("wayland-2".to_string()),
+            "DISPLAY" => Some(":2".to_string()),
             "XDG_CURRENT_DESKTOP" => Some("navi".into()),
             "XDG_SESSION_TYPE" => Some(String::new()),
             _ => Some("leak".into()),
@@ -201,6 +207,7 @@ mod tests {
             exported(env),
             [
                 ("WAYLAND_DISPLAY", "wayland-2".to_string()),
+                ("DISPLAY", ":2".to_string()),
                 ("XDG_CURRENT_DESKTOP", "navi".into()),
             ]
         );
