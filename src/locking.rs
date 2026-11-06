@@ -162,6 +162,9 @@ pub struct Lock {
 }
 
 impl Navi {
+    pub fn lock_outputs_covered(&self) -> bool {
+        self.lock.active && self.space.outputs().all(|o| self.lock.covered.contains(o))
+    }
     pub fn protect_session(&mut self) {
         if !self.lock.active {
             self.lock.active = true;
@@ -312,6 +315,7 @@ impl Navi {
     }
 
     pub fn isolate_lock_input(&mut self) {
+        self.release_sticky();
         self.cancel_drag();
         if let Some(kb) = self.seat.get_keyboard() {
             kb.unset_grab(self);

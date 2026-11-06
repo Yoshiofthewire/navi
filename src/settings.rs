@@ -17,6 +17,7 @@ use smithay::{
         channel,
         timer::{TimeoutAction, Timer},
     },
+    utils::Transform,
 };
 
 use crate::{
@@ -101,6 +102,40 @@ fn config(name: &str) -> Option<PathBuf> {
     )
 }
 
+#[derive(Clone, Debug)]
+pub struct OutputPreferences {
+    pub enabled: bool,
+    pub rotation: u16,
+    pub mirror: Option<String>,
+    pub vrr: bool,
+}
+impl Default for OutputPreferences {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            rotation: 0,
+            mirror: None,
+            vrr: false,
+        }
+    }
+}
+pub fn output_preferences(output: &Output) -> OutputPreferences {
+    output
+        .user_data()
+        .get_or_insert_threadsafe(|| std::sync::Mutex::new(OutputPreferences::default()))
+        .lock()
+        .unwrap()
+        .clone()
+}
+fn transform(rotation: u16) -> Transform {
+    match rotation {
+        90 => Transform::_90,
+        180 => Transform::_180,
+        270 => Transform::_270,
+        _ => Transform::Normal,
+    }
+}
+
 #[derive(Clone)]
 struct Placement {
     output: Output,
@@ -109,43 +144,101 @@ struct Placement {
     scale: f64,
     priority: u32,
     mode: smithay::output::Mode,
+    preferences: OutputPreferences,
 }
 fn placements(data: &CalloopData) -> Vec<Placement> {
-    data.state
-        .space
-        .outputs()
+    let outputs = crate::udev::outputs(data);
+    outputs
+        .into_iter()
         .filter_map(|o| {
-            let g = data.state.space.output_geometry(o)?;
+            let loc = o.current_location();
             Some(Placement {
-                output: o.clone(),
-                x: g.loc.x,
-                y: g.loc.y,
+                x: loc.x,
+                y: loc.y,
                 scale: o.current_scale().fractional_scale(),
-                priority: data.state.priority_of(&identity(o)),
+                priority: data.state.priority_of(&identity(&o)),
                 mode: o.current_mode()?,
+                preferences: output_preferences(&o),
+                output: o,
             })
         })
         .collect()
 }
-fn apply(data: &mut CalloopData, placements: &[Placement]) -> Result<(), String> {
+fn apply(data: &mut CalloopData, requested: &[Placement]) -> Result<(), String> {
+    let current = placements(data);
+    let topology_changed = current.len() != requested.len()
+        || current
+            .iter()
+            .any(|p| !requested.iter().any(|q| q.output == p.output));
+    let mut placements = if topology_changed {
+        current
+    } else {
+        requested.to_vec()
+    };
+    if topology_changed
+        || !placements
+            .iter()
+            .any(|p| p.preferences.enabled && p.preferences.mirror.is_none())
+    {
+        safe_row(&mut placements);
+    }
     data.state.cancel_drag();
-    for p in placements {
-        if !data.state.space.outputs().any(|o| o == &p.output) {
+    for p in &mut placements {
+        if data.udev.is_none() {
+            p.mode = p.output.current_mode().unwrap_or(p.mode);
+        }
+    }
+    for p in &placements {
+        if !crate::udev::outputs(data).iter().any(|o| o == &p.output) {
             continue;
         }
         if p.output.current_mode() != Some(p.mode) {
             crate::udev::set_mode(data, &p.output, p.mode)?;
         }
+        if data.udev.is_some() {
+            crate::udev::set_vrr(data, &p.output, p.preferences.vrr)?;
+        }
+        let orientation = if data.udev.is_some() {
+            Some(transform(p.preferences.rotation))
+        } else {
+            None
+        };
         p.output.change_current_state(
             Some(p.mode),
-            None,
+            orientation,
             Some(Scale::Fractional(p.scale)),
             Some((p.x, p.y).into()),
         );
-        data.state.space.map_output(&p.output, (p.x, p.y));
-        data.state.arrange_layers(&p.output);
+        *p.output
+            .user_data()
+            .get::<std::sync::Mutex<OutputPreferences>>()
+            .unwrap()
+            .lock()
+            .unwrap() = p.preferences.clone();
+        if p.preferences.enabled {
+            data.state.space.map_output(&p.output, (p.x, p.y));
+            let id = identity(&p.output);
+            if p.preferences.mirror.is_none() && !data.state.grid.iter().any(|g| g.name == id) {
+                data.state.add_output(&p.output, p.priority);
+            }
+            if p.preferences.mirror.is_some() {
+                data.state.grid.retain(|g| g.name != id);
+                data.state.layout.remove_output(&id);
+            }
+            data.state.arrange_layers(&p.output);
+        }
     }
-    let mut order = placements.to_vec();
+    for p in placements.iter().filter(|p| !p.preferences.enabled) {
+        if data.state.space.outputs().any(|o| o == &p.output) {
+            data.state.remove_output(&p.output);
+        }
+        crate::udev::output_power(data, &p.output, false)?;
+    }
+    let mut order: Vec<_> = placements
+        .iter()
+        .filter(|p| p.preferences.enabled && p.preferences.mirror.is_none())
+        .cloned()
+        .collect();
     order.sort_by_key(|p| p.priority);
     data.state.set_priorities(
         &order
@@ -154,10 +247,23 @@ fn apply(data: &mut CalloopData, placements: &[Placement]) -> Result<(), String>
             .collect::<Vec<_>>(),
     );
     data.state.place_shell();
+    data.state.lock_outputs_changed();
     data.state.wallpaper_epoch += 1;
     data.state.request_redraw();
     crate::udev::redraw(data);
     Ok(())
+}
+
+fn safe_row(placements: &mut [Placement]) {
+    placements.sort_by_key(|p| p.output.name());
+    let mut x = 0;
+    for (priority, p) in placements.iter_mut().enumerate() {
+        p.preferences = OutputPreferences::default();
+        p.x = x;
+        p.y = 0;
+        p.priority = priority as u32;
+        x += monitors::logical((p.mode.size.w, p.mode.size.h), p.scale).0;
+    }
 }
 
 fn snapshot(data: &CalloopData, nested: bool, pending: bool) -> Value {
@@ -166,17 +272,27 @@ fn snapshot(data: &CalloopData, nested: bool, pending: bool) -> Value {
         .map(|p| {
             let mode = p.output.current_mode();
             json!({"id":identity(&p.output),"name":p.output.name(),"x":p.x,"y":p.y,
-            "scale":p.scale,"priority":p.priority,
+            "scale":p.scale,"priority":p.priority,"enabled":p.preferences.enabled,
+            "rotation":p.preferences.rotation,"mirror":p.preferences.mirror,"vrr":p.preferences.vrr,
+            "vrr_supported":crate::udev::vrr_supported(data,&p.output),
             "modes":p.output.modes().iter().map(|m| [m.size.w,m.size.h,m.refresh]).collect::<Vec<_>>(),
             "width":mode.map_or(1,|m|m.size.w),"height":mode.map_or(1,|m|m.size.h),
             "refresh":mode.map_or(0,|m|m.refresh)})
         })
         .collect();
     json!({"ok":true,"nested":nested,"pending":pending,"outputs":outputs,
+        "desktop":data.state.desktop,
         "preferences":data.state.preferences.value(),"input_capabilities":crate::udev::input_capabilities(data),"version":env!("CARGO_PKG_VERSION")})
 }
 
 fn preview(data: &CalloopData, value: &Value) -> Result<Vec<Placement>, String> {
+    preview_for_backend(data, value, data.udev.is_some())
+}
+fn preview_for_backend(
+    data: &CalloopData,
+    value: &Value,
+    physical: bool,
+) -> Result<Vec<Placement>, String> {
     let text = value["arrangement"]
         .as_str()
         .ok_or("Missing display arrangement")?;
@@ -206,10 +322,39 @@ fn preview(data: &CalloopData, value: &Value) -> Result<Vec<Placement>, String> 
         } else {
             p.mode
         };
-        if data.udev.is_none() && mode != p.mode {
+        if !physical && mode != p.mode {
             return Err("The host controls nested resolution".into());
         }
-        let (w, h) = monitors::logical((mode.size.w, mode.size.h), e.scale);
+        let rotation = a
+            .rotations
+            .get(&e.id)
+            .copied()
+            .unwrap_or(p.preferences.rotation);
+        if !physical
+            && (rotation != 0
+                || a.disabled.contains(&e.id)
+                || a.mirrors.contains_key(&e.id)
+                || a.vrr.contains(&e.id))
+        {
+            return Err(
+                "Rotation, enable/disable, mirroring and VRR require a full Navi session".into(),
+            );
+        }
+        let preferences = OutputPreferences {
+            enabled: !a.disabled.contains(&e.id),
+            rotation,
+            mirror: a.mirrors.get(&e.id).cloned(),
+            vrr: a.vrr.contains(&e.id),
+        };
+        if preferences.vrr && !crate::udev::vrr_supported(data, &p.output) {
+            return Err("VRR is unavailable on this output".into());
+        }
+        let size = if rotation == 90 || rotation == 270 {
+            (mode.size.h, mode.size.w)
+        } else {
+            (mode.size.w, mode.size.h)
+        };
+        let (w, h) = monitors::logical(size, e.scale);
         mons.push(Mon {
             connector: p.output.name(),
             id: e.id.clone(),
@@ -228,30 +373,65 @@ fn preview(data: &CalloopData, value: &Value) -> Result<Vec<Placement>, String> 
             scale: e.scale,
             priority: 0,
             mode,
+            preferences,
         });
     }
-    for (i, a) in mons.iter().enumerate() {
-        if mons[..i].iter().any(|b| {
-            a.rect.x < b.rect.x + b.rect.w
-                && b.rect.x < a.rect.x + a.rect.w
-                && a.rect.y < b.rect.y + b.rect.h
-                && b.rect.y < a.rect.y + a.rect.h
+    let active: Vec<_> = next
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.preferences.enabled && p.preferences.mirror.is_none())
+        .map(|(i, _)| i)
+        .collect();
+    if active.is_empty() {
+        return Err("Keep at least one independent display enabled".into());
+    }
+    for &i in &active {
+        if active.iter().copied().take_while(|j| *j != i).any(|j| {
+            let (a, b) = (&mons[i].rect, &mons[j].rect);
+            a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h
         }) {
             return Err("Displays overlap. Move them apart before applying.".into());
         }
     }
+    for i in 0..next.len() {
+        if let Some(source) = &next[i].preferences.mirror {
+            let j = active
+                .iter()
+                .copied()
+                .find(|&j| identity(&next[j].output) == *source)
+                .ok_or("Mirror source must be an enabled independent display")?;
+            if next[i].mode.size != next[j].mode.size
+                || next[i].scale != next[j].scale
+                || next[i].preferences.rotation != next[j].preferences.rotation
+            {
+                return Err("Mirroring requires matching resolution, rotation and scale".into());
+            }
+            next[i].x = next[j].x;
+            next[i].y = next[j].y;
+        }
+    }
+    let active_mons: Vec<_> = active.iter().map(|&i| mons[i].clone()).collect();
     if a.main
         .as_ref()
-        .is_some_and(|id| !mons.iter().any(|m| &m.id == id))
+        .is_some_and(|id| !active_mons.iter().any(|m| &m.id == id))
     {
-        return Err("Primary display is disconnected".into());
+        return Err("Primary display must be enabled and independent".into());
     }
-    let main = monitors::main(&mons, a.main.as_deref());
-    if a.main.as_ref().is_some_and(|id| &mons[main].id != id) {
+    let main = monitors::main(&active_mons, a.main.as_deref());
+    if a.main
+        .as_ref()
+        .is_some_and(|id| &active_mons[main].id != id)
+    {
         return Err("Choose an external primary display while one is connected".into());
     }
-    for (priority, index) in monitors::priority(&mons, main).into_iter().enumerate() {
-        next[index].priority = priority as u32;
+    for p in &mut next {
+        p.priority = u32::MAX;
+    }
+    for (priority, index) in monitors::priority(&active_mons, main)
+        .into_iter()
+        .enumerate()
+    {
+        next[active[index]].priority = priority as u32;
     }
     Ok(next)
 }
@@ -316,7 +496,7 @@ impl Session {
                     && (placements(data).len() != p.original.len()
                         || p.original
                             .iter()
-                            .any(|p| !data.state.space.outputs().any(|o| o == &p.output)))
+                            .any(|p| !crate::udev::outputs(data).iter().any(|o| o == &p.output)))
                 {
                     self.revert(data);
                     return Err("Displays changed during preview; refresh and try again".into());
@@ -346,6 +526,22 @@ impl Session {
                                 y: p.y,
                                 scale: p.scale,
                             });
+                            a.rotations.insert(id.clone(), p.preferences.rotation);
+                            if p.preferences.enabled {
+                                a.disabled.remove(&id);
+                            } else {
+                                a.disabled.insert(id.clone());
+                            }
+                            if let Some(source) = p.preferences.mirror {
+                                a.mirrors.insert(id.clone(), source);
+                            } else {
+                                a.mirrors.remove(&id);
+                            }
+                            if p.preferences.vrr {
+                                a.vrr.insert(id.clone());
+                            } else {
+                                a.vrr.remove(&id);
+                            }
                             a.modes
                                 .insert(id, (p.mode.size.w, p.mode.size.h, p.mode.refresh));
                         }
@@ -426,6 +622,28 @@ impl Session {
                 data.state.request_redraw();
                 Ok(json!({"ok":true}))
             }
+            "desktop" => {
+                let desktop = crate::desktop_config::parse(&value["settings"])?;
+                data.state.release_sticky();
+                crate::desktop_config::load()?; // Preserve a malformed existing configuration.
+                if let Some(kb) = data.state.seat.get_keyboard() {
+                    kb.set_xkb_config(&mut data.state, xkb_config(&desktop))
+                        .map_err(|_| "Keyboard layout could not be loaded")?;
+                }
+                let path = crate::desktop_config::path().ok_or("No configuration directory")?;
+                if let Err(e) = persist::write(&path, &desktop.to_string()) {
+                    if let Some(kb) = data.state.seat.get_keyboard() {
+                        let previous = data.state.desktop.clone();
+                        let _ = kb.set_xkb_config(&mut data.state, xkb_config(&previous));
+                    }
+                    return Err(e.to_string());
+                }
+                crate::theme::configure(&desktop);
+                data.state.desktop = desktop;
+                crate::udev::apply_input_preferences(data);
+                data.state.request_redraw();
+                Ok(snapshot(data, nested, self.pending.is_some()))
+            }
             "lock" => {
                 data.state.request_lock(None);
                 Ok(json!({"ok":true}))
@@ -483,13 +701,24 @@ pub fn start(
                 session.revert(data);
             }
             let state = &mut data.state;
+            let elapsed = state.last_activity.elapsed().as_secs();
+            let off = state.desktop["screen_off_minutes"].as_u64().unwrap_or(0);
+            if !nested && off > 0 && elapsed >= off * 60 && !state.screen_off {
+                // Lock first; the display may wake through an external event.
+                state.request_lock(None);
+                state.screen_off = state.lock_outputs_covered();
+            }
+            let sleep = state.desktop["sleep_minutes"].as_u64().unwrap_or(0);
+            if !nested && sleep > 0 && elapsed >= sleep * 60 && !state.sleep_requested {
+                request_sleep(state);
+            }
             if state
                 .preferences
                 .idle_due(state.last_activity.elapsed(), state.lock.active)
             {
-                state.last_activity = Instant::now();
                 state.request_lock(None);
             }
+            crate::udev::redraw(data);
             TimeoutAction::ToDuration(Duration::from_secs(1))
         },
     )?;
@@ -553,6 +782,92 @@ pub fn saved_arrangement() -> Option<Arrangement> {
     Arrangement::parse(&persist::read(&config("monitors")?).ok()??).ok()
 }
 
+pub fn xkb_config(v: &Value) -> smithay::input::keyboard::XkbConfig<'_> {
+    smithay::input::keyboard::XkbConfig {
+        layout: v["keyboard_layout"].as_str().unwrap_or("us"),
+        variant: v["keyboard_variant"].as_str().unwrap_or(""),
+        options: Some(v["keyboard_options"].as_str().unwrap_or("").to_string()),
+        ..Default::default()
+    }
+}
+
+/// Reapply saved advanced output preferences after connector discovery, retaining safe defaults on error.
+pub fn restore_outputs(data: &mut CalloopData) {
+    let Some(saved) = saved_arrangement() else {
+        return;
+    };
+    let mut connected = saved.clone();
+    let old = placements(data);
+    connected
+        .entries
+        .retain(|e| old.iter().any(|p| identity(&p.output) == e.id));
+    for p in &old {
+        let id = identity(&p.output);
+        if !connected.entries.iter().any(|e| e.id == id) {
+            connected.entries.push(Entry {
+                id,
+                x: p.x,
+                y: p.y,
+                scale: p.scale,
+            });
+        }
+    }
+    if connected
+        .main
+        .as_ref()
+        .is_some_and(|id| !connected.entries.iter().any(|e| &e.id == id))
+    {
+        connected.main = None;
+    }
+    let next = match preview(data, &json!({"arrangement":connected.text()})) {
+        Ok(next) => next,
+        Err(_) => {
+            let mut safe = placements(data);
+            safe_row(&mut safe);
+            safe
+        }
+    };
+    if let Err(e) = apply(data, &next) {
+        tracing::warn!("saved output preferences could not be restored: {e}");
+    }
+}
+
+pub fn request_sleep(state: &mut crate::state::Navi) {
+    if state.session.is_none() || state.sleep_requested {
+        return;
+    }
+    state.sleep_requested = true;
+    let (ready, result) = std::sync::mpsc::channel();
+    state.request_lock(Some(ready));
+    std::thread::spawn(move || {
+        if !result
+            .recv_timeout(Duration::from_secs(12))
+            .unwrap_or(false)
+        {
+            tracing::warn!("automatic sleep refused: lock not confirmed");
+            return;
+        }
+        let sleep = || -> zbus::Result<()> {
+            let c = zbus::blocking::connection::Builder::system()?
+                .method_timeout(Duration::from_secs(5))
+                .build()?;
+            let p = zbus::blocking::Proxy::new(
+                &c,
+                "org.freedesktop.login1",
+                "/org/freedesktop/login1",
+                "org.freedesktop.login1.Manager",
+            )?;
+            if p.call::<_, _, String>("CanSuspend", &())? != "yes" {
+                return Err(zbus::Error::Failure("Sleep unavailable".into()));
+            }
+            p.call("Suspend", &(false,))
+        };
+        if sleep().is_err() {
+            tracing::warn!("automatic sleep unavailable; session remains locked");
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -579,6 +894,56 @@ mod tests {
             v[key] = bad;
             assert!(Preferences::parse(&v).is_err());
         }
+    }
+
+    #[test]
+    fn advanced_display_plans_reject_blackouts_and_invalid_mirrors() {
+        let mut h = crate::locking::tests::Harness::new();
+        h.output("left", 0);
+        h.output("right", 800);
+        h.data
+            .state
+            .set_priorities(&["left".into(), "right".into()]);
+        let plan = |lines: &str| json!({"arrangement":format!("navi-monitors 1\nleft 0 0 1\nright 800 0 1\n{lines}")});
+        assert!(
+            preview_for_backend(&h.data, &plan("disabled left\ndisabled right\n"), true).is_err()
+        );
+        assert!(preview_for_backend(&h.data, &plan("disabled left\nmain left\n"), true).is_err());
+        assert!(
+            preview_for_backend(
+                &h.data,
+                &plan("mirror left right\nmirror right left\n"),
+                true
+            )
+            .is_err()
+        );
+        assert!(
+            preview_for_backend(
+                &h.data,
+                &plan("rotation right 90\nmirror right left\n"),
+                true
+            )
+            .is_err()
+        );
+        let mirror =
+            preview_for_backend(&h.data, &plan("mirror right left\nmain left\n"), true).unwrap();
+        assert_eq!(mirror[1].x, mirror[0].x);
+        assert!(preview(&h.data, &plan("rotation left 90\n")).is_err());
+        let before = snapshot(&h.data, true, false);
+        let original = placements(&h.data);
+        let right = h
+            .data
+            .state
+            .space
+            .outputs()
+            .find(|o| o.name() == "right")
+            .unwrap()
+            .clone();
+        h.data.state.remove_output(&right);
+        apply(&mut h.data, &original).unwrap();
+        assert!(h.data.state.space.outputs().next().is_some());
+        assert!(h.data.state.grid.iter().any(|o| o.name == "left"));
+        assert_ne!(snapshot(&h.data, true, false), before);
     }
 
     #[test]
@@ -627,6 +992,7 @@ mod tests {
             "keep",
             "revert",
             "preferences",
+            "desktop",
             "wallpaper",
             "lock",
         ] {

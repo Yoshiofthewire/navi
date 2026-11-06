@@ -30,6 +30,8 @@ pub enum Call {
     /// Answered with the id.
     Notify(String, Request, mpsc::SyncSender<u32>),
     Close(String, u32),
+    Configure(serde_json::Value),
+    Settings(serde_json::Value, mpsc::SyncSender<serde_json::Value>),
 }
 
 struct Server(Sender<Call>);
@@ -41,7 +43,7 @@ fn sender(h: &Header<'_>) -> String {
 #[interface(name = "org.freedesktop.Notifications")]
 impl Server {
     fn get_capabilities(&self) -> Vec<&str> {
-        vec!["body"]
+        vec!["body", "actions"]
     }
 
     fn get_server_information(&self) -> (&str, &str, &str, &str) {
@@ -57,16 +59,33 @@ impl Server {
         _app_icon: String,
         summary: String,
         body: String,
-        _actions: Vec<String>,
-        _hints: HashMap<String, OwnedValue>,
+        actions: Vec<String>,
+        hints: HashMap<String, OwnedValue>,
         expire_timeout: i32,
     ) -> fdo::Result<u32> {
         let r = Request {
-            app_name,
+            app_name: app_name.clone(),
             replaces_id,
             summary,
             body,
             expire_timeout,
+            actions: actions
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .take(8)
+                .map(|p| {
+                    (
+                        crate::notify::sanitize(&p[0], 64),
+                        crate::notify::sanitize(&p[1], 64),
+                    )
+                })
+                .collect(),
+            app_id: hints
+                .get("desktop-entry")
+                .and_then(|v| <&str>::try_from(v).ok())
+                .map(|s| crate::notify::sanitize(s, 128))
+                .unwrap_or_else(|| crate::notify::sanitize(&app_name, 64)),
         };
         let (tx, rx) = mpsc::sync_channel(1);
         self.0
@@ -115,6 +134,29 @@ pub fn serve(tx: Sender<Call>) -> Option<Connection> {
     }
     info!("notifications: serving");
     Some(conn)
+}
+
+/// Keep this connection separate: notification-only sandbox proxies may route calls to
+/// any interface on the notification name's unique owner.
+pub fn serve_settings(tx: Sender<Call>) -> Option<Connection> {
+    std::env::var_os("DBUS_SESSION_BUS_ADDRESS")?;
+    let conn = Connection::session()
+        .inspect_err(|e| warn!("shell settings: no session bus: {e}"))
+        .ok()?;
+    if let Err(e) = conn
+        .object_server()
+        .at("/io/github/Yoshiofthewire/Navi/Shell", SettingsServer(tx))
+    {
+        warn!("shell settings unavailable: {e}");
+        return None;
+    }
+    match conn.request_name_with_flags(shell_name(), RequestNameFlags::DoNotQueue.into()) {
+        Ok(RequestNameReply::PrimaryOwner) => Some(conn),
+        result => {
+            warn!(?result, "shell settings name unavailable");
+            None
+        }
+    }
 }
 
 /// The variables exported, and nothing else.
@@ -190,6 +232,59 @@ pub fn emit(conn: &Connection, (id, reason): Closed) {
 mod tests {
     use super::*;
 
+    /// Real exports and proxy filtering, on a private bus without a display or GPU.
+    #[test]
+    #[ignore = "requires dbus-run-session, xdg-dbus-proxy and Python GI"]
+    fn notification_only_proxy_isolation() {
+        if std::env::var_os("NAVI_DBUS_TEST_HELPER").as_deref() == Some(OsStr::new("1")) {
+            assert_eq!(std::env::var("NAVI_PRIVATE_DBUS_TEST").as_deref(), Ok("1"));
+            use smithay_client_toolkit::reexports::calloop::channel;
+            let (tx, rx) = channel::channel();
+            let notifications = serve(tx.clone()).expect("notification export");
+            assert!(
+                serve(tx.clone()).is_none(),
+                "do not replace another notification owner"
+            );
+            let _settings = serve_settings(tx).expect("settings export");
+            let mut notes: Vec<(u32, String)> = Vec::new();
+            // Only application state is a fixture; registration, dispatch, lock guard and
+            // signal routing use the production interfaces above.
+            while let Ok(call) = rx.recv() {
+                match call {
+                    Call::Notify(sender, _, reply) => {
+                        let id = notes.len() as u32 + 1;
+                        notes.push((id, sender));
+                        reply.send(id).unwrap();
+                    }
+                    Call::Settings(value, reply) => {
+                        if value["op"] == "action" {
+                            let id = value["id"].as_u64().unwrap() as u32;
+                            let (_, sender) = notes.iter().find(|(n, _)| *n == id).unwrap();
+                            action(&notifications, sender, id, value["key"].as_str().unwrap());
+                        }
+                        reply.send(serde_json::json!({
+                            "ok": true,
+                            "history": notes.iter().map(|(id, _)| serde_json::json!({"id": id})).collect::<Vec<_>>()
+                        })).unwrap();
+                    }
+                    _ => {}
+                }
+            }
+            return;
+        }
+        let status = std::process::Command::new("dbus-run-session")
+            .args(["--", "python3"])
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/scripts/check-notification-isolation.py"
+            ))
+            .arg(std::env::current_exe().unwrap())
+            .env("NAVI_PRIVATE_DBUS_TEST", "1")
+            .status()
+            .expect("start isolated D-Bus integration");
+        assert!(status.success(), "notification-only proxy isolation failed");
+    }
+
     #[test]
     fn exports_only_session_display_names() {
         assert!(wants_export(Some(OsStr::new("1"))));
@@ -212,4 +307,63 @@ mod tests {
             ]
         );
     }
+}
+
+pub fn shell_name() -> String {
+    let display = std::env::var("WAYLAND_DISPLAY").unwrap_or_default();
+    let suffix: String = display
+        .bytes()
+        .take(80)
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    format!("io.github.Yoshiofthewire.Navi.Shell.d{suffix}")
+}
+struct SettingsServer(Sender<Call>);
+#[interface(name = "io.github.Yoshiofthewire.Navi.Shell1")]
+impl SettingsServer {
+    fn request(&self, text: &str) -> fdo::Result<String> {
+        if text.len() > 16384 {
+            return Err(fdo::Error::InvalidArgs("Request too large".into()));
+        }
+        // Keep the compositor's independent locked-session guard for history and actions too.
+        let display = std::env::var("WAYLAND_DISPLAY").unwrap_or_default();
+        if display.is_empty() || display.contains('/') {
+            return Err(fdo::Error::Failed("No Navi instance".into()));
+        }
+        use std::io::{BufRead, Write};
+        let path =
+            std::path::PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap_or_default())
+                .join(format!("navi-{display}.settings"));
+        let guard = || -> Option<()> {
+            let mut socket = std::os::unix::net::UnixStream::connect(path).ok()?;
+            socket.set_read_timeout(Some(REPLY_WAIT)).ok()?;
+            socket.set_write_timeout(Some(REPLY_WAIT)).ok()?;
+            socket.write_all(b"{\"op\":\"get\"}\n").ok()?;
+            let mut reply = String::new();
+            use std::io::Read;
+            std::io::BufReader::new(socket.take(65537))
+                .read_line(&mut reply)
+                .ok()?;
+            (serde_json::from_str::<serde_json::Value>(&reply).ok()?["ok"] == true).then_some(())
+        };
+        if guard().is_none() {
+            return Err(fdo::Error::AccessDenied(
+                "Unlock Navi to view notifications".into(),
+            ));
+        }
+        let value = serde_json::from_str(text)
+            .map_err(|_| fdo::Error::InvalidArgs("Invalid request".into()))?;
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.0
+            .send(Call::Settings(value, tx))
+            .map_err(|_| fdo::Error::Failed("Shell closed".into()))?;
+        Ok(rx
+            .recv_timeout(REPLY_WAIT)
+            .map_err(|_| fdo::Error::Failed("Shell did not answer".into()))?
+            .to_string())
+    }
+}
+
+pub fn action(conn: &Connection, sender: &str, id: u32, key: &str) {
+    let _ = conn.emit_signal(Some(sender), PATH, NAME, "ActionInvoked", &(id, key));
 }

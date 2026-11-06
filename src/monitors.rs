@@ -207,6 +207,10 @@ pub struct Arrangement {
     pub entries: Vec<Entry>,
     pub main: Option<String>,
     pub modes: std::collections::BTreeMap<String, (i32, i32, i32)>,
+    pub rotations: std::collections::BTreeMap<String, u16>,
+    pub disabled: std::collections::BTreeSet<String>,
+    pub mirrors: std::collections::BTreeMap<String, String>,
+    pub vrr: std::collections::BTreeSet<String>,
 }
 
 impl Arrangement {
@@ -235,6 +239,21 @@ impl Arrangement {
                         return Err(bad());
                     };
                     a.modes.insert(id.into(), (w, h, r));
+                }
+                ["rotation", id, angle] if safe(id) && !a.rotations.contains_key(id) => {
+                    let angle = angle
+                        .parse::<u16>()
+                        .ok()
+                        .filter(|n| [0, 90, 180, 270].contains(n))
+                        .ok_or_else(bad)?;
+                    a.rotations.insert(id.into(), angle);
+                }
+                ["disabled", id] if safe(id) && a.disabled.insert(id.into()) => {}
+                ["vrr", id] if safe(id) && a.vrr.insert(id.into()) => {}
+                ["mirror", id, source]
+                    if safe(id) && safe(source) && id != source && !a.mirrors.contains_key(id) =>
+                {
+                    a.mirrors.insert(id.into(), source.into());
                 }
                 ["main", id] if safe(id) && a.main.is_none() => a.main = Some(id.into()),
                 [id, x, y, scale] if safe(id) && id != "main" && ids.insert(id) => {
@@ -274,6 +293,18 @@ impl Arrangement {
         for (id, (w, h, r)) in &self.modes {
             t += &format!("mode {id} {w} {h} {r}\n");
         }
+        for (id, angle) in &self.rotations {
+            t += &format!("rotation {id} {angle}\n");
+        }
+        for id in &self.disabled {
+            t += &format!("disabled {id}\n");
+        }
+        for (id, source) in &self.mirrors {
+            t += &format!("mirror {id} {source}\n");
+        }
+        for id in &self.vrr {
+            t += &format!("vrr {id}\n");
+        }
         t
     }
 
@@ -290,14 +321,27 @@ impl Arrangement {
             let Some(i) = mons.iter().position(|m| m.id == e.id) else {
                 continue;
             };
-            let (w, h) = logical(mons[i].size, e.scale);
+            let (w, h) = logical(
+                oriented(
+                    mons[i].size,
+                    self.rotations.get(&e.id).copied().unwrap_or(0),
+                ),
+                e.scale,
+            );
             let r = Rect {
                 x: e.x,
                 y: e.y,
                 w,
                 h,
             };
-            if !placed.iter().flatten().any(|(p, _)| overlaps(*p, r)) {
+            if self.disabled.contains(&e.id)
+                || self.mirrors.contains_key(&e.id)
+                || !placed.iter().enumerate().any(|(j, p)| {
+                    !self.disabled.contains(&mons[j].id)
+                        && !self.mirrors.contains_key(&mons[j].id)
+                        && p.as_ref().is_some_and(|(p, _)| overlaps(*p, r))
+                })
+            {
                 placed[i] = Some((r, e.scale));
             }
         }
@@ -320,7 +364,13 @@ impl Arrangement {
                 false => done[main(&done, self.main.as_deref())].rect.y,
             };
             let scale = self.entry(&mons[i].id).map_or(1.0, |e| e.scale);
-            let (w, h) = logical(mons[i].size, scale);
+            let (w, h) = logical(
+                oriented(
+                    mons[i].size,
+                    self.rotations.get(&mons[i].id).copied().unwrap_or(0),
+                ),
+                scale,
+            );
             placed[i] = Some((Rect { x, y, w, h }, scale));
             let fresh = Entry {
                 id: mons[i].id.clone(),
@@ -334,6 +384,14 @@ impl Arrangement {
             }
         }
         (placed.into_iter().flatten().collect(), changed)
+    }
+}
+
+fn oriented((w, h): (i32, i32), rotation: u16) -> (i32, i32) {
+    if rotation == 90 || rotation == 270 {
+        (h, w)
+    } else {
+        (w, h)
     }
 }
 
@@ -363,6 +421,7 @@ pub fn auto(mons: &[Mon]) -> Arrangement {
         entries,
         main: None,
         modes: Default::default(),
+        ..Default::default()
     }
 }
 
@@ -404,6 +463,7 @@ pub fn import(json: &str, connected: &[Mon]) -> Option<String> {
             entries,
             main: None,
             modes: Default::default(),
+            ..Default::default()
         })
     };
     let setups = section("setups")?;
@@ -562,6 +622,40 @@ pub mod tests {
         ]
     }
 
+    #[test]
+    fn advanced_arrangement_round_trips_and_rejects_bad_data() {
+        let text = "navi-monitors 1\na 0 0 1\nb 800 0 1\nmain a\nrotation a 90\ndisabled b\nmirror b a\nvrr a\n";
+        let a = Arrangement::parse(text).unwrap();
+        assert_eq!(Arrangement::parse(&a.text()).unwrap(), a);
+        for line in [
+            "rotation a 45",
+            "rotation a NaN",
+            "mirror a a",
+            "disabled a b",
+            "vrr a\nvrr a",
+        ] {
+            assert!(Arrangement::parse(&format!("navi-monitors 1\n{line}\n")).is_err());
+        }
+    }
+    #[test]
+    fn rotation_and_mirrors_keep_the_saved_layout_on_restart() {
+        let mons = vec![
+            mon("DP-1", "a", (1920, 1080), 0, 0, 1.0),
+            mon("DP-2", "b", (1920, 1080), 1080, 0, 1.0),
+        ];
+        let mut a =
+            Arrangement::parse("navi-monitors 1\na 0 0 1\nb 1080 0 1\nrotation a 90\n").unwrap();
+        let (placed, changed) = a.place(&mons);
+        assert!(!changed);
+        assert_eq!(
+            (placed[0].0.w, placed[0].0.h, placed[1].0.x),
+            (1080, 1920, 1080)
+        );
+        let mut a = Arrangement::parse("navi-monitors 1\na 0 0 1\nb 0 0 1\nmirror b a\n").unwrap();
+        let (placed, changed) = a.place(&mons);
+        assert!(!changed);
+        assert_eq!(placed[0].0, placed[1].0);
+    }
     #[test]
     fn ac2_rig_identities() {
         let ids: Vec<Option<String>> = rig_edids().iter().map(|e| identity(e)).collect();

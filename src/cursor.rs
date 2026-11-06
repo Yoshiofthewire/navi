@@ -120,16 +120,30 @@ pub fn from_env(scale: f64) -> Option<Cursor> {
         var("HOME").as_deref(),
         var("XDG_DATA_DIRS").as_deref(),
     );
-    let Some(theme) = theme(&dirs) else {
+    let settings =
+        crate::desktop_config::load().unwrap_or_else(|_| crate::desktop_config::defaults());
+    let chosen = settings["cursor_theme"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .or_else(|| theme(&dirs).map(str::to_owned));
+    let Some(theme) = chosen else {
         warn!(
             ?dirs,
             "no cursor theme of {THEMES:?} found: navi draws no cursor"
         );
         return None;
     };
-    let loaded = file(&dirs, theme)
+    let loaded = file(&dirs, &theme)
         .ok_or_else(|| "no default or left_ptr cursor".to_string())
-        .and_then(|p| load(&p, theme, scale).map_err(|e| format!("{}: {e}", p.display())));
+        .and_then(|p| {
+            let bytes = read_bytes(&p, MAX_FILE)?.ok_or("No cursor file")?;
+            decode(
+                &bytes,
+                &theme,
+                (settings["cursor_size"].as_u64().unwrap_or(24) as f64 * scale).round() as u32,
+            )
+        });
     match loaded {
         Ok(c) => {
             let (x, y) = c.hotspot;
@@ -144,6 +158,7 @@ pub fn from_env(scale: f64) -> Option<Cursor> {
 }
 
 /// The first frame of the size nearest `SIZE × scale` in the file at `path`.
+#[cfg(test)]
 pub fn load(path: &Path, theme: &str, scale: f64) -> Result<Cursor, String> {
     let bytes = read_bytes(path, MAX_FILE)?.ok_or("no file")?;
     decode(&bytes, theme, (SIZE * scale).round() as u32)

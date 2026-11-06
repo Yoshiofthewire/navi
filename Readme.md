@@ -179,3 +179,12 @@ See [Settings](docs/settings.md) for built-in controls, advanced feature limits 
 
 Built-in network and Bluetooth controls need NetworkManager and BlueZ. Sound controls need
 PipeWire-Pulse or PulseAudio and `pactl` (`pulseaudio-utils` on Debian/Ubuntu, `libpulse` on Arch).
+
+
+Settings also includes Appearance, Notifications (with optional UnifiedPush **off by default**),
+System Sounds, Accessibility, Printers, Accounts, and Date/Time/Language. Display changes retain
+20-second recovery. See [the controls and limits](docs/settings.md) before hardware validation.
+Optional services/tools: `kunifiedpush`, `canberra-gtk-play`, CUPS clients, AccountsService,
+power-profiles-daemon and a Polkit agent; install only what you use. Navi does not install or
+activate these system services for you. The UnifiedPush child contacts a provider only after
+explicit opt-in in a full session.

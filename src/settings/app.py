@@ -10,7 +10,7 @@ def run_settings():
         print("Navi Settings needs Python 3, PyGObject and GTK 4. See Readme.md.", file=sys.stderr)
         return 1
 
-    class Settings(Gtk.Application):
+    class Settings(expanded_settings(Gtk,Gdk,Gio,GLib),Gtk.Application):
         def __init__(self):
             super().__init__(application_id="io.github.Yoshiofthewire.Navi.Settings", flags=Gio.ApplicationFlags.NON_UNIQUE)
             self.pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
@@ -31,11 +31,13 @@ def run_settings():
             self.window = Gtk.ApplicationWindow(application=self, title="Navi Settings", default_width=1000, default_height=700)
             self.window.set_size_request(360, 360)
             self.window.connect("close-request", self.close_window)
+            self.initial_icon_theme = Gtk.Settings.get_default().get_property("gtk-icon-theme-name")
             Gtk.Settings.get_default().set_property("gtk-application-prefer-dark-theme", True)
             Gtk.Settings.get_default().set_property("gtk-enable-animations", False)
             provider = Gtk.CssProvider()
             css = """
                 window { background: #0b0d12; color: #d0d4dc; font-family: 'Noto Sans', sans-serif; font-size: 14px; }
+                window label, window image, headerbar label, .sidebar label, .sidebar image, spinbutton button image { color: #d0d4dc; }
                 window.csd { border: 1px solid #7a8396; box-shadow: none; }
                 headerbar { background: #151922; border-bottom: 1px solid #262c38; box-shadow: none; min-height: 44px; }
                 headerbar label { font-weight: 600; }
@@ -98,6 +100,8 @@ def run_settings():
                 button:focus-visible, entry:focus-within, spinbutton:focus-within, dropdown:focus-visible, switch:focus-visible, scale:focus-visible, .sidebar row:focus-visible { outline: 2px solid #2ba3d8; outline-offset: 2px; }
                 selection { background: #2ba3d8; color: #0b0d12; }
             """
+            self.base_css = css
+            self.css_provider = provider
             for old, new in json.loads(os.environ.get("NAVI_SETTINGS_COLORS", "{}")).items():
                 css = css.replace(old, new)
             provider.load_from_data(css.encode())
@@ -193,10 +197,10 @@ def run_settings():
                     vertical = stacked and not isinstance(control, (Gtk.Switch, Gtk.Button))
                     row.set_orientation(Gtk.Orientation.VERTICAL if vertical else Gtk.Orientation.HORIZONTAL)
                     row.set_spacing(8 if vertical else 16)
-                    labels.set_hexpand(not form or stacked)
+                    labels.set_hexpand(not form or stacked or isinstance(control, (Gtk.Switch, Gtk.Button)))
                     labels.set_size_request(200 if form and not stacked else -1, -1)
                     if control:
-                        stretch = isinstance(control, (Gtk.Entry, Gtk.DropDown, Gtk.Scale, Gtk.AppChooserButton)) or (form and isinstance(control, Gtk.Box))
+                        stretch = isinstance(control, (Gtk.Entry, Gtk.DropDown, Gtk.Scale, Gtk.AppChooserButton, Gtk.FlowBox)) or (form and isinstance(control, Gtk.Box))
                         control.set_hexpand(stretch)
                         control.set_halign(Gtk.Align.FILL if stretch else (Gtk.Align.START if form else Gtk.Align.END))
             return True
@@ -240,7 +244,8 @@ def run_settings():
                     self.show_notice(error, True)
                 else:
                     self.snapshot = result
-                    self.show_notice("Nested session · Navi changes affect this window. Network, Bluetooth and audio changes affect the computer." if result["nested"] else "Connected to your Navi session")
+                    self.apply_appearance()
+                    self.show_notice("Nested session · Desktop preferences affect this window. Device and system controls affect this computer." if result["nested"] else "Connected to your Navi session")
                 self.render()
             self.work(lambda: request("get"), ready)
 
@@ -348,6 +353,8 @@ def run_settings():
 
         def button(self, text, action, primary=False):
             button = Gtk.Button(label=text, halign=Gtk.Align.END)
+            button.get_child().set_wrap(True)
+            button.get_child().set_max_width_chars(30)
             if primary:
                 button.add_css_class("suggested-action")
             button.connect("clicked", lambda _: action())
@@ -387,8 +394,22 @@ def run_settings():
                 self.defaults()
             elif name == "About This PC":
                 self.about()
+            elif name == "Printers":
+                self.printers_page()
+            elif name == "Accounts":
+                self.accounts_page()
+            elif name == "Date, Time & Language":
+                self.regional_page()
             elif not self.snapshot:
                 self.content.append(self.label("Open this app from Navi’s launcher to change desktop settings. You can still use Network, Bluetooth, Sound and About This PC.", "muted"))
+            elif name == "Appearance":
+                self.appearance()
+            elif name == "Notifications":
+                self.notifications_page()
+            elif name == "System Sounds":
+                self.system_sounds()
+            elif name == "Accessibility":
+                self.accessibility()
             elif name == "Displays":
                 self.displays()
             elif name == "Wallpaper":
@@ -402,6 +423,8 @@ def run_settings():
         def displays(self):
             self.content.append(self.label("Set display positions in logical pixels and choose a scale. Changes are previewed for 20 seconds before you keep them.", "muted"))
             self.fields = []
+            diagram = self.monitor_diagram()
+            self.content.append(diagram)
             outputs = self.snapshot["outputs"]
             for output in sorted(outputs, key=lambda o: o["priority"]):
                 self.group(output["name"])
@@ -416,7 +439,19 @@ def run_settings():
                     self.row("Resolution and refresh rate", picker, context=output["name"])
                     fields["mode"] = (picker, modes)
                 fields["id"] = output["id"]
+                if not self.snapshot['nested']:
+                    fields['enabled'] = self.switch_row('Use this display',output.get('enabled',True))
+                    angles=[0,90,180,270]
+                    fields['rotation'] = self.selected_choice('Orientation',['Landscape','Portrait left','Landscape inverted','Portrait right'],angles,output.get('rotation',0))
+                    sources=['',*[o['id'] for o in outputs if o['id']!=output['id']]]
+                    fields['mirror_sources']=sources
+                    fields['mirror']=self.selected_choice('Mirror another display',['Independent',*[o['name'] for o in outputs if o['id']!=output['id']]],sources,output.get('mirror') or '', 'Mirroring requires matching resolution, scale and orientation.')
+                    fields['vrr']=self.switch_row('Variable refresh rate',output.get('vrr',False))
+                    fields['vrr'].set_sensitive(output.get('vrr_supported',False))
+                for key in ('x','y','scale'):
+                    fields[key].connect('value-changed',lambda _:diagram.queue_draw())
                 self.fields.append(fields)
+            diagram.queue_draw()
             self.group("Arrangement")
             self.primary = self.choice([o["name"] for o in outputs])
             self.primary.set_selected(next((i for i, o in enumerate(outputs) if o["priority"] == 0), 0))
@@ -426,6 +461,9 @@ def run_settings():
             self.content.append(apply)
             if self.token is not None:
                 self.keep_controls()
+            self.group('Color capabilities')
+            self.row('HDR',self.label('Unavailable in this renderer'))
+            self.row('ICC color profiles',self.label('Color-managed output is not implemented'))
             if self.snapshot["nested"]:
                 self.content.append(self.label("This previews Navi’s nested output. The host controls its physical monitor resolution and refresh rate; preview changes are not saved.", "muted"))
 
@@ -438,6 +476,13 @@ def run_settings():
                     w, h, r = modes[picker.get_selected()]
                     text += f"mode {fields['id']} {w} {h} {r}\n"
             primary = self.snapshot["outputs"][self.primary.get_selected()]["id"]
+            for fields in self.fields:
+                if 'enabled' in fields:
+                    if not fields['enabled'].get_active(): text += f"disabled {fields['id']}\n"
+                    text += f"rotation {fields['id']} {[0,90,180,270][fields['rotation'].get_selected()]}\n"
+                    source=fields['mirror_sources'][fields['mirror'].get_selected()]
+                    if source: text += f"mirror {fields['id']} {source}\n"
+                    if fields['vrr'].get_active(): text += f"vrr {fields['id']}\n"
             text += "main " + primary + "\n"
             def ready(result, error):
                 if error:
@@ -540,7 +585,8 @@ def run_settings():
             self.content.append(self.button("Save Locking Preferences", lambda: self.save_preferences({"idle_minutes": int(idle.get_value())}), True))
             self.group("Session security")
             self.row("Lock now", self.button("Lock Screen", lambda: self.work(lambda: request("lock"), lambda _, error: self.show_notice(error or "Lock requested", bool(error)))))
-            self.content.append(self.label("Inactivity counts input in Navi; applications cannot inhibit idle locking yet. Automatic screen-off and sleep timeouts are not configured by this version.", "muted"))
+            self.content.append(self.label("Timers count input only; applications cannot inhibit automatic actions yet. Automatic actions require a full Navi session.", "muted"))
+            self.extra_power()
 
         def input_settings(self):
             p = self.snapshot["preferences"]
@@ -563,6 +609,7 @@ def run_settings():
             self.group()
             test = Gtk.Entry(placeholder_text="Type here to test keyboard repeat")
             self.row("Test typing", test)
+            self.extra_input()
 
         def load_native(self, job, render, unavailable):
             generation = self.generation
@@ -595,7 +642,13 @@ def run_settings():
             self.operation(lambda: function(*values))
 
         def apply_audio(self, kind, index, volume, mute, default=False):
-            self.change(self.services.set_audio, kind, index, int(volume.get_value()), mute.get_active(), default)
+            value, muted = int(volume.get_value()), mute.get_active()
+            def apply():
+                self.services.set_audio(kind,index,value,muted,default)
+                if self.snapshot:
+                    try: shell_request('sound',event='volume')
+                    except Exception: pass
+            self.operation(apply)
 
         def action_button(self, text, job, success='Settings applied'):
             button = self.button(text, lambda: self.operation(job, success))
@@ -665,15 +718,17 @@ def run_settings():
                     button = self.action_button('Connect', lambda n=network: self.services.connect_network(n['device'], network=n), 'Connected')
                 else:
                     button = self.button('Connect', lambda n=network: self.wifi_dialog(n))
-                    button.set_sensitive(not self.busy and bool(network['ssid']) and network['security'] in ('open', 'owe', 'wpa-psk', 'sae'))
+                    button.set_sensitive(not self.busy and bool(network['ssid']) and network['security'] in ('open', 'owe', 'wpa-psk', 'sae', 'enterprise'))
                 controls.append(button)
-                security = {'wpa-psk':'WPA Personal', 'sae':'WPA3 Personal', 'enterprise':'Enterprise · provisioned profile required', 'wep':'Legacy WEP · provisioned profile required', 'open':'Open', 'owe':'Enhanced Open'}[network['security']]
+                security = {'wpa-psk':'WPA Personal', 'sae':'WPA3 Personal', 'enterprise':'Enterprise · PEAP or provisioned profile', 'wep':'Legacy WEP · provisioned profile required', 'open':'Open', 'owe':'Enhanced Open'}[network['security']]
                 self.row(network['name'], controls, ('Connected · ' if network['connected'] else '') + f"{network['strength']}% signal · {security}")
             saved = [p for p in data['profiles'] if p['kind'] == '802-11-wireless']
             if saved:
                 self.group('Saved networks')
                 for profile in saved:
                     self.row(profile['name'], self.button('Forget…', lambda p=profile: self.confirm('Forget this network?', 'Its saved configuration and credentials will be removed.', lambda: self.operation(lambda: self.services.forget_network(p['path']), 'Network forgotten'))))
+
+            self.advanced_network(data)
 
         def wifi_dialog(self, network, hidden=False):
             if self.busy:
@@ -695,9 +750,14 @@ def run_settings():
             password = Gtk.PasswordEntry(show_peek_icon=True)
             self.name_control(password, 'Wi-Fi password')
             password.set_size_request(300, -1)
-            password.set_visible(hidden or network['security'] in ('wpa-psk', 'sae'))
+            password.set_visible(hidden or network['security'] in ('wpa-psk', 'sae', 'enterprise'))
             box.append(self.label('Wi-Fi password' if password.get_visible() else 'Connect to this network?'))
             box.append(password)
+            enterprise_fields={}
+            if network['security']=='enterprise':
+                box.append(self.label('PEAP / MSCHAPv2. Your server’s domain is required for certificate verification.', 'muted'))
+                for key,title in [('identity','Enterprise identity'),('domain','Authentication server domain'),('certificate','CA certificate path (optional)')]:
+                    box.append(self.label(title));entry=Gtk.Entry();self.name_control(entry,title);box.append(entry);enterprise_fields[key]=entry
             remember = Gtk.CheckButton(label='Remember this network and password', active=True)
             box.append(remember)
             problem = self.label('', 'error')
@@ -712,9 +772,10 @@ def run_settings():
                 if hidden:
                     selected['ssid'] = name.get_text().encode('utf-8')
                     selected['security'] = ['wpa-psk', 'sae', 'open'][security.get_selected()]
-                secret = password.get_text() if selected['security'] in ('wpa-psk', 'sae') else ''
+                secret = password.get_text() if selected['security'] in ('wpa-psk', 'sae', 'enterprise') else ''
+                enterprise={k:w.get_text() for k,w in enterprise_fields.items()} if enterprise_fields else None
                 try:
-                    wifi_profile(selected['ssid'], selected['security'], secret, remember.get_active(), GLib.get_user_name(), hidden)
+                    wifi_profile(selected['ssid'], selected['security'], secret, remember.get_active(), GLib.get_user_name(), hidden, enterprise)
                 except ValueError as error:
                     problem.set_text(str(error))
                     problem.set_visible(True)
@@ -722,7 +783,7 @@ def run_settings():
                 save = remember.get_active()
                 password.set_text('')
                 widget.destroy()
-                self.operation(lambda: self.services.connect_network(selected['device'], network=selected, password=secret, remember=save, hidden=hidden), 'Connected')
+                self.operation(lambda: self.services.connect_network(selected['device'], network=selected, password=secret, remember=save, hidden=hidden, enterprise=enterprise), 'Connected')
             dialog.connect('response', response)
             dialog.present()
 

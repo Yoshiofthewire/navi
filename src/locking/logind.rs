@@ -62,6 +62,17 @@ pub fn watch(state: &mut Navi) {
             let proxy = Proxy::new(&conn, DEST, PATH, MANAGER)?;
             // Subscribe before taking the inhibitor, avoiding a startup gap.
             let signals = proxy.receive_signal("PrepareForSleep")?;
+            let _lid: Option<OwnedFd> = proxy
+                .call(
+                    "Inhibit",
+                    &(
+                        "handle-lid-switch",
+                        "Navi",
+                        "Navi handles the configured lid action",
+                        "block",
+                    ),
+                )
+                .ok();
             let mut inhibitor = Some(inhibit(&proxy)?);
             for signal in signals {
                 if signal.body().deserialize::<bool>()? {

@@ -12,6 +12,7 @@ from unittest.mock import patch
 spec = importlib.util.spec_from_file_location('settings_model', Path(__file__).with_name('model.py'))
 model = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(model)
+exec(Path(__file__).with_name('system.py').read_text(), model.__dict__)
 exec(Path(__file__).with_name('services.py').read_text(), model.__dict__)
 
 class SettingsTests(unittest.TestCase):

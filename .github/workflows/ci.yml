@@ -22,7 +22,7 @@ jobs:
         with:
           persist-credentials: false
       # Xwayland probes EGL even when the headless integration test uses software rendering.
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libxkbcommon-dev libwayland-dev pkg-config libudev-dev libinput-dev libseat-dev libgbm-dev libdrm-dev xwayland libegl1 swaylock meson ninja-build wayland-protocols libcairo2-dev libpam0g-dev curl patch python3-gi gir1.2-gtk-4.0
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libxkbcommon-dev libwayland-dev pkg-config libudev-dev libinput-dev libseat-dev libgbm-dev libdrm-dev xwayland libegl1 swaylock meson ninja-build wayland-protocols libcairo2-dev libpam0g-dev curl patch python3-gi gir1.2-gtk-4.0 dbus-daemon xdg-dbus-proxy
       - name: Rust toolchain
         id: toolchain
         run: |
@@ -43,6 +43,8 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
+      - name: Notification-only sandbox isolation (private D-Bus, no display)
+        run: cargo test --locked dbus::tests::notification_only_proxy_isolation -- --ignored
       - name: XWayland integration (no host display or GPU)
         run: cargo test --locked xwayland::tests::x11_lifecycle_and_input -- --ignored
       - name: Swaylock protocol handshake (no host display or authentication)
