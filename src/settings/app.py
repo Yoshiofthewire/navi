@@ -36,6 +36,7 @@ def run_settings():
             provider = Gtk.CssProvider()
             css = """
                 window { background: #0b0d12; color: #d0d4dc; font-family: 'Noto Sans', sans-serif; font-size: 14px; }
+                window.csd { border: 1px solid #7a8396; box-shadow: none; }
                 headerbar { background: #151922; border-bottom: 1px solid #262c38; box-shadow: none; min-height: 44px; }
                 headerbar label { font-weight: 600; }
                 .sidebar { background: #151922; padding: 16px 12px; border-right: 1px solid #262c38; }
@@ -66,6 +67,8 @@ def run_settings():
                 button:disabled { background-color: #151922; color: #a4adbd; border-color: #303847; }
                 headerbar button { background: transparent; border-color: transparent; padding: 4px 8px; }
                 headerbar button:hover { background: #262c38; }
+                /* Breeze hides these icons in favor of background images, which we replace. */
+                headerbar windowcontrols button image { color: #d0d4dc; }
                 entry, spinbutton { background: #0b0d12; color: #d0d4dc; border: 1px solid #7a8396; border-radius: 8px; min-height: 36px; box-shadow: none; }
                 entry { padding: 0 10px; }
                 entry:disabled, spinbutton:disabled { color: #a4adbd; background: #151922; }
