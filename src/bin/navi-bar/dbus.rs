@@ -110,20 +110,6 @@ pub fn serve(tx: Sender<Call>) -> Option<Connection> {
     let conn = Connection::session()
         .inspect_err(|e| warn!("notifications: no session bus, not serving: {e}"))
         .ok()?;
-    if let Err(e) = conn.object_server().at(
-        "/io/github/Yoshiofthewire/Navi/Shell",
-        SettingsServer(tx.clone()),
-    ) {
-        warn!("shell settings unavailable: {e}");
-        return None;
-    }
-    if conn
-        .request_name_with_flags(shell_name(), RequestNameFlags::DoNotQueue.into())
-        .is_err()
-    {
-        warn!("shell settings name unavailable");
-        return None;
-    }
     // An empty object server first, or zbus warns; the interface is added once the name is ours.
     let _ = conn.object_server();
     match conn.request_name_with_flags(NAME, RequestNameFlags::DoNotQueue.into()) {
@@ -131,7 +117,7 @@ pub fn serve(tx: Sender<Call>) -> Option<Connection> {
         // zbus turns the `Exists` reply into this error.
         Err(zbus::Error::NameTaken) => {
             info!("notifications: name owned by another server, not serving");
-            return Some(conn);
+            return None;
         }
         Ok(r) => {
             warn!(?r, "notifications: unexpected reply, not serving");
@@ -148,6 +134,29 @@ pub fn serve(tx: Sender<Call>) -> Option<Connection> {
     }
     info!("notifications: serving");
     Some(conn)
+}
+
+/// Keep this connection separate: notification-only sandbox proxies may route calls to
+/// any interface on the notification name's unique owner.
+pub fn serve_settings(tx: Sender<Call>) -> Option<Connection> {
+    std::env::var_os("DBUS_SESSION_BUS_ADDRESS")?;
+    let conn = Connection::session()
+        .inspect_err(|e| warn!("shell settings: no session bus: {e}"))
+        .ok()?;
+    if let Err(e) = conn
+        .object_server()
+        .at("/io/github/Yoshiofthewire/Navi/Shell", SettingsServer(tx))
+    {
+        warn!("shell settings unavailable: {e}");
+        return None;
+    }
+    match conn.request_name_with_flags(shell_name(), RequestNameFlags::DoNotQueue.into()) {
+        Ok(RequestNameReply::PrimaryOwner) => Some(conn),
+        result => {
+            warn!(?result, "shell settings name unavailable");
+            None
+        }
+    }
 }
 
 /// The variables exported, and nothing else.
@@ -222,6 +231,59 @@ pub fn emit(conn: &Connection, (id, reason): Closed) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Real exports and proxy filtering, on a private bus without a display or GPU.
+    #[test]
+    #[ignore = "requires dbus-run-session, xdg-dbus-proxy and Python GI"]
+    fn notification_only_proxy_isolation() {
+        if std::env::var_os("NAVI_DBUS_TEST_HELPER").as_deref() == Some(OsStr::new("1")) {
+            assert_eq!(std::env::var("NAVI_PRIVATE_DBUS_TEST").as_deref(), Ok("1"));
+            use smithay_client_toolkit::reexports::calloop::channel;
+            let (tx, rx) = channel::channel();
+            let notifications = serve(tx.clone()).expect("notification export");
+            assert!(
+                serve(tx.clone()).is_none(),
+                "do not replace another notification owner"
+            );
+            let _settings = serve_settings(tx).expect("settings export");
+            let mut notes: Vec<(u32, String)> = Vec::new();
+            // Only application state is a fixture; registration, dispatch, lock guard and
+            // signal routing use the production interfaces above.
+            while let Ok(call) = rx.recv() {
+                match call {
+                    Call::Notify(sender, _, reply) => {
+                        let id = notes.len() as u32 + 1;
+                        notes.push((id, sender));
+                        reply.send(id).unwrap();
+                    }
+                    Call::Settings(value, reply) => {
+                        if value["op"] == "action" {
+                            let id = value["id"].as_u64().unwrap() as u32;
+                            let (_, sender) = notes.iter().find(|(n, _)| *n == id).unwrap();
+                            action(&notifications, sender, id, value["key"].as_str().unwrap());
+                        }
+                        reply.send(serde_json::json!({
+                            "ok": true,
+                            "history": notes.iter().map(|(id, _)| serde_json::json!({"id": id})).collect::<Vec<_>>()
+                        })).unwrap();
+                    }
+                    _ => {}
+                }
+            }
+            return;
+        }
+        let status = std::process::Command::new("dbus-run-session")
+            .args(["--", "python3"])
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/scripts/check-notification-isolation.py"
+            ))
+            .arg(std::env::current_exe().unwrap())
+            .env("NAVI_PRIVATE_DBUS_TEST", "1")
+            .status()
+            .expect("start isolated D-Bus integration");
+        assert!(status.success(), "notification-only proxy isolation failed");
+    }
 
     #[test]
     fn exports_only_session_display_names() {

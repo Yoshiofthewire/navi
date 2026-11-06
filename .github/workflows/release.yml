@@ -23,7 +23,7 @@ jobs:
           persist-credentials: false
       # Xwayland's software-rendering path still probes libEGL.so.1.
       - name: System dependencies
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libxkbcommon-dev libwayland-dev pkg-config libudev-dev libinput-dev libseat-dev libgbm-dev libdrm-dev xwayland libegl1 swaylock meson ninja-build wayland-protocols libcairo2-dev libpam0g-dev curl patch python3-gi gir1.2-gtk-4.0
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libxkbcommon-dev libwayland-dev pkg-config libudev-dev libinput-dev libseat-dev libgbm-dev libdrm-dev xwayland libegl1 swaylock meson ninja-build wayland-protocols libcairo2-dev libpam0g-dev curl patch python3-gi gir1.2-gtk-4.0 dbus-daemon xdg-dbus-proxy
       - name: Rust toolchain
         id: toolchain
         run: |
@@ -40,6 +40,8 @@ jobs:
           key: ${{ runner.os }}-${{ runner.arch }}-release-${{ steps.toolchain.outputs.version }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'rust-toolchain.toml') }}
           restore-keys: ${{ runner.os }}-${{ runner.arch }}-release-${{ steps.toolchain.outputs.version }}-
       - run: cargo test --release --locked
+      - name: Notification-only sandbox isolation (private D-Bus, no display)
+        run: cargo test --release --locked dbus::tests::notification_only_proxy_isolation -- --ignored
       - name: XWayland integration (release, no host display or GPU)
         run: cargo test --release --locked xwayland::tests::x11_lifecycle_and_input -- --ignored
       - name: Swaylock protocol handshake (no host display or authentication)

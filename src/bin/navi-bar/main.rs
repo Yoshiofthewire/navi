@@ -244,6 +244,7 @@ fn run() -> Result<(), String> {
         desktop_settings,
         runtime,
         dbus: dbus::serve(tx.clone()),
+        _settings_dbus: dbus::serve_settings(tx.clone()),
         notes: Notes::default(),
         start: Instant::now(),
         band,
@@ -382,6 +383,8 @@ struct Bar {
     notes: Notes,
     /// The bus connection, while serving notifications.
     dbus: Option<zbus::blocking::Connection>,
+    /// Independent owner for trusted Settings requests, even with another notification server.
+    _settings_dbus: Option<zbus::blocking::Connection>,
     /// The notifications' clock.
     start: Instant,
     registry: RegistryState,

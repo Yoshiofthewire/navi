@@ -76,6 +76,9 @@ def main():
         def notify(title,app='org.navi.Integration'):
             return bus.call_sync('org.freedesktop.Notifications','/org/freedesktop/Notifications','org.freedesktop.Notifications','Notify',
                 GLib.Variant('(susssasa{sv}i)',('Navi integration',0,'',title,'<b>Plain text body</b>',['default','Open'],{'desktop-entry':GLib.Variant('s',app)},10000)),None,Gio.DBusCallFlags.NO_AUTO_START,5000,None).unpack()[0]
+        isolation_spec=importlib.util.spec_from_file_location('isolation_check',repo/'scripts/check-notification-isolation.py')
+        isolation=importlib.util.module_from_spec(isolation_spec);isolation_spec.loader.exec_module(isolation)
+        isolation.check(bus,'io.github.Yoshiofthewire.Navi.Shell.d'+display.encode().hex()[:160])
         first=notify('Normal notification')
         note=next(n for n in get()['history'] if n['id']==first)
         assert note['body']=='Plain text body' and note['actions']==[['default','Open']]

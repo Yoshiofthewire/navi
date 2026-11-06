@@ -109,6 +109,13 @@ are refused while locked. The app uses a worker pool and GTK's main-loop callbac
 do not block interaction. Only explicit controls change system devices. Audio uses fixed native commands and typed arguments;
 network credentials never enter process arguments or application logs.
 
+Shell history/actions use the per-instance `io.github.Yoshiofthewire.Navi.Shell.d<display-hex>`
+D-Bus name on a connection separate from `org.freedesktop.Notifications`. A sandbox granted
+only notification access cannot reach Settings through the notification name or its unique
+owner. Trusted Settings remains available when another notification server owns the standard
+name. Shell requests retain the compositor's independent lock check; this isolation does not
+restrict trusted applications with unrestricted access to the user's session bus.
+
 ## Direction contract
 
 **Mode / thesis:** Operate. A familiar searchable category list leads to a focused, directly
@@ -183,6 +190,18 @@ physical Bluetooth pairing, audio changes and KMS mode changes remain supervised
 
 ## Expanded verification
 
+CI explicitly runs the headless notification isolation regression in debug and release:
+
+```sh
+cargo test --locked dbus::tests::notification_only_proxy_isolation -- --ignored
+cargo test --release --locked dbus::tests::notification_only_proxy_isolation -- --ignored
+```
+
+It requires `dbus-run-session`, `xdg-dbus-proxy`, and Python GI. It uses the real D-Bus exports,
+a private bus, and a fixture compositor lock response. Notification-only clients must fail
+history/action calls via both well-known and unique names, while notifications and trusted
+Settings actions still work. Locked requests must still be denied.
+
 Run the existing full Rust checks and Python tests. Native fixture verification covers all 16
 pages at wide/compact sizes, light/dark, large text, keyboard focus, service failures and timed
 recovery. Fixtures never contact the host system bus or mutate audio/devices. Run these optional
@@ -196,7 +215,8 @@ CARGO_TARGET_DIR=/home/yoshi/git/navi/target python3 scripts/check-shell-setting
 The first uses private D-Bus and loopback-only traffic to verify the installed distributor's
 receipt, registration persistence, provider changes and unregister. Exit 77 means an optional
 prerequisite is missing. The second needs a host X11/XWayland display and launches only its own
-nested Navi, testing real notification actions/DND/blocking/history, nested push refusal,
+nested Navi, repeating the notification-only proxy isolation check against the real shell,
+notification actions/DND/blocking/history, nested push refusal,
 malformed-config preservation, and the packaged Settings entrypoint. Neither proves real
 hardware mode/VRR/DPMS/suspend, public-provider TLS/delivery, printer/device operations, local
 account administration or locale changes. Those remain supervised full-session checks.
