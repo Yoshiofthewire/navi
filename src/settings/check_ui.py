@@ -26,6 +26,7 @@ class Devices(namespace['DesktopServices']):
         self.operations = []
         self.wifi_on = True
         self.connected = False
+        self.long_names = False
     @property
     def bus(self):
         raise AssertionError("The UI check must never contact the system bus")
@@ -34,7 +35,7 @@ class Devices(namespace['DesktopServices']):
     def network(self):
         return dict(enabled=self.wifi_on, hardware=True,
                     devices=[dict(kind=2, path='/wifi', interface='Test wireless adapter', profiles=[], connected=False)],
-                    networks=[dict(name='Test Wi-Fi', ssid=b'Test Wi-Fi', security='wpa-psk', strength=80, path='/ap', device='/wifi', connected=self.connected, profile=None)], profiles=[])
+                    networks=[dict(name=('Test Wi-Fi ' * 10) if self.long_names else 'Test Wi-Fi', ssid=b'Test Wi-Fi', security='wpa-psk', strength=80, path='/ap', device='/wifi', connected=self.connected, profile=None)], profiles=[])
     def bluetooth(self):
         return dict(adapters=[dict(path='/adapter', name='Test Bluetooth adapter', powered=True)],
                     devices=[dict(path='/device', adapter='/adapter', name='Test headphones', paired=True, connected=False, trusted=False, battery=75)])
@@ -59,6 +60,8 @@ namespace['DesktopServices'] = Devices
 steps = list(range(9)) + ['empty', 'search', 'wifi-form', 'wifi-password', 'audio', 'pair-confirm', 'pair-accept', 'pair-passkey', 'pair-passkey-accept', 'preview', 'revert']
 if os.environ.get('NAVI_UI_CHECK_RESIZE_HELPER'):
     steps += ['small', 'small-network', 'small-sound']
+    steps += ['compact-' + str(i) for i in range(9)]
+    steps += ['narrow-network', 'narrow-sound', 'keyboard-focus', 'unavailable']
 failures = []
 original = Gtk.ApplicationWindow.present
 
@@ -172,11 +175,44 @@ def present(window):
                 subprocess.run([os.environ['NAVI_UI_CHECK_RESIZE_HELPER'], pid, '660', '650'], check=True, env=dict(os.environ, DISPLAY=os.environ['NAVI_UI_CHECK_HOST_DISPLAY']))
                 app.nav.select_row(app.rows[8])
                 name = 'small-about'
-            else:
+            elif step in ('small-network', 'small-sound'):
                 assert app.compact.get_visible() and not app.sidebar_scroll.get_visible()
                 app.compact_select.set_selected(2 if step == 'small-network' else 4)
                 name = step
+            elif step.startswith('compact-'):
+                app.compact_select.set_selected(int(step.split('-')[1]))
+                name = step
+            elif step == 'narrow-network':
+                subprocess.run([os.environ['NAVI_UI_CHECK_RESIZE_HELPER'], os.environ['NAVI_UI_CHECK_NAVI_PID'], '420', '740'], check=True, env=dict(os.environ, DISPLAY=os.environ['NAVI_UI_CHECK_HOST_DISPLAY']))
+                app.services.long_names = True
+                app.nav.select_row(app.rows[2])
+                def reveal_network():
+                    adjustment = app.scroll.get_vadjustment()
+                    adjustment.set_value(adjustment.get_upper() - adjustment.get_page_size())
+                    return False
+                GLib.timeout_add(800, reveal_network)
+                name = step
+            elif step == 'narrow-sound':
+                assert app.window.get_width() <= 420, 'Settings forced the narrow tile wider'
+                app.nav.select_row(app.rows[4])
+                name = step
+            elif step == 'keyboard-focus':
+                app.compact_search.grab_focus()
+                name = step
+            elif step == 'unavailable':
+                focus = app.window.get_focus()
+                assert focus and focus.is_ancestor(app.compact_search), 'Search keyboard focus was lost'
+                def unavailable():
+                    raise RuntimeError('Simulated unavailable network service')
+                app.services.network = unavailable
+                app.nav.select_row(app.rows[2])
+                name = step
             def capture():
+                if app.content.get_width() > app.scroll.get_width():
+                    failures.append('Settings content overflowed the tile')
+                    print('UI CHECK FAILED: Settings content overflowed the tile', flush=True)
+                    app.quit()
+                    return False
                 shutil.copyfile(output / 'settings-live.png', output / (name + '.png'))
                 print('Captured', name, flush=True)
                 GLib.timeout_add(100, advance)
