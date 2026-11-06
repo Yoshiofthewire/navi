@@ -61,6 +61,7 @@ steps = list(range(9)) + ['empty', 'search', 'wifi-form', 'wifi-password', 'audi
 if os.environ.get('NAVI_UI_CHECK_RESIZE_HELPER'):
     steps += ['small', 'small-network', 'small-sound']
     steps += ['compact-' + str(i) for i in range(9)]
+    steps += ['compact-empty', 'compact-clear', 'compact-preview', 'compact-preview-scroll', 'compact-revert']
     steps += ['narrow-network', 'narrow-sound', 'keyboard-focus', 'unavailable']
 failures = []
 original = Gtk.ApplicationWindow.present
@@ -179,8 +180,26 @@ def present(window):
                 assert app.compact.get_visible() and not app.sidebar_scroll.get_visible()
                 app.compact_select.set_selected(2 if step == 'small-network' else 4)
                 name = step
-            elif step.startswith('compact-'):
+            elif step.startswith('compact-') and step.split('-')[1].isdigit():
                 app.compact_select.set_selected(int(step.split('-')[1]))
+                name = step
+            elif step == 'compact-empty':
+                app.compact_search.set_text('zzzz-no-match')
+                name = step
+            elif step == 'compact-clear':
+                app.compact_search.set_text('')
+                name = step
+            elif step == 'compact-preview':
+                app.nav.select_row(app.rows[0])
+                app.preview_displays()
+                name = step
+            elif step == 'compact-preview-scroll':
+                adjustment = app.scroll.get_vadjustment()
+                adjustment.set_value(adjustment.get_upper() - adjustment.get_page_size())
+                name = step
+            elif step == 'compact-revert':
+                assert app.token is not None
+                app.finish_preview('revert')
                 name = step
             elif step == 'narrow-network':
                 subprocess.run([os.environ['NAVI_UI_CHECK_RESIZE_HELPER'], os.environ['NAVI_UI_CHECK_NAVI_PID'], '420', '740'], check=True, env=dict(os.environ, DISPLAY=os.environ['NAVI_UI_CHECK_HOST_DISPLAY']))
@@ -208,9 +227,23 @@ def present(window):
                 app.nav.select_row(app.rows[2])
                 name = step
             def capture():
-                if app.content.get_width() > app.scroll.get_width():
-                    failures.append('Settings content overflowed the tile')
-                    print('UI CHECK FAILED: Settings content overflowed the tile', flush=True)
+                try:
+                    assert app.content.get_width() <= app.scroll.get_width(), 'Settings content overflowed the tile'
+                    if app.search.get_text() == 'zzzz-no-match':
+                        assert int(app.empty.get_mapped()) + int(app.compact_empty.get_mapped()) == 1, 'Duplicate or missing no-results message'
+                    if app.token is not None and app.page == 0:
+                        for widget in (app.preview_box, app.preview_box.get_last_child()):
+                            valid, bounds = widget.compute_bounds(app.window)
+                            assert valid and bounds.get_y() >= 0 and bounds.get_y() + bounds.get_height() <= app.window.get_height(), 'Timed display recovery was clipped'
+                    if step == 4 or app.page == 8:
+                        labels = ('Apply Output', 'Apply Input') if step == 4 else ('Copy System Information',)
+                        for label in labels:
+                            button = next(w for w in all_widgets(app.window) if isinstance(w, Gtk.Button) and w.get_label() == label)
+                            valid, bounds = button.compute_bounds(app.window)
+                            assert valid and bounds.get_y() >= 0 and bounds.get_y() + bounds.get_height() <= app.window.get_height(), label + ' was outside the first viewport'
+                except AssertionError as error:
+                    failures.append(str(error))
+                    print('UI CHECK FAILED:', str(error), flush=True)
                     app.quit()
                     return False
                 shutil.copyfile(output / 'settings-live.png', output / (name + '.png'))
