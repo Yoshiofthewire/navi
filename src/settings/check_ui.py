@@ -64,6 +64,7 @@ if os.environ.get('NAVI_UI_CHECK_RESIZE_HELPER'):
     steps += ['compact-empty', 'compact-clear', 'compact-preview', 'compact-preview-scroll', 'compact-revert']
     steps += ['narrow-network', 'narrow-sound', 'keyboard-focus', 'unavailable']
 failures = []
+closed = []
 original = Gtk.ApplicationWindow.present
 
 class Invocation:
@@ -84,6 +85,7 @@ def all_widgets(widget):
 
 def present(window):
     original(window)
+    window.connect('close-request', lambda _: (closed.append(True), False)[1])
     app = window.get_application()
     GLib.timeout_add(700, lambda: (window.maximize(), False)[1])
     pending = {}
@@ -95,7 +97,8 @@ def present(window):
                 assert 'wifi-connect' in app.services.operations
                 assert 'audio-apply' in app.services.operations
                 print('NATIVE UI CHECK PASSED: pages, search, credential submission, audio, pairing sender/device guards, confirmation/passkey and preview/revert', flush=True)
-                app.quit()
+                close = next(w for w in all_widgets(window.get_titlebar()) if isinstance(w, Gtk.Button) and w.has_css_class('close'))
+                close.emit('clicked')
                 return False
             step = steps.pop(0)
             if isinstance(step, int):
@@ -228,6 +231,13 @@ def present(window):
                 name = step
             def capture():
                 try:
+                    border = window.get_style_context().get_border()
+                    assert min(border.top, border.right, border.bottom, border.left) >= 1, 'Settings frame was missing'
+                    for kind in ('minimize', 'maximize', 'close'):
+                        button = next(w for w in all_widgets(window.get_titlebar()) if isinstance(w, Gtk.Button) and w.has_css_class(kind))
+                        assert button.get_mapped() and button.get_sensitive(), kind + ' control was unavailable'
+                        icon = next(w for w in all_widgets(button) if isinstance(w, Gtk.Image))
+                        assert icon.get_style_context().get_color().alpha > 0.99, kind + ' icon was transparent'
                     assert app.content.get_width() <= app.scroll.get_width(), 'Settings content overflowed the tile'
                     if app.search.get_text() == 'zzzz-no-match':
                         assert int(app.empty.get_mapped()) + int(app.compact_empty.get_mapped()) == 1, 'Duplicate or missing no-results message'
@@ -260,4 +270,4 @@ def present(window):
     GLib.timeout_add(2500, advance)
 Gtk.ApplicationWindow.present = present
 code = namespace['run_settings']()
-raise SystemExit(1 if failures else code)
+raise SystemExit(1 if failures or not closed else code)
