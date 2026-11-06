@@ -1,2 +1,5 @@
 /target
 /.claude/worktrees/
+
+__pycache__/
+/.impeccable/review/

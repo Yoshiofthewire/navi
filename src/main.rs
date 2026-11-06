@@ -14,6 +14,7 @@ mod render;
 #[cfg(debug_assertions)]
 mod replay;
 mod screenshot;
+mod settings;
 mod shell;
 mod state;
 mod theme;
@@ -160,6 +161,13 @@ fn run(backend: Backend) -> Result<(), Box<dyn Error>> {
     if backend == Backend::Drm {
         locking::logind::watch(&mut data.state);
     }
+    let _settings = match settings::start(&mut data, &socket_name, backend == Backend::Nested) {
+        Ok(socket) => Some(socket),
+        Err(e) => {
+            warn!("settings unavailable: {e}");
+            None
+        }
+    };
     // After the first output exists, so the bar lands on it.
     let xdisplay = xwayland::start(&handle, &data.state);
     shell::start_bar(

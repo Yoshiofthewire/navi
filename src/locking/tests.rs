@@ -117,12 +117,12 @@ struct Peer {
     queue: EventQueue<View>,
     view: View,
 }
-struct Harness {
-    data: CalloopData,
+pub(crate) struct Harness {
+    pub(crate) data: CalloopData,
     _events: EventLoop<'static, CalloopData>,
 }
 impl Harness {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let events = EventLoop::try_new().unwrap();
         let display = Display::new().unwrap();
         let mut state = Navi::new(display.handle(), events.handle(), events.get_signal()).unwrap();
@@ -137,7 +137,7 @@ impl Harness {
             _events: events,
         }
     }
-    fn output(&mut self, name: &str, x: i32) -> Output {
+    pub(crate) fn output(&mut self, name: &str, x: i32) -> Output {
         let o = Output::new(
             name.into(),
             PhysicalProperties {

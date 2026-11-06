@@ -445,3 +445,13 @@ session.
   the taskbar is hidden, and there is no keyboard escape yet.
 - The taskbar and menu need a pointer to open: there's no keyboard shortcut for the menu or the
   window slots yet, and the bar exposes nothing to screen readers.
+
+## Settings application
+
+The on-demand native GTK 4 Settings app inherits Navi's palette and uses a searchable category
+sidebar, scrolling forms, native controls and explicit status/recovery. GTK/Python remain outside
+the compositor. Displays support live arrangement/scaling, advertised KMS modes, primary output
+and an independent 20-second revert; wallpaper updates live. Idle locking and libinput/repeat
+preferences are persisted. Networking and Bluetooth use native NetworkManager/BlueZ
+controls, while audio uses native pactl operations; defaults use GIO and About reports real system information. See [Settings](settings.md)
+for scope, protocol boundaries, unavailable controls and the surface direction contract.

@@ -65,6 +65,7 @@ pub fn binding(mods: &ModifiersState, sym: Keysym) -> Option<Binding> {
 
 impl Navi {
     pub fn process_input_event<I: InputBackend>(&mut self, event: InputEvent<I>) {
+        self.last_activity = std::time::Instant::now();
         match event {
             InputEvent::Keyboard { event, .. } => {
                 self.keyboard_key(event.key_code(), event.state(), Event::time_msec(&event));

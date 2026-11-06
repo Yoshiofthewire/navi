@@ -92,6 +92,9 @@ pub struct Managed {
 }
 
 pub struct Navi {
+    pub preferences: crate::settings::Preferences,
+    pub last_activity: std::time::Instant,
+    pub wallpaper_epoch: u64,
     pub lock: crate::locking::Lock,
     pub session_lock_state: smithay::wayland::session_lock::SessionLockManagerState,
     pub start_time: std::time::Instant,
@@ -142,7 +145,12 @@ impl Navi {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let mut seat_state = SeatState::new();
         let mut seat = seat_state.new_wl_seat(&dh, "seat0");
-        seat.add_keyboard(Default::default(), 200, 25)?;
+        let preferences = crate::settings::Preferences::load();
+        seat.add_keyboard(
+            Default::default(),
+            preferences.repeat_delay,
+            preferences.repeat_rate,
+        )?;
         seat.add_pointer();
         // Before the first window is placed.
         let mut layout = Layout::default();
@@ -151,6 +159,9 @@ impl Navi {
         dh.create_global::<Self, ZwlrForeignToplevelManagerV1, _>(3, toplevels::Filter);
 
         Ok(Self {
+            preferences,
+            last_activity: std::time::Instant::now(),
+            wallpaper_epoch: 0,
             lock: Default::default(),
             session_lock_state: smithay::wayland::session_lock::SessionLockManagerState::new::<
                 Self,

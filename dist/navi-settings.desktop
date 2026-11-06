@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Navi Settings
+Comment=Configure Navi and your computer
+Exec=navi-settings
+TryExec=navi-settings
+Icon=preferences-system
+Type=Application
+Categories=Settings;DesktopSettings;
+Keywords=Displays;Network;Bluetooth;Sound;Power;Keyboard;Mouse;
+StartupWMClass=io.github.Yoshiofthewire.Navi.Settings

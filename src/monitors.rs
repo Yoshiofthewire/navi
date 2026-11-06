@@ -206,6 +206,7 @@ pub struct Entry {
 pub struct Arrangement {
     pub entries: Vec<Entry>,
     pub main: Option<String>,
+    pub modes: std::collections::BTreeMap<String, (i32, i32, i32)>,
 }
 
 impl Arrangement {
@@ -220,9 +221,28 @@ impl Arrangement {
         for (n, line) in lines.enumerate() {
             let bad = || format!("line {}", n + 2);
             match line.split(' ').collect::<Vec<_>>()[..] {
+                ["mode", id, width, height, refresh] if safe(id) && !a.modes.contains_key(id) => {
+                    let dimension =
+                        |s: &str| s.parse::<i32>().ok().filter(|v| (1..=16384).contains(v));
+                    let (Some(w), Some(h), Some(r)) = (
+                        dimension(width),
+                        dimension(height),
+                        refresh
+                            .parse::<i32>()
+                            .ok()
+                            .filter(|v| (1000..=1000000).contains(v)),
+                    ) else {
+                        return Err(bad());
+                    };
+                    a.modes.insert(id.into(), (w, h, r));
+                }
                 ["main", id] if safe(id) && a.main.is_none() => a.main = Some(id.into()),
                 [id, x, y, scale] if safe(id) && id != "main" && ids.insert(id) => {
-                    let pos = |s: &str| s.parse().ok().filter(|v: &i32| v.abs() <= MAX_POS);
+                    let pos = |s: &str| {
+                        s.parse()
+                            .ok()
+                            .filter(|v: &i32| (-MAX_POS..=MAX_POS).contains(v))
+                    };
                     let scale = scale
                         .parse::<f64>()
                         .ok()
@@ -250,6 +270,9 @@ impl Arrangement {
         }
         if let Some(m) = &self.main {
             t += &format!("main {m}\n");
+        }
+        for (id, (w, h, r)) in &self.modes {
+            t += &format!("mode {id} {w} {h} {r}\n");
         }
         t
     }
@@ -339,6 +362,7 @@ pub fn auto(mons: &[Mon]) -> Arrangement {
     Arrangement {
         entries,
         main: None,
+        modes: Default::default(),
     }
 }
 
@@ -379,6 +403,7 @@ pub fn import(json: &str, connected: &[Mon]) -> Option<String> {
         (ids == want && ids.len() == entries.len()).then_some(Arrangement {
             entries,
             main: None,
+            modes: Default::default(),
         })
     };
     let setups = section("setups")?;
