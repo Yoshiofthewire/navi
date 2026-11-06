@@ -5,7 +5,7 @@ def run_settings():
         import gi
         gi.require_version("Gtk", "4.0")
         gi.require_version("Gdk", "4.0")
-        from gi.repository import Gtk, Gdk, Gio, GLib
+        from gi.repository import Gtk, Gdk, Gio, GLib, Pango
     except (ImportError, ValueError) as error:
         print("Navi Settings needs Python 3, PyGObject and GTK 4. See Readme.md.", file=sys.stderr)
         return 1
@@ -35,23 +35,64 @@ def run_settings():
             Gtk.Settings.get_default().set_property("gtk-enable-animations", False)
             provider = Gtk.CssProvider()
             css = """
-                window { background: #0b0d12; color: #d0d4dc; font-family: 'Noto Sans', sans-serif; }
-                headerbar, .sidebar { background: #151922; }
-                .sidebar { padding: 12px; border-right: 1px solid #303847; }
-                .sidebar row { padding: 10px 8px; border-radius: 6px; min-height: 24px; }
+                window { background: #0b0d12; color: #d0d4dc; font-family: 'Noto Sans', sans-serif; font-size: 14px; }
+                headerbar { background: #151922; border-bottom: 1px solid #262c38; box-shadow: none; min-height: 44px; }
+                headerbar label { font-weight: 600; }
+                .sidebar { background: #151922; padding: 16px 12px; border-right: 1px solid #262c38; }
+                .sidebar list { background: transparent; }
+                .sidebar row { background: transparent; padding: 11px 10px; border-radius: 8px; margin-bottom: 4px; }
+                .sidebar row:hover { background: #1d2430; }
                 .sidebar row:selected { background: #262c38; color: #d0d4dc; }
-                .page { padding: 24px; }
-                .title { font-size: 24px; font-weight: 600; }
-                .section { font-size: 17px; font-weight: 600; margin-top: 12px; }
-                .muted { color: #a4adbd; }
-                .error { color: #ff9aa6; }
+                .sidebar row:selected image { color: #2ba3d8; }
+                .page { padding: 24px 24px 36px; }
+                .page-title { font-size: 26px; font-weight: 600; margin-bottom: 4px; }
+                .identity-title { font-size: 20px; font-weight: 600; }
+                .section { font-size: 14px; font-weight: 600; margin-top: 14px; margin-bottom: 2px; }
+                .muted { color: #a4adbd; font-size: 13px; }
+                .error { color: #ff9aa6; background: transparent; }
                 .success { color: #5bd6a2; }
-                .setting-row { padding: 12px 0; border-bottom: 1px solid #303847; }
-                button, entry, spinbutton, dropdown { min-height: 32px; }
+                .session-notice { padding: 12px 16px; background: #151922; border-radius: 8px; }
+                .settings-group { background: #151922; border-radius: 12px; }
+                .setting-row { padding: 10px 18px; }
+                .setting-row.fact-row { padding: 8px 18px; }
+                .setting-row + .setting-row { border-top: 1px solid #262c38; }
+                .monitor-preview { background: #151922; border: 1px solid #7a8396; border-radius: 8px; padding: 16px; }
+                .row-title { font-weight: 500; }
+                .row-value { color: #d0d4dc; font-weight: 500; }
+                .preview-controls { padding: 18px; background: #151922; border-radius: 12px; }
+                button { background-image: none; background-color: #262c38; color: #d0d4dc; border: 1px solid #7a8396; border-radius: 8px; padding: 6px 14px; min-height: 24px; box-shadow: none; text-shadow: none; }
+                button:hover { background-color: #303847; }
+                button:active { background-color: #151922; }
+                button:disabled { background-color: #151922; color: #a4adbd; border-color: #303847; }
+                headerbar button { background: transparent; border-color: transparent; padding: 4px 8px; }
+                headerbar button:hover { background: #262c38; }
+                entry, spinbutton { background: #0b0d12; color: #d0d4dc; border: 1px solid #7a8396; border-radius: 8px; min-height: 36px; box-shadow: none; }
+                entry { padding: 0 10px; }
+                entry:disabled, spinbutton:disabled { color: #a4adbd; background: #151922; }
+                spinbutton text, spinbutton:backdrop text { background: transparent; color: #d0d4dc; padding: 0 8px; min-width: 40px; }
+                spinbutton:disabled text, spinbutton:disabled:backdrop text, spinbutton:disabled image { color: #a4adbd; }
+                spinbutton button { background: transparent; border: 0; padding: 0 8px; min-width: 20px; border-radius: 6px; }
+                spinbutton button:hover { background: #262c38; }
+                switch { background: #303847; border: 1px solid #7a8396; border-radius: 14px; min-width: 42px; min-height: 24px; }
+                switch:checked { background: #2ba3d8; border-color: #2ba3d8; }
+                switch slider { background: #d0d4dc; border: none; border-radius: 50%; min-width: 18px; min-height: 18px; margin: 3px; box-shadow: none; }
+                switch:checked slider { background: #0b0d12; }
+                switch:disabled { opacity: 0.5; }
+                scale { padding: 8px 0; }
+                scale trough { background: #303847; min-height: 4px; border: none; border-radius: 4px; }
+                scale highlight { background: #2ba3d8; border: none; border-radius: 4px; min-width: 0; min-height: 4px; margin: 0; padding: 0; }
+                scale slider { background: #d0d4dc; border: 2px solid #151922; border-radius: 50%; min-width: 14px; min-height: 14px; margin: -7px; padding: 0; box-shadow: none; }
+                scale value { color: #d0d4dc; font-size: 13px; min-width: 28px; }
+                scrollbar { background: transparent; }
+                scrollbar slider { background: #7a8396; min-width: 6px; min-height: 6px; border: none; border-radius: 6px; margin: 0; padding: 0; }
+                popover contents { background: #151922; color: #d0d4dc; border: 1px solid #303847; border-radius: 8px; }
                 button.suggested-action:not(:disabled), button.suggested-action:not(:disabled):backdrop { background: #2ba3d8; color: #0b0d12; }
+                button.suggested-action { border-color: transparent; font-weight: 600; }
+                button.suggested-action:not(:disabled):hover { background: shade(#2ba3d8, 1.12); }
+                button.suggested-action:not(:disabled):active { background: shade(#2ba3d8, 0.9); }
                 button.suggested-action:not(:disabled) label, button.suggested-action:not(:disabled):backdrop label { color: #0b0d12; }
                 button.suggested-action:disabled, button.suggested-action:disabled label { background: #262c38; color: #a4adbd; }
-                button:focus-visible, entry:focus, spinbutton:focus-within, dropdown:focus-visible { outline: 2px solid #2ba3d8; outline-offset: 2px; }
+                button:focus-visible, entry:focus-within, spinbutton:focus-within, dropdown:focus-visible, switch:focus-visible, scale:focus-visible, .sidebar row:focus-visible { outline: 2px solid #2ba3d8; outline-offset: 2px; }
                 selection { background: #2ba3d8; color: #0b0d12; }
             """
             for old, new in json.loads(os.environ.get("NAVI_SETTINGS_COLORS", "{}")).items():
@@ -69,7 +110,7 @@ def run_settings():
             self.window.set_child(body)
             sidebar = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
             sidebar.add_css_class("sidebar")
-            sidebar.set_size_request(215, -1)
+            sidebar.set_size_request(230, -1)
             self.search = Gtk.SearchEntry(placeholder_text="Search settings")
             self.search.connect("search-changed", self.filter_pages)
             self.name_control(self.search, "Search settings")
@@ -93,30 +134,40 @@ def run_settings():
             body.append(sidebar_scroll)
             right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, hexpand=True)
             body.append(right)
-            self.compact = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin_start=16, margin_end=16, margin_top=12)
-            self.compact_search = Gtk.SearchEntry(placeholder_text="Search settings")
+            self.compact = Gtk.Box(spacing=8, margin_start=16, margin_end=16, margin_top=12)
+            self.compact_search = Gtk.SearchEntry(placeholder_text="Search settings", hexpand=True)
             self.compact_search.connect("search-changed", lambda entry: self.search.set_text(entry.get_text()))
             self.name_control(self.compact_search, "Search settings")
             self.compact.append(self.compact_search)
             self.compact_indices = list(range(len(PAGES)))
-            self.compact_select = Gtk.DropDown.new_from_strings([p[0] for p in PAGES])
-            category_label = Gtk.Label(label="Settings category", xalign=0)
-            category_label.set_mnemonic_widget(self.compact_select)
-            self.compact.append(category_label)
+            self.compact_select = self.choice([p[0] for p in PAGES])
+            self.compact_select.set_tooltip_text("Settings category")
             self.name_control(self.compact_select, "Settings category")
             self.compact_select.connect("notify::selected", self.compact_selected)
             self.compact.append(self.compact_select)
-            self.compact_empty = Gtk.Label(label="No matching settings", xalign=0)
+            self.compact_empty = Gtk.Label(label="No matching settings", xalign=0, wrap=True, margin_start=16, margin_end=16, margin_top=8)
+            self.compact_empty.add_css_class("muted")
             self.compact_empty.set_visible(False)
-            self.compact.append(self.compact_empty)
             self.compact.set_visible(False)
             right.append(self.compact)
+            right.append(self.compact_empty)
             GLib.timeout_add(200, self.responsive)
-            self.notice = Gtk.Label(xalign=0, wrap=True, margin_start=24, margin_end=24, margin_top=12)
+            notice_box = Gtk.Box(spacing=10, margin_start=24, margin_end=24, margin_top=16)
+            notice_box.add_css_class("session-notice")
+            notice_icon = Gtk.Image.new_from_icon_name("dialog-information-symbolic")
+            notice_icon.set_valign(Gtk.Align.START)
+            notice_box.append(notice_icon)
+            self.notice = Gtk.Label(xalign=0, wrap=True, hexpand=True)
             self.notice.add_css_class("muted")
-            right.append(self.notice)
+            notice_box.append(self.notice)
+            right.append(notice_box)
             self.scroll = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
             right.append(self.scroll)
+            # Timed recovery stays outside the scrolling form, even in a small tile.
+            self.preview_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, margin_start=24, margin_end=24, margin_top=12, margin_bottom=16)
+            self.preview_box.add_css_class("preview-controls")
+            self.preview_box.set_visible(False)
+            right.append(self.preview_box)
             self.nav.select_row(self.rows[0])
             self.window.present()
             self.refresh()
@@ -126,6 +177,25 @@ def run_settings():
             if self.compact.get_visible() != compact:
                 self.compact.set_visible(compact)
                 self.sidebar_scroll.set_visible(not compact)
+            self.compact_empty.set_visible(compact and not self.compact_indices)
+            if hasattr(self, "content"):
+                margin = max(0, (self.scroll.get_width() - 820) // 2)
+                self.content.set_margin_start(margin)
+                self.content.set_margin_end(margin)
+                stacked = self.scroll.get_width() < 540
+                self.heading.set_orientation(Gtk.Orientation.VERTICAL if stacked else Gtk.Orientation.HORIZONTAL)
+                for target in self.display_targets:
+                    target.set_orientation(Gtk.Orientation.VERTICAL if stacked else Gtk.Orientation.HORIZONTAL)
+                for row, control, labels, form in self.setting_rows:
+                    vertical = stacked and not isinstance(control, (Gtk.Switch, Gtk.Button))
+                    row.set_orientation(Gtk.Orientation.VERTICAL if vertical else Gtk.Orientation.HORIZONTAL)
+                    row.set_spacing(8 if vertical else 16)
+                    labels.set_hexpand(not form or stacked)
+                    labels.set_size_request(200 if form and not stacked else -1, -1)
+                    if control:
+                        stretch = isinstance(control, (Gtk.Entry, Gtk.DropDown, Gtk.Scale, Gtk.AppChooserButton)) or (form and isinstance(control, Gtk.Box))
+                        control.set_hexpand(stretch)
+                        control.set_halign(Gtk.Align.FILL if stretch else (Gtk.Align.START if form else Gtk.Align.END))
             return True
 
         def compact_selected(self, widget, _):
@@ -182,7 +252,7 @@ def run_settings():
             self.compact_select.set_sensitive(bool(visible))
             if self.page in visible:
                 self.compact_select.set_selected(visible.index(self.page))
-            self.compact_empty.set_visible(not visible)
+            self.compact_empty.set_visible(self.compact.get_visible() and not visible)
             self.compact_search.set_tooltip_text("No matching settings" if not visible else "Search settings")
             self.updating_compact = False
             if visible and self.page not in visible:
@@ -202,15 +272,15 @@ def run_settings():
                 self.render()
 
         def label(self, text, style=None):
-            label = Gtk.Label(label=text, xalign=0, wrap=True, selectable=True)
+            label = Gtk.Label(label=text, xalign=0, wrap=True)
             if style:
                 label.add_css_class(style)
             return label
 
         def name_control(self, widget, name):
             def apply_name(control):
-                if isinstance(control, Gtk.Button):
-                    control.reset_relation(Gtk.AccessibleRelation.LABELLED_BY)
+                # Native mnemonic associations otherwise replace contextual names.
+                control.reset_relation(Gtk.AccessibleRelation.LABELLED_BY)
                 control.update_property([Gtk.AccessibleProperty.LABEL], [name])
             apply_name(widget)
             widget.connect("map", apply_name)
@@ -230,11 +300,12 @@ def run_settings():
                     self.row_names(child, name)
                     child = child.get_next_sibling()
 
-        def row(self, name, widget=None, detail=None, context=None):
+        def row(self, name, widget=None, detail=None, context=None, form=False):
             row = Gtk.Box(spacing=16)
             row.add_css_class("setting-row")
             labels = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, hexpand=True)
-            row_label = self.label(name + (" · " + context if context else ""))
+            labels.set_valign(Gtk.Align.CENTER)
+            row_label = self.label(name, "row-title")
             labels.append(row_label)
             if widget and not isinstance(widget, (Gtk.Box, Gtk.Button, Gtk.Label)):
                 row_label.set_mnemonic_widget(widget)
@@ -244,12 +315,36 @@ def run_settings():
             if widget:
                 self.row_names(widget, name + (": " + context if context else ""))
                 widget.set_valign(Gtk.Align.CENTER)
+                if isinstance(widget, Gtk.Label):
+                    widget.set_xalign(1)
+                    widget.set_max_width_chars(36)
+                    widget.set_selectable(True)
+                    widget.add_css_class("row-value")
                 row.append(widget)
-            self.content.append(row)
+            if self.row_box is None:
+                self.group()
+            self.row_box.append(row)
+            form = form or isinstance(widget, (Gtk.Switch, Gtk.SpinButton, Gtk.DropDown, Gtk.Scale, Gtk.Entry, Gtk.AppChooserButton))
+            self.setting_rows.append((row, widget, labels, form))
             return widget
 
+        def group(self, title=None):
+            if title:
+                self.content.append(self.label(title, "section"))
+            self.row_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            self.row_box.add_css_class("settings-group")
+            self.content.append(self.row_box)
+
+        def choice(self, strings):
+            chooser = Gtk.DropDown.new_from_strings(strings)
+            factory = Gtk.SignalListItemFactory()
+            factory.connect("setup", lambda _, item: item.set_child(Gtk.Label(xalign=0, ellipsize=Pango.EllipsizeMode.END, max_width_chars=26)))
+            factory.connect("bind", lambda _, item: item.get_child().set_text(item.get_item().get_string()))
+            chooser.set_factory(factory)
+            return chooser
+
         def button(self, text, action, primary=False):
-            button = Gtk.Button(label=text)
+            button = Gtk.Button(label=text, halign=Gtk.Align.END)
             if primary:
                 button.add_css_class("suggested-action")
             button.connect("clicked", lambda _: action())
@@ -263,11 +358,22 @@ def run_settings():
 
         def render(self):
             self.generation += 1
+            while child := self.preview_box.get_first_child():
+                self.preview_box.remove(child)
+            self.preview_box.set_visible(False)
+            self.row_box = None
+            self.setting_rows = []
+            self.display_targets = []
             self.content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
             self.content.add_css_class("page")
             self.scroll.set_child(self.content)
+            self.scroll.get_vadjustment().set_value(0)
             name = PAGES[self.page][0]
-            self.content.append(self.label(name, "title"))
+            self.heading = Gtk.Box(spacing=12)
+            title = self.label(name, "page-title")
+            title.set_hexpand(True)
+            self.heading.append(title)
+            self.content.append(self.heading)
             if name == "Wi-Fi & Network":
                 self.network_page()
             elif name == "Bluetooth":
@@ -288,37 +394,37 @@ def run_settings():
                 self.locking()
             elif name == "Mouse & Keyboard":
                 self.input_settings()
+            self.responsive()
 
         def displays(self):
             self.content.append(self.label("Set display positions in logical pixels and choose a scale. Changes are previewed for 20 seconds before you keep them.", "muted"))
-            if self.snapshot["nested"]:
-                self.content.append(self.label("This previews Navi’s nested output. The host controls its physical monitor resolution and refresh rate; preview changes are not saved.", "muted"))
             self.fields = []
             outputs = self.snapshot["outputs"]
             for output in sorted(outputs, key=lambda o: o["priority"]):
-                self.content.append(self.label(output["name"], "section"))
+                self.group(output["name"])
                 self.row("Current mode", self.label(f"{output['width']} × {output['height']} · {output['refresh'] / 1000:g} Hz"))
                 fields = {}
                 for name, key, low, high, step in [("Horizontal position", "x", -65535, 65535, 1), ("Vertical position", "y", -65535, 65535, 1), ("Scale", "scale", 0.5, 4, 0.25)]:
                     fields[key] = self.row(name, self.spin(output[key], low, high, step), context=output["name"])
                 modes = output.get("modes", [])
                 if not self.snapshot["nested"] and modes:
-                    picker = Gtk.DropDown.new_from_strings([f"{w} × {h} · {r / 1000:g} Hz" for w,h,r in modes])
+                    picker = self.choice([f"{w} × {h} · {r / 1000:g} Hz" for w,h,r in modes])
                     picker.set_selected(next((i for i,m in enumerate(modes) if m == [output["width"], output["height"], output["refresh"]]), 0))
                     self.row("Resolution and refresh rate", picker, context=output["name"])
                     fields["mode"] = (picker, modes)
                 fields["id"] = output["id"]
                 self.fields.append(fields)
-            self.primary = Gtk.DropDown.new_from_strings([o["name"] for o in outputs])
+            self.group("Arrangement")
+            self.primary = self.choice([o["name"] for o in outputs])
             self.primary.set_selected(next((i for i, o in enumerate(outputs) if o["priority"] == 0), 0))
             self.row("Primary display", self.primary, "The laptop panel has lower priority while an external display is connected.")
             apply = self.button("Preview Changes", self.preview_displays, True)
             apply.set_sensitive(bool(outputs) and self.token is None and not self.snapshot["pending"])
             self.content.append(apply)
-            self.preview_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-            self.content.append(self.preview_box)
             if self.token is not None:
                 self.keep_controls()
+            if self.snapshot["nested"]:
+                self.content.append(self.label("This previews Navi’s nested output. The host controls its physical monitor resolution and refresh rate; preview changes are not saved.", "muted"))
 
         def preview_displays(self):
             text = "navi-monitors 1\n"
@@ -338,15 +444,11 @@ def run_settings():
                 self.remaining = result["seconds"]
                 self.render()
                 self.show_notice("Display preview active. Keep or revert it on the Displays page.")
-                def reveal():
-                    adjustment = self.scroll.get_vadjustment()
-                    adjustment.set_value(adjustment.get_upper() - adjustment.get_page_size())
-                    return False
-                GLib.timeout_add(100, reveal)
                 GLib.timeout_add_seconds(1, self.countdown)
             self.work(lambda: request("preview", arrangement=text), ready)
 
         def keep_controls(self):
+            self.preview_box.set_visible(True)
             self.count_label = self.label(f"Keep these display settings? Reverting in {self.remaining} seconds.")
             self.preview_box.append(self.count_label)
             buttons = Gtk.Box(spacing=12)
@@ -382,7 +484,24 @@ def run_settings():
         def wallpaper(self):
             self.content.append(self.label("Choose a PNG or JPEG for each display. The image fills the screen using Navi’s centered crop and is also used by the lock screen.", "muted"))
             for output in sorted(self.snapshot["outputs"], key=lambda o: o["priority"]):
-                self.row(output["name"], self.button("Choose Image…", lambda p=output["priority"]: self.choose_wallpaper(p)))
+                target = Gtk.Box(spacing=24, margin_top=16, margin_bottom=8, vexpand=False)
+                preview = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, width_request=220, height_request=110, valign=Gtk.Align.CENTER)
+                preview.add_css_class("monitor-preview")
+                for text, style in [(output["name"], "row-title"), (f"{output['width']} × {output['height']}", "muted")]:
+                    label = self.label(text, style)
+                    label.set_xalign(0.5)
+                    label.set_vexpand(True)
+                    preview.append(label)
+                target.append(preview)
+                actions = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, valign=Gtk.Align.CENTER)
+                choose = self.button("Choose Image…", lambda p=output["priority"]: self.choose_wallpaper(p))
+                self.name_control(choose, "Choose Image: " + output["name"])
+                choose.set_halign(Gtk.Align.START)
+                actions.append(choose)
+                actions.append(self.label("PNG or JPEG · scaled and cropped to fill", "muted"))
+                target.append(actions)
+                self.content.append(target)
+                self.display_targets.append(target)
 
         def choose_wallpaper(self, priority):
             chooser = Gtk.FileChooserNative.new("Choose Wallpaper", self.window, Gtk.FileChooserAction.OPEN, "Choose", "Cancel")
@@ -413,14 +532,17 @@ def run_settings():
 
         def locking(self):
             self.content.append(self.label("Navi locks before session-menu Sleep and Switch User. Password authentication is handled by swaylock and your system’s PAM service.", "muted"))
+            self.group("Automatic locking")
             idle = self.row("Lock after inactivity", self.spin(self.snapshot["preferences"]["idle_minutes"], 0, 240), "Minutes. Set to 0 to turn automatic idle locking off.")
             self.content.append(self.button("Save Locking Preferences", lambda: self.save_preferences({"idle_minutes": int(idle.get_value())}), True))
+            self.group("Session security")
             self.row("Lock now", self.button("Lock Screen", lambda: self.work(lambda: request("lock"), lambda _, error: self.show_notice(error or "Lock requested", bool(error)))))
             self.content.append(self.label("Inactivity counts input in Navi; applications cannot inhibit idle locking yet. Automatic screen-off and sleep timeouts are not configured by this version.", "muted"))
 
         def input_settings(self):
             p = self.snapshot["preferences"]
             self.content.append(self.label("Pointer and touchpad preferences apply to devices managed by a full Navi desktop session. A nested window keeps the host’s device configuration.", "muted"))
+            self.group("Pointer & touchpad")
             speed = self.row("Pointer speed", self.spin(p["pointer_speed"], -1, 1, 0.1))
             natural = Gtk.Switch(active=p["natural_scroll"])
             tap = Gtk.Switch(active=p["tap_to_click"])
@@ -431,9 +553,11 @@ def run_settings():
                 widget.set_sensitive(capabilities.get(key, False))
                 if not capabilities.get(key, False):
                     widget.set_tooltip_text("No supported device is managed by this Navi session")
+            self.group("Keyboard")
             rate = self.row("Keyboard repeat rate", self.spin(p["repeat_rate"], 0, 100), "Characters per second; 0 disables repeat.")
             delay = self.row("Keyboard repeat delay", self.spin(p["repeat_delay"], 100, 2000, 50), "Milliseconds before a held key repeats.")
             self.content.append(self.button("Save Input Preferences", lambda: self.save_preferences({"pointer_speed": speed.get_value(), "natural_scroll": natural.get_active(), "tap_to_click": tap.get_active(), "repeat_rate": int(rate.get_value()), "repeat_delay": int(delay.get_value())}), True))
+            self.group()
             test = Gtk.Entry(placeholder_text="Type here to test keyboard repeat")
             self.row("Test typing", test)
 
@@ -477,9 +601,7 @@ def run_settings():
 
         def confirm(self, title, message, action):
             dialog = Gtk.MessageDialog(transient_for=self.window, modal=True, text=title, secondary_text=message)
-            dialog.add_button('Cancel', Gtk.ResponseType.CANCEL)
-            dialog.add_button('Confirm', Gtk.ResponseType.ACCEPT)
-            dialog.set_default_response(Gtk.ResponseType.CANCEL)
+            self.dialog_buttons(dialog, 'Confirm')
             def response(widget, value):
                 widget.destroy()
                 if value == Gtk.ResponseType.ACCEPT:
@@ -487,11 +609,23 @@ def run_settings():
             dialog.connect('response', response)
             dialog.present()
 
+        def dialog_buttons(self, dialog, accept_label):
+            cancel = dialog.add_button('Cancel', Gtk.ResponseType.CANCEL)
+            accept = dialog.add_button(accept_label, Gtk.ResponseType.ACCEPT)
+            cancel.set_margin_start(16)
+            cancel.set_margin_end(8)
+            accept.set_margin_end(16)
+            for button in (cancel, accept):
+                button.set_margin_top(8)
+                button.set_margin_bottom(16)
+            dialog.set_default_response(Gtk.ResponseType.CANCEL)
+
         def network_page(self):
             self.content.append(self.label('Connect to Wi-Fi and Ethernet, scan nearby networks, and manage saved connections.', 'muted'))
             self.load_native(self.services.network, self.render_network, 'NetworkManager is unavailable or access was denied. Install and enable NetworkManager, then try again.')
 
         def render_network(self, data):
+            self.group("Connections")
             wifi = [d for d in data['devices'] if d['kind'] == 2]
             if wifi:
                 switch = Gtk.Switch(active=data['enabled'])
@@ -514,7 +648,7 @@ def run_settings():
                     controls.append(scan_button)
                     controls.append(self.button('Hidden Network…', lambda path=device['path']: self.wifi_dialog(dict(device=path, ssid=b'', security='wpa-psk', path='/'), hidden=True)))
                     self.row(device['interface'], controls, 'Wi-Fi adapter')
-            self.content.append(self.label('Nearby networks', 'section'))
+            self.group('Nearby networks')
             visible = data['networks'] if data['enabled'] and data['hardware'] else []
             if not visible:
                 self.content.append(self.label('No networks found. Enable Wi-Fi and scan again.', 'muted'))
@@ -534,7 +668,7 @@ def run_settings():
                 self.row(network['name'], controls, ('Connected · ' if network['connected'] else '') + f"{network['strength']}% signal · {security}")
             saved = [p for p in data['profiles'] if p['kind'] == '802-11-wireless']
             if saved:
-                self.content.append(self.label('Saved networks', 'section'))
+                self.group('Saved networks')
                 for profile in saved:
                     self.row(profile['name'], self.button('Forget…', lambda p=profile: self.confirm('Forget this network?', 'Its saved configuration and credentials will be removed.', lambda: self.operation(lambda: self.services.forget_network(p['path']), 'Network forgotten'))))
 
@@ -542,15 +676,13 @@ def run_settings():
             if self.busy:
                 return
             dialog = Gtk.Dialog(title='Join Hidden Network' if hidden else 'Connect to ' + network['name'], transient_for=self.window, modal=True)
-            dialog.add_button('Cancel', Gtk.ResponseType.CANCEL)
-            dialog.add_button('Connect', Gtk.ResponseType.ACCEPT)
-            dialog.set_default_response(Gtk.ResponseType.CANCEL)
+            self.dialog_buttons(dialog, 'Connect')
             box = dialog.get_content_area()
             box.set_spacing(12)
             for setter in (box.set_margin_start, box.set_margin_end, box.set_margin_top, box.set_margin_bottom):
                 setter(20)
             name = Gtk.Entry(placeholder_text='Network name (SSID)')
-            security = Gtk.DropDown.new_from_strings(['WPA2 Personal', 'WPA3 Personal', 'Open'])
+            security = self.choice(['WPA2 Personal', 'WPA3 Personal', 'Open'])
             if hidden:
                 box.append(self.label('Network name'))
                 box.append(name)
@@ -566,6 +698,7 @@ def run_settings():
             remember = Gtk.CheckButton(label='Remember this network and password', active=True)
             box.append(remember)
             problem = self.label('', 'error')
+            problem.set_visible(False)
             box.append(problem)
             def response(widget, result):
                 if result != Gtk.ResponseType.ACCEPT:
@@ -581,6 +714,7 @@ def run_settings():
                     wifi_profile(selected['ssid'], selected['security'], secret, remember.get_active(), GLib.get_user_name(), hidden)
                 except ValueError as error:
                     problem.set_text(str(error))
+                    problem.set_visible(True)
                     return
                 save = remember.get_active()
                 password.set_text('')
@@ -596,11 +730,15 @@ def run_settings():
         def render_bluetooth(self, data):
             if not data['adapters']:
                 self.content.append(self.label('No Bluetooth adapter is available.', 'muted'))
+            if data['adapters']:
+                self.group("Adapters")
             for adapter in data['adapters']:
                 switch = Gtk.Switch(active=adapter['powered'])
+                switch.set_valign(Gtk.Align.CENTER)
                 switch.set_sensitive(not self.busy)
                 switch.connect('notify::active', lambda w, _, a=adapter: self.change(self.services.bluetooth_power, a['path'], w.get_active()))
-                self.row(adapter['name'], switch, 'Bluetooth radio', context='Bluetooth radio')
+                controls = Gtk.Box(spacing=12)
+                controls.append(switch)
                 if adapter['powered']:
                     own_scan = adapter['path'] in self.services.discovering
                     def scan(a=adapter['path'], enabled=not own_scan):
@@ -619,9 +757,12 @@ def run_settings():
                             GLib.timeout_add_seconds(3, update)
                     button = self.button('Stop Scanning' if own_scan else 'Scan for Devices', scan)
                     button.set_sensitive(not self.busy)
-                    self.content.append(button)
+                    controls.append(button)
+                self.row(adapter['name'], controls, 'Bluetooth radio', context='Bluetooth radio')
             if not data['devices']:
                 self.content.append(self.label('No devices found. Turn on Bluetooth and make the device discoverable, then scan.', 'muted'))
+            else:
+                self.group("Devices")
             for device in data['devices']:
                 controls = Gtk.Box(spacing=8)
                 if device['paired']:
@@ -708,10 +849,13 @@ def run_settings():
             self.pair_kind = method
             dialog = Gtk.Dialog(title='Bluetooth Pairing', transient_for=self.window, modal=True)
             self.pair_dialog = dialog
-            dialog.add_button('Cancel', Gtk.ResponseType.CANCEL)
             if not display_only:
-                dialog.add_button('Confirm', Gtk.ResponseType.ACCEPT)
-            dialog.set_default_response(Gtk.ResponseType.CANCEL)
+                self.dialog_buttons(dialog, 'Confirm')
+            else:
+                button = dialog.add_button('Cancel', Gtk.ResponseType.CANCEL)
+                button.set_margin_end(16)
+                button.set_margin_bottom(16)
+                dialog.set_default_response(Gtk.ResponseType.CANCEL)
             box = dialog.get_content_area()
             box.set_spacing(12)
             for setter in (box.set_margin_start, box.set_margin_end, box.set_margin_top, box.set_margin_bottom):
@@ -719,6 +863,7 @@ def run_settings():
             self.pair_message = self.label(message)
             box.append(self.pair_message)
             problem = self.label('', 'error')
+            problem.set_visible(False)
             box.append(problem)
             entry = Gtk.Entry()
             self.name_control(entry, 'Bluetooth PIN' if method == 'RequestPinCode' else 'Bluetooth passkey')
@@ -738,11 +883,13 @@ def run_settings():
                     if method == 'RequestPinCode':
                         if not 1 <= len(entry.get_text()) <= 16 or not entry.get_text().isascii() or not entry.get_text().isalnum():
                             problem.set_text('Enter a PIN of 1–16 letters or digits.')
+                            problem.set_visible(True)
                             return
                         value = GLib.Variant('(s)', (entry.get_text(),))
                     elif method == 'RequestPasskey':
                         if not entry.get_text().isascii() or not entry.get_text().isdigit() or len(entry.get_text()) > 6:
                             problem.set_text('Enter a numeric passkey from 0 to 999999.')
+                            problem.set_visible(True)
                             return
                         value = GLib.Variant('(u)', (int(entry.get_text()),))
                     pending.return_value(value)
@@ -760,29 +907,35 @@ def run_settings():
 
         def render_sound(self, data):
             for title, key, default_key, kind in [('Output', 'outputs', 'default_output', 'sink'), ('Input', 'inputs', 'default_input', 'source')]:
-                self.content.append(self.label(title, 'section'))
+                self.group(title)
                 devices = data[key]
                 if not devices:
                     self.content.append(self.label('No ' + title.lower() + ' devices are available.', 'muted'))
                     continue
-                chooser = Gtk.DropDown.new_from_strings([d['label'] for d in devices])
+                chooser = self.choice([d['label'] for d in devices])
                 chooser.set_selected(next((i for i,d in enumerate(devices) if d['name'] == data[default_key]), 0))
                 self.row('Device', chooser, context=title)
                 volume = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1)
-                volume.set_size_request(180, -1)
+                volume.set_size_request(140, -1)
+                volume.set_hexpand(True)
                 volume.set_draw_value(True)
                 volume.set_value_pos(Gtk.PositionType.RIGHT)
-                mute = Gtk.Switch()
+                mute = Gtk.Switch(valign=Gtk.Align.CENTER)
                 def selected(w, _, items=devices, slider=volume, switch=mute):
                     d = items[w.get_selected()]
                     slider.set_value(min(100, d['volume']))
                     switch.set_active(d['mute'])
                 chooser.connect('notify::selected', selected)
                 selected(chooser, None)
-                self.row('Volume (%)', volume, context=title)
-                self.row('Muted', mute, context=title)
+                controls = Gtk.Box(spacing=8)
+                controls.append(volume)
+                controls.append(Gtk.Label(label='Muted'))
+                controls.append(mute)
+                self.name_control(volume, 'Volume (%): ' + title)
+                self.name_control(mute, 'Muted: ' + title)
+                self.row('Volume (%)', controls, context=title, form=True)
                 self.content.append(self.button('Apply ' + title, lambda c=chooser, v=volume, m=mute, items=devices, k=kind: self.apply_audio(k, items[c.get_selected()]['index'], v, m, True), True))
-            self.content.append(self.label('Applications', 'section'))
+            self.group('Applications')
             if not data['applications']:
                 self.content.append(self.label('Applications playing audio appear here.', 'muted'))
             for application in data['applications']:
@@ -798,6 +951,7 @@ def run_settings():
 
         def defaults(self):
             self.content.append(self.label("Choose applications for common links and files. Changes use the system’s standard MIME associations.", "muted"))
+            self.group()
             for name, mime in [("Web browser", "x-scheme-handler/https"), ("Email", "x-scheme-handler/mailto"), ("File manager", "inode/directory"), ("PDF documents", "application/pdf"), ("Text files", "text/plain")]:
                 button = Gtk.AppChooserButton.new(mime)
                 button.set_show_default_item(True)
@@ -819,8 +973,18 @@ def run_settings():
         def about(self):
             self.content.append(self.label("System information for this computer. Copy the summary when reporting an issue.", "muted"))
             version = self.snapshot.get("version", "0.1.0") if self.snapshot else "0.1.0"
-            self.row("Navi", self.label(version))
-            self.row("Session", self.label("Nested Navi" if self.snapshot and self.snapshot["nested"] else ("Navi desktop" if self.snapshot else "Outside Navi")))
+            identity = Gtk.Box(spacing=16, margin_top=16, margin_bottom=4)
+            image = Gtk.Image.new_from_icon_name("computer-symbolic")
+            image.set_pixel_size(48)
+            identity.append(image)
+            text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            text.append(self.label("Navi " + version, "identity-title"))
+            text.append(self.label("Nested Navi" if self.snapshot and self.snapshot["nested"] else ("Navi desktop" if self.snapshot else "Outside Navi"), "muted"))
+            identity.append(text)
+            self.content.append(identity)
+            copy = self.button("Copy System Information", lambda: Gdk.Display.get_default().get_clipboard().set(self.summary))
+            copy.set_sensitive(False)
+            self.heading.append(copy)
             generation = self.generation
             def loaded(values, error):
                 if self.generation != generation:
@@ -828,10 +992,13 @@ def run_settings():
                 if error:
                     self.content.append(self.label(error, "error"))
                     return
-                for key, value in values:
-                    self.row(key, self.label(value))
-                summary = "Navi " + version + "\n" + "\n".join(key + ": " + value for key, value in values)
-                self.content.append(self.button("Copy System Information", lambda: Gdk.Display.get_default().get_clipboard().set(summary)))
+                for title, keys in [("Software", ["Operating system", "Kernel", "Architecture"]), ("Hardware", ["Processor", "Memory", "Graphics", "Home storage"])]:
+                    self.group(title)
+                    for key in keys:
+                        self.row(key, self.label(dict(values)[key]))
+                        self.setting_rows[-1][0].add_css_class("fact-row")
+                self.summary = "Navi " + version + "\n" + "\n".join(key + ": " + value for key, value in values)
+                copy.set_sensitive(True)
             self.work(about_pc, loaded)
 
     return Settings().run(sys.argv)

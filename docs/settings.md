@@ -68,18 +68,36 @@ selection/action accent from `src/theme.rs`; use native GTK controls and Noto Sa
 **Story:** Find a task, inspect real current values, edit, apply, and see success or a useful
 failure. Device pages explain that system changes affect the computer, including from a nested session.
 
-**First viewport:** A 215px searchable category column beside a scrolling content area, collapsing to native
-search/category controls below 760px; current
-connection status above the page. Displays opens by default, with each output's values and an
-explicit preview action. A countdown with Revert and Keep appears after applying.
+**First viewport:** A 230px searchable category column beside a scrolling page column capped
+at approximately 820px, with current connection status above the page. Below 760px, a single
+line of native search/category controls replaces the sidebar. Rows stack labels above wider
+controls when the content area is narrower than 540px; switches and single actions stay beside
+their labels. Wide scalar forms align controls after a shared 200px label column. Displays opens
+by default, with each output's values and an explicit preview action. After applying, a fixed
+footer on Displays holds the countdown, Revert and Keep Settings outside the scrolling form, so
+recovery stays visible while scrolling at wide and compact widths.
 
 **Form:** Conventional native settings sidebar and forms, selected from the already approved
 settings task. Code-first, established Navi visual world; no concept roll was performed for this established
-settings layout, and there is no seed reference.
+settings layout, and there is no seed reference. User-supplied KDE About, Bluetooth, Sound,
+Mouse and Wallpaper screenshots serve as comparisons for hierarchy, density and task placement.
+Navi retains its own palette, native GTK controls and implemented capabilities.
 
 **Finish:** Native finish review and documentation compare the built app with the incumbent
 `docs/design.md` and shared palette in `src/theme.rs`. This ordinary extension preserves that
-system; it introduces no separate `DESIGN.md`, palette or shipping raster assets.
+system; it introduces no separate `DESIGN.md`, palette or shipping raster assets. All nine pages
+share a page title and explanation, consistent spacing and natural-width actions. Settings and
+fact rows use semantic groups on dark surfaces with subtle separators. Native buttons, fields,
+switches and sliders share contrast and blue keyboard-focus treatments. Long dropdown values ellipsize;
+system-information values remain selectable. State changes stay instant. Credential handling,
+explicit pairing approval and the independent display revert retain their existing boundaries.
+
+Sound places volume and an explicitly labeled Muted control together under each device selector;
+Bluetooth keeps scanning beside its adapter radio. About leads with Navi's version and session,
+then Software and Hardware facts; Copy System Information sits beside the heading and stacks
+below it at narrow widths. Wallpaper identifies each target with a display schematic containing
+its actual connector and dimensions, alongside Choose Image and format/crop guidance. The
+schematic represents the display; image selection continues through the native file picker.
 
 ## Validation
 
@@ -89,6 +107,16 @@ it refuses access to real system D-Bus and audio mutation. Run it only inside a 
 instance with private XDG directories and Navi-only screenshot instrumentation. Optional
 `NAVI_UI_CHECK_RESIZE_HELPER`, `NAVI_UI_CHECK_NAVI_PID` and `NAVI_UI_CHECK_HOST_DISPLAY` supply a
 host test-window resizer (arguments: PID, width, height) for the compact-window checks.
+
+Verify native finish across all nine pages at wide and compact widths, no-match and task search,
+unavailable services, long device names, keyboard focus, credential and pairing prompts, and
+display preview/revert. Check that the countdown and recovery actions remain in bounds while
+scrolling the form at compact widths, and that compact no-match search shows one message.
+Compare the supplied KDE examples for task hierarchy and density, including complete Output
+and Input controls in the first 1280 × 800 Sound viewport. Verify contextual accessible names
+through AT-SPI for repeated device, volume, mute and dialog controls as well as compact navigation.
+Fixture captures establish layout and interaction evidence; they do not establish real-device
+behavior. Browser-only visual detectors do not apply to this GTK app.
 
 Captured device examples are simulated. Separate read-only queries can validate real service
 availability without connecting, pairing or adjusting the host. Real new Wi-Fi connection,
