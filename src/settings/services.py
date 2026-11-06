@@ -36,10 +36,10 @@ def wifi_security(properties):
         return 'owe'
     return 'wep' if properties.get('Flags', 0) & 1 else 'open'
 
-def wifi_profile(ssid, security, password, remember, username, hidden=False):
+def wifi_profile(ssid, security, password, remember, username, hidden=False, enterprise=None):
     if not 1 <= len(ssid) <= 32:
         raise ValueError('A Wi-Fi network name must contain 1–32 bytes.')
-    if security not in ('open', 'wpa-psk', 'sae', 'owe'):
+    if security not in ('open', 'wpa-psk', 'sae', 'owe', 'enterprise'):
         raise ValueError('This security type needs a provisioned NetworkManager profile.')
     if security in ('wpa-psk', 'sae'):
         size = len(password.encode('utf-8'))
@@ -57,13 +57,27 @@ def wifi_profile(ssid, security, password, remember, username, hidden=False):
         profile['802-11-wireless-security'] = {'key-mgmt': ('s', security)}
         if security in ('wpa-psk', 'sae'):
             profile['802-11-wireless-security'].update({'psk': ('s', password), 'psk-flags': ('u', 0 if remember else 2)})
+    if security == 'enterprise':
+        identity = (enterprise or {}).get('identity','').strip()
+        domain = (enterprise or {}).get('domain','').strip()
+        certificate = (enterprise or {}).get('certificate','').strip()
+        if not identity or len(identity) > 256 or not password or len(password) > 1024 or not re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?',domain):
+            raise ValueError('Enterprise Wi-Fi needs your identity, password, and the authentication server’s DNS domain.')
+        if certificate and (not Path(certificate).is_absolute() or not Path(certificate).is_file() or '\x00' in certificate):
+            raise ValueError('Choose your organization’s CA certificate, or leave it empty to use system trust.')
+        profile['802-11-wireless-security'] = {'key-mgmt':('s','wpa-eap')}
+        profile['802-1x'] = {'eap':('as',['peap']), 'phase2-auth':('s','mschapv2'),'identity':('s',identity),
+            'password':('s',password),'password-flags':('u',0 if remember else 2),'domain-suffix-match':('s',domain),
+            'system-ca-certs':('b',not bool(certificate))}
+        if certificate:
+            profile['802-1x']['ca-cert']=('ay',list(('file://'+certificate+'\x00').encode()))
     return profile
 
 def audio_percent(item):
     channels = list(item.get('volume', {}).values())
     return round(sum(c.get('value', 0) for c in channels) / len(channels) / 65536 * 100) if channels else 0
 
-class DesktopServices:
+class DesktopServices(SystemServices):
     def __init__(self):
         self._bus = None
         self.cancelled = threading.Event()
@@ -85,7 +99,8 @@ class DesktopServices:
     def call(self, service, path, interface, method, signature=None, args=(), timeout=8000):
         from gi.repository import Gio, GLib
         parameters = GLib.Variant(signature, args) if signature else None
-        result = self.bus.call_sync(service, path, interface, method, parameters, None, Gio.DBusCallFlags.NONE, timeout, None)
+        flags = Gio.DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION if timeout >= 60000 else Gio.DBusCallFlags.NONE
+        result = self.bus.call_sync(service, path, interface, method, parameters, None, flags, timeout, None)
         return result.unpack() if result else ()
 
     def properties(self, service, path, interface):
@@ -161,7 +176,7 @@ class DesktopServices:
     def forget_network(self, profile):
         self.call(NM, profile, NM + '.Settings.Connection', 'Delete')
 
-    def connect_network(self, device, profile=None, network=None, password='', remember=True, hidden=False):
+    def connect_network(self, device, profile=None, network=None, password='', remember=True, hidden=False, enterprise=None):
         from gi.repository import GLib
         try:
             if profile:
@@ -170,7 +185,7 @@ class DesktopServices:
                 settings = {}
                 specific = '/'
                 if network:
-                    spec = wifi_profile(network['ssid'], network['security'], password, remember, GLib.get_user_name(), hidden)
+                    spec = wifi_profile(network['ssid'], network['security'], password, remember, GLib.get_user_name(), hidden, enterprise)
                     settings = {section: {key: GLib.Variant(signature, value) for key, (signature, value) in values.items()} for section, values in spec.items()}
                     specific = network.get('path', '/')
                 active = self.call(NM, NM_ROOT, NM, 'AddAndActivateConnection2', '(a{sa{sv}}ooa{sv})',

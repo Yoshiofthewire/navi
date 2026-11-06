@@ -24,7 +24,9 @@ pub const OUTLINE: u32 = DIM;
 
 /// `hex` at `alpha`, premultiplied.
 pub fn rgba(hex: u32, alpha: f32) -> [f32; 4] {
-    let [_, r, g, b] = hex.to_be_bytes().map(|c| f32::from(c) / 255.0 * alpha);
+    let [_, r, g, b] = resolve(hex)
+        .to_be_bytes()
+        .map(|c| f32::from(c) / 255.0 * alpha);
     [r, g, b, alpha]
 }
 
@@ -43,6 +45,66 @@ pub fn contrast(a: u32, b: u32) -> f32 {
     }
     let (a, b) = (luminance(a), luminance(b));
     (a.max(b) + 0.05) / (a.min(b) + 0.05)
+}
+
+// Packed, immutable per-frame palette choices; no file reads in painting paths.
+static APPEARANCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub fn configure(settings: &serde_json::Value) {
+    let accent = match settings["accent"].as_str() {
+        Some("green") => 1,
+        Some("purple") => 2,
+        Some("amber") => 3,
+        Some("pink") => 4,
+        _ => 0,
+    };
+    let flags = accent
+        | (u32::from(settings["scheme"] == "light") << 4)
+        | (u32::from(settings["high_contrast"] == true) << 5);
+    APPEARANCE.store(flags, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn resolve(color: u32) -> u32 {
+    let flags = APPEARANCE.load(std::sync::atomic::Ordering::Relaxed);
+    let light = flags & 16 != 0;
+    let high = flags & 32 != 0;
+    if color == ACCENT {
+        return if light {
+            [0x0077AA, 0x08754F, 0x7950AD, 0x906000, 0xAD3268]
+        } else {
+            [ACCENT, 0x4BCD96, 0xBD94F7, 0xEDB64E, 0xF28AB8]
+        }[(flags & 7).min(4) as usize];
+    }
+    if light && high {
+        return match color {
+            BG | BAR_BG => 0xFFFFFF,
+            INK => 0x000000,
+            DIM | SHELL_EDGE => 0x333333,
+            TAB_BG => 0xDDDDDD,
+            _ => color,
+        };
+    }
+    if light {
+        match color {
+            BG => 0xF5F6F8,
+            BAR_BG => 0xFFFFFF,
+            TAB_BG => 0xE3E7ED,
+            INK => 0x202734,
+            DIM => 0x525E70,
+            SHELL_EDGE => 0xA0AABA,
+            MINIMIZED => 0x256B8C,
+            _ => color,
+        }
+    } else if high {
+        match color {
+            BG | BAR_BG => 0x000000,
+            INK => 0xFFFFFF,
+            DIM | SHELL_EDGE => 0xB8C0CE,
+            _ => color,
+        }
+    } else {
+        color
+    }
 }
 
 #[cfg(test)]

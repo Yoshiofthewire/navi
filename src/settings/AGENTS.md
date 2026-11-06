@@ -4,8 +4,9 @@
 
 `model.py` owns socket requests, settings search, desktop-service models and system information.
 `services.py` owns NetworkManager/BlueZ D-Bus and native audio-client operations.
-`app.py` owns native GTK interaction and state. `src/bin/navi-settings.rs` embeds all three sources
-into one executable. The adjacent Rust `src/settings.rs` owns compositor-side settings.
+`system.py` owns the additional system-service controls and per-instance shell requests.
+`extra_ui.py` extends the existing native forms; `app.py` owns GTK interaction and state.
+`src/bin/navi-settings.rs` embeds the sources into one isolated Python invocation. The adjacent Rust `src/settings.rs` owns compositor-side settings.
 
 ## Local contracts
 

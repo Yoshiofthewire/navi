@@ -18,6 +18,13 @@ PAGES = [
     ("Mouse & Keyboard", "input-keyboard-symbolic", "touchpad pointer acceleration scroll tap repeat input"),
     ("Default Applications", "application-x-executable-symbolic", "browser email files terminal default mime"),
     ("About This PC", "computer-symbolic", "version cpu processor memory ram gpu operating system diagnostics"),
+    ("Appearance", "preferences-desktop-theme-symbolic", "theme light dark color accent icons cursor font dock"),
+    ("Notifications", "preferences-system-notifications-symbolic", "push unifiedpush history alerts do not disturb privacy"),
+    ("System Sounds", "audio-speakers-symbolic", "event theme chime alert warning login sounds"),
+    ("Accessibility", "preferences-desktop-accessibility-symbolic", "large text high contrast visual alerts keyboard accessibility"),
+    ("Printers", "printer-symbolic", "printing cups printer default queue"),
+    ("Accounts", "system-users-symbolic", "users account password administrator provisioning"),
+    ("Date, Time & Language", "preferences-system-time-symbolic", "clock timezone ntp locale region language date time"),
 ]
 
 def matching_pages(query):

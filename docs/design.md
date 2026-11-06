@@ -240,32 +240,33 @@ The screen shows a wallpaper, a taskbar and your apps. There are no desktop icon
   selected, and Escape cancels or closes. Clicking elsewhere closes the menu. All actions need
   explicit confirmation; holding Enter never accepts one. Errors appear in the menu and are
   logged. System services are queried off the UI thread with bounded method timeouts.
-  Sleep/Restart/Shutdown use login1 and its normal permissions/inhibitors; actions needing
-  interactive authorization are disabled because there is no authentication agent yet.
+  Sleep/Restart/Shutdown use login1 and its normal permissions/inhibitors. Full sessions start
+  an available installed Polkit authentication agent; actions still need service authorization.
   Switch User uses the display manager's `SwitchToGreeter` only for `XDG_SEAT_PATH` and only
   when its `CanSwitch` is true. Switching user and sleeping first wait for Navi to confirm
   protected presentation on every output. Lock Screen and Super+L use a privately connected swaylock, with PAM authentication.
   Nested, Lock Screen protects only Navi’s window and Log Out closes just Navi. A confirmed
   logout exits navi-bar successfully; Navi treats
   that private child exit as a graceful quit, while failed/crashed bars still respawn.
-- **Notifications:** navi-bar serves `org.freedesktop.Notifications` (spec 1.2) only if no other
-  server holds the name when it starts. It asks with `DoNotQueue` and neither replace flag, so
-  it never takes the name from Plasma or anyone else, never queues for it, and can't have it
-  taken. Up to 3 cards, newest on top, each up to 5 s by default and never more than 10 s, `0`
-  ("never") included. A click dismisses one. Text is plain: simple tags like `<b>` are dropped
-  and the five XML entities decoded, nothing is styled or linked, control and bidi-override
-  characters are removed, and the app name, summary and body are cut at 64, 120 and 400
-  characters (only the first four times that is read at all, so a huge message costs nothing).
-  Icons, images, sounds and actions are ignored; navi-bar never opens a path a notification
-  names. Replacing or closing a notification works only for the app that sent
-  it. Each app may send 5 per 10 s and all apps together 20; past that the call still gets an id,
-  but nothing shows. No history and no do-not-disturb; notifications that arrive during
-  fullscreen aren't shown, and expire as usual.
+- **Notifications:** navi-bar serves `org.freedesktop.Notifications` 1.2 only when no other
+  server owns the name. It never replaces or queues behind Plasma. Up to three bounded,
+  plain-text cards use the existing 1–10 second lifetime and per-sender/global rate limits.
+  Images, icon paths and sound hints remain ignored. Live actions emit only to the original
+  unique sender; a default action runs on a card click, and other actions are explicit in
+  Settings. Replacing/closing is still sender-scoped. Global enable, Do Not Disturb,
+  per-app blocking and a 50-entry in-memory history are configurable. Blocked notifications
+  never enter history. History/actions require an unlocked compositor settings check.
+  Fullscreen and locking hide notification surfaces. Optional UnifiedPush is a separate,
+  owned external distributor, disabled by default; payloads reach their participating apps,
+  which decide whether to notify. See [Settings](settings.md) and [UnifiedPush](unifiedpush.md).
 - **Laptop alone:** the same layout with a slimmer taskbar.
 - **No virtual desktops.**
 - **Look:** cyberpunk, with no animations: every state change is instant. (The half-second hold
   before a drop tabs is a state change, not an animation.) The accent is the logo's neon blue,
-  `#2BA3D8`, on near-black, from one palette (`src/theme.rs`) that navi and navi-bar share. The
+  `#2BA3D8`, on near-black, from one palette (`src/theme.rs`) that navi and navi-bar share.
+  This dark/blue baseline remains the default. Appearance offers light mode and blue, green,
+  purple, amber or pink accents; Accessibility offers high contrast. These are opt-in variants
+  of the same system, preserving geometry, hierarchy and instant state changes. The
   window with the keyboard has a 2 px accent frame just outside it, in the gap; every other shown
   window has a dim 1 px one, so the gaps read as thin neon lines and the grab strips stay easy to
   find. A lit strip or edge, the bars and the minimized strips draw in front of the frames.
@@ -274,6 +275,14 @@ The screen shows a wallpaper, a taskbar and your apps. There are no desktop icon
   single lines is used at 16–32 px, where the full logo's double lines blur together.
 
 ## Themes
+
+`src/theme.rs` owns the compositor/shell palette and its scheme-dependent accent values.
+The default background, shell surface and text are `#0B0D12`, `#151922` and `#D0D4DC`;
+light mode uses `#F5F6F8`, white and `#202734`, with a darker blue accent (`#0077AA`).
+High contrast uses black/white surfaces and text in the selected scheme. Settings maps these
+same roles onto native GTK controls in `app.py` and `extra_ui.py`, with separate control borders
+and secondary-text values for legibility. Noto Sans remains the Settings/shell typeface; the
+default text size is 14 logical px, adjustable from 12 to 24 without changing the layout model.
 
 navi uses the user's installed themes and ships none of its own. Icons, cursors and sounds
 follow freedesktop.org standards, so any theme from the distro's repos or the KDE Store works,
@@ -313,8 +322,8 @@ don't affect navi's MIT licence.
   no splash.
 - **Theme files are untrusted input**, since anyone can upload a theme to the KDE Store. The
   compositor decodes icons and cursors with memory-safe Rust libraries (`resvg`, `xcursor`) and
-  caps image size. Sounds are decoded and played in a separate process (`pw-play`), never inside
-  the compositor.
+  caps image size. Optional event sounds are off by default and play through a separate
+  `canberra-gtk-play` process, never inside the compositor.
 
 ## Security defaults
 
@@ -348,7 +357,7 @@ session.
   passwords; Navi never reads them. Its user config is bypassed to prevent daemonization.
   Full sessions listen for logind Lock and PrepareForSleep with a delay inhibitor, and report
   ordered LockedHint changes. A failed before-sleep lock retains protection/inhibitor until
-  logind’s own timeout; listener failure is logged. Idle locking remains future work.
+  logind’s own timeout; listener failure is logged. Idle locking, screen-off and automatic sleep are configurable, with protected presentation required before power actions.
   The lock backdrop is the configured per-monitor wallpaper with the desktop's centered crop,
   darkened to 27% brightness and blurred. No Navi logo, name, avatar or clock is displayed.
   Small “Session locked”, password and Enter prompts remain. The circle is eight clockwise
@@ -367,7 +376,8 @@ session.
   first blurred image until the next lock. The static prompt art is regenerated during
   development with `scripts/render-lock-prompts.sh` and is embedded in the binary.
   See [session validation limits](session.md).
-- **No network access**, no plugins, and no shell commands anywhere in the compositor or shell.
+- **No direct network access**, no plugins, and no shell command evaluation in the compositor or shell.
+  The optional UnifiedPush child handles network transport only after opt-in in a full session.
   navi-bar, not navi, launches apps, so `.desktop` files, icon themes and fonts (all untrusted)
   are parsed outside the compositor. Launching runs the `Exec=` line broken into arguments (any
   shell syntax rejects the entry), with an XDG activation token, in its own process group and
@@ -452,6 +462,8 @@ The on-demand native GTK 4 Settings app inherits Navi's palette and uses a searc
 sidebar, scrolling forms, native controls and explicit status/recovery. GTK/Python remain outside
 the compositor. Displays support live arrangement/scaling, advertised KMS modes, primary output
 and an independent 20-second revert; wallpaper updates live. Idle locking and libinput/repeat
-preferences are persisted. Networking and Bluetooth use native NetworkManager/BlueZ
+preferences are persisted. The expanded categories include appearance, notification history/DND,
+optional UnifiedPush, event sounds, accessibility, printers, local accounts and regional settings.
+Networking and Bluetooth use native NetworkManager/BlueZ
 controls, while audio uses native pactl operations; defaults use GIO and About reports real system information. See [Settings](settings.md)
 for scope, protocol boundaries, unavailable controls and the surface direction contract.

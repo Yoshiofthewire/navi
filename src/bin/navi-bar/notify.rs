@@ -27,6 +27,8 @@ pub struct Request {
     pub summary: String,
     pub body: String,
     pub expire_timeout: i32,
+    pub app_id: String,
+    pub actions: Vec<(String, String)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -38,6 +40,8 @@ pub struct Note {
     pub summary: String,
     pub body: String,
     pub expires_ms: u64,
+    pub app_id: String,
+    pub actions: Vec<(String, String)>,
 }
 
 /// A `NotificationClosed` to emit: id and reason.
@@ -50,6 +54,7 @@ pub struct Notes {
     shown: Vec<Note>,
     /// Calls let through in the last `WINDOW_MS`: sender and time.
     recent: Vec<(String, u64)>,
+    pub history: Vec<Note>,
 }
 
 impl Default for Notes {
@@ -58,6 +63,7 @@ impl Default for Notes {
             next: 1,
             shown: Vec::new(),
             recent: Vec::new(),
+            history: Vec::new(),
         }
     }
 }
@@ -90,19 +96,39 @@ impl Notes {
             summary: text(&r.summary, SUMMARY_CHARS, true),
             body: text(&r.body, BODY_CHARS, true),
             expires_ms: now.saturating_add(timeout_ms(r.expire_timeout)),
+            app_id: sanitize(&r.app_id, 128),
+            actions: r
+                .actions
+                .iter()
+                .take(8)
+                .map(|(k, v)| (sanitize(k, 64), sanitize(v, 64)))
+                .collect(),
         };
         if let Some(at) = replaced {
             note.id = r.replaces_id;
+            self.remember(&note);
             self.shown[at] = note;
             return (r.replaces_id, Some(Vec::new()));
         }
         note.id = self.fresh();
         let id = note.id;
+        self.remember(&note);
         self.shown.insert(0, note);
         let evicted = self.shown.split_off(self.shown.len().min(MAX_SHOWN));
         (id, Some(evicted.iter().map(|n| (n.id, EXPIRED)).collect()))
     }
 
+    fn remember(&mut self, note: &Note) {
+        self.history.retain(|n| n.id != note.id);
+        self.history.insert(0, note.clone());
+        self.history.truncate(50);
+    }
+    pub fn hide(&mut self, id: u32) {
+        self.shown.retain(|n| n.id != id);
+    }
+    pub fn clear_shown(&mut self) {
+        self.shown.clear();
+    }
     /// `CloseNotification`: only the sender's own notification closes.
     pub fn close(&mut self, sender: &str, id: u32) -> Option<Closed> {
         let at = self
@@ -201,6 +227,7 @@ pub fn sanitize(s: &str, max: usize) -> String {
     let kept: Vec<char> = s
         .chars()
         .filter(|&c| c == '\n' || !(c.is_control() || bidi(c)))
+        .take(max.saturating_add(1))
         .collect();
     if kept.len() <= max {
         return kept.into_iter().collect();

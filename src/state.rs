@@ -93,6 +93,11 @@ pub struct Managed {
 
 pub struct Navi {
     pub preferences: crate::settings::Preferences,
+    pub desktop: serde_json::Value,
+    pub screen_off: bool,
+    pub sleep_requested: bool,
+    pub sticky: crate::input::Sticky,
+    pub swipe: Option<(f64, f64)>,
     pub last_activity: std::time::Instant,
     pub wallpaper_epoch: u64,
     pub lock: crate::locking::Lock,
@@ -112,7 +117,7 @@ pub struct Navi {
     pub drag: Option<Drag>,
     pub edge_clicks: layout::EdgeClicks,
     /// The layout's outputs, with the area layer surfaces leave for the grid.
-    grid: Vec<layout::Output>,
+    pub(crate) grid: Vec<layout::Output>,
     pub toplevels: Toplevels,
     pub loop_handle: LoopHandle<'static, CalloopData>,
     /// The seat session on real hardware, for VT switches; `None` nested.
@@ -146,11 +151,24 @@ impl Navi {
         let mut seat_state = SeatState::new();
         let mut seat = seat_state.new_wl_seat(&dh, "seat0");
         let preferences = crate::settings::Preferences::load();
-        seat.add_keyboard(
-            Default::default(),
-            preferences.repeat_delay,
-            preferences.repeat_rate,
-        )?;
+        let desktop =
+            crate::desktop_config::load().unwrap_or_else(|_| crate::desktop_config::defaults());
+        crate::theme::configure(&desktop);
+        if seat
+            .add_keyboard(
+                crate::settings::xkb_config(&desktop),
+                preferences.repeat_delay,
+                preferences.repeat_rate,
+            )
+            .is_err()
+        {
+            warn!("configured keyboard layout unavailable; using the default layout");
+            seat.add_keyboard(
+                Default::default(),
+                preferences.repeat_delay,
+                preferences.repeat_rate,
+            )?;
+        }
         seat.add_pointer();
         // Before the first window is placed.
         let mut layout = Layout::default();
@@ -160,6 +178,11 @@ impl Navi {
 
         Ok(Self {
             preferences,
+            desktop,
+            screen_off: false,
+            sleep_requested: false,
+            sticky: Default::default(),
+            swipe: None,
             last_activity: std::time::Instant::now(),
             wallpaper_epoch: 0,
             lock: Default::default(),
@@ -588,7 +611,7 @@ impl Navi {
     /// Feeds the taskbar's hover band at `pos`; after a rest on another output's bottom edge the
     /// taskbar moves there.
     pub fn bar_hover(&mut self, pos: Point<f64, Logical>) {
-        if self.lock.active {
+        if self.lock.active || self.desktop["dock_follow"] != true {
             return;
         }
         let Some(bar) = self.bar_on() else {

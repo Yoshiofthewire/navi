@@ -30,6 +30,8 @@ pub enum Call {
     /// Answered with the id.
     Notify(String, Request, mpsc::SyncSender<u32>),
     Close(String, u32),
+    Configure(serde_json::Value),
+    Settings(serde_json::Value, mpsc::SyncSender<serde_json::Value>),
 }
 
 struct Server(Sender<Call>);
@@ -41,7 +43,7 @@ fn sender(h: &Header<'_>) -> String {
 #[interface(name = "org.freedesktop.Notifications")]
 impl Server {
     fn get_capabilities(&self) -> Vec<&str> {
-        vec!["body"]
+        vec!["body", "actions"]
     }
 
     fn get_server_information(&self) -> (&str, &str, &str, &str) {
@@ -57,16 +59,33 @@ impl Server {
         _app_icon: String,
         summary: String,
         body: String,
-        _actions: Vec<String>,
-        _hints: HashMap<String, OwnedValue>,
+        actions: Vec<String>,
+        hints: HashMap<String, OwnedValue>,
         expire_timeout: i32,
     ) -> fdo::Result<u32> {
         let r = Request {
-            app_name,
+            app_name: app_name.clone(),
             replaces_id,
             summary,
             body,
             expire_timeout,
+            actions: actions
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .take(8)
+                .map(|p| {
+                    (
+                        crate::notify::sanitize(&p[0], 64),
+                        crate::notify::sanitize(&p[1], 64),
+                    )
+                })
+                .collect(),
+            app_id: hints
+                .get("desktop-entry")
+                .and_then(|v| <&str>::try_from(v).ok())
+                .map(|s| crate::notify::sanitize(s, 128))
+                .unwrap_or_else(|| crate::notify::sanitize(&app_name, 64)),
         };
         let (tx, rx) = mpsc::sync_channel(1);
         self.0
@@ -91,6 +110,20 @@ pub fn serve(tx: Sender<Call>) -> Option<Connection> {
     let conn = Connection::session()
         .inspect_err(|e| warn!("notifications: no session bus, not serving: {e}"))
         .ok()?;
+    if let Err(e) = conn.object_server().at(
+        "/io/github/Yoshiofthewire/Navi/Shell",
+        SettingsServer(tx.clone()),
+    ) {
+        warn!("shell settings unavailable: {e}");
+        return None;
+    }
+    if conn
+        .request_name_with_flags(shell_name(), RequestNameFlags::DoNotQueue.into())
+        .is_err()
+    {
+        warn!("shell settings name unavailable");
+        return None;
+    }
     // An empty object server first, or zbus warns; the interface is added once the name is ours.
     let _ = conn.object_server();
     match conn.request_name_with_flags(NAME, RequestNameFlags::DoNotQueue.into()) {
@@ -98,7 +131,7 @@ pub fn serve(tx: Sender<Call>) -> Option<Connection> {
         // zbus turns the `Exists` reply into this error.
         Err(zbus::Error::NameTaken) => {
             info!("notifications: name owned by another server, not serving");
-            return None;
+            return Some(conn);
         }
         Ok(r) => {
             warn!(?r, "notifications: unexpected reply, not serving");
@@ -212,4 +245,63 @@ mod tests {
             ]
         );
     }
+}
+
+pub fn shell_name() -> String {
+    let display = std::env::var("WAYLAND_DISPLAY").unwrap_or_default();
+    let suffix: String = display
+        .bytes()
+        .take(80)
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    format!("io.github.Yoshiofthewire.Navi.Shell.d{suffix}")
+}
+struct SettingsServer(Sender<Call>);
+#[interface(name = "io.github.Yoshiofthewire.Navi.Shell1")]
+impl SettingsServer {
+    fn request(&self, text: &str) -> fdo::Result<String> {
+        if text.len() > 16384 {
+            return Err(fdo::Error::InvalidArgs("Request too large".into()));
+        }
+        // Keep the compositor's independent locked-session guard for history and actions too.
+        let display = std::env::var("WAYLAND_DISPLAY").unwrap_or_default();
+        if display.is_empty() || display.contains('/') {
+            return Err(fdo::Error::Failed("No Navi instance".into()));
+        }
+        use std::io::{BufRead, Write};
+        let path =
+            std::path::PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap_or_default())
+                .join(format!("navi-{display}.settings"));
+        let guard = || -> Option<()> {
+            let mut socket = std::os::unix::net::UnixStream::connect(path).ok()?;
+            socket.set_read_timeout(Some(REPLY_WAIT)).ok()?;
+            socket.set_write_timeout(Some(REPLY_WAIT)).ok()?;
+            socket.write_all(b"{\"op\":\"get\"}\n").ok()?;
+            let mut reply = String::new();
+            use std::io::Read;
+            std::io::BufReader::new(socket.take(65537))
+                .read_line(&mut reply)
+                .ok()?;
+            (serde_json::from_str::<serde_json::Value>(&reply).ok()?["ok"] == true).then_some(())
+        };
+        if guard().is_none() {
+            return Err(fdo::Error::AccessDenied(
+                "Unlock Navi to view notifications".into(),
+            ));
+        }
+        let value = serde_json::from_str(text)
+            .map_err(|_| fdo::Error::InvalidArgs("Invalid request".into()))?;
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.0
+            .send(Call::Settings(value, tx))
+            .map_err(|_| fdo::Error::Failed("Shell closed".into()))?;
+        Ok(rx
+            .recv_timeout(REPLY_WAIT)
+            .map_err(|_| fdo::Error::Failed("Shell did not answer".into()))?
+            .to_string())
+    }
+}
+
+pub fn action(conn: &Connection, sender: &str, id: u32, key: &str) {
+    let _ = conn.emit_signal(Some(sender), PATH, NAME, "ActionInvoked", &(id, key));
 }

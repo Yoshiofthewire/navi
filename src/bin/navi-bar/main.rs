@@ -13,8 +13,13 @@ mod theme;
 mod cards;
 #[path = "../../control.rs"]
 mod control;
+#[allow(dead_code)]
+#[path = "../../cursor.rs"]
+mod cursor;
 mod dbus;
 mod desktop;
+#[path = "../../desktop_config.rs"]
+mod desktop_config;
 mod dock;
 mod exec;
 mod font;
@@ -22,6 +27,7 @@ mod icons;
 mod layout;
 mod menu;
 mod notify;
+mod runtime;
 mod session;
 mod status;
 #[cfg(test)]
@@ -87,7 +93,10 @@ use theme::{DIM, INK};
 
 const BTN_LEFT: u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
-const TEXT_PX: f32 = 14.0;
+fn text_px() -> f32 {
+    TEXT_SIZE.load(std::sync::atomic::Ordering::Relaxed) as f32
+}
+static TEXT_SIZE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(14);
 /// How long a launch waits for its activation token.
 const TOKEN_WAIT: Duration = Duration::from_secs(1);
 /// The status band across the top of the main output.
@@ -181,7 +190,13 @@ fn run() -> Result<(), String> {
         var("HOME").as_deref(),
         ".config",
     );
-    let preferred = icons::preferred(config.as_deref());
+    let desktop_settings = desktop_config::load().unwrap_or_else(|_| desktop_config::defaults());
+    theme::configure(&desktop_settings);
+    let preferred = desktop_settings["icon_theme"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| icons::preferred(config.as_deref()));
     let themes = Themes::new(
         icons::bases(&data_dirs, var("HOME").as_deref()),
         Some(PathBuf::from("/usr/share/pixmaps")),
@@ -214,12 +229,21 @@ fn run() -> Result<(), String> {
     event_loop
         .handle()
         .insert_source(tick, |_, _, bar| {
+            if bar.full_session {
+                runtime::play(&bar.desktop_settings, "login");
+            }
             bar.refresh_status();
             TimeoutAction::ToDuration(status::next_tick(&jiff::Zoned::now()))
         })
         .map_err(|e| e.to_string())?;
+    let runtime = runtime::watch(
+        tx.clone(),
+        dbus::wants_export(var("NAVI_EXPORT_ENV").as_deref()),
+    );
     let mut bar = Bar {
-        dbus: dbus::serve(tx),
+        desktop_settings,
+        runtime,
+        dbus: dbus::serve(tx.clone()),
         notes: Notes::default(),
         start: Instant::now(),
         band,
@@ -280,6 +304,7 @@ fn run() -> Result<(), String> {
     }
     // A successful shell exit is the private logout request to Navi. Failures respawn the bar.
     if bar.logout {
+        runtime::play(&bar.desktop_settings, "logout");
         Ok(())
     } else {
         Err("Shell surfaces were closed unexpectedly".into())
@@ -332,6 +357,8 @@ struct Win {
 }
 
 struct Bar {
+    desktop_settings: serde_json::Value,
+    runtime: runtime::Runtime,
     qh: QueueHandle<Bar>,
     compositor: CompositorState,
     layer_shell: LayerShell,
@@ -759,7 +786,7 @@ impl Bar {
                 }
                 Item::Field(query, r) => {
                     let r = scaled(r, s);
-                    let px = TEXT_PX * s as f32;
+                    let px = text_px() * s as f32;
                     let end = match &self.font {
                         Some(font) => draw_text(&mut canvas, font, &query, r, px, INK),
                         None => r.x,
@@ -858,6 +885,7 @@ impl Bar {
             session::Reply::Capabilities(caps) => self.session.capabilities = caps,
             session::Reply::Done(Ok(())) => self.close_session(),
             session::Reply::Done(Err(e)) => {
+                runtime::play(&self.desktop_settings, "warning");
                 warn!(error = %e, "session action failed");
                 self.session.message = if e.contains("lock") || e.contains("Lock") {
                     "Could not lock. Install swaylock;\ncheck the Navi log and try again.".into()
@@ -871,6 +899,11 @@ impl Bar {
 
     fn refresh_status(&mut self) {
         let battery = status::battery(Path::new(POWER));
+        if battery.is_some_and(|b| !b.charging && b.percent <= 15)
+            && self.battery.is_some_and(|b| b.percent > 15)
+        {
+            runtime::play(&self.desktop_settings, "battery");
+        }
         let status = status::format(&jiff::Zoned::now(), battery);
         if status != self.status {
             self.status = status;
@@ -950,7 +983,7 @@ impl Bar {
                     "%a %d %b   %H:%M"
                 })
                 .to_string();
-            let w = text_w(font, &clock, TEXT_PX).ceil() as i32;
+            let w = text_w(font, &clock, text_px()).ceil() as i32;
             for item in [
                 Item::Text(
                     "Navi".into(),
@@ -981,7 +1014,7 @@ impl Bar {
                     if b.charging { "Charging  " } else { "" },
                     b.percent
                 );
-                let w = text_w(font, &text, TEXT_PX).ceil() as i32;
+                let w = text_w(font, &text, text_px()).ceil() as i32;
                 let x = self.band_w - 12 - w;
                 paint(
                     &mut canvas,
@@ -1071,6 +1104,92 @@ impl Bar {
     fn call(&mut self, call: Call) {
         let now = self.now_ms();
         match call {
+            Call::Configure(settings) => {
+                theme::configure(&settings);
+                TEXT_SIZE.store(
+                    settings["font_size"].as_u64().unwrap_or(14) as u32,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                if settings["icon_theme"] != self.desktop_settings["icon_theme"] {
+                    let config = files::xdg_dir(
+                        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+                        std::env::var_os("HOME").as_deref(),
+                        ".config",
+                    );
+                    let preferred = settings["icon_theme"]
+                        .as_str()
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| icons::preferred(config.as_deref()));
+                    self.icons = Icons::new(Themes::new(
+                        icons::bases(&self.data_dirs, std::env::var_os("HOME").as_deref()),
+                        Some(PathBuf::from("/usr/share/pixmaps")),
+                        &preferred,
+                    ));
+                }
+                if settings["dnd"] == true || settings["notifications"] != true {
+                    self.notes.clear_shown();
+                }
+                let blocked: Vec<_> = self
+                    .notes
+                    .shown()
+                    .iter()
+                    .filter(|n| {
+                        settings["blocked_apps"]
+                            .as_array()
+                            .is_some_and(|a| a.iter().any(|v| v == &n.app_id))
+                    })
+                    .map(|n| n.id)
+                    .collect();
+                for id in blocked {
+                    self.notes.hide(id);
+                }
+                if settings["history"] != true {
+                    self.notes.history.clear();
+                }
+                self.desktop_settings = settings;
+                self.draw();
+                self.draw_band();
+                self.show_cards();
+            }
+            Call::Settings(value, reply) => {
+                let result = match value["op"].as_str() {
+                    Some("get") => {
+                        serde_json::json!({"ok":true,"settings":self.desktop_settings,"history":self.notes.history.iter().map(|n| serde_json::json!({
+                        "id":n.id,"app":n.app,"app_id":n.app_id,"summary":n.summary,"body":n.body,
+                        "actions":if n.expires_ms > now && self.notes.shown().iter().any(|shown| shown.id == n.id) { n.actions.clone() } else { Vec::new() }
+                    })).collect::<Vec<_>>(),"push":self.runtime.status.lock().map(|s| s.clone()).unwrap_or_default()})
+                    }
+                    Some("clear") => {
+                        self.notes.history.clear();
+                        serde_json::json!({"ok":true})
+                    }
+                    Some("action") => {
+                        let id = value["id"].as_u64().and_then(|v| u32::try_from(v).ok());
+                        let key = value["key"].as_str().unwrap_or("");
+                        let note = self.notes.shown().iter().find(|n| {
+                            Some(n.id) == id
+                                && n.expires_ms > now
+                                && n.actions.iter().any(|(k, _)| k == key)
+                        });
+                        if let (Some(note), Some(conn)) = (note, self.dbus.as_ref()) {
+                            dbus::action(conn, &note.sender, note.id, key);
+                            serde_json::json!({"ok":true})
+                        } else {
+                            serde_json::json!({"ok":false,"error":"Notification action expired"})
+                        }
+                    }
+                    Some("sound") => {
+                        runtime::play(
+                            &self.desktop_settings,
+                            value["event"].as_str().unwrap_or(""),
+                        );
+                        serde_json::json!({"ok":true})
+                    }
+                    _ => serde_json::json!({"ok":false,"error":"Unknown shell setting"}),
+                };
+                let _ = reply.send(result);
+            }
             Call::Notify(sender, r, reply) => {
                 let (id, closed) = self.notes.notify(now, &sender, &r);
                 let _ = reply.send(id);
@@ -1079,6 +1198,25 @@ impl Bar {
                 };
                 let lens = (r.app_name.len(), r.summary.len(), r.body.len());
                 info!(id, sender, ?lens, "notification");
+                let blocked = self.desktop_settings["blocked_apps"]
+                    .as_array()
+                    .is_some_and(|a| a.iter().any(|v| v == &r.app_id));
+                let suppressed = blocked
+                    || self.desktop_settings["dnd"] == true
+                    || self.desktop_settings["notifications"] != true;
+                if suppressed {
+                    self.notes.hide(id);
+                }
+                if blocked || self.desktop_settings["history"] != true {
+                    self.notes.history.retain(|n| n.id != id);
+                }
+                if !suppressed {
+                    runtime::play(&self.desktop_settings, "notification");
+                }
+                let mut closed = closed;
+                if suppressed {
+                    closed.push((id, notify::EXPIRED));
+                }
                 self.emit(closed);
                 let at = self.notes.shown().iter().find(|n| n.id == id);
                 let wait = Duration::from_millis(at.map_or(0, |n| n.expires_ms - now));
@@ -1116,8 +1254,10 @@ impl Bar {
     fn show_cards(&mut self) {
         let font = self.font.as_ref();
         let advance = |c: char| match font {
-            Some(f) => (f.lookup_glyph_index(c) != 0).then(|| f.metrics(c, TEXT_PX).advance_width),
-            None => Some(TEXT_PX / 2.0),
+            Some(f) => {
+                (f.lookup_glyph_index(c) != 0).then(|| f.metrics(c, text_px()).advance_width)
+            }
+            None => Some(text_px() / 2.0),
         };
         let cards = cards::layout(self.notes.shown(), &advance);
         if cards == self.cards && self.cards_layer.is_some() {
@@ -1164,7 +1304,7 @@ impl Bar {
         let Some(mut canvas) = Pixmap::new((w * s) as u32, (h * s) as u32) else {
             return;
         };
-        for item in cards::draw(&self.cards) {
+        for item in cards::draw(&self.cards, self.desktop_settings["visual_alerts"] == true) {
             paint(&mut canvas, self.font.as_ref(), item, s);
         }
         present(&mut self.pool, layer, &canvas, s);
@@ -1198,7 +1338,7 @@ fn paint(canvas: &mut Pixmap, font: Option<&fontdue::Font>, item: Item, s: i32) 
         Item::Round(r, radius, rgb) => rounded(canvas, scaled(r, s), radius * s, rgb),
         Item::Text(text, r, rgb) => {
             if let Some(font) = font {
-                draw_text(canvas, font, &text, scaled(r, s), TEXT_PX * s as f32, rgb);
+                draw_text(canvas, font, &text, scaled(r, s), text_px() * s as f32, rgb);
             }
         }
         _ => {}
@@ -1222,7 +1362,7 @@ fn scaled(r: Rect, s: i32) -> Rect {
 }
 
 fn color(rgb: u32, alpha: f32) -> Color {
-    let [_, r, g, b] = rgb.to_be_bytes();
+    let [_, r, g, b] = theme::resolve(rgb).to_be_bytes();
     let mut c = Color::from_rgba8(r, g, b, 255);
     c.apply_opacity(alpha);
     c
@@ -1318,7 +1458,7 @@ fn draw_text(
         return r.x;
     };
     let baseline = r.y as f32 + (r.h as f32 - (line.ascent - line.descent)) / 2.0 + line.ascent;
-    let [_, cr, cg, cb] = rgb.to_be_bytes();
+    let [_, cr, cg, cb] = theme::resolve(rgb).to_be_bytes();
     let (cw, ch) = (canvas.width() as i32, canvas.height() as i32);
     let mut pen = r.x as f32;
     for c in font::fit(text, r.w as f32, advance) {
@@ -1366,6 +1506,27 @@ fn spawn(e: &Entry, token: Option<&str>) {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .process_group(0);
+    if let Ok(settings) = desktop_config::load() {
+        cmd.env("XCURSOR_SIZE", settings["cursor_size"].to_string());
+        if let Some(theme) = settings["cursor_theme"].as_str().filter(|s| !s.is_empty()) {
+            cmd.env("XCURSOR_THEME", theme);
+        } else {
+            let dirs = cursor::dirs(
+                std::env::var_os("XDG_DATA_HOME").as_deref(),
+                std::env::var_os("HOME").as_deref(),
+                std::env::var_os("XDG_DATA_DIRS").as_deref(),
+            );
+            cmd.env("XCURSOR_THEME", cursor::theme(&dirs).unwrap_or("default"));
+        }
+        cmd.env(
+            "GTK_THEME",
+            if settings["scheme"] == "light" {
+                "Adwaita"
+            } else {
+                "Adwaita:dark"
+            },
+        );
+    }
     match token {
         Some(t) => cmd
             .env("XDG_ACTIVATION_TOKEN", t)
@@ -1733,8 +1894,14 @@ impl PointerHandler for Bar {
                 } = e.kind
                 {
                     let (x, y) = (e.position.0 as i32, e.position.1 as i32);
-                    let dismissed =
-                        cards::hit(&self.cards, x, y).and_then(|id| self.notes.dismiss(id));
+                    let clicked = cards::hit(&self.cards, x, y);
+                    if let Some(note) = self.notes.shown().iter().find(|n| Some(n.id) == clicked)
+                        && note.actions.iter().any(|(k, _)| k == "default")
+                        && let Some(conn) = &self.dbus
+                    {
+                        dbus::action(conn, &note.sender, note.id, "default");
+                    }
+                    let dismissed = clicked.and_then(|id| self.notes.dismiss(id));
                     self.emit(dismissed.into_iter().collect());
                 }
                 continue;

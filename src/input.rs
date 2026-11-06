@@ -4,9 +4,10 @@
 use smithay::{
     backend::{
         input::{
-            AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, InputBackend, InputEvent,
-            KeyState, KeyboardKeyEvent, MouseButton, PointerAxisEvent, PointerButtonEvent,
-            PointerMotionEvent,
+            AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, GestureBeginEvent,
+            GestureEndEvent, GestureSwipeUpdateEvent, InputBackend, InputEvent, KeyState,
+            KeyboardKeyEvent, MouseButton, PointerAxisEvent, PointerButtonEvent,
+            PointerMotionEvent, Switch, SwitchState, SwitchToggleEvent,
         },
         session::Session,
     },
@@ -66,7 +67,53 @@ pub fn binding(mods: &ModifiersState, sym: Keysym) -> Option<Binding> {
 impl Navi {
     pub fn process_input_event<I: InputBackend>(&mut self, event: InputEvent<I>) {
         self.last_activity = std::time::Instant::now();
+        self.screen_off = false;
+        self.sleep_requested = false;
         match event {
+            InputEvent::SwitchToggle { event, .. }
+                if event.switch() == Some(Switch::Lid) && event.state() == SwitchState::On =>
+            {
+                match self.desktop["lid_action"].as_str() {
+                    Some("lock") => self.request_lock(None),
+                    Some("suspend") if self.session.is_some() => {
+                        crate::settings::request_sleep(self)
+                    }
+                    _ => {}
+                }
+            }
+            InputEvent::GestureSwipeBegin { event, .. } => {
+                self.swipe = (event.fingers() == 3
+                    && self.desktop["swipe_moves"] == true
+                    && !self.lock.active
+                    && self.drag.is_none())
+                .then_some((0.0, 0.0));
+            }
+            InputEvent::GestureSwipeUpdate { event, .. } => {
+                if let Some((x, y)) = self.swipe.as_mut() {
+                    *x += event.delta_x();
+                    *y += event.delta_y();
+                }
+            }
+            InputEvent::GestureSwipeEnd { event, .. } => {
+                if let Some((x, y)) = self.swipe.take()
+                    && !event.cancelled()
+                    && !self.lock.active
+                    && x.abs().max(y.abs()) >= 80.0
+                    && let Some(id) = self.focused_tile()
+                {
+                    let side = if x.abs() > y.abs() {
+                        if x < 0.0 { Side::Left } else { Side::Right }
+                    } else if y < 0.0 {
+                        Side::Top
+                    } else {
+                        Side::Bottom
+                    };
+                    if self.layout.keyboard_adjust(id, side, false).is_some() {
+                        self.memory.sync(&self.layout);
+                        self.apply_layout();
+                    }
+                }
+            }
             InputEvent::Keyboard { event, .. } => {
                 self.keyboard_key(event.key_code(), event.state(), Event::time_msec(&event));
             }
@@ -142,6 +189,26 @@ impl Navi {
 
     /// A key (an xkb keycode), from a backend or the debug replay.
     pub fn keyboard_key(&mut self, code: Keycode, state: KeyState, time: u32) {
+        let (forward, releases) = if self.desktop["sticky_keys"] == true && !self.lock.active {
+            self.sticky.event(code.raw(), state == KeyState::Pressed)
+        } else {
+            (true, Vec::new())
+        };
+        if forward {
+            self.keyboard_key_inner(code, state, time);
+        }
+        for code in releases {
+            self.keyboard_key_inner(code.into(), KeyState::Released, time);
+        }
+    }
+    pub fn release_sticky(&mut self) {
+        let codes = std::mem::take(&mut self.sticky).latched;
+        self.swipe = None;
+        for code in codes {
+            self.keyboard_key_inner(code.into(), KeyState::Released, 0);
+        }
+    }
+    fn keyboard_key_inner(&mut self, code: Keycode, state: KeyState, time: u32) {
         self.request_redraw();
         let Some(kb) = self.seat.get_keyboard() else {
             return;
@@ -165,6 +232,15 @@ impl Navi {
                     };
                 }
                 let binding = binding(mods, key.modified_sym());
+                let binding = match binding {
+                    Some(Binding::Move(side)) if navi.desktop["move_modifier"] == "super" => {
+                        Some(Binding::Expand(side))
+                    }
+                    Some(Binding::Expand(side)) if navi.desktop["expand_modifier"] == "alt" => {
+                        Some(Binding::Move(side))
+                    }
+                    other => other,
+                };
                 if navi.lock.active && !matches!(binding, Some(Binding::Vt(_) | Binding::Lock)) {
                     if binding.is_some() || navi.suppressed.contains(&code) {
                         if !navi.suppressed.contains(&code) {
@@ -363,6 +439,70 @@ impl Navi {
                 self.apply_layout();
             }
         }
+    }
+}
+
+/// One-shot modifiers: tap a modifier, then press a key. Tap it again to release it.
+#[derive(Default)]
+pub struct Sticky {
+    held: Vec<(u32, bool)>,
+    latched: Vec<u32>,
+    ignored: Vec<u32>,
+}
+impl Sticky {
+    fn event(&mut self, code: u32, pressed: bool) -> (bool, Vec<u32>) {
+        if [50, 62, 37, 105, 64, 108, 133, 134].contains(&code) {
+            if pressed {
+                if let Some(at) = self.latched.iter().position(|c| *c == code) {
+                    self.latched.remove(at);
+                    self.ignored.push(code);
+                    return (false, vec![code]);
+                }
+                if !self.held.iter().any(|(c, _)| *c == code) {
+                    self.held.push((code, false));
+                }
+            } else {
+                if let Some(at) = self.ignored.iter().position(|c| *c == code) {
+                    self.ignored.remove(at);
+                    return (false, Vec::new());
+                }
+                if let Some(at) = self.held.iter().position(|(c, _)| *c == code) {
+                    let (_, used) = self.held.remove(at);
+                    if !used {
+                        self.latched.push(code);
+                        return (false, Vec::new());
+                    }
+                }
+            }
+            (true, Vec::new())
+        } else if pressed {
+            for (_, used) in &mut self.held {
+                *used = true;
+            }
+            (true, Vec::new())
+        } else {
+            (true, std::mem::take(&mut self.latched))
+        }
+    }
+}
+#[cfg(test)]
+mod accessibility_tests {
+    use super::*;
+    #[test]
+    fn sticky_keys_latch_once_toggle_and_preserve_held_chords() {
+        let mut s = Sticky::default();
+        assert_eq!(s.event(50, true), (true, vec![]));
+        assert_eq!(s.event(50, false), (false, vec![]));
+        assert_eq!(s.event(38, true), (true, vec![]));
+        assert_eq!(s.event(38, false), (true, vec![50]));
+        s.event(50, true);
+        s.event(50, false);
+        assert_eq!(s.event(50, true), (false, vec![50]));
+        assert_eq!(s.event(50, false), (false, vec![]));
+        s.event(37, true);
+        s.event(38, true);
+        assert_eq!(s.event(37, false), (true, vec![]));
+        assert_eq!(s.event(38, false), (true, vec![]));
     }
 }
 

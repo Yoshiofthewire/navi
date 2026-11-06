@@ -2,6 +2,7 @@
 
 mod activation;
 mod cursor;
+mod desktop_config;
 mod files;
 mod focus;
 mod image;

@@ -89,6 +89,7 @@ struct Screen {
     timed: bool,
     /// The last frame failed; logged once until one works.
     failing: bool,
+    off: bool,
 }
 
 /// Starts navi on the seat's primary GPU. Returns the cursor theme and size apps should use.
@@ -180,6 +181,7 @@ pub fn init(
                     _ => {}
                 }
                 data.state.process_input_event(ev);
+                render_all(data);
             },
         )
         .map_err(|e| format!("input: {e}"))?;
@@ -479,6 +481,7 @@ fn scan(data: &mut CalloopData) -> Result<usize, String> {
             queued_lock: None,
             timed: false,
             failing: false,
+            off: false,
         });
     }
 
@@ -547,6 +550,7 @@ fn scan(data: &mut CalloopData) -> Result<usize, String> {
         s.wallpaper = img.map(|i| Wallpaper::new(&i));
     }
     let n = udev.screens.len();
+    crate::settings::restore_outputs(data);
     if n > 0 {
         render_all(data);
     }
@@ -663,7 +667,12 @@ fn render(data: &mut CalloopData, crtc: crtc::Handle) {
             .map(|s| {
                 (
                     identity(&s.output),
-                    data.state.priority_of(&identity(&s.output)),
+                    data.state.priority_of(
+                        crate::settings::output_preferences(&s.output)
+                            .mirror
+                            .as_deref()
+                            .unwrap_or(&identity(&s.output)),
+                    ),
                 )
             })
             .collect();
@@ -676,6 +685,21 @@ fn render(data: &mut CalloopData, crtc: crtc::Handle) {
     let Some(s) = udev.screens.iter_mut().find(|s| s.crtc == crtc) else {
         return;
     };
+    if data.state.screen_off || !crate::settings::output_preferences(&s.output).enabled {
+        if s.queued {
+            s.queued_lock = None;
+        }
+        if !s.off && s.drm.with_compositor(|c| c.surface().clear()).is_ok() {
+            s.off = true;
+        }
+        s.queued = false;
+        return;
+    }
+    if s.off {
+        s.off = false;
+        s.drm.reset_buffers();
+        s.queued = false;
+    }
     if s.queued {
         return;
     }
@@ -691,10 +715,24 @@ fn render(data: &mut CalloopData, crtc: crtc::Handle) {
         }
     };
     let arrow = udev.pointer.as_ref().map_or(Arrow::Square, Arrow::Image);
+    let mirror = crate::settings::output_preferences(&s.output).mirror;
+    let source = if data.state.lock.active {
+        s.output.clone()
+    } else {
+        mirror
+            .and_then(|id| {
+                data.state
+                    .space
+                    .outputs()
+                    .find(|o| identity(o) == id)
+                    .cloned()
+            })
+            .unwrap_or_else(|| s.output.clone())
+    };
     let elements = render::elements(
         &mut renderer,
         &data.state,
-        &s.output,
+        &source,
         arrow,
         &mut s.wallpaper,
         &mut s.solids,
@@ -761,6 +799,15 @@ fn configure_input(
     device: &mut smithay::reexports::input::Device,
     p: &crate::settings::Preferences,
 ) {
+    let desktop =
+        crate::desktop_config::load().unwrap_or_else(|_| crate::desktop_config::defaults());
+    let _ = device.config_left_handed_set(desktop["left_handed"] == true);
+    let _ = device.config_dwt_set_enabled(desktop["disable_while_typing"] == true);
+    let _ = device.config_accel_set_profile(if desktop["flat_acceleration"] == true {
+        smithay::reexports::input::AccelProfile::Flat
+    } else {
+        smithay::reexports::input::AccelProfile::Adaptive
+    });
     let _ = device.config_accel_set_speed(p.pointer_speed);
     let _ = device.config_scroll_set_natural_scroll_enabled(p.natural_scroll);
     if device.config_tap_finger_count() > 0 {
@@ -768,7 +815,16 @@ fn configure_input(
     }
 }
 pub fn apply_input_preferences(data: &mut CalloopData) {
+    let scale = data
+        .state
+        .space
+        .outputs()
+        .map(|o| o.current_scale().fractional_scale())
+        .fold(1.0, f64::max)
+        .ceil();
+    let pointer = cursor::from_env(scale).map(|c| Pointer::new(&c, scale as i32));
     if let Some(udev) = data.udev.as_mut() {
+        udev.pointer = pointer;
         for device in &mut udev.input_devices {
             configure_input(device, &data.state.preferences);
         }
@@ -826,4 +882,56 @@ pub fn input_capabilities(data: &CalloopData) -> serde_json::Value {
 
 pub fn redraw(data: &mut CalloopData) {
     render_all(data);
+}
+
+pub fn outputs(data: &CalloopData) -> Vec<Output> {
+    data.udev
+        .as_ref()
+        .map(|u| u.screens.iter().map(|s| s.output.clone()).collect())
+        .unwrap_or_else(|| data.state.space.outputs().cloned().collect())
+}
+pub fn output_power(data: &mut CalloopData, output: &Output, enabled: bool) -> Result<(), String> {
+    let Some(screen) = data
+        .udev
+        .as_mut()
+        .and_then(|u| u.screens.iter_mut().find(|s| &s.output == output))
+    else {
+        return Ok(());
+    };
+    if !enabled {
+        screen.off = true;
+        screen
+            .drm
+            .with_compositor(|c| c.surface().clear())
+            .map_err(|_| "Display could not be powered off")?;
+    }
+    screen.queued = false;
+    screen.queued_lock = None;
+    screen.drm.reset_buffers();
+    Ok(())
+}
+pub fn vrr_supported(data: &CalloopData, output: &Output) -> bool {
+    data.udev
+        .as_ref()
+        .and_then(|u| u.screens.iter().find(|s| &s.output == output))
+        .is_some_and(|s| {
+            s.drm.with_compositor(|c| {
+                c.vrr_supported(s.connector)
+                    .is_ok_and(|v| !matches!(v, smithay::backend::drm::VrrSupport::NotSupported))
+            })
+        })
+}
+pub fn set_vrr(data: &mut CalloopData, output: &Output, enabled: bool) -> Result<(), String> {
+    if let Some(s) = data
+        .udev
+        .as_mut()
+        .and_then(|u| u.screens.iter_mut().find(|s| &s.output == output))
+        && s.drm.with_compositor(|c| c.vrr_enabled()) != enabled
+    {
+        s.drm
+            .with_compositor(|c| c.use_vrr(enabled))
+            .map_err(|_| "VRR could not be applied")?;
+        s.drm.reset_buffers();
+    }
+    Ok(())
 }

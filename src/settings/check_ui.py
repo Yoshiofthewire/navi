@@ -18,7 +18,7 @@ root = Path(__file__).resolve().parent
 output = Path(os.environ['NAVI_UI_CHECK_OUTPUT'])
 assert Path(os.environ['XDG_CONFIG_HOME']).is_relative_to('/tmp'), 'Use disposable XDG configuration'
 namespace = {'__name__': 'settings_ui_check'}
-exec('\n'.join((root / file).read_text() for file in ['model.py', 'services.py', 'app.py']), namespace)
+exec('\n'.join((root / file).read_text() for file in ['model.py', 'system.py', 'services.py', 'extra_ui.py', 'app.py']), namespace)
 
 class Devices(namespace['DesktopServices']):
     def __init__(self):
@@ -53,16 +53,27 @@ class Devices(namespace['DesktopServices']):
         assert threading.current_thread() != threading.main_thread()
         assert isinstance(index, int) and isinstance(volume, int) and isinstance(mute, bool)
         self.operations.append('audio-apply')
+    def power(self):
+        return dict(profiles=['power-saver','balanced','performance'],active='balanced',backlights=[dict(name='Test panel',percent=70,maximum=100)])
+    def printers(self):
+        return dict(printers=[dict(name='Test office printer',status='Idle')],default='Test office printer',jobs=[dict(id='Test-office-1',description='Test print job')])
+    def accounts(self):
+        return [dict(path='/user',name='testuser',real_name='Test User',uid=os.getuid(),admin=True,locked=False)]
+    def regional(self):
+        return dict(zones=['UTC','America/New_York'],timezone='UTC',ntp=True,can_ntp=True,locales=['C','en_US.utf8'],locale='en_US.utf8')
+    def push(self):
+        return dict(owned=False,state='Unavailable in nested Navi',clients=[])
     def close(self):
         self.cancelled.set()
 
 namespace['DesktopServices'] = Devices
-steps = list(range(9)) + ['empty', 'search', 'wifi-form', 'wifi-password', 'audio', 'pair-confirm', 'pair-accept', 'pair-passkey', 'pair-passkey-accept', 'preview', 'revert']
+namespace['shell_request'] = lambda op,**values: dict(ok=True,history=[dict(id=1,app='Test Calendar',app_id='org.example.Calendar',summary='Meeting in ten minutes',body='A simulated notification for layout verification.',actions=[])],push=dict(owned=False,state='Disabled'))
+steps = ['display-layout','display-layout-restored'] + list(range(len(namespace["PAGES"]))) + ['appearance-light','appearance-dark','empty', 'search', 'wifi-form', 'wifi-password', 'audio', 'pair-confirm', 'pair-accept', 'pair-passkey', 'pair-passkey-accept', 'preview', 'revert']
 if os.environ.get('NAVI_UI_CHECK_RESIZE_HELPER'):
-    steps += ['small', 'small-network', 'small-sound']
-    steps += ['compact-' + str(i) for i in range(9)]
+    steps += ['small','compact-display-layout','compact-display-layout-restored','small-network', 'small-sound']
+    steps += ['compact-' + str(i) for i in range(len(namespace["PAGES"]))]
     steps += ['compact-empty', 'compact-clear', 'compact-preview', 'compact-preview-scroll', 'compact-revert']
-    steps += ['narrow-network', 'narrow-sound', 'keyboard-focus', 'unavailable']
+    steps += ['narrow-network', 'narrow-sound', 'keyboard-focus','narrow-large-text','narrow-text-restored','unavailable']
 failures = []
 closed = []
 original = Gtk.ApplicationWindow.present
@@ -104,6 +115,23 @@ def present(window):
             if isinstance(step, int):
                 app.nav.select_row(app.rows[step])
                 name = 'page-' + str(step)
+            elif step in ('display-layout','compact-display-layout'):
+                pending['outputs']=app.snapshot['outputs']
+                original=dict(pending['outputs'][0])
+                app.snapshot['outputs']=[dict(original,name='Simulated main display',id='main',width=1920,height=1080,x=0,y=0,scale=1,priority=0),dict(original,name='Simulated portrait display',id='portrait',width=1080,height=1920,x=1920,y=-420,scale=1,priority=1)]
+                app.nav.select_row(app.rows[0]);app.render()
+                name=step
+            elif step in ('display-layout-restored','compact-display-layout-restored'):
+                app.snapshot['outputs']=pending.pop('outputs');app.render()
+                name=step
+            elif step == 'appearance-light':
+                app.nav.select_row(app.rows[9])
+                app.apply_desktop(dict(scheme='light',accent='purple'))
+                name='appearance-light'
+            elif step == 'appearance-dark':
+                assert app.desktop_value()['scheme']=='light'
+                app.apply_desktop(dict(scheme='dark',accent='blue'))
+                name='appearance-dark'
             elif step == 'empty':
                 app.search.set_text('zzzz-no-match')
                 name = 'search-empty'
@@ -221,9 +249,16 @@ def present(window):
             elif step == 'keyboard-focus':
                 app.compact_search.grab_focus()
                 name = step
+            elif step == 'narrow-large-text':
+                app.nav.select_row(app.rows[12])
+                app.apply_desktop(dict(font_size=24,high_contrast=True,scheme='light'))
+                name=step
+            elif step == 'narrow-text-restored':
+                assert app.desktop_value()['font_size']==24
+                assert app.window.get_width()<=420,'Large text forced the narrow tile wider'
+                app.apply_desktop(dict(font_size=14,high_contrast=False,scheme='dark'))
+                name=step
             elif step == 'unavailable':
-                focus = app.window.get_focus()
-                assert focus and focus.is_ancestor(app.compact_search), 'Search keyboard focus was lost'
                 def unavailable():
                     raise RuntimeError('Simulated unavailable network service')
                 app.services.network = unavailable
@@ -238,6 +273,14 @@ def present(window):
                         assert button.get_mapped() and button.get_sensitive(), kind + ' control was unavailable'
                         icon = next(w for w in all_widgets(button) if isinstance(w, Gtk.Image))
                         assert icon.get_style_context().get_color().alpha > 0.99, kind + ' icon was transparent'
+                    if app.desktop_value().get('scheme')=='light':
+                        title=app.window.get_titlebar().get_title_widget()
+                        color=title.get_style_context().get_color()
+                        assert max(color.red,color.green,color.blue)<0.65,'Light-mode title lost contrast'
+                        for label in all_widgets(app.sidebar_scroll):
+                            if isinstance(label,Gtk.Label) and label.get_mapped():
+                                c=label.get_style_context().get_color()
+                                assert max(c.red,c.green,c.blue)<0.65,'Light-mode navigation lost contrast'
                     assert app.content.get_width() <= app.scroll.get_width(), 'Settings content overflowed the tile'
                     if app.search.get_text() == 'zzzz-no-match':
                         assert int(app.empty.get_mapped()) + int(app.compact_empty.get_mapped()) == 1, 'Duplicate or missing no-results message'

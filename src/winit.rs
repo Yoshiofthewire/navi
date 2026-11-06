@@ -61,12 +61,13 @@ pub fn init(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (backend, winit) = winit::init::<GlesRenderer>()?;
     // Winit drops `CursorLeft`, so this arrow stays where the pointer left the window.
-    let cursor = cursor.map(|c| {
+    let mut cursor = cursor.map(|c| {
         // Winit sends the host `wl_pointer.set_cursor` with no surface on every pointer enter.
         backend.window().set_cursor_visible(false);
         info!("host cursor hidden over navi's window");
         Pointer::new(&c, 1)
     });
+    let mut cursor_settings = data.state.desktop.clone();
     let mode = Mode {
         size: backend.window_size(),
         refresh: 60_000,
@@ -154,6 +155,16 @@ pub fn init(
                 WinitEvent::Input(event) => state.process_input_event(event),
                 WinitEvent::Focus(false) => state.cancel_drag(),
                 WinitEvent::Redraw => {
+                    if state.desktop["cursor_theme"] != cursor_settings["cursor_theme"]
+                        || state.desktop["cursor_size"] != cursor_settings["cursor_size"]
+                    {
+                        cursor = crate::cursor::from_env(1.0).map(|c| Pointer::new(&c, 1));
+                        backend
+                            .borrow()
+                            .window()
+                            .set_cursor_visible(cursor.is_none());
+                        cursor_settings = state.desktop.clone();
+                    }
                     if wallpaper_epoch != state.wallpaper_epoch {
                         wallpaper = wallpaper::open(&[(NAME, 0)])[0]
                             .as_ref()

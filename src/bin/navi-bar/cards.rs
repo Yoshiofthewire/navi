@@ -8,7 +8,9 @@ use crate::theme::{ACCENT, BG, DIM, INK};
 pub const CARD_W: i32 = 360;
 const GAP: i32 = 8;
 const PAD: i32 = 8;
-pub const LINE_H: i32 = 20;
+fn line_h() -> i32 {
+    (crate::text_px() as i32 + 6).max(20)
+}
 const BODY_LINES: usize = 3;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -32,7 +34,7 @@ pub fn layout(notes: &[Note], advance: &impl Fn(char) -> Option<f32>) -> Vec<Car
                 true => Vec::new(),
                 false => wrap(&n.body, text_w, BODY_LINES, advance),
             };
-            let h = 2 * PAD + LINE_H * (2 + body.len() as i32);
+            let h = 2 * PAD + line_h() * (2 + body.len() as i32);
             let rect = Rect {
                 x: 0,
                 y,
@@ -63,25 +65,26 @@ pub fn hit(cards: &[Card], x: i32, y: i32) -> Option<u32> {
 }
 
 /// Back to front.
-pub fn draw(cards: &[Card]) -> Vec<Item> {
+pub fn draw(cards: &[Card], visual: bool) -> Vec<Item> {
+    let border = if visual { 3 } else { 1 };
     let mut out = Vec::new();
     for c in cards {
         let r = c.rect;
         out.push(Item::Fill(r, ACCENT));
         out.push(Item::Fill(
             Rect {
-                x: r.x + 1,
-                y: r.y + 1,
-                w: r.w - 2,
-                h: r.h - 2,
+                x: r.x + border,
+                y: r.y + border,
+                w: r.w - 2 * border,
+                h: r.h - 2 * border,
             },
             BG,
         ));
         let line = |k: i32| Rect {
             x: r.x + PAD,
-            y: r.y + PAD + k * LINE_H,
+            y: r.y + PAD + k * line_h(),
             w: r.w - 2 * PAD,
-            h: LINE_H,
+            h: line_h(),
         };
         out.push(Item::Text(c.app.clone(), line(0), DIM));
         out.push(Item::Text(c.summary.clone(), line(1), INK));
@@ -154,13 +157,15 @@ mod tests {
             app: "App".into(),
             summary: "Hi".into(),
             body: body.into(),
+            app_id: String::new(),
+            actions: Vec::new(),
             expires_ms: 0,
         }
     }
 
     #[test]
     fn ac9_stacked_newest_first() {
-        let one_line = 2 * PAD + 3 * LINE_H;
+        let one_line = 2 * PAD + 3 * line_h();
         for n in 1..=3 {
             let notes: Vec<Note> = (0..n).map(|k| note(10 - k, "body")).collect();
             let cards = layout(&notes, &adv);
@@ -181,7 +186,10 @@ mod tests {
             );
         }
         // No body: app name and summary only.
-        assert_eq!(layout(&[note(1, "")], &adv)[0].rect.h, 2 * PAD + 2 * LINE_H);
+        assert_eq!(
+            layout(&[note(1, "")], &adv)[0].rect.h,
+            2 * PAD + 2 * line_h()
+        );
     }
 
     #[test]
@@ -197,8 +205,8 @@ mod tests {
         let long = wrap(&"x".repeat(50), 344.0, 3, &adv);
         assert_eq!(long.iter().map(|l| l.len()).collect::<Vec<_>>(), [34, 16]);
         let cards = layout(&[note(1, &body)], &adv);
-        assert_eq!(cards[0].rect.h, 2 * PAD + 5 * LINE_H);
-        let items = draw(&cards);
+        assert_eq!(cards[0].rect.h, 2 * PAD + 5 * line_h());
+        let items = draw(&cards, false);
         assert!(items.contains(&Item::Text(
             "App".into(),
             Rect {
