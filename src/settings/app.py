@@ -758,8 +758,9 @@ def run_settings():
                 box.append(self.label('PEAP / MSCHAPv2. Your server’s domain is required for certificate verification.', 'muted'))
                 for key,title in [('identity','Enterprise identity'),('domain','Authentication server domain'),('certificate','CA certificate path (optional)')]:
                     box.append(self.label(title));entry=Gtk.Entry();self.name_control(entry,title);box.append(entry);enterprise_fields[key]=entry
-            remember = Gtk.CheckButton(label='Remember this network and password', active=True)
+            remember = Gtk.CheckButton(label='Remember this network', active=True)
             box.append(remember)
+            box.append(self.label('Saved passwords use oo7. Uncheck Remember to connect without saving a password.', 'muted'))
             problem = self.label('', 'error')
             problem.set_visible(False)
             box.append(problem)

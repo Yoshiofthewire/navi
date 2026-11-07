@@ -39,6 +39,8 @@ def wifi_security(properties):
 def wifi_profile(ssid, security, password, remember, username, hidden=False, enterprise=None):
     if not 1 <= len(ssid) <= 32:
         raise ValueError('A Wi-Fi network name must contain 1–32 bytes.')
+    if '\x00' in password:
+        raise ValueError('A network password cannot contain a null character.')
     if security not in ('open', 'wpa-psk', 'sae', 'owe', 'enterprise'):
         raise ValueError('This security type needs a provisioned NetworkManager profile.')
     if security in ('wpa-psk', 'sae'):
@@ -56,7 +58,7 @@ def wifi_profile(ssid, security, password, remember, username, hidden=False, ent
     if security != 'open':
         profile['802-11-wireless-security'] = {'key-mgmt': ('s', security)}
         if security in ('wpa-psk', 'sae'):
-            profile['802-11-wireless-security'].update({'psk': ('s', password), 'psk-flags': ('u', 0 if remember else 2)})
+            profile['802-11-wireless-security'].update({'psk': ('s', password), 'psk-flags': ('u', 1 if remember else 2)})
     if security == 'enterprise':
         identity = (enterprise or {}).get('identity','').strip()
         domain = (enterprise or {}).get('domain','').strip()
@@ -67,7 +69,7 @@ def wifi_profile(ssid, security, password, remember, username, hidden=False, ent
             raise ValueError('Choose your organization’s CA certificate, or leave it empty to use system trust.')
         profile['802-11-wireless-security'] = {'key-mgmt':('s','wpa-eap')}
         profile['802-1x'] = {'eap':('as',['peap']), 'phase2-auth':('s','mschapv2'),'identity':('s',identity),
-            'password':('s',password),'password-flags':('u',0 if remember else 2),'domain-suffix-match':('s',domain),
+            'password':('s',password),'password-flags':('u',1 if remember else 2),'domain-suffix-match':('s',domain),
             'system-ca-certs':('b',not bool(certificate))}
         if certificate:
             profile['802-1x']['ca-cert']=('ay',list(('file://'+certificate+'\x00').encode()))
@@ -88,6 +90,8 @@ class DesktopServices(SystemServices):
         self.blue_owner = None
         self.pairing_device = None
         self.agent_device = None
+        self._secret_lock = threading.Lock()
+        self._secret_cancel = None
 
     @property
     def bus(self):
@@ -176,18 +180,68 @@ class DesktopServices(SystemServices):
     def forget_network(self, profile):
         self.call(NM, profile, NM + '.Settings.Connection', 'Delete')
 
+    def store_network_secret(self, profile):
+        """Stage a new user-owned credential before NetworkManager changes any profile."""
+        try:
+            import gi
+            gi.require_version('Secret', '1')
+            from gi.repository import Gio, Secret
+        except (ImportError, ValueError):
+            raise RuntimeError('Install libsecret with its Python introspection bindings to save passwords in oo7.') from None
+        with self._secret_lock:
+            if self.cancelled.is_set():
+                raise RuntimeError('Settings is closing; no connection was saved.')
+            if self._secret_cancel is None:
+                self._secret_cancel = Gio.Cancellable()
+            cancel = self._secret_cancel
+        try:
+            from gi.repository import GLib
+            bus = Gio.bus_get_sync(Gio.BusType.SESSION, cancel)
+            def owner(name):
+                return bus.call_sync('org.freedesktop.DBus', '/org/freedesktop/DBus', 'org.freedesktop.DBus',
+                    'GetNameOwner', GLib.Variant('(s)', (name,)), None, Gio.DBusCallFlags.NO_AUTO_START, 3000, cancel).unpack()[0]
+            unique = owner('org.freedesktop.secrets')
+            pid = bus.call_sync('org.freedesktop.DBus', '/org/freedesktop/DBus', 'org.freedesktop.DBus',
+                'GetConnectionUnixProcessID', GLib.Variant('(s)', (unique,)), None,
+                Gio.DBusCallFlags.NO_AUTO_START, 3000, cancel).unpack()[0]
+            if Path(os.readlink('/proc/' + str(pid) + '/exe')).name != 'oo7-daemon':
+                raise RuntimeError('oo7 is not the current Secret Service')
+            # Presence is only a preflight. NM itself accepts/chooses fully registered agents.
+            owner('org.freedesktop.network-manager-applet')
+        except Exception:
+            raise RuntimeError('Saving passwords needs oo7 and network-manager-applet in a full Navi session. An existing keyring is left unchanged; uncheck Remember for a temporary connection.') from None
+        try:
+            # A unique owner prevents a provider switch from redirecting this write.
+            vault = Secret.Service.open_sync(Secret.Service.__gtype__, unique, Secret.ServiceFlags.OPEN_SESSION, cancel)
+            vault.set_default_timeout(8000)
+            schema = Secret.Schema.new('org.freedesktop.NetworkManager.Connection', Secret.SchemaFlags.DONT_MATCH_NAME,
+                {k: Secret.SchemaAttributeType.STRING for k in ('connection-uuid', 'setting-name', 'setting-key')})
+            section, key = ('802-1x', 'password') if '802-1x' in profile else ('802-11-wireless-security', 'psk')
+            secret = profile[section][key][1]
+            attributes = {'connection-uuid': profile['connection']['uuid'][1], 'setting-name': section, 'setting-key': key}
+            if not vault.store_sync(schema, attributes, Secret.COLLECTION_DEFAULT, 'Network connection password',
+                                    Secret.Value.new(secret, -1, 'text/plain'), cancel):
+                raise RuntimeError('Secret Service did not save the password')
+            # Never send a remembered password as a NetworkManager profile property. The
+            # registered native agent retrieves the staged item through libsecret instead.
+            del profile[section][key]
+        except Exception:
+            raise RuntimeError('oo7 could not save the password. Unlock the keyring and try again; no NetworkManager profile was changed.') from None
+
     def connect_network(self, device, profile=None, network=None, password='', remember=True, hidden=False, enterprise=None):
         from gi.repository import GLib
+        settings = {}
+        specific = '/'
+        if not profile and network:
+            spec = wifi_profile(network['ssid'], network['security'], password, remember, GLib.get_user_name(), hidden, enterprise)
+            if remember and network['security'] in ('wpa-psk', 'sae', 'enterprise'):
+                self.store_network_secret(spec)
+            settings = {section: {key: GLib.Variant(signature, value) for key, (signature, value) in values.items()} for section, values in spec.items()}
+            specific = network.get('path', '/')
         try:
             if profile:
                 active = self.call(NM, NM_ROOT, NM, 'ActivateConnection', '(ooo)', (profile, device, network['path'] if network else '/'))[0]
             else:
-                settings = {}
-                specific = '/'
-                if network:
-                    spec = wifi_profile(network['ssid'], network['security'], password, remember, GLib.get_user_name(), hidden, enterprise)
-                    settings = {section: {key: GLib.Variant(signature, value) for key, (signature, value) in values.items()} for section, values in spec.items()}
-                    specific = network.get('path', '/')
                 active = self.call(NM, NM_ROOT, NM, 'AddAndActivateConnection2', '(a{sa{sv}}ooa{sv})',
                                    (settings, device, specific, {'persist': GLib.Variant('s', 'disk' if remember else 'volatile')}))[1]
             deadline = time.monotonic() + 45
@@ -304,6 +358,9 @@ class DesktopServices(SystemServices):
 
     def close(self):
         self.cancelled.set()
+        with self._secret_lock:
+            if self._secret_cancel is not None:
+                self._secret_cancel.cancel()
         if self._bus is None:
             return
         from gi.repository import Gio

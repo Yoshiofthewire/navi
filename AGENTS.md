@@ -9,13 +9,16 @@ Settings scope, configuration and the per-instance settings protocol.
 ## Local contracts
 
 - Keep login authentication in swaylock/PAM. Settings has no unlock operation and accepts no
-  login passwords. NetworkManager owns Wi-Fi credential storage.
+  login passwords. NetworkManager owns connection profiles; new remembered Wi-Fi passwords use
+  oo7 through libsecret and a native NM agent.
 - Keep Settings isolated from compositor GUI dependencies; native GTK runs only while open.
 - Display changes retain an independent compositor timeout and restore on failure. Nested
   tests affect only their own Navi output; system-device controls explicitly name their scope.
 - Settings requests are bounded data, use private runtime sockets, reject changes while locked,
   and preserve malformed configuration. Device controls use native services; audio arguments are
   bounded and never evaluated by a shell. Wi-Fi passwords use D-Bus, and pairing checks the BlueZ owner.
+- Secrets: never replace an existing provider or edit PAM automatically. Read `docs/secrets.md`
+  before changing vault startup, saved network secrets or the private-bus checks.
 - Reuse `/home/yoshi/git/navi/target` for local Cargo across worktrees, with four jobs and
   6 GiB/no-swap systemd scopes on this host.
 

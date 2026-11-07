@@ -188,3 +188,17 @@ Optional services/tools: `kunifiedpush`, `canberra-gtk-play`, CUPS clients, Acco
 power-profiles-daemon and a Polkit agent; install only what you use. Navi does not install or
 activate these system services for you. The UnifiedPush child contacts a provider only after
 explicit opt-in in a full session.
+
+### Passwords and keys
+
+Navi uses **oo7 with libsecret** for application secrets and newly remembered Wi-Fi
+passwords. A standard NetworkManager applet agent retrieves those passwords on reconnect;
+NetworkManager profiles carry agent-owned flags, with no embedded remembered password.
+Existing profiles keep their storage. Uncheck Remember for an unsaved connection.
+
+For a full session on Arch, install `oo7 libsecret gcr network-manager-applet`.
+On Debian/Ubuntu install `libsecret-1-0 libsecret-tools gir1.2-secret-1 gcr network-manager-gnome`
+and a supported oo7 daemon package/build (the distro Rust source package alone is insufficient).
+Nested Navi leaves the host's vault untouched. Full sessions never replace an existing
+provider; no login password is collected by Navi and no PAM configuration is installed.
+See [setup, unlock behavior and isolated checks](docs/secrets.md).

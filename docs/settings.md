@@ -107,7 +107,7 @@ commands, arbitrary config destinations or unlock operation. Requests and image 
 on one worker with I/O deadlines; geometry changes run on the compositor event loop. Changes
 are refused while locked. The app uses a worker pool and GTK's main-loop callbacks so queries
 do not block interaction. Only explicit controls change system devices. Audio uses fixed native commands and typed arguments;
-network credentials never enter process arguments or application logs.
+network credentials never enter process arguments or application logs. New remembered Wi-Fi passwords are staged in oo7 through owner-bound libsecret; NetworkManager receives agent-owned flags without password properties. A native NetworkManager applet agent retrieves them on reconnect. Existing profiles retain their storage; temporary connections remain unsaved. See [secrets setup and verification](secrets.md).
 
 Shell history/actions use the per-instance `io.github.Yoshiofthewire.Navi.Shell.d<display-hex>`
 D-Bus name on a connection separate from `org.freedesktop.Notifications`. A sandbox granted

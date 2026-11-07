@@ -129,11 +129,112 @@ fn configure_push(pid: u32, settings: &Value) -> Result<(), String> {
     run().map_err(|_| "Waiting for the owned distributor’s provider configuration".into())
 }
 
+/// These are user-session services, never started by a nested desktop. No replacement
+/// flags, login passwords, or shell evaluation; an existing provider/app stays untouched.
+fn start_secrets(full_session: bool) -> (Option<Child>, Option<Child>) {
+    if !full_session {
+        return (None, None);
+    }
+    let (mut vault, mut agent) = (None, None);
+    let mut run = || -> zbus::Result<()> {
+        let conn = Builder::session()?
+            .method_timeout(Duration::from_secs(2))
+            .build()?;
+        let bus = Proxy::new(
+            &conn,
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+        )?;
+        if !bus.call::<_, _, bool>("NameHasOwner", &("org.freedesktop.secrets",))? {
+            let path = ["/usr/lib/oo7-daemon", "/usr/libexec/oo7-daemon"]
+                .into_iter()
+                .find(|p| std::path::Path::new(p).is_file());
+            vault = path.and_then(spawn_service);
+            if vault.is_none() {
+                tracing::warn!("secrets: install oo7 for application and saved Wi-Fi passwords");
+                return Ok(());
+            }
+            for _ in 0..40 {
+                if bus.call::<_, _, bool>("NameHasOwner", &("org.freedesktop.secrets",))? {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+        agent = if let Ok(owner) =
+            bus.call::<_, _, String>("GetNameOwner", &("org.freedesktop.secrets",))
+        {
+            let pid: u32 = bus.call("GetConnectionUnixProcessID", &(&owner,))?;
+            let oo7 = std::fs::read_link(format!("/proc/{pid}/exe"))
+                .ok()
+                .is_some_and(|p| p.file_name() == Some(std::ffi::OsStr::new("oo7-daemon")));
+            if oo7
+                && !bus.call::<_, _, bool>(
+                    "NameHasOwner",
+                    &("org.freedesktop.network-manager-applet",),
+                )?
+            {
+                let child = spawn_service("/usr/bin/nm-applet");
+                if child.is_none() {
+                    tracing::warn!(
+                        "secrets: install network-manager-applet for Wi-Fi keyring retrieval"
+                    );
+                }
+                child
+            } else {
+                if !oo7 {
+                    tracing::warn!("secrets: another provider is running; it remains unchanged");
+                }
+                None
+            }
+        } else {
+            None
+        };
+        Ok(())
+    };
+    if run().is_err() {
+        tracing::warn!("secrets: session service setup unavailable");
+    }
+    // Retain any child even if a later D-Bus query fails, so logout still reaps it.
+    (vault, agent)
+}
+
+fn spawn_service(path: &str) -> Option<Child> {
+    let mut command = Command::new(path);
+    if path.ends_with("/oo7-daemon") {
+        use std::os::unix::fs::DirBuilderExt;
+        let data = files::xdg_dir(
+            std::env::var_os("XDG_DATA_HOME").as_deref(),
+            std::env::var_os("HOME").as_deref(),
+            ".local/share",
+        )?
+        .join("navi/secrets");
+        // Starting oo7 must not discover/import an existing GNOME/KWallet data store.
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&data)
+            .ok()?;
+        command.env("XDG_DATA_HOME", data);
+    }
+    command
+        .env_remove("LIBNM_USE_SESSION_BUS")
+        .env_remove("WAYLAND_SOCKET")
+        .env_remove("NAVI_CONTROL_FD")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()
+}
+
 pub fn watch(tx: Sender<Call>, full_session: bool) -> Runtime {
     let (stop_tx, stop_rx) = mpsc::channel();
     let status = Arc::new(Mutex::new(json!({"owned":false,"state":"Disabled"})));
     let state = status.clone();
     let worker = std::thread::spawn(move || {
+        let (mut vault, mut network_agent) = start_secrets(full_session);
         let mut authentication = if full_session {
             [
                 "/usr/lib/polkit-kde-authentication-agent-1",
@@ -223,6 +324,8 @@ pub fn watch(tx: Sender<Call>, full_session: bool) -> Runtime {
         }
         stop(&mut child);
         stop(&mut authentication);
+        stop(&mut network_agent);
+        stop(&mut vault);
     });
     Runtime {
         status,
@@ -292,5 +395,14 @@ pub fn play(settings: &Value, event: &str) {
         });
     } else {
         SOUND_BUSY.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn nested_never_starts_secret_services() {
+        let (vault, agent) = super::start_secrets(false);
+        assert!(vault.is_none() && agent.is_none());
     }
 }
