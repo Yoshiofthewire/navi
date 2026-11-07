@@ -78,6 +78,48 @@ class SystemTests(unittest.TestCase):
             service.add_printer('office','ipps://printer.local/ipp/print')
             self.assertEqual(tool.call_args.args,('lpadmin','-p','office','-E','-v','ipps://printer.local/ipp/print','-m','everywhere'))
 
+    def test_remembered_wifi_is_staged_before_nm_and_never_serializes_the_password(self):
+        service = model.DesktopServices()
+        order, calls = [], []
+        def stage(profile):
+            order.append('store')
+            self.assertEqual(profile['802-11-wireless-security']['psk-flags'], ('u', 1))
+            self.assertEqual(profile['802-11-wireless-security']['psk'], ('s', 'dummy-passphrase'))
+            del profile['802-11-wireless-security']['psk']
+        def call(*args):
+            order.append('activate');calls.append(args)
+            return ('/profile','/active',{})
+        service.store_network_secret = stage
+        service.call = call
+        service.properties = lambda *args: {'State':2}
+        service.connect_network('/device', network=dict(ssid=b'Fixture',security='wpa-psk',path='/ap'),password='dummy-passphrase')
+        self.assertEqual(order, ['store','activate'])
+        values=calls[0][-1][0]
+        self.assertNotIn('psk', values['802-11-wireless-security'])
+        self.assertEqual(values['802-11-wireless-security']['psk-flags'].unpack(), 1)
+        self.assertNotIn('dummy-passphrase', repr(values))
+
+    def test_failed_vault_save_does_not_create_or_activate_any_nm_profile(self):
+        service = model.DesktopServices()
+        service.store_network_secret = lambda _: (_ for _ in ()).throw(RuntimeError('Unlock oo7 and try again'))
+        with patch.object(service,'call') as call:
+            with self.assertRaisesRegex(RuntimeError,'oo7'):
+                service.connect_network('/device',network=dict(ssid=b'Fixture',security='wpa-psk',path='/ap'),password='dummy-passphrase')
+            call.assert_not_called()
+
+    def test_temporary_wifi_bypasses_the_keyring_and_enterprise_uses_agent_owned_secrets(self):
+        service = model.DesktopServices()
+        service.properties = lambda *args: {'State':2}
+        with patch.object(service,'store_network_secret') as store, patch.object(service,'call',return_value=('/profile','/active',{})) as call:
+            service.connect_network('/device',network=dict(ssid=b'Fixture',security='wpa-psk',path='/ap'),password='dummy-passphrase',remember=False)
+            store.assert_not_called()
+            profile=call.call_args.args[-1][0]
+            self.assertEqual(profile['802-11-wireless-security']['psk-flags'].unpack(),2)
+            self.assertEqual(call.call_args.args[-1][-1]['persist'].unpack(),'volatile')
+        profile=model.wifi_profile(b'Office','enterprise','dummy-password',True,'alice',enterprise=dict(identity='alice',domain='radius.example.org'))
+        self.assertEqual(profile['802-1x']['password-flags'],('u',1))
+        with self.assertRaises(ValueError):model.wifi_profile(b'Fixture','wpa-psk','bad\0password',True,'alice')
+
     def test_new_pages_are_searchable(self):
         for term, title in [('unifiedpush','Notifications'),('accent','Appearance'),('cups','Printers'),('locale','Date, Time & Language'),('administrator','Accounts')]:
             self.assertIn(title,[model.PAGES[i][0] for i in model.matching_pages(term)])

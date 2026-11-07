@@ -467,3 +467,11 @@ optional UnifiedPush, event sounds, accessibility, printers, local accounts and 
 Networking and Bluetooth use native NetworkManager/BlueZ
 controls, while audio uses native pactl operations; defaults use GIO and About reports real system information. See [Settings](settings.md)
 for scope, protocol boundaries, unavailable controls and the surface direction contract.
+
+### Secret storage
+
+Application secrets use the external oo7 service through standard libsecret. Full-session
+helpers and newly remembered Wi-Fi storage follow [Secrets](secrets.md); credentials never
+enter compositor settings/JSON, argv or logs. The Wi-Fi dialog distinguishes remembering a
+network from an unsaved connection and states that saved passwords use oo7. Existing
+providers and saved network profiles are not migrated by Navi.

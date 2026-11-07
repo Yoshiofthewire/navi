@@ -16,7 +16,9 @@
   and no shell; Wi-Fi passwords travel only through NetworkManager D-Bus, never logs or argv.
 - Use Gio's native application associations and file picker; preserve keyboard and accessibility
   support supplied by the toolkit.
-- NetworkManager owns Wi-Fi credential storage. Clear password widgets after submission/cancel.
+- NetworkManager owns profiles; new remembered protected Wi-Fi secrets must be stored in
+  oo7/libsecret before profile creation, with agent-owned flags and no password property.
+  Clear password widgets after submission/cancel.
   Only the current BlueZ bus owner may invoke pairing prompts for the explicitly requested device.
   Keep pairing confirmations explicit and cancel requests on app closure. Swaylock owns login authentication.
 

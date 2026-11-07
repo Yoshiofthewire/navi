@@ -53,6 +53,22 @@ remembered. Maximized/fullscreen windows keep their geometry. Floating dialogs a
 surfaces keep their app shortcuts. When testing nested, the host compositor may reserve these
 chords before Navi receives them; a full Navi session receives them directly.
 
+## Passwords and application secrets
+
+Full Navi sessions start an installed oo7 Secret Service and the standard NetworkManager
+applet agent, when no existing provider/applet owns their names. Only Navi-owned children
+are stopped on exit. Nested sessions start neither helper. Applications use libsecret;
+new remembered protected Wi-Fi passwords use the same vault before NetworkManager creates
+a profile. Missing/locked storage produces an actionable error, with temporary connections
+still available.
+
+Install oo7, libsecret (including Python introspection), the native GCR prompter, and
+network-manager-applet. The daemon started by Navi uses a private
+`$XDG_DATA_HOME/navi/secrets` data home so it does not discover/import existing keyring
+files. A preexisting oo7 service retains its own data location. Navi does not enable a
+global user service, replace KWallet/gnome-keyring, or alter PAM. Native graphical/PAM
+unlock setup and distro package details are in [Secrets](secrets.md).
+
 ## Power and session menu
 
 Click **Navi** at the upper left of the status bar for **Sleep**, **Lock Screen**, **Switch User**,
