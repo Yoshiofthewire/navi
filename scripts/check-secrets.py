@@ -175,10 +175,15 @@ def inside(args):
             os.close(write_fd)
             with os.fdopen(read_fd) as reader:env['DISPLAY']=':'+reader.readline().strip()
             env['GDK_BACKEND']='x11'
-            applet=subprocess.Popen([str(args.nm_applet)],env=env,stdout=log,stderr=log)
+            # GTK needs the system MIME database/icon assets (Ubuntu's indicator path
+            # aborts without PNG type discovery). Only the applet gets these read-only
+            # resources; the bus activation directories and vault data remain private.
+            applet_env=dict(env,XDG_DATA_DIRS='/usr/local/share:/usr/share')
+            applet=subprocess.Popen([str(args.nm_applet)],env=applet_env,stdout=log,stderr=log)
             wait(lambda: bool(registrations) or applet.poll() is not None,'Native agent did not register',15)
             assert registrations and applet.poll() is None,'Native agent failed registration; inspect services.log'
             for security in ('wpa-psk','sae','enterprise'):
+                print('Checking native agent: '+security,flush=True)
                 enterprise=dict(identity='dummy-user',domain='radius.example.org') if security=='enterprise' else None
                 service.connect_network('/org/freedesktop/NetworkManager/Devices/1',network={'ssid':b'Private fixture','security':security,'path':'/'},password=secret,remember=True,enterprise=enterprise)
                 profile=observed[-1]

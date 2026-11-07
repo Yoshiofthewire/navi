@@ -41,7 +41,7 @@ jobs:
       - name: Real oo7, libsecret and native NetworkManager agent (private bus/display)
         run: |
           navi_test_daemon=$(bash scripts/build-oo7-test.sh)
-          python3 scripts/check-secrets.py --daemon "$navi_test_daemon" --nm-applet /usr/bin/nm-applet --xvfb /usr/bin/Xvfb
+          python3 scripts/check-secrets.py --daemon "$navi_test_daemon" --nm-applet /usr/bin/nm-applet --xvfb /usr/bin/Xvfb --output "$RUNNER_TEMP/navi-secrets-check"
       - name: Settings model checks
         run: python3 -m unittest discover -s src/settings -p 'test_*.py'
       - run: cargo fmt --check
@@ -67,3 +67,13 @@ jobs:
           echo "exit status $code, uid $(id -u)"
           test "$code" = 1
           grep -F 'navi: cannot start on real hardware:' err.txt
+      - name: Preserve isolated secrets diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: secrets-check-diagnostics
+          path: |
+            ${{ runner.temp }}/navi-secrets-check/services.log
+            ${{ runner.temp }}/navi-secrets-check/results.json
+          if-no-files-found: ignore
+          retention-days: 7
