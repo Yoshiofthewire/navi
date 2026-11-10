@@ -374,6 +374,10 @@ def run_settings():
             self.row_box = None
             self.setting_rows = []
             self.display_targets = []
+            self.fields = []
+            self.primary = None
+            self.monitor_targets = []
+            self.drag_monitor = None
             self.content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
             self.content.add_css_class("page")
             self.scroll.set_child(self.content)

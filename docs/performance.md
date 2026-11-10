@@ -79,3 +79,39 @@ holding a window to form tabs, and X11 animation. An X11 gears window rendered 2
 four seconds; closing it returned the desktop to zero frames over a subsequent four seconds.
 A separate unchanged-desktop check saw zero new frames over five seconds. These frame-count
 checks used debug logging, separately from the resource samples.
+
+## Settings memory (2026-11-10)
+
+The shipped Settings default is Cairo. On Usagi at 1280 × 800, the release entrypoint
+settled at 73.6 MiB PSS (96.8 MiB RSS) on Displays, with about 0.20% of one CPU core
+over a 20-second idle sample. Explicitly selecting `GSK_RENDERER=gl` used 244.3 MiB PSS
+in the same nested test. The earlier approximately 242 MiB OpenGL measurement does not
+describe the default renderer. Renderer overrides remain supported.
+
+Rebuilding Displays leaked its monitor diagram: the drag controller's callback captured
+the widget that owned the controller. The callback now gets the widget from the gesture.
+Leaving or rebuilding a page also clears the saved display fields, primary selector,
+monitor hit targets and active drag, so hidden controls can be released.
+
+A separate Cairo native-fixture stress run rebuilt Displays 1,000 times, sampling `/proc`
+and Python widget counts. Both runs used the same private nested configuration and simulated
+services, with no screenshots or input replay. They ran sequentially; swapped PSS was zero.
+
+| After 1,000 rebuilds | Before | After |
+| --- | ---: | ---: |
+| Live monitor diagrams | 1,001 | 1 |
+| Settings fixture PSS | 70.50 MiB | 66.16 MiB |
+| Settings fixture RSS | 96.43 MiB | 91.17 MiB |
+| PSS growth from rebuild 500 to 1,000 | 2.58 MiB | 0.12 MiB |
+
+This prevents continuing retention; it does not establish a lower fresh-open footprint.
+The fixture and packaged application have different startup overhead, and PSS varies with
+shared libraries and residency. GPU memory is excluded. Real device operations and hardware
+sessions were not benchmarked.
+
+`src/settings/check_ui.py` includes a native lifetime regression: rebuild Displays 50 times,
+simulate retained drag state, leave the page, and assert that every retired diagram's native
+weak reference is dead. It fails on the original code. To increase its stress count, set
+`NAVI_UI_CHECK_REFRESHES=1000` when running the disposable native UI check described in
+[Settings validation](settings.md#validation). Its screenshots are for behavior verification,
+not idle performance measurement.
