@@ -138,8 +138,8 @@ pub struct Navi {
     pub(crate) exclusive: crate::focus::Exclusive<WlSurface, Window>,
     /// navi's last return of the keyboard from a layer to a window, until focus moves again.
     pub(crate) handback: Option<(WlSurface, WlSurface)>,
-    /// The window that held the keyboard when a layer last took it by a click.
-    before_layer: Option<Window>,
+    /// The window that held the keyboard when a click gave it to a layer.
+    before_layer: crate::focus::BeforeLayer<Window>,
 
     compositor_state: CompositorState,
     xdg_shell_state: XdgShellState,
@@ -247,7 +247,7 @@ impl Navi {
             super_tap: Default::default(),
             exclusive: Default::default(),
             handback: None,
-            before_layer: None,
+            before_layer: Default::default(),
             seat_state,
             popups: PopupManager::default(),
             seat,
@@ -573,9 +573,7 @@ impl Navi {
                 t.send_pending_configure();
             }
         });
-        if let Some(w) = self.focused_window() {
-            self.before_layer = Some(w);
-        }
+        self.before_layer.took(self.focused_window());
         let focus = Some(format!("layer {}", layer.namespace()));
         info!(?focus, "keyboard focus");
         kb.set_focus(
@@ -1338,7 +1336,7 @@ impl CompositorHandler for Navi {
                 // before that click.
                 let window = self
                     .focused_window()
-                    .or_else(|| self.before_layer.clone().filter(|_| focused));
+                    .or_else(|| self.before_layer.window().filter(|_| focused));
                 let space = &self.space;
                 let handoff = self.exclusive.commit(
                     surface.clone(),
@@ -1545,6 +1543,10 @@ impl SeatHandler for Navi {
     fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&Focus>) {
         let surface = focused.and_then(Focus::surface);
         self.handback = activation::after_focus_change(self.handback.take(), surface.as_ref());
+        let to_layer = surface
+            .as_ref()
+            .is_some_and(|s| self.layer_output(s).is_some());
+        self.before_layer.moved(to_layer);
         let dh = &self.display_handle;
         let client = (!self.lock.active)
             .then_some(focused)

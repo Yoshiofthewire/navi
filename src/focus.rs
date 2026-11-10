@@ -144,9 +144,58 @@ impl<L: PartialEq, W> Exclusive<L, W> {
     }
 }
 
+/// The window that held the keyboard when a click gave it to a layer, kept only while layers
+/// hold the keyboard: a pointer-opened menu returns it there, never to a window left since.
+#[derive(Debug)]
+pub struct BeforeLayer<W>(Option<W>);
+
+impl<W> Default for BeforeLayer<W> {
+    fn default() -> Self {
+        Self(None)
+    }
+}
+
+impl<W: Clone> BeforeLayer<W> {
+    /// A click gives a layer the keyboard; `focused` is the toplevel that had it, if any.
+    pub fn took(&mut self, focused: Option<W>) {
+        self.0 = focused;
+    }
+
+    /// The keyboard moved: forgotten unless it went to a layer.
+    pub fn moved(&mut self, to_layer: bool) {
+        if !to_layer {
+            self.0 = None;
+        }
+    }
+
+    pub fn window(&self) -> Option<W> {
+        self.0.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn before_layer_never_names_a_window_left_since() {
+        let mut b = BeforeLayer::default();
+        // Window 7 focused, then a click on the taskbar.
+        b.took(Some(7));
+        b.moved(true);
+        assert_eq!(b.window(), Some(7));
+        // Then a click on empty space (nobody), then the taskbar again from nobody.
+        b.moved(false);
+        assert_eq!(b.window(), None);
+        b.took(None);
+        b.moved(true);
+        assert_eq!(b.window(), None, "not the window the user left");
+        // Window 8 focused, the taskbar clicked, then the user clicked window 9.
+        b.took(Some(8));
+        b.moved(true);
+        b.moved(false);
+        assert_eq!(b.window(), None);
+    }
 
     const BAR: u8 = 1;
     const SHOWN: fn(&u32) -> bool = |_| true;
