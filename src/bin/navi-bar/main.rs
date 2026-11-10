@@ -9,6 +9,8 @@ mod files;
 mod image;
 #[path = "../../theme.rs"]
 mod theme;
+#[path = "../../utility_theme.rs"]
+mod utility_theme;
 
 mod cards;
 #[path = "../../control.rs"]

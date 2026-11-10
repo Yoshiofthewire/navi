@@ -22,7 +22,7 @@ jobs:
         with:
           persist-credentials: false
       # Xwayland probes EGL even when the headless integration test uses software rendering.
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libxkbcommon-dev libwayland-dev pkg-config libudev-dev libinput-dev libseat-dev libgbm-dev libdrm-dev xwayland libegl1 swaylock meson ninja-build wayland-protocols libcairo2-dev libpam0g-dev curl patch python3-gi gir1.2-gtk-4.0 dbus-daemon xdg-dbus-proxy libsecret-tools gir1.2-secret-1 network-manager-gnome xvfb gettext
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libxkbcommon-dev libwayland-dev pkg-config libudev-dev libinput-dev libseat-dev libgbm-dev libdrm-dev xwayland libegl1 libgl1-mesa-dri libegl-mesa0 swaylock meson ninja-build wayland-protocols libcairo2-dev libgtk-3-dev libpam0g-dev curl patch python3-gi gir1.2-gtk-4.0 gir1.2-gtk-3.0 librsvg2-common adwaita-icon-theme shared-mime-info fonts-noto-core thunar dbus-daemon xdg-dbus-proxy libsecret-tools gir1.2-secret-1 network-manager-gnome xvfb gettext
       - name: Rust toolchain
         id: toolchain
         run: |
@@ -56,6 +56,19 @@ jobs:
       - name: Eight-slice locker protocol handshake
         run: NAVI_TEST_SWAYLOCK="$PWD/target/debug/navi-swaylock" cargo test --locked locking::tests::swaylock_real_client_handshake -- --ignored
       - run: cargo build --locked
+      - name: Native utility themes and real Thunar operations (private bus/display)
+        run: python3 scripts/check-utilities.py --output "$RUNNER_TEMP/navi-utility-check"
+      - name: Preserve native utility evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: native-utility-check
+          path: |
+            ${{ runner.temp }}/navi-utility-check/*.png
+            ${{ runner.temp }}/navi-utility-check/results.json
+            ${{ runner.temp }}/navi-utility-check/services.log
+          if-no-files-found: ignore
+          retention-days: 7
       # No display and no seat: navi must take the real-hardware path and exit 1 with its
       # message, not hang (124), panic (101) or succeed.
       - name: Fail-safe smoke

@@ -38,9 +38,6 @@ def run_settings():
             css = """
                 window { background: #0b0d12; color: #d0d4dc; font-family: 'Noto Sans', sans-serif; font-size: 14px; }
                 window label, window image, headerbar label, .sidebar label, .sidebar image, spinbutton button image { color: #d0d4dc; }
-                window.csd { border: 1px solid #7a8396; box-shadow: none; }
-                headerbar { background: #151922; border-bottom: 1px solid #262c38; box-shadow: none; min-height: 44px; }
-                headerbar label { font-weight: 600; }
                 .sidebar { background: #151922; padding: 16px 12px; border-right: 1px solid #262c38; }
                 .sidebar list { background: transparent; }
                 .sidebar row { background: transparent; padding: 11px 10px; border-radius: 8px; margin-bottom: 4px; }
@@ -67,8 +64,6 @@ def run_settings():
                 button:hover { background-color: #303847; }
                 button:active { background-color: #151922; }
                 button:disabled { background-color: #151922; color: #a4adbd; border-color: #303847; }
-                headerbar button { background: transparent; border-color: transparent; padding: 4px 8px; }
-                headerbar button:hover { background: #262c38; }
                 /* Breeze hides these icons in favor of background images, which we replace. */
                 headerbar windowcontrols button image { color: #d0d4dc; }
                 entry, spinbutton { background: #0b0d12; color: #d0d4dc; border: 1px solid #7a8396; border-radius: 8px; min-height: 36px; box-shadow: none; }
@@ -100,6 +95,7 @@ def run_settings():
                 button:focus-visible, entry:focus-within, spinbutton:focus-within, dropdown:focus-visible, switch:focus-visible, scale:focus-visible, .sidebar row:focus-visible { outline: 2px solid #2ba3d8; outline-offset: 2px; }
                 selection { background: #2ba3d8; color: #0b0d12; }
             """
+            css += os.environ.get('NAVI_WINDOW_CHROME', globals().get('WINDOW_CHROME_CSS', ''))
             self.base_css = css
             self.css_provider = provider
             for old, new in json.loads(os.environ.get("NAVI_SETTINGS_COLORS", "{}")).items():
