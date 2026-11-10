@@ -68,7 +68,7 @@ class Devices(namespace['DesktopServices']):
 
 namespace['DesktopServices'] = Devices
 namespace['shell_request'] = lambda op,**values: dict(ok=True,history=[dict(id=1,app='Test Calendar',app_id='org.example.Calendar',summary='Meeting in ten minutes',body='A simulated notification for layout verification.',actions=[])],push=dict(owned=False,state='Disabled'))
-steps = ['display-layout','display-layout-restored'] + list(range(len(namespace["PAGES"]))) + ['appearance-light','appearance-dark','empty', 'search', 'wifi-form', 'wifi-password', 'audio', 'pair-confirm', 'pair-accept', 'pair-passkey', 'pair-passkey-accept', 'preview', 'revert']
+steps = ['display-layout','display-layout-restored','diagram-lifetime'] + list(range(len(namespace["PAGES"]))) + ['appearance-light','appearance-dark','empty', 'search', 'wifi-form', 'wifi-password', 'audio', 'pair-confirm', 'pair-accept', 'pair-passkey', 'pair-passkey-accept', 'preview', 'revert']
 if os.environ.get('NAVI_UI_CHECK_RESIZE_HELPER'):
     steps += ['small','compact-display-layout','compact-display-layout-restored','small-network', 'small-sound']
     steps += ['compact-' + str(i) for i in range(len(namespace["PAGES"]))]
@@ -123,6 +123,23 @@ def present(window):
                 name=step
             elif step in ('display-layout-restored','compact-display-layout-restored'):
                 app.snapshot['outputs']=pending.pop('outputs');app.render()
+                name=step
+            elif step == 'diagram-lifetime':
+                diagram = next(w for w in all_widgets(app.content) if isinstance(w, Gtk.DrawingArea))
+                gesture = next(c for c in diagram.observe_controllers() if isinstance(c, Gtk.GestureDrag))
+                fields, (x, y, width, height) = app.monitor_targets[0]
+                start = fields['x'].get_value()
+                gesture.emit('drag-begin', x + width / 2, y + height / 2)
+                gesture.emit('drag-update', 20 * app.monitor_factor, 0.0)
+                assert fields['x'].get_value() == round((start + 20) / 20) * 20, 'Monitor drag stopped updating its position'
+                pending['diagrams'] = []
+                for _ in range(int(os.environ.get("NAVI_UI_CHECK_REFRESHES", "50"))):
+                    pending['diagrams'].extend(w.weak_ref() for w in all_widgets(app.content) if isinstance(w, Gtk.DrawingArea))
+                    app.render()
+                # Include fields retained by an in-progress monitor drag.
+                app.drag_monitor = (app.fields[0], 0, 0)
+                pending['diagrams'].extend(w.weak_ref() for w in all_widgets(app.content) if isinstance(w, Gtk.DrawingArea))
+                app.nav.select_row(app.rows[1])
                 name=step
             elif step == 'appearance-light':
                 app.nav.select_row(app.rows[9])
@@ -266,6 +283,8 @@ def present(window):
                 name = step
             def capture():
                 try:
+                    if step == 'diagram-lifetime':
+                        assert all(ref() is None for ref in pending.pop('diagrams')), 'Retired display diagrams are still alive'
                     border = window.get_style_context().get_border()
                     assert min(border.top, border.right, border.bottom, border.left) >= 1, 'Settings frame was missing'
                     for kind in ('minimize', 'maximize', 'close'):

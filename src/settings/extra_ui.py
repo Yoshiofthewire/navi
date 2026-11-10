@@ -91,13 +91,14 @@ def expanded_settings(Gtk, Gdk, Gio, GLib):
             def begin(_,x,y):
                 self.drag_monitor=next(((f,f['x'].get_value(),f['y'].get_value()) for f,(a,b,w,h) in reversed(self.monitor_targets) if a<=x<a+w and b<=y<b+h),None)
                 self.drag_factor=getattr(self,'monitor_factor',1)
-            def update(_,dx,dy):
+            def update(gesture,dx,dy):
                 item=getattr(self,'drag_monitor',None)
                 if item:
                     fields,x,y=item
                     fields['x'].set_value(round((x+dx/self.drag_factor)/20)*20)
                     fields['y'].set_value(round((y+dy/self.drag_factor)/20)*20)
-                    diagram.queue_draw()
+                    # The controller owns this callback; capturing its widget leaks each diagram.
+                    gesture.get_widget().queue_draw()
             drag.connect('drag-begin',begin);drag.connect('drag-update',update)
             diagram.add_controller(drag)
             return diagram
