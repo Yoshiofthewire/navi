@@ -88,6 +88,13 @@ fn keep(
     binding.filter(|_| usable).map(Some)
 }
 
+/// Whether a key press lifts the fullscreen re-entry guard on the window it reached: only a
+/// non-modifier key that navi forwarded. A bare Super, the first half of the next Super+Esc,
+/// must not let the app back into fullscreen. A delivered button press always lifts it.
+pub fn lifts_guard(sym: Keysym, forwarded: bool) -> bool {
+    forwarded && !sym.is_modifier_key()
+}
+
 /// The output Super+Esc ends fullscreen on, if a window is fullscreen there: the focused
 /// window's (`focused` is its tile, a dialog's parent's), else the one under the pointer.
 pub fn escape_output(
@@ -252,6 +259,7 @@ impl Navi {
             return;
         };
         let vt = self.session.is_some();
+        let mut sym = Keysym::NoSymbol;
         let kept = kb.input::<Option<Binding>, _>(
             self,
             code,
@@ -269,7 +277,8 @@ impl Navi {
                         None => FilterResult::Forward,
                     };
                 }
-                let binding = binding(mods, key.modified_sym());
+                sym = key.modified_sym();
+                let binding = binding(mods, sym);
                 // Move/Expand are remapped; Super+Esc and Super+L never are.
                 let binding = match binding {
                     Some(Binding::Move(side)) if navi.desktop["move_modifier"] == "super" => {
@@ -301,7 +310,7 @@ impl Navi {
                 }
             },
         );
-        if kept.is_none() && state == KeyState::Pressed {
+        if state == KeyState::Pressed && lifts_guard(sym, kept.is_none()) {
             let focus = kb.current_focus().and_then(|f| f.surface());
             self.user_pressed(focus);
         }
@@ -695,5 +704,30 @@ mod tests {
         assert_eq!(keep(None, true, false, true), None);
         // A held key stays navi's until released.
         assert_eq!(keep(None, false, true, true), Some(None));
+    }
+
+    #[test]
+    fn only_a_forwarded_non_modifier_key_lifts_the_escape_guard() {
+        // Bare modifiers reach the app but never lift it: Super (Super+Esc's first half, and
+        // a bare tap that may open the menu), Alt, Ctrl, Shift, AltGr and the locks.
+        for sym in [
+            Keysym::Super_L,
+            Keysym::Super_R,
+            Keysym::Alt_L,
+            Keysym::Control_R,
+            Keysym::Shift_L,
+            Keysym::ISO_Level3_Shift,
+            Keysym::Caps_Lock,
+            Keysym::Num_Lock,
+        ] {
+            assert!(!lifts_guard(sym, true), "{sym:?}");
+        }
+        // Keys navi kept: Super+Esc itself and the window shortcuts.
+        assert!(!lifts_guard(Keysym::Escape, false));
+        assert!(!lifts_guard(Keysym::Right, false));
+        assert!(!lifts_guard(Keysym::l, false));
+        // An ordinary key the app received.
+        assert!(lifts_guard(Keysym::a, true));
+        assert!(lifts_guard(Keysym::Escape, true));
     }
 }

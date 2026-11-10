@@ -147,8 +147,8 @@ space when you want it.
   minimized, when a new window opens on that monitor, when another window there is
   activated, or when the user presses Super+Esc on that monitor (the focused window's, else the
   pointer's); the window goes back to its tile. navi keeps Super+Esc from apps while it acts on
-  it. A window left by Super+Esc can't go fullscreen again until the user next presses a key
-  or button on it. Its dialogs still float over it.
+  it. A window left by Super+Esc can't go fullscreen again until the user next types a
+  non-modifier key into it or clicks it; Super, Alt, Ctrl, Shift and the lock keys don't count. Its dialogs still float over it.
 
 ## Monitors
 
