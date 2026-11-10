@@ -117,6 +117,7 @@ impl Navi {
             tile,
             last_size: x.geometry().size,
             want_fullscreen: false,
+            escaped: false,
             x11_parent,
         });
         self.apply_layout();
@@ -288,7 +289,14 @@ impl XwmHandler for Navi {
         self.x11_request(&x, Layout::unmaximize);
     }
     fn fullscreen_request(&mut self, _: XwmId, x: X11Surface) {
-        self.x11_request(&x, Layout::fullscreen);
+        let id = self
+            .windows
+            .iter()
+            .find(|m| m.window.x11_surface() == Some(&x))
+            .and_then(|m| m.tile);
+        if !self.refuse_escaped(id) {
+            self.x11_request(&x, Layout::fullscreen);
+        }
     }
     fn unfullscreen_request(&mut self, _: XwmId, x: X11Surface) {
         self.x11_request(&x, Layout::unfullscreen);
@@ -871,6 +879,99 @@ mod tests {
             !d.state.layout.is_fullscreen(id)
         });
         assert_eq!(surface.geometry().size, (rect.w, rect.h).into());
+        // Super+Esc ends it without the app; Esc never reaches the app.
+        request(1);
+        pump(&mut event_loop, &mut data, |d| {
+            d.state.layout.is_fullscreen(id)
+        });
+        for (code, state) in [
+            (133u32, KeyState::Pressed),
+            (9, KeyState::Pressed),
+            (9, KeyState::Released),
+            (133, KeyState::Released),
+        ] {
+            data.state.keyboard_key(code.into(), state, 6);
+        }
+        assert!(!data.state.layout.is_fullscreen(id));
+        assert!(data.state.suppressed.is_empty());
+        pump(&mut event_loop, &mut data, |_| {
+            surface.geometry().size == (rect.w, rect.h).into()
+        });
+        // A fullscreen request, then a title change that the XWM handles after it, in order:
+        // once the title shows, the request has been decided.
+        let mut asks = 0;
+        let mut ask = |event_loop: &mut EventLoop<CalloopData>, data: &mut CalloopData| {
+            asks += 1;
+            let title = format!("ask {asks}");
+            request(1);
+            conn.change_property8(PropMode::REPLACE, window, name, utf8, title.as_bytes())
+                .unwrap();
+            conn.flush().unwrap();
+            pump(event_loop, data, |_| {
+                metadata.read(&mut queue);
+                metadata.titles.last() == Some(&title)
+            });
+            data.state.layout.is_fullscreen(id)
+        };
+        // Its next request is refused, also after a bare Super tap: that is the first half of
+        // the next Super+Esc, and the app does see it.
+        assert!(!ask(&mut event_loop, &mut data), "re-entry refused");
+        data.state.keyboard_key(133u32.into(), KeyState::Pressed, 7);
+        data.state
+            .keyboard_key(133u32.into(), KeyState::Released, 7);
+        assert!(
+            !ask(&mut event_loop, &mut data),
+            "bare Super doesn't lift the guard"
+        );
+        // A second Super+Esc, with nothing fullscreen, is still navi's: kept from the app (the
+        // leak check below covers keycode 9) and no lift.
+        for (code, state) in [
+            (133u32, KeyState::Pressed),
+            (9, KeyState::Pressed),
+            (9, KeyState::Released),
+            (133, KeyState::Released),
+        ] {
+            data.state.keyboard_key(code.into(), state, 7);
+        }
+        assert!(data.state.suppressed.is_empty());
+        assert!(
+            !ask(&mut event_loop, &mut data),
+            "a second Super+Esc doesn't lift the guard"
+        );
+        // A key press it receives lifts the guard.
+        data.state.keyboard_key(38u32.into(), KeyState::Pressed, 7);
+        data.state.keyboard_key(38u32.into(), KeyState::Released, 8);
+        let mut key = false;
+        pump(&mut event_loop, &mut data, |_| {
+            while let Some(event) = conn.poll_for_event().unwrap() {
+                if let Event::KeyPress(event) | Event::KeyRelease(event) = event {
+                    assert_ne!(event.detail, 9, "Super+Esc leaked to client");
+                    key |= event.detail == 38;
+                }
+            }
+            key
+        });
+        assert!(
+            ask(&mut event_loop, &mut data),
+            "a typed key lifts the guard"
+        );
+        // So does a click on it, after another escape.
+        for (code, state) in [
+            (133u32, KeyState::Pressed),
+            (9, KeyState::Pressed),
+            (9, KeyState::Released),
+            (133, KeyState::Released),
+        ] {
+            data.state.keyboard_key(code.into(), state, 9);
+        }
+        assert!(!ask(&mut event_loop, &mut data), "refused again");
+        data.state.pointer_button(0x110, true, true, 10);
+        data.state.pointer_button(0x110, true, false, 11);
+        assert!(ask(&mut event_loop, &mut data), "a click lifts the guard");
+        request(0);
+        pump(&mut event_loop, &mut data, |d| {
+            !d.state.layout.is_fullscreen(id)
+        });
         let wm_id = data.state.xwm.as_ref().unwrap().id();
         assert!(
             data.state
@@ -1077,6 +1178,25 @@ mod tests {
                 .is_none()
         );
         assert!(data.state.space.element_location(&dialog_window).is_some());
+        // Super+Esc from the parent's focused dialog acts on the parent's output, with the
+        // pointer off every output so only the dialog's parent can decide.
+        let output = data.state.layout.tile(id).unwrap().output.clone();
+        data.state.focus(Some(dialog_window.clone()));
+        assert_eq!(data.state.focused_tile(), None);
+        data.state.pointer_motion((-50.0, -50.0).into(), 12);
+        assert!(data.state.layout.fullscreen(id));
+        data.state.apply_layout();
+        assert_eq!(data.state.escape_target(), Some(output));
+        data.state
+            .keyboard_key(133u32.into(), KeyState::Pressed, 13);
+        data.state.keyboard_key(9u32.into(), KeyState::Pressed, 13);
+        assert!(!data.state.layout.is_fullscreen(id));
+        assert_eq!(data.state.escape_target(), None);
+        data.state.keyboard_key(9u32.into(), KeyState::Released, 13);
+        data.state
+            .keyboard_key(133u32.into(), KeyState::Released, 13);
+        assert!(data.state.suppressed.is_empty());
+        data.state.pointer_motion((80.0, 80.0).into(), 14);
         data.state.layout.minimize(id);
         data.state.apply_layout();
         assert!(data.state.space.element_location(&dialog_window).is_none());

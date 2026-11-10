@@ -1,5 +1,5 @@
-//! Input from either backend. navi keeps quit/VT bindings and focused-window move/expand
-//! shortcuts before clients see them.
+//! Input from either backend. navi keeps quit/VT bindings, the fullscreen escape and
+//! focused-window move/expand shortcuts before clients see them.
 
 use smithay::{
     backend::{
@@ -21,7 +21,7 @@ use smithay::{
 use tracing::{info, warn};
 
 use crate::{
-    layout::{Action, Done, Drag, Rect, Side},
+    layout::{Action, Done, Drag, Layout, Rect, Side, WinId},
     monitors,
     state::{Navi, identity, px},
 };
@@ -34,13 +34,19 @@ pub enum Binding {
     Vt(i32),
     Move(Side),
     Expand(Side),
+    LeaveFullscreen,
 }
 
-/// Quit/VT bindings, Alt+Arrow to move, and Super+Arrow to expand. Extra modifiers on the
-/// window shortcuts are left for apps, including Ctrl+Alt+Arrow and Alt+Shift+Arrow.
+/// Quit/VT bindings, Super+L, Super+Esc, Alt+Arrow to move, and Super+Arrow to expand. Extra
+/// modifiers on the window shortcuts are left for apps, including Ctrl+Alt+Arrow and
+/// Alt+Shift+Arrow.
 pub fn binding(mods: &ModifiersState, sym: Keysym) -> Option<Binding> {
-    if mods.logo && !mods.ctrl && !mods.alt && !mods.shift && sym == Keysym::l {
-        return Some(Binding::Lock);
+    if mods.logo && !mods.ctrl && !mods.alt && !mods.shift {
+        match sym {
+            Keysym::l => return Some(Binding::Lock),
+            Keysym::Escape => return Some(Binding::LeaveFullscreen),
+            _ => {}
+        }
     }
     if mods.ctrl && mods.alt {
         let vt = sym.raw().wrapping_sub(Keysym::XF86_Switch_VT_1.raw());
@@ -62,6 +68,46 @@ pub fn binding(mods: &ModifiersState, sym: Keysym) -> Option<Binding> {
         (false, false, true, false) => Some(Binding::Expand(side)),
         _ => None,
     }
+}
+
+/// Whether a key press is navi's: `Some(binding to act on)` keeps it from apps, `None` forwards
+/// it. `held`: navi kept this key's earlier press. `usable`: the binding can act right now.
+/// While locked every binding but VT and Lock is swallowed without acting.
+fn keep(
+    binding: Option<Binding>,
+    locked: bool,
+    held: bool,
+    usable: bool,
+) -> Option<Option<Binding>> {
+    if locked && !matches!(binding, Some(Binding::Vt(_) | Binding::Lock)) {
+        return (binding.is_some() || held).then_some(None);
+    }
+    if held {
+        return Some(binding);
+    }
+    binding.filter(|_| usable).map(Some)
+}
+
+/// Whether a key press lifts the fullscreen re-entry guard on the window it reached: only a
+/// non-modifier key that navi forwarded and that is no navi chord. A bare Super, or any part of
+/// the next Super+Esc, must not let the app back into fullscreen. A delivered button press
+/// always lifts it.
+pub fn lifts_guard(sym: Keysym, binding: Option<Binding>, forwarded: bool) -> bool {
+    forwarded && binding.is_none() && !sym.is_modifier_key()
+}
+
+/// The output Super+Esc ends fullscreen on, if a window is fullscreen there: the focused
+/// window's (`focused` is its tile, a dialog's parent's), else the one under the pointer.
+pub fn escape_output(
+    layout: &Layout,
+    focused: Option<WinId>,
+    pointer: Option<&str>,
+) -> Option<String> {
+    let output = match focused {
+        Some(id) => &layout.tile(id)?.output,
+        None => pointer?,
+    };
+    layout.fullscreen_on(output).then(|| output.to_string())
 }
 
 impl Navi {
@@ -214,6 +260,7 @@ impl Navi {
             return;
         };
         let vt = self.session.is_some();
+        let (mut sym, mut chord) = (Keysym::NoSymbol, None);
         let kept = kb.input::<Option<Binding>, _>(
             self,
             code,
@@ -231,7 +278,9 @@ impl Navi {
                         None => FilterResult::Forward,
                     };
                 }
-                let binding = binding(mods, key.modified_sym());
+                sym = key.modified_sym();
+                let binding = binding(mods, sym);
+                // Move/Expand are remapped; Super+Esc and Super+L never are.
                 let binding = match binding {
                     Some(Binding::Move(side)) if navi.desktop["move_modifier"] == "super" => {
                         Some(Binding::Expand(side))
@@ -241,35 +290,48 @@ impl Navi {
                     }
                     other => other,
                 };
-                if navi.lock.active && !matches!(binding, Some(Binding::Vt(_) | Binding::Lock)) {
-                    if binding.is_some() || navi.suppressed.contains(&code) {
-                        if !navi.suppressed.contains(&code) {
+                chord = binding;
+                let usable = match binding {
+                    Some(Binding::Vt(_)) => vt,
+                    Some(Binding::Move(_) | Binding::Expand(_)) => {
+                        navi.focused_tile().is_some() && navi.drag.is_none()
+                    }
+                    _ => true,
+                };
+                // Once a press is ours, repeats and release remain ours.
+                let held = navi.suppressed.contains(&code);
+                match keep(binding, navi.lock.active, held, usable) {
+                    Some(b) => {
+                        if !held {
                             navi.suppressed.push(code);
                         }
-                        return FilterResult::Intercept(None);
-                    }
-                    return FilterResult::Forward;
-                }
-                // Once a press is ours, repeats and release remain ours.
-                if navi.suppressed.contains(&code) {
-                    return FilterResult::Intercept(binding);
-                }
-                match binding {
-                    Some(Binding::Vt(_)) if !vt => FilterResult::Forward,
-                    Some(Binding::Move(_) | Binding::Expand(_))
-                        if navi.focused_tile().is_none() || navi.drag.is_some() =>
-                    {
-                        FilterResult::Forward
-                    }
-                    Some(b) => {
-                        navi.suppressed.push(code);
-                        FilterResult::Intercept(Some(b))
+                        FilterResult::Intercept(b)
                     }
                     None => FilterResult::Forward,
                 }
             },
         );
+        if state == KeyState::Pressed && lifts_guard(sym, chord, kept.is_none()) {
+            let focus = kb.current_focus().and_then(|f| f.surface());
+            self.user_pressed(focus);
+        }
         match kept.flatten() {
+            Some(Binding::LeaveFullscreen) => {
+                let ended = self
+                    .escape_target()
+                    .map(|o| self.layout.unfullscreen_output(&o))
+                    .unwrap_or_default();
+                for &id in &ended {
+                    info!(id, by = "keyboard", "fullscreen escape");
+                    if let Some(m) = self.windows.iter_mut().find(|m| m.tile == Some(id)) {
+                        m.want_fullscreen = false;
+                        m.escaped = true;
+                    }
+                }
+                if !ended.is_empty() {
+                    self.apply_layout();
+                }
+            }
             Some(Binding::Lock) => self.request_lock(None),
             Some(Binding::Quit) => {
                 info!("quit: Ctrl+Alt+Backspace");
@@ -413,6 +475,9 @@ impl Navi {
             }
         }
         self.edge_clicks = Default::default();
+        if pressed {
+            self.user_pressed(pointer.current_focus());
+        }
         let state = match pressed {
             true => ButtonState::Pressed,
             false => ButtonState::Released,
@@ -561,5 +626,121 @@ mod tests {
                 assert_eq!(binding(&mods, sym), expected, "{sym:?}, mask {mask}");
             }
         }
+    }
+
+    fn masks() -> impl Iterator<Item = (u8, ModifiersState)> {
+        (0..16).map(|mask| {
+            let mods = ModifiersState {
+                ctrl: mask & 1 != 0,
+                alt: mask & 2 != 0,
+                logo: mask & 4 != 0,
+                shift: mask & 8 != 0,
+                ..Default::default()
+            };
+            (mask, mods)
+        })
+    }
+
+    #[test]
+    fn super_escape_is_only_super_escape() {
+        for (mask, mods) in masks() {
+            let expected = (mask == 4).then_some(Binding::LeaveFullscreen);
+            assert_eq!(binding(&mods, Keysym::Escape), expected, "mask {mask}");
+        }
+        let logo = masks().nth(4).unwrap().1;
+        assert_eq!(binding(&logo, Keysym::l), Some(Binding::Lock));
+    }
+
+    /// Yoshi's ultrawide and the 4K above it, with a window on each.
+    fn two_outputs() -> (Layout, WinId, WinId) {
+        let out = |name: &str, y, w, h| crate::layout::Output {
+            name: name.into(),
+            area: Rect { x: 0, y, w, h },
+            full: Rect { x: 0, y, w, h },
+            priority: 0,
+        };
+        let mut l = Layout::default();
+        l.set_outputs(vec![out("uw", 2160, 3440, 1440), out("4k", 0, 3840, 2160)]);
+        let (uw, _) = l.place("a", (100, 2200)).unwrap();
+        let (k, _) = l.place("b", (100, 100)).unwrap();
+        assert_eq!(l.tile(uw).unwrap().output, "uw");
+        assert_eq!(l.tile(k).unwrap().output, "4k");
+        (l, uw, k)
+    }
+
+    #[test]
+    fn escape_acts_on_the_focused_monitor() {
+        let (mut l, uw, k) = two_outputs();
+        assert!(l.fullscreen(k));
+        // Focused window (or a dialog's parent tile) on the fullscreen output: intercept.
+        assert_eq!(escape_output(&l, Some(k), Some("uw")), Some("4k".into()));
+        // Focused window elsewhere: forward, whatever the pointer says.
+        assert_eq!(escape_output(&l, Some(uw), Some("4k")), None);
+        assert!(l.is_fullscreen(k));
+        // No focused toplevel: the pointer's output decides.
+        assert_eq!(escape_output(&l, None, Some("4k")), Some("4k".into()));
+        assert_eq!(escape_output(&l, None, Some("uw")), None);
+        assert_eq!(escape_output(&l, None, None), None);
+        // Nothing fullscreen: forward.
+        assert!(l.unfullscreen(k));
+        assert_eq!(escape_output(&l, Some(k), Some("4k")), None);
+    }
+
+    #[test]
+    fn locked_super_escape_is_swallowed_and_does_nothing() {
+        let esc = Some(Binding::LeaveFullscreen);
+        // Unlocked: acts when usable, else reaches the app.
+        assert_eq!(keep(esc, false, false, true), Some(esc));
+        assert_eq!(keep(esc, false, false, false), None);
+        // Locked: kept from every client, acted on by nobody.
+        for usable in [true, false] {
+            assert_eq!(keep(esc, true, false, usable), Some(None));
+            assert_eq!(keep(esc, true, true, usable), Some(None));
+        }
+        // The lock still lets VT and Lock act, and other keys through.
+        assert_eq!(
+            keep(Some(Binding::Lock), true, false, true),
+            Some(Some(Binding::Lock))
+        );
+        assert_eq!(keep(None, true, false, true), None);
+        // A held key stays navi's until released.
+        assert_eq!(keep(None, false, true, true), Some(None));
+    }
+
+    #[test]
+    fn only_a_forwarded_non_modifier_key_lifts_the_escape_guard() {
+        // Bare modifiers reach the app but never lift it: Super (Super+Esc's first half, and
+        // a bare tap that may open the menu), Alt, Ctrl, Shift, AltGr and the locks.
+        for sym in [
+            Keysym::Super_L,
+            Keysym::Super_R,
+            Keysym::Alt_L,
+            Keysym::Control_R,
+            Keysym::Shift_L,
+            Keysym::ISO_Level3_Shift,
+            Keysym::Caps_Lock,
+            Keysym::Num_Lock,
+        ] {
+            assert!(!lifts_guard(sym, None, true), "{sym:?}");
+        }
+        // Keys navi kept: Super+Esc itself and the window shortcuts.
+        let esc = Some(Binding::LeaveFullscreen);
+        assert!(!lifts_guard(Keysym::Escape, esc, false));
+        assert!(!lifts_guard(
+            Keysym::Right,
+            Some(Binding::Move(Side::Right)),
+            false
+        ));
+        assert!(!lifts_guard(Keysym::l, Some(Binding::Lock), false));
+        // A navi chord that reached the app anyway (Alt+Right with no focused tile).
+        assert!(!lifts_guard(
+            Keysym::Right,
+            Some(Binding::Move(Side::Right)),
+            true
+        ));
+        assert!(!lifts_guard(Keysym::Escape, esc, true));
+        // An ordinary key the app received, a bare Esc included.
+        assert!(lifts_guard(Keysym::a, None, true));
+        assert!(lifts_guard(Keysym::Escape, None, true));
     }
 }
