@@ -50,7 +50,7 @@ pub fn contrast(a: u32, b: u32) -> f32 {
 // Packed, immutable per-frame palette choices; no file reads in painting paths.
 static APPEARANCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
-pub fn configure(settings: &serde_json::Value) {
+fn flags(settings: &serde_json::Value) -> u32 {
     let accent = match settings["accent"].as_str() {
         Some("green") => 1,
         Some("purple") => 2,
@@ -58,14 +58,24 @@ pub fn configure(settings: &serde_json::Value) {
         Some("pink") => 4,
         _ => 0,
     };
-    let flags = accent
+    accent
         | (u32::from(settings["scheme"] == "light") << 4)
-        | (u32::from(settings["high_contrast"] == true) << 5);
-    APPEARANCE.store(flags, std::sync::atomic::Ordering::Relaxed);
+        | (u32::from(settings["high_contrast"] == true) << 5)
+}
+
+pub fn configure(settings: &serde_json::Value) {
+    APPEARANCE.store(flags(settings), std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn resolve_for(settings: &serde_json::Value, color: u32) -> u32 {
+    resolve_flags(color, flags(settings))
 }
 
 pub fn resolve(color: u32) -> u32 {
-    let flags = APPEARANCE.load(std::sync::atomic::Ordering::Relaxed);
+    resolve_flags(color, APPEARANCE.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+fn resolve_flags(color: u32, flags: u32) -> u32 {
     let light = flags & 16 != 0;
     let high = flags & 32 != 0;
     if color == ACCENT {

@@ -321,8 +321,10 @@ don't affect navi's MIT licence.
   from `kdeglobals` `[Sounds]`, cursor from `kcminputrc` `[Mouse]`. This is a one-time copy into
   navi's config, so Plasma users keep the look they chose. Icons already read KDE's explicit
   choice on each startup, as described above.
-- **Other apps match:** navi passes the chosen themes to apps through `XCURSOR_THEME`,
-  `XCURSOR_SIZE` and the portal's appearance settings.
+- **Utility appearance:** Navi Files/Thunar uses the shared palette and native GTK module for
+  live colors, accents, text, icons, cursors and window controls. Settings retains its native
+  GTK 4 styling. See [utility integration](utilities.md) for scope and verification. Apps also
+  receive `XCURSOR_THEME`/`XCURSOR_SIZE`; utility appearance is verified per supported application.
 - **No KDE login splash.** KDE's splash themes are QML programs. Running them would pull in Qt,
   and would mean executing code that came from a theme download. navi starts fast enough to need
   no splash.

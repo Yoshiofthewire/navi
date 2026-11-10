@@ -20,6 +20,7 @@ and physical input still need hardware validation. See [limitations](#limitation
 - A rounded dock with persistent app pins, categorized app folders, search, and scrolling.
 - A top status bar with a clock and battery indicator, plus basic notifications.
 - Native Wayland apps and X11 apps through XWayland, including clipboard text transfer.
+- Navi Files: Thunar with Navi's live utility theme, native file operations and MIME handlers.
 - Swaylock screen locking from the session menu or Super+L, including lock-before-sleep.
 - Nested operation inside another desktop and a DRM/libinput/libseat hardware backend.
 
@@ -40,14 +41,14 @@ On Debian/Ubuntu:
 sudo apt-get update
 sudo apt-get install -y build-essential git pkg-config libwayland-dev libxkbcommon-dev \
   libudev-dev libinput-dev libseat-dev libgbm-dev libdrm-dev libegl1 xwayland swaylock fonts-noto-core \
-  meson ninja-build wayland-protocols libcairo2-dev libpam0g-dev curl patch
+  meson ninja-build wayland-protocols libcairo2-dev libgtk-3-dev libpam0g-dev curl patch
 ```
 
 On Arch Linux/CachyOS:
 
 ```sh
 sudo pacman -S --needed base-devel git pkgconf wayland libxkbcommon systemd-libs \
-  libinput seatd mesa libglvnd libdrm xorg-xwayland swaylock noto-fonts meson ninja wayland-protocols cairo pam
+  libinput seatd mesa libglvnd libdrm xorg-xwayland swaylock noto-fonts meson ninja wayland-protocols cairo gtk3 pam
 ```
 
 ## Build and try it
@@ -60,7 +61,8 @@ cargo build --release --locked
 ```
 
 Run that last command from an existing Wayland or X11 desktop to open Navi as a nested window.
-Keep `navi`, `navi-bar`, `navi-swaylock` and `navi-settings` together. Navi starts the bar automatically; Settings opens on demand.
+Keep `navi`, `navi-bar`, `navi-swaylock`, `navi-settings`, `navi-files` and `libnavi-gtk3.so` together.
+Navi starts the bar automatically; Settings and Files open on demand.
 Cargo also builds the small locker helper from pinned swaylock 1.8.6 source, verified by SHA-256,
 with a rendering-only patch for the eight-slice indicator. The first build needs network access;
 the verified source and native build are cached under `target/navi-locker`.
@@ -94,7 +96,8 @@ Pin/Unpin controls to customize the dock, and scroll with a wheel or touchpad.
 After building the release binaries:
 
 ```sh
-sudo install -Dm755 -t /usr/local/bin target/release/navi target/release/navi-bar target/release/navi-swaylock target/release/navi-settings
+sudo install -Dm755 -t /usr/local/bin target/release/navi target/release/navi-bar target/release/navi-swaylock target/release/navi-settings target/release/navi-files
+sudo install -Dm644 target/release/libnavi-gtk3.so /usr/local/bin/libnavi-gtk3.so
 sudo install -Dm644 -t /usr/share/wayland-sessions dist/navi.desktop
 sudo install -Dm644 -t /usr/share/xdg-desktop-portal dist/navi-portals.conf
 ```
@@ -145,9 +148,10 @@ The monitor-probe test remains manual because it reads the host's hardware.
 
 Release artifacts are built on Ubuntu 24.04 for Linux x86_64 and require compatible system
 libraries. Download them from successful **Release build** runs in GitHub Actions. The archive
-contains `navi`, `navi-bar`, `navi-swaylock`, `navi-settings`, the `dist/` session files, `docs/`, icons, this README, and the license. Workflows
+contains `navi`, `navi-bar`, `navi-swaylock`, `navi-settings`, `navi-files`, `libnavi-gtk3.so`,
+the `dist/` session files, `docs/`, icons, this README, and the license. Workflows
 cache compiled dependencies; tests still execute on every run. CI does not publish GitHub releases.
-Extract the archive, keep all four binaries together, and run `./navi` from an existing desktop.
+Extract the archive, keep the binaries and utility module together, and run `./navi` from an existing desktop.
 
 ## Limitations
 
@@ -176,6 +180,21 @@ GTK 4 controls. Install runtime dependencies on Debian/Ubuntu with
 `sudo pacman -S python-gobject gtk4`. Python/GTK are not compositor runtime dependencies.
 Install `dist/navi-settings.desktop` into `/usr/local/share/applications` for other launchers.
 See [Settings](docs/settings.md) for built-in controls, advanced feature limits and validation.
+
+## Files and utility appearance
+
+Open **Navi Files** from the launcher's System folder, or pin it to the dock. Install its backend
+with `sudo apt-get install thunar gvfs gvfs-backends` (Debian/Ubuntu), or
+`sudo pacman -S thunar gvfs` (Arch). Additional GVfs backend packages enable particular protocols.
+The error/recovery window uses the same Python/PyGObject/GTK 4 runtime as Settings.
+Install `dist/navi-files.desktop` into `/usr/local/share/applications` to offer Files in Open With
+and Default Applications; existing defaults are preserved until explicitly changed.
+
+Appearance settings update Files' colors, accents, text, icons and cursors while it is open.
+The Desktop directory is browsable in Files; the desktop surface has no icons or enablement option.
+Navi uses the browser you bring. See [utility integration](docs/utilities.md) for scope and checks.
+
+## Desktop services
 
 Built-in network and Bluetooth controls need NetworkManager and BlueZ. Sound controls need
 PipeWire-Pulse or PulseAudio and `pactl` (`pulseaudio-utils` on Debian/Ubuntu, `libpulse` on Arch).

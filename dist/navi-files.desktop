@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=Navi Files
+Comment=Browse files with Navi’s appearance and Thunar
+Exec=navi-files %U
+TryExec=navi-files
+Icon=system-file-manager
+Type=Application
+Categories=System;FileTools;FileManager;
+MimeType=inode/directory;
+Keywords=Files;Folders;Home;Desktop;Trash;Drives;Network;
+StartupWMClass=thunar

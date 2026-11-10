@@ -263,6 +263,19 @@ pub fn watch(tx: Sender<Call>, full_session: bool) -> Runtime {
         loop {
             if let Ok(settings) = desktop_config::load() {
                 if settings != previous {
+                    let mut appearance = settings.clone();
+                    if appearance["icon_theme"] == "" {
+                        let config = files::xdg_dir(
+                            std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+                            std::env::var_os("HOME").as_deref(),
+                            ".config",
+                        );
+                        appearance["icon_theme"] =
+                            crate::icons::preferred(config.as_deref()).into();
+                    }
+                    if let Err(error) = crate::utility_theme::write(&appearance) {
+                        tracing::warn!("utility appearance unavailable: {error}");
+                    }
                     if tx.send(Call::Configure(settings.clone())).is_err() {
                         break;
                     }

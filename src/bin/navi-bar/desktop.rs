@@ -155,6 +155,23 @@ pub fn scan(data_dirs: &[PathBuf]) -> Vec<Entry> {
         })
         .collect();
     if let Ok(exe) = std::env::current_exe() {
+        let files = exe.with_file_name("navi-files");
+        if files.is_file() {
+            out.retain(|e| {
+                !matches!(
+                    e.id.as_str(),
+                    "navi-files.desktop" | "thunar.desktop" | "org.xfce.Thunar.desktop"
+                )
+            });
+            out.push(Entry {
+                id: "navi-files.desktop".into(),
+                name: "Navi Files".into(),
+                icon: Some("system-file-manager".into()),
+                argv: vec![files.to_string_lossy().into_owned()],
+                wm_class: Some("thunar".into()),
+                category: Category::System,
+            });
+        }
         let settings = exe.with_file_name("navi-settings");
         if settings.is_file() {
             out.retain(|e| e.id != "navi-settings.desktop");
