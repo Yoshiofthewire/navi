@@ -9,8 +9,8 @@ pub use bar::{Decor, decoration};
 pub use drag::{Action, Done, Drag, EdgeClicks, Side, overlay};
 pub use memory::safe;
 
-pub const COLS: i32 = 12;
-pub const ROWS: i32 = 6;
+pub const COLS: i32 = 24;
+pub const ROWS: i32 = 12;
 /// Space between tiles in logical px. Tiles are inset by half of it, and by all of it at the top,
 /// where the grab strip will go.
 pub const GAP: i32 = 8;
@@ -70,6 +70,7 @@ pub struct Output {
 }
 
 impl Output {
+    /// The smallest cell; even boundaries make every cell this or 1 px more.
     fn cell_w(&self) -> i32 {
         (self.area.w / COLS).max(1)
     }
@@ -78,19 +79,13 @@ impl Output {
         (self.area.h / ROWS).max(1)
     }
 
-    // The last column and row absorb the rounding remainder.
+    // Even boundaries: cells differ by at most 1 px, and halving the grid keeps every boundary.
     fn x_edge(&self, col: i32) -> i32 {
-        match col {
-            COLS => self.area.x + self.area.w,
-            _ => self.area.x + col * self.cell_w(),
-        }
+        self.area.x + (i64::from(col) * i64::from(self.area.w) / i64::from(COLS)) as i32
     }
 
     fn y_edge(&self, row: i32) -> i32 {
-        match row {
-            ROWS => self.area.y + self.area.h,
-            _ => self.area.y + row * self.cell_h(),
-        }
+        self.area.y + (i64::from(row) * i64::from(self.area.h) / i64::from(ROWS)) as i32
     }
 
     /// The px covered by `c`, gap included.
@@ -795,96 +790,93 @@ mod tests {
         l.tile(id).unwrap().cells
     }
 
-    #[test]
-    fn cell_sizes_on_example_monitors() {
-        let uw = ultrawide();
-        assert_eq!(
-            uw.cells_rect(cells(0, 0, 1, 1)),
-            Rect {
-                x: 0,
-                y: 0,
-                w: 286,
-                h: 240
-            }
-        );
-        // The remainder (3440 - 12 * 286 = 8 px) goes to the last column.
-        assert_eq!(
-            uw.cells_rect(cells(11, 5, 1, 1)),
-            Rect {
-                x: 3146,
-                y: 1200,
-                w: 294,
-                h: 240
-            }
-        );
-
-        let k = uhd();
-        assert_eq!(
-            k.cells_rect(cells(0, 0, 1, 1)),
-            Rect {
-                x: 0,
-                y: 0,
-                w: 320,
-                h: 360
-            }
-        );
-        assert_eq!(
-            k.cells_rect(cells(11, 5, 1, 1)),
-            Rect {
-                x: 3520,
-                y: 1800,
-                w: 320,
-                h: 360
-            }
-        );
-
-        let lp = laptop();
-        assert_eq!(
-            lp.cells_rect(cells(0, 0, 1, 1)),
-            Rect {
-                x: 0,
-                y: 0,
-                w: 93,
-                h: 117
-            }
-        );
-        assert_eq!(
-            lp.cells_rect(cells(11, 5, 1, 1)),
-            Rect {
-                x: 1023,
-                y: 585,
-                w: 102,
-                h: 118
-            }
-        );
-    }
-
-    #[test]
-    fn whole_grid_covers_output_exactly() {
-        for o in [
+    /// The rig's outputs, the ultrawide also with a 48 px taskbar and 32 px band, and an odd one.
+    fn sample_outputs() -> [Output; 5] {
+        [
             ultrawide(),
+            out("uw-bars", 0, 32, 3440, 1360, 0),
             uhd(),
             laptop(),
             out("odd", 7, 11, 1001, 599, 0),
-        ] {
-            assert_eq!(o.cells_rect(cells(0, 0, COLS, ROWS)), o.area);
+        ]
+    }
+
+    #[test]
+    fn ac1_grid_is_24_by_12_and_covers_the_area() {
+        assert_eq!((COLS, ROWS), (24, 12));
+        for o in sample_outputs() {
+            assert_eq!(o.cells_rect(FULL), o.area, "{}", o.name);
+        }
+    }
+
+    #[test]
+    fn ac2_cells_are_even_and_tile_the_area() {
+        for o in sample_outputs() {
+            let (a, name) = (o.area, &o.name);
+            let ws: Vec<i32> = (0..COLS)
+                .map(|c| o.cells_rect(cells(c, 0, 1, 1)).w)
+                .collect();
+            let hs: Vec<i32> = (0..ROWS)
+                .map(|r| o.cells_rect(cells(0, r, 1, 1)).h)
+                .collect();
+            // Each cell starts where the previous one ends, and the last ends at the area's edge.
+            for c in 0..COLS {
+                let x = a.x + ws[..c as usize].iter().sum::<i32>();
+                assert_eq!(o.cells_rect(cells(c, 0, 1, 1)).x, x, "{name} col {c}");
+            }
+            for r in 0..ROWS {
+                let y = a.y + hs[..r as usize].iter().sum::<i32>();
+                assert_eq!(o.cells_rect(cells(0, r, 1, 1)).y, y, "{name} row {r}");
+            }
+            assert_eq!(ws.iter().sum::<i32>(), a.w, "{name}");
+            assert_eq!(hs.iter().sum::<i32>(), a.h, "{name}");
+            for v in [ws, hs] {
+                let (lo, hi) = (v.iter().min().unwrap(), v.iter().max().unwrap());
+                assert!(hi - lo <= 1, "{name}: {v:?}");
+            }
+        }
+
+        let uw = ultrawide();
+        for col in 0..=COLS - 8 {
+            let w = uw.cells_rect(cells(col, 0, 8, ROWS)).w;
+            assert!(w == 1146 || w == 1147, "8 cols at {col}: {w}");
+        }
+        for col in 0..=COLS - 6 {
+            assert_eq!(uw.cells_rect(cells(col, 0, 6, ROWS)).w, 860, "at {col}");
+        }
+        // The laptop's 21 px remainder is spread, not given to the last column.
+        let lp = laptop();
+        assert_eq!(lp.cells_rect(cells(0, 0, 1, 1)).w, 46);
+        assert_eq!(lp.cells_rect(cells(COLS - 1, 0, 1, 1)).w, 47);
+    }
+
+    #[test]
+    fn ac3_minimum_span_is_at_least_320_by_240_everywhere() {
+        let [uw, uw_bars, k, lp, _] = sample_outputs();
+        for (o, span) in [(uw, (3, 2)), (uw_bars, (3, 3)), (k, (2, 2)), (lp, (7, 5))] {
+            assert_eq!(o.span_for((MIN_W, MIN_H)), span, "{}", o.name);
+            for c in spots(span.0, span.1) {
+                let r = o.cells_rect(c);
+                assert!(r.w >= MIN_W && r.h >= MIN_H, "{} {c:?}: {r:?}", o.name);
+            }
         }
     }
 
     #[test]
     fn common_splits_are_exact() {
         let uw = ultrawide();
-        // T3 at 8 columns, browser at 4.
-        assert_eq!(uw.cells_rect(cells(0, 0, 8, 6)).w, 2288);
-        assert_eq!(uw.cells_rect(cells(8, 0, 4, 6)).w, 1152);
-        // Three and four wide.
-        assert_eq!(uw.cells_rect(cells(4, 0, 4, 6)).w, 1144);
-        assert_eq!(uw.cells_rect(cells(3, 0, 3, 6)).w, 858);
+        // Halves, thirds and quarters of the ultrawide.
+        assert_eq!(uw.cells_rect(cells(12, 0, 12, 12)).w, 1720);
+        let thirds: Vec<i32> = (0..3)
+            .map(|k| uw.cells_rect(cells(k * 8, 0, 8, 12)).w)
+            .collect();
+        assert_eq!(thirds, [1146, 1147, 1147]);
+        assert_eq!(uw.cells_rect(cells(18, 0, 6, 12)).w, 860);
 
         // The 4K as 3x3, and a video in its top 2x2.
         let k = uhd();
         assert_eq!(
-            k.cells_rect(cells(4, 2, 4, 2)),
+            k.cells_rect(cells(8, 4, 8, 4)),
             Rect {
                 x: 1280,
                 y: 720,
@@ -893,7 +885,7 @@ mod tests {
             }
         );
         assert_eq!(
-            k.cells_rect(cells(0, 0, 8, 4)),
+            k.cells_rect(cells(0, 0, 16, 8)),
             Rect {
                 x: 0,
                 y: 0,
@@ -907,7 +899,7 @@ mod tests {
     fn tile_rect_leaves_gap_and_grab_strip() {
         let k = uhd();
         assert_eq!(
-            k.tile_rect(cells(0, 0, 4, 2)),
+            k.tile_rect(cells(0, 0, 8, 4)),
             Rect {
                 x: 4,
                 y: 8,
@@ -919,13 +911,17 @@ mod tests {
 
     #[test]
     fn span_rounds_to_nearest_cell_and_respects_minimum() {
-        assert_eq!(uhd().span_for((900, 700)), (3, 2));
-        assert_eq!(ultrawide().span_for((900, 700)), (3, 3));
-        // 320x240 needs 4x3 laptop cells (93x117 each).
-        assert_eq!(laptop().span_for((10, 10)), (4, 3));
-        assert_eq!(laptop().span_for((99_999, 99_999)), (12, 6));
+        assert_eq!(uhd().span_for((900, 700)), (6, 4));
+        assert_eq!(ultrawide().span_for((900, 700)), (6, 6));
+        // 320x240 needs 7x5 laptop cells (46x58 at least).
+        assert_eq!(laptop().span_for((10, 10)), (7, 5));
+        assert_eq!(laptop().span_for((99_999, 99_999)), (COLS, ROWS));
         // An output too small for the minimum gets the whole grid, not a panic.
-        assert_eq!(out("tiny", 0, 0, 200, 100, 0).span_for((10, 10)), (12, 6));
+        assert_eq!(
+            out("tiny", 0, 0, 200, 100, 0).span_for((10, 10)),
+            (COLS, ROWS)
+        );
+        assert_eq!(out("tinier", 0, 0, 5, 5, 0).cells_rect(FULL).w, 5);
     }
 
     #[test]
@@ -933,23 +929,23 @@ mod tests {
         let mut l = layout(vec![ultrawide()]);
         let (id, step) = l.place("browser", (3000, 700)).unwrap();
         assert_eq!(step, Step::Nearest);
-        assert_eq!(cells_of(&l, id), cells(6, 0, 6, 6));
+        assert_eq!(cells_of(&l, id), cells(12, 0, 12, 12));
 
         let (id2, _) = l.place("term", (3000, 700)).unwrap();
-        assert_eq!(cells_of(&l, id2), cells(0, 0, 6, 6));
+        assert_eq!(cells_of(&l, id2), cells(0, 0, 12, 12));
     }
 
     #[test]
     fn app_returns_to_its_remembered_spot() {
         let mut l = layout(vec![ultrawide()]);
         let (id, _) = l.place("t3", (10, 10)).unwrap();
-        assert_eq!(cells_of(&l, id), cells(0, 0, 6, 6));
+        assert_eq!(cells_of(&l, id), cells(0, 0, 12, 12));
         l.remove(id);
 
         // The pointer is on the far side, but the old spot is free.
         let (id, step) = l.place("t3", (3400, 10)).unwrap();
         assert_eq!(step, Step::Remembered);
-        assert_eq!(cells_of(&l, id), cells(0, 0, 6, 6));
+        assert_eq!(cells_of(&l, id), cells(0, 0, 12, 12));
     }
 
     #[test]
@@ -958,12 +954,12 @@ mod tests {
         let (a, _) = l.place("term", (10, 10)).unwrap();
         l.memory.get_mut("term").unwrap().size = (860, 720);
         l.remove(a);
-        l.place("other", (10, 10)).unwrap(); // takes cols 0..6
+        l.place("other", (10, 10)).unwrap(); // takes cols 0..12
 
         let (id, step) = l.place("term", (10, 10)).unwrap();
         assert_eq!(step, Step::Nearest);
-        // 860x720 = 3x3 cells, as close to the pointer as the free space allows.
-        assert_eq!(cells_of(&l, id), cells(6, 0, 3, 3));
+        // 860x720 = 6x6 cells, as close to the pointer as the free space allows.
+        assert_eq!(cells_of(&l, id), cells(12, 0, 6, 6));
     }
 
     #[test]
@@ -973,7 +969,7 @@ mod tests {
         let (b, _) = l.place("b", (3400, 10)).unwrap();
         l.remove(a);
         assert_eq!(l.tiles().len(), 1);
-        assert_eq!(cells_of(&l, b), cells(6, 0, 6, 6));
+        assert_eq!(cells_of(&l, b), cells(12, 0, 12, 12));
     }
 
     #[test]
@@ -981,13 +977,13 @@ mod tests {
         let mut l = layout(vec![ultrawide()]);
         let (browser, _) = l.place("browser", (10, 10)).unwrap();
         let (term, _) = l.place("term", (3400, 10)).unwrap();
-        // The browser now wants only 3 columns, but still has 6.
+        // The browser now wants only 6 columns, but still has 12.
         l.memory.get_mut("browser").unwrap().size = (860, 1440);
         l.memory.insert(
             "editor".into(),
             Memory {
                 output: "gone".into(),
-                cells: cells(0, 0, 3, 6),
+                cells: cells(0, 0, 6, 12),
                 size: (860, 1440),
                 stamp: 0,
             },
@@ -995,9 +991,9 @@ mod tests {
 
         let (editor, step) = l.place("editor", (10, 700)).unwrap();
         assert_eq!(step, Step::Shrunk);
-        assert_eq!(cells_of(&l, browser), cells(3, 0, 3, 6));
-        assert_eq!(cells_of(&l, editor), cells(0, 0, 3, 6));
-        assert_eq!(cells_of(&l, term), cells(6, 0, 6, 6));
+        assert_eq!(cells_of(&l, browser), cells(6, 0, 6, 12));
+        assert_eq!(cells_of(&l, editor), cells(0, 0, 6, 12));
+        assert_eq!(cells_of(&l, term), cells(12, 0, 12, 12));
     }
 
     /// Places unknown `a` at the left and `b` at the right: two half-width tiles.
@@ -1044,7 +1040,7 @@ mod tests {
             for (slot, &k) in order.iter().enumerate() {
                 assert_eq!(
                     cells_of(&l, ids[k]),
-                    cells(slot as i32 * 4, 0, 4, 6),
+                    cells(slot as i32 * 8, 0, 8, ROWS),
                     "x={x}"
                 );
             }
@@ -1059,15 +1055,26 @@ mod tests {
         let (d, step) = l.place("d", (3400, 10)).unwrap();
         assert_eq!(step, Step::Shrunk);
         for (slot, id) in [a, b, c, d].into_iter().enumerate() {
-            assert_eq!(cells_of(&l, id), cells(slot as i32 * 3, 0, 3, 6));
+            assert_eq!(cells_of(&l, id), cells(slot as i32 * 6, 0, 6, ROWS));
         }
     }
 
     #[test]
-    fn tabs_only_when_every_tile_is_at_minimum() {
+    fn ac4_equal_share_then_tabs_only_when_every_tile_is_at_minimum() {
         let mut l = layout(vec![ultrawide()]);
         let mut order = Vec::new();
-        for n in 1..=6 {
+        // Sorted column widths after each window; 24 isn't divisible by 5 or 7.
+        let shares: [&[i32]; 8] = [
+            &[12],
+            &[12, 12],
+            &[8, 8, 8],
+            &[6, 6, 6, 6],
+            &[4, 5, 5, 5, 5],
+            &[4, 4, 4, 4, 4, 4],
+            &[3, 3, 3, 3, 4, 4, 4],
+            &[3, 3, 3, 3, 3, 3, 3, 3],
+        ];
+        for (n, share) in (1..=8).zip(shares) {
             let (id, step) = l.place(&format!("app{n}"), (3400, 10)).unwrap();
             if n >= 3 {
                 assert_eq!(step, Step::Shrunk, "window {n}");
@@ -1077,23 +1084,25 @@ mod tests {
                 2 => order.insert(0, id),
                 _ => order.push(id),
             }
-            assert_row(&l, &order, 2);
+            assert_row(&l, &order, 3);
+            let mut widths: Vec<i32> = order.iter().map(|&id| cells_of(&l, id).cols).collect();
+            widths.sort_unstable();
+            assert_eq!(widths, share, "window {n}");
         }
-        assert!(order.iter().all(|&id| cells_of(&l, id).cols == 2));
-        let (_, step) = l.place("app7", (3400, 10)).unwrap();
+        let (_, step) = l.place("app9", (3400, 10)).unwrap();
         assert!(matches!(step, Step::Tabbed(_)));
     }
 
     #[test]
     fn laptop_minimum_stops_at_thirds_and_failure_moves_nothing() {
-        // AC6 and AC11: 4 laptop columns are the minimum.
+        // AC6 and AC11: 7 laptop columns are the minimum.
         let mut l = layout(vec![laptop()]);
         let (a, _) = l.place("a", (10, 10)).unwrap();
         let (b, _) = l.place("b", (1100, 10)).unwrap();
         let (c, step) = l.place("c", (1100, 10)).unwrap();
         assert_eq!(step, Step::Shrunk);
         for (slot, id) in [a, b, c].into_iter().enumerate() {
-            assert_eq!(cells_of(&l, id), cells(slot as i32 * 4, 0, 4, 6));
+            assert_eq!(cells_of(&l, id), cells(slot as i32 * 8, 0, 8, ROWS));
         }
 
         let before: Vec<Cells> = l.tiles().iter().map(|t| t.cells).collect();
@@ -1114,16 +1123,16 @@ mod tests {
         assert_eq!(step, Step::Shrunk);
         assert_eq!(l.tile(c).unwrap().output, "uw");
 
-        for n in 4..=6 {
+        for n in 4..=8 {
             let (_, step) = l.place(&format!("app{n}"), (100, 100)).unwrap();
             assert_eq!(step, Step::Shrunk);
         }
-        let (g, step) = l.place("app7", (100, 100)).unwrap();
+        let (g, step) = l.place("app9", (100, 100)).unwrap();
         assert_eq!(step, Step::OtherOutput);
         let t = l.tile(g).unwrap();
         assert_eq!(t.output, "4k");
-        // Half the ultrawide (1720x1440 px) is 5x4 4K cells, as near the centre as they go.
-        assert_eq!(t.cells, cells(3, 1, 5, 4));
+        // Half the ultrawide (1720x1440 px) is 11x8 4K cells, as near the centre as they go.
+        assert_eq!(t.cells, cells(6, 2, 11, 8));
     }
 
     #[test]
@@ -1132,14 +1141,14 @@ mod tests {
         let (a, _) = l.place("a", (10, 10)).unwrap();
         remember(&mut l, "b", (1144, 1440));
         let (b, _) = l.place("b", (3400, 10)).unwrap();
-        assert_eq!(cells_of(&l, a), cells(0, 0, 6, 6));
-        assert_eq!(cells_of(&l, b), cells(8, 0, 4, 6));
+        assert_eq!(cells_of(&l, a), cells(0, 0, 12, 12));
+        assert_eq!(cells_of(&l, b), cells(16, 0, 8, 12));
 
         let (c, step) = l.place("c", (3400, 10)).unwrap();
         assert_eq!(step, Step::Smaller);
-        assert_eq!(cells_of(&l, c), cells(6, 0, 2, 6));
-        assert_eq!(cells_of(&l, a), cells(0, 0, 6, 6));
-        assert_eq!(cells_of(&l, b), cells(8, 0, 4, 6));
+        assert_eq!(cells_of(&l, c), cells(12, 0, 4, 12));
+        assert_eq!(cells_of(&l, a), cells(0, 0, 12, 12));
+        assert_eq!(cells_of(&l, b), cells(16, 0, 8, 12));
         // AC10
         assert_eq!(l.memory["a"].size, (1720, 1440));
         assert_eq!(l.memory["b"].size, (1144, 1440));
@@ -1152,12 +1161,13 @@ mod tests {
         let (a, _) = l.place("a", (10, 10)).unwrap();
         remember(&mut l, "b", (1430, 1440));
         let (b, _) = l.place("b", (3400, 10)).unwrap();
-        assert_eq!(cells_of(&l, b), cells(7, 0, 5, 6));
+        // 2 free columns (286 px) are below the 3-column minimum.
+        assert_eq!(cells_of(&l, b), cells(14, 0, 10, 12));
 
         let (c, step) = l.place("c", (3400, 10)).unwrap();
         assert_eq!(step, Step::Shrunk);
-        assert_eq!(cells_of(&l, c).cols, 4);
-        assert_row(&l, &[a, b, c], 2);
+        assert_eq!(cells_of(&l, c).cols, 8);
+        assert_row(&l, &[a, b, c], 3);
     }
 
     #[test]

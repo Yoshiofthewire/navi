@@ -25,18 +25,21 @@ These come from hands-on tests of COSMIC and niri. Each one names the thing that
 
 ## Layout model
 
-Each monitor is a **12 × 6 grid** in logical pixels. A window covers a rectangle of whole cells.
+Each monitor is a **24 × 12 grid** in logical pixels. A window covers a rectangle of whole cells.
 Cells may be empty. There is no split tree, so nothing can flip orientation (principle 2).
 
-12 divides by 2, 3, 4 and 6, so common splits are exact:
+24 divides by 2, 3, 4, 6, 8 and 12, so common splits are whole cells. The minimum tile is about
+320×240 px, rounded up to whole cells:
 
-| Monitor | Cell | Example |
-|---|---|---|
-| 3440×1440 ultrawide | 286×240 | T3 8 cols + browser 4 cols; 3-wide (4 cols each) or 4-wide (3 cols each) |
-| 3840×2160 4K | 320×360 | 3×3 of 4×2-cell tiles; a video in the top 2×2 = 2560×1440 |
-| 1800×1125 @1.6 laptop | 94×117 | halves, thirds, quarters |
+| Monitor | Grid area | Cell | Minimum span (MIN 320 × 240) | Most side by side |
+|---|---|---|---|---|
+| Ultrawide 3440×1440 | 3440×1440 (no bars) | 143⅓×120 | 3 × 2 | 8 (3 cols each) |
+| Ultrawide, taskbar 48 + band 32 | 3440×1360 | 143⅓×113⅓ | 3 × 3 | 8 |
+| 4K 3840×2160 @1 | 3840×2160 | 160×180 | 2 × 2 | 12 |
+| Laptop 1800×1125 @1.6 | 1125×703 | 46.9×58.6 | 7 × 5 | 3 |
 
-Cell sizes are rounded down to whole pixels; the last row and column take the leftover. Tiles have a
+Cell boundaries are spread evenly: boundary `k` is at `k × width ÷ 24` px, rounded down, so every
+cell is within 1 px of the others and nothing collects at the last column. Tiles have a
 small gap around them. The gap at the top of each tile is 6–8 px, and only the compositor draws
 there (see *Grab strip*).
 
@@ -49,7 +52,9 @@ rectangle. A terminal stays about the same physical size everywhere and never in
 
 Memory survives restarts. navi keeps it in `$XDG_STATE_HOME/navi/memory` (default
 `~/.local/state/navi/memory`), readable only by the user. It holds at most the 512 most recently
-used apps, and navi ignores a damaged file.
+used apps, and navi ignores a damaged file. A file from the 12 × 6 grid (`navi-memory 1`) is
+read with its cells doubled, which keeps the same layout, and is saved in the new format on the
+next change.
 
 If navi has no memory for an app, it gets half the monitor's width at full height. Wayland gives
 an app no way to ask for a size before it's first placed.
@@ -63,12 +68,12 @@ These steps are tried in order. The first one that fits wins.
 3. **Open smaller.** The nearest empty rectangle at less than the remembered size, but no
    smaller than the minimum (about 320×240 logical px, rounded up to whole cells).
 4. **Shrink the neighbours.** The new window's target width is an equal share of the monitor's
-   columns (12 ÷ the number of tiles in that row, counting the new one), or its remembered width
+   columns (24 ÷ the number of tiles in that row, counting the new one), or its remembered width
    if that is smaller, and never below the minimum. Tiles give back one column at a time, largest
    first, until the target fits. Tiles larger than their remembered size go first. Tiles may
    slide sideways, keeping their order, so the freed columns form one gap. No tile shrinks below
    the minimum. Shrinking never changes what navi remembers for an app. On the ultrawide, two
-   half-width apps plus a third become 4 + 4 + 4 columns, and a fourth makes 3 + 3 + 3 + 3.
+   half-width apps plus a third become 8 + 8 + 8 columns, and a fourth makes 6 + 6 + 6 + 6.
 5. **Another monitor** that has room, by monitor priority (see *Monitors*).
 6. **Tab with the nearest tile.** This happens only when every tile is already at its minimum
    (principle 3).
@@ -466,7 +471,7 @@ session.
 
 ## Open questions
 
-- Grid size: hard-coded at 12 × 6, or configurable? Leaning hard-coded.
+- Grid size: hard-coded at 24 × 12; no per-monitor or configurable grid.
 - More look references, beyond the logo.
 - Is this a daily driver? That decides whether laptop polish is in v1.
 - Multi-monitor test of COSMIC in a real session, after the running T3 tasks finish.

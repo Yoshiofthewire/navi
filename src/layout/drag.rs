@@ -1086,25 +1086,25 @@ pub(super) mod tests {
         }
     }
 
-    // Points on the ultrawide. Cells are 286 x 240 px; a is cols 0..6, b cols 6..12.
+    // Points on the ultrawide. Cells are 143 or 144 x 120 px; a is cols 0..12, b cols 12..24.
     const A_STRIP: (i32, i32) = (100, 2);
     const B_MIDDLE: (i32, i32) = (2500, 700);
     const B_RIM: (i32, i32) = (1800, 100);
 
     fn halves() -> Layout {
-        with(&[c(0, 0, 6, 6), c(6, 0, 6, 6)])
+        with(&[c(0, 0, 12, 12), c(12, 0, 12, 12)])
     }
 
     #[test]
     fn ac1_hit_zones_are_gap_px() {
         let l = halves();
-        // a's window spans x 4..1712, y 8..1436; b's starts at x 1720.
+        // a's window spans x 4..1716, y 8..1436; b's starts at x 1724.
         assert_eq!(l.hit(A_STRIP), Some(Hit::Strip(0)));
-        assert_eq!(l.hit((1711, 7)), Some(Hit::Strip(0)));
-        assert_eq!(l.hit((1716, 700)), Some(Hit::Edge(1, Side::Left)));
-        assert_eq!(l.hit((1719, 700)), Some(Hit::Edge(1, Side::Left)));
-        assert_eq!(l.hit((1712, 700)), Some(Hit::Edge(0, Side::Right)));
-        assert_eq!(l.hit((1715, 700)), Some(Hit::Edge(0, Side::Right)));
+        assert_eq!(l.hit((1715, 7)), Some(Hit::Strip(0)));
+        assert_eq!(l.hit((1720, 700)), Some(Hit::Edge(1, Side::Left)));
+        assert_eq!(l.hit((1723, 700)), Some(Hit::Edge(1, Side::Left)));
+        assert_eq!(l.hit((1716, 700)), Some(Hit::Edge(0, Side::Right)));
+        assert_eq!(l.hit((1719, 700)), Some(Hit::Edge(0, Side::Right)));
         assert_eq!(l.hit((500, 1437)), Some(Hit::Edge(0, Side::Bottom)));
         assert_eq!(l.hit((500, 700)), None);
         assert_eq!(l.hit((4, 8)), None);
@@ -1114,7 +1114,7 @@ pub(super) mod tests {
             }
         }
         // Below row 0 the top edge exists, and the bottom zone of the tile above wins it.
-        let l = with(&[c(0, 0, 6, 3), c(0, 3, 6, 3), c(6, 3, 6, 3)]);
+        let l = with(&[c(0, 0, 12, 6), c(0, 6, 12, 6), c(12, 6, 12, 6)]);
         assert_eq!(l.hit((500, 718)), Some(Hit::Edge(0, Side::Bottom)));
         assert_eq!(l.hit((2500, 718)), Some(Hit::Edge(2, Side::Top)));
         assert_eq!(l.hit((-5, -5)), None);
@@ -1137,10 +1137,10 @@ pub(super) mod tests {
             drag(&mut l, A_STRIP, &[(B_RIM, 0), (B_RIM, 1000)]),
             Some("swapped")
         );
-        assert_eq!(at(&l, 0), c(6, 0, 6, 6));
-        assert_eq!(at(&l, 1), c(0, 0, 6, 6));
-        assert_eq!(l.memory["a0"].cells, c(6, 0, 6, 6));
-        assert_eq!(l.memory["a1"].cells, c(0, 0, 6, 6));
+        assert_eq!(at(&l, 0), c(12, 0, 12, 12));
+        assert_eq!(at(&l, 1), c(0, 0, 12, 12));
+        assert_eq!(l.memory["a0"].cells, c(12, 0, 12, 12));
+        assert_eq!(l.memory["a1"].cells, c(0, 0, 12, 12));
         assert_eq!((l.memory["a0"].size, l.memory["a1"].size), sizes);
     }
 
@@ -1152,7 +1152,7 @@ pub(super) mod tests {
             Some("tabbed")
         );
         assert_eq!(at(&l, 0), at(&l, 1));
-        assert_eq!(at(&l, 1), c(6, 0, 6, 6));
+        assert_eq!(at(&l, 1), c(12, 0, 12, 12));
 
         let mut l = halves();
         assert_eq!(
@@ -1178,31 +1178,31 @@ pub(super) mod tests {
 
     #[test]
     fn ac5_drop_on_empty_uses_the_remembered_size() {
-        let mut l = with(&[c(0, 0, 6, 6)]);
+        let mut l = with(&[c(0, 0, 12, 12)]);
         let mut d = Drag::press(&l, A_STRIP).unwrap();
         d.motion(&mut l, (3000, 700), 0);
-        assert_eq!(preview(&d), Some(c(6, 0, 6, 6)));
+        assert_eq!(preview(&d), Some(c(12, 0, 12, 12)));
         let Some(Done::Layout(what, tiles)) = d.release(&mut l, (3000, 700), 10) else {
             panic!("not moved");
         };
-        assert_eq!((what, tiles[0].cells), ("moved", c(6, 0, 6, 6)));
-        assert_eq!(at(&l, 0), c(6, 0, 6, 6));
-        assert_eq!(l.memory["a0"].cells, c(6, 0, 6, 6));
+        assert_eq!((what, tiles[0].cells), ("moved", c(12, 0, 12, 12)));
+        assert_eq!(at(&l, 0), c(12, 0, 12, 12));
+        assert_eq!(l.memory["a0"].cells, c(12, 0, 12, 12));
 
-        let mut l = with(&[c(0, 0, 6, 6)]);
+        let mut l = with(&[c(0, 0, 12, 12)]);
         l.memory.get_mut("a0").unwrap().size = (1144, 1440);
         let mut d = Drag::press(&l, A_STRIP).unwrap();
         d.motion(&mut l, (3000, 700), 0);
-        assert_eq!(preview(&d), Some(c(8, 0, 4, 6)));
+        assert_eq!(preview(&d), Some(c(16, 0, 8, 12)));
         d.release(&mut l, (3000, 700), 10);
-        assert_eq!(at(&l, 0), c(8, 0, 4, 6));
+        assert_eq!(at(&l, 0), c(16, 0, 8, 12));
         assert_eq!(l.memory["a0"].size, (1144, 1440));
         assert_valid(&l);
     }
 
     #[test]
     fn ac6_preview_stays_on_the_grid_and_own_cells_cancel() {
-        let mut l = with(&[c(0, 0, 6, 6)]);
+        let mut l = with(&[c(0, 0, 12, 12)]);
         let mut d = Drag::press(&l, A_STRIP).unwrap();
         for p in [
             (3439, 700),
@@ -1245,7 +1245,7 @@ pub(super) mod tests {
             priority: 1,
         };
         l.set_outputs(vec![uw(), laptop]);
-        for (id, cells) in [(1, c(0, 0, 5, 6)), (2, c(6, 0, 6, 6))] {
+        for (id, cells) in [(1, c(0, 0, 10, 12)), (2, c(12, 0, 12, 12))] {
             let (app, output) = (format!("a{id}"), "laptop".into());
             l.tiles.push(Tile {
                 id,
@@ -1271,10 +1271,10 @@ pub(super) mod tests {
     #[test]
     fn ac7_dragging_a_tab_moves_only_that_tab() {
         // Job 003: the bar is all tabs, and A_STRIP is in tile 0's.
-        let mut l = with(&[c(0, 0, 6, 6), c(0, 0, 6, 6)]);
+        let mut l = with(&[c(0, 0, 12, 12), c(0, 0, 12, 12)]);
         assert_eq!(drag(&mut l, A_STRIP, &[((3000, 700), 0)]), Some("untabbed"));
-        assert_eq!(at(&l, 0), c(6, 0, 6, 6));
-        assert_eq!(at(&l, 1), c(0, 0, 6, 6));
+        assert_eq!(at(&l, 0), c(12, 0, 12, 12));
+        assert_eq!(at(&l, 1), c(0, 0, 12, 12));
     }
 
     /// x of column boundary `k`, y of row boundary `k`, on the ultrawide.
@@ -1288,20 +1288,21 @@ pub(super) mod tests {
     #[test]
     fn ac8_resize_moves_a_shared_edge() {
         let mut l = halves();
-        let mut d = Drag::press(&l, (1714, 700)).unwrap();
+        let mut d = Drag::press(&l, (1718, 700)).unwrap();
         for (k, a, b) in [
-            (8, c(0, 0, 8, 6), c(8, 0, 4, 6)),
-            (11, c(0, 0, 10, 6), c(10, 0, 2, 6)),
-            (0, c(0, 0, 2, 6), c(2, 0, 10, 6)),
-            (6, c(0, 0, 6, 6), c(6, 0, 6, 6)),
+            (16, c(0, 0, 16, 12), c(16, 0, 8, 12)),
+            // Each side stops at the 3-column minimum.
+            (23, c(0, 0, 21, 12), c(21, 0, 3, 12)),
+            (0, c(0, 0, 3, 12), c(3, 0, 21, 12)),
+            (12, c(0, 0, 12, 12), c(12, 0, 12, 12)),
         ] {
             d.motion(&mut l, col(k), 0);
             assert_eq!((at(&l, 0), at(&l, 1)), (a, b), "to {k}");
             assert_valid(&l);
         }
-        assert!(d.release(&mut l, col(6), 0).is_none());
+        assert!(d.release(&mut l, col(12), 0).is_none());
 
-        assert_eq!(drag(&mut l, (1714, 700), &[(col(8), 0)]), Some("resized"));
+        assert_eq!(drag(&mut l, (1718, 700), &[(col(16), 0)]), Some("resized"));
         let o = uw();
         for id in [0, 1] {
             let t = l.tile(id).unwrap();
@@ -1313,51 +1314,51 @@ pub(super) mod tests {
 
     #[test]
     fn ac9_only_touching_tiles_change() {
-        let first = [c(0, 0, 6, 3), c(6, 0, 6, 6), c(0, 3, 6, 3)];
+        let first = [c(0, 0, 12, 6), c(12, 0, 12, 12), c(0, 6, 12, 6)];
         let mut l = with(&first);
-        drag(&mut l, (1714, 100), &[(col(8), 0)]);
-        assert_eq!(at(&l, 0), c(0, 0, 8, 3));
-        assert_eq!(at(&l, 1), c(8, 0, 4, 6));
-        assert_eq!(at(&l, 2), c(0, 3, 6, 3));
+        drag(&mut l, (1718, 100), &[(col(16), 0)]);
+        assert_eq!(at(&l, 0), c(0, 0, 16, 6));
+        assert_eq!(at(&l, 1), c(16, 0, 8, 12));
+        assert_eq!(at(&l, 2), c(0, 6, 12, 6));
 
         // c grows into the empty cells and stops at b.
-        drag(&mut l, (1714, 1000), &[(col(10), 0)]);
-        assert_eq!(at(&l, 2), c(0, 3, 8, 3));
-        assert_eq!(at(&l, 1), c(8, 0, 4, 6));
+        drag(&mut l, (1718, 1000), &[(col(20), 0)]);
+        assert_eq!(at(&l, 2), c(0, 6, 16, 6));
+        assert_eq!(at(&l, 1), c(16, 0, 8, 12));
 
         let mut l = with(&first);
-        drag(&mut l, (1718, 700), &[(col(4), 0)]);
-        assert_eq!(at(&l, 0), c(0, 0, 4, 3));
-        assert_eq!(at(&l, 2), c(0, 3, 4, 3));
-        assert_eq!(at(&l, 1), c(4, 0, 8, 6));
+        drag(&mut l, (1722, 700), &[(col(8), 0)]);
+        assert_eq!(at(&l, 0), c(0, 0, 8, 6));
+        assert_eq!(at(&l, 2), c(0, 6, 8, 6));
+        assert_eq!(at(&l, 1), c(8, 0, 16, 12));
     }
 
     #[test]
     fn ac10_vertical_edges() {
-        let mut l = with(&[c(0, 0, 6, 3), c(0, 3, 6, 3)]);
+        let mut l = with(&[c(0, 0, 12, 6), c(0, 6, 12, 6)]);
         let mut d = Drag::press(&l, (500, 718)).unwrap();
-        d.motion(&mut l, row(4), 0);
-        assert_eq!((at(&l, 0), at(&l, 1)), (c(0, 0, 6, 4), c(0, 4, 6, 2)));
-        d.motion(&mut l, row(6), 0);
-        assert_eq!((at(&l, 0), at(&l, 1)), (c(0, 0, 6, 5), c(0, 5, 6, 1)));
+        d.motion(&mut l, row(8), 0);
+        assert_eq!((at(&l, 0), at(&l, 1)), (c(0, 0, 12, 8), c(0, 8, 12, 4)));
+        d.motion(&mut l, row(12), 0);
+        assert_eq!((at(&l, 0), at(&l, 1)), (c(0, 0, 12, 10), c(0, 10, 12, 2)));
         assert_valid(&l);
-        assert_eq!(what(d.release(&mut l, row(6), 0)), Some("resized"));
+        assert_eq!(what(d.release(&mut l, row(12), 0)), Some("resized"));
 
         // The top edge of the lower tile is the same boundary.
-        let mut l = with(&[c(0, 0, 6, 3), c(0, 3, 6, 3), c(6, 3, 6, 3)]);
-        drag(&mut l, (2500, 718), &[(row(1), 0)]);
-        assert_eq!(at(&l, 2), c(6, 1, 6, 5));
-        assert_eq!(at(&l, 0), c(0, 0, 6, 3));
+        let mut l = with(&[c(0, 0, 12, 6), c(0, 6, 12, 6), c(12, 6, 12, 6)]);
+        drag(&mut l, (2500, 718), &[(row(2), 0)]);
+        assert_eq!(at(&l, 2), c(12, 2, 12, 10));
+        assert_eq!(at(&l, 0), c(0, 0, 12, 6));
     }
 
     #[test]
     fn all_four_corners_resize_both_axes_and_remember_the_size() {
-        let original = c(3, 1, 6, 4);
+        let original = c(6, 2, 12, 8);
         for (x, y, target, expected) in [
-            (Side::Left, Side::Top, (2, 0), c(2, 0, 7, 5)),
-            (Side::Right, Side::Top, (10, 0), c(3, 0, 7, 5)),
-            (Side::Left, Side::Bottom, (2, 6), c(2, 1, 7, 5)),
-            (Side::Right, Side::Bottom, (10, 6), c(3, 1, 7, 5)),
+            (Side::Left, Side::Top, (4, 0), c(4, 0, 14, 10)),
+            (Side::Right, Side::Top, (20, 0), c(6, 0, 14, 10)),
+            (Side::Left, Side::Bottom, (4, 12), c(4, 2, 14, 10)),
+            (Side::Right, Side::Bottom, (20, 12), c(6, 2, 14, 10)),
         ] {
             let mut l = with(&[original]);
             let (frame, _) = l.frame(0).unwrap();
@@ -1385,18 +1386,23 @@ pub(super) mod tests {
 
     #[test]
     fn diagonal_junction_moves_four_tiles_and_reverses_without_drift() {
-        let original = [c(0, 0, 6, 3), c(6, 0, 6, 3), c(0, 3, 6, 3), c(6, 3, 6, 3)];
+        let original = [
+            c(0, 0, 12, 6),
+            c(12, 0, 12, 6),
+            c(0, 6, 12, 6),
+            c(12, 6, 12, 6),
+        ];
         let mut l = with(&original);
-        let from = (uw().x_edge(6) - 2, uw().y_edge(3) - 2);
+        let from = (uw().x_edge(12) - 2, uw().y_edge(6) - 2);
         let mut d = Drag::press(&l, from).unwrap();
-        for (col, row) in [(8, 4), (2, 1), (10, 5), (6, 3)] {
+        for (col, row) in [(16, 8), (4, 2), (20, 10), (12, 6)] {
             let p = (uw().x_edge(col), uw().y_edge(row));
             d.motion(&mut l, p, 0);
             let expected = [
                 c(0, 0, col, row),
-                c(col, 0, 12 - col, row),
-                c(0, row, col, 6 - row),
-                c(col, row, 12 - col, 6 - row),
+                c(col, 0, 24 - col, row),
+                c(0, row, col, 12 - row),
+                c(col, row, 24 - col, 12 - row),
             ];
             assert_eq!(
                 l.tiles.iter().map(|t| t.cells).collect::<Vec<_>>(),
@@ -1414,34 +1420,35 @@ pub(super) mod tests {
     #[test]
     fn diagonal_limits_each_axis_and_keeps_tabs_together() {
         let mut l = with(&[
-            c(0, 0, 6, 3),
-            c(0, 0, 6, 3),
-            c(6, 0, 6, 3),
-            c(0, 3, 6, 3),
-            c(6, 3, 6, 3),
+            c(0, 0, 12, 6),
+            c(0, 0, 12, 6),
+            c(12, 0, 12, 6),
+            c(0, 6, 12, 6),
+            c(12, 6, 12, 6),
         ]);
-        let from = (uw().x_edge(6) - 2, uw().y_edge(3) - 2);
+        let from = (uw().x_edge(12) - 2, uw().y_edge(6) - 2);
         let mut d = Drag::press(&l, from).unwrap();
         d.motion(&mut l, (i32::MAX, i32::MAX), 0);
-        assert_eq!(at(&l, 0), c(0, 0, 10, 5));
+        // The minimum is 3 x 2 cells.
+        assert_eq!(at(&l, 0), c(0, 0, 21, 10));
         assert_eq!(at(&l, 1), at(&l, 0));
-        assert_eq!(at(&l, 4), c(10, 5, 2, 1));
+        assert_eq!(at(&l, 4), c(21, 10, 3, 2));
         assert_valid(&l);
         assert!(d.cancel(&mut l));
-        assert_eq!(at(&l, 0), c(0, 0, 6, 3));
-        assert_eq!(at(&l, 4), c(6, 3, 6, 3));
+        assert_eq!(at(&l, 0), c(0, 0, 12, 6));
+        assert_eq!(at(&l, 4), c(12, 6, 12, 6));
 
         // A full-height neighbor shares only the vertical boundary.
-        let mut l = with(&[c(0, 0, 6, 3), c(6, 0, 6, 6), c(0, 3, 6, 3)]);
-        drag(&mut l, from, &[((uw().x_edge(8), uw().y_edge(4)), 0)]);
-        assert_eq!(at(&l, 0), c(0, 0, 8, 4));
-        assert_eq!(at(&l, 1), c(8, 0, 4, 6));
-        assert_eq!(at(&l, 2), c(0, 4, 8, 2));
+        let mut l = with(&[c(0, 0, 12, 6), c(12, 0, 12, 12), c(0, 6, 12, 6)]);
+        drag(&mut l, from, &[((uw().x_edge(16), uw().y_edge(8)), 0)]);
+        assert_eq!(at(&l, 0), c(0, 0, 16, 8));
+        assert_eq!(at(&l, 1), c(16, 0, 8, 12));
+        assert_eq!(at(&l, 2), c(0, 8, 16, 4));
     }
 
     #[test]
     fn corner_targets_stay_in_gaps_and_light_both_edges() {
-        let l = with(&[c(3, 1, 6, 4)]);
+        let l = with(&[c(6, 2, 12, 8)]);
         let (frame, win) = l.frame(0).unwrap();
         for x in frame.x - 5..frame.x + frame.w + 5 {
             for y in frame.y - 5..frame.y + frame.h + 5 {
@@ -1484,12 +1491,12 @@ pub(super) mod tests {
     #[test]
     fn double_click_expands_only_the_clicked_side_in_all_directions() {
         for (side, expected) in [
-            (Side::Left, c(0, 1, 9, 4)),
-            (Side::Right, c(3, 1, 9, 4)),
-            (Side::Top, c(3, 0, 6, 5)),
-            (Side::Bottom, c(3, 1, 6, 5)),
+            (Side::Left, c(0, 2, 18, 8)),
+            (Side::Right, c(6, 2, 18, 8)),
+            (Side::Top, c(6, 0, 12, 10)),
+            (Side::Bottom, c(6, 2, 12, 10)),
         ] {
-            let mut l = with(&[c(3, 1, 6, 4)]);
+            let mut l = with(&[c(6, 2, 12, 8)]);
             let p = l.zone(Hit::Edge(0, side)).unwrap().center();
             let mut clicks = EdgeClicks::default();
             assert!(edge_click(&mut l, &mut clicks, p, 0).is_none());
@@ -1506,14 +1513,14 @@ pub(super) mod tests {
     #[test]
     fn keyboard_moves_one_cell_and_preserves_the_remembered_size() {
         for (side, expected) in [
-            (Side::Left, c(2, 1, 6, 4)),
-            (Side::Right, c(4, 1, 6, 4)),
-            (Side::Top, c(3, 0, 6, 4)),
-            (Side::Bottom, c(3, 2, 6, 4)),
+            (Side::Left, c(5, 2, 12, 8)),
+            (Side::Right, c(7, 2, 12, 8)),
+            (Side::Top, c(6, 1, 12, 8)),
+            (Side::Bottom, c(6, 3, 12, 8)),
         ] {
-            let mut l = with(&[c(3, 1, 6, 4)]);
+            let mut l = with(&[c(6, 2, 12, 8)]);
             let size = l.memory["a0"].size;
-            l.tile_mut(0).unwrap().home = Some(("unplugged".into(), c(0, 0, 6, 6)));
+            l.tile_mut(0).unwrap().home = Some(("unplugged".into(), c(0, 0, 12, 12)));
             assert_eq!(what(l.keyboard_adjust(0, side, false)), Some("moved"));
             assert_eq!(at(&l, 0), expected);
             assert_eq!(l.memory["a0"].cells, expected);
@@ -1526,12 +1533,12 @@ pub(super) mod tests {
     #[test]
     fn keyboard_expands_to_each_usable_monitor_edge_and_remembers_size() {
         for (side, expected) in [
-            (Side::Left, c(0, 1, 9, 4)),
-            (Side::Right, c(3, 1, 9, 4)),
-            (Side::Top, c(3, 0, 6, 5)),
-            (Side::Bottom, c(3, 1, 6, 5)),
+            (Side::Left, c(0, 2, 18, 8)),
+            (Side::Right, c(6, 2, 18, 8)),
+            (Side::Top, c(6, 0, 12, 10)),
+            (Side::Bottom, c(6, 2, 12, 10)),
         ] {
-            let mut l = with(&[c(3, 1, 6, 4)]);
+            let mut l = with(&[c(6, 2, 12, 8)]);
             let mut output = uw();
             output.area.x = -3440;
             output.area.y = -1408;
@@ -1554,12 +1561,12 @@ pub(super) mod tests {
     #[test]
     fn keyboard_expansion_stops_at_partial_neighbors_without_shrinking_them() {
         for (side, neighbor, expected) in [
-            (Side::Left, c(1, 3, 2, 2), c(3, 2, 5, 2)),
-            (Side::Right, c(10, 3, 2, 2), c(4, 2, 6, 2)),
-            (Side::Top, c(6, 0, 2, 1), c(4, 1, 4, 3)),
-            (Side::Bottom, c(6, 5, 2, 1), c(4, 2, 4, 3)),
+            (Side::Left, c(2, 6, 4, 4), c(6, 4, 10, 4)),
+            (Side::Right, c(20, 6, 4, 4), c(8, 4, 12, 4)),
+            (Side::Top, c(12, 0, 4, 2), c(8, 2, 8, 6)),
+            (Side::Bottom, c(12, 10, 4, 2), c(8, 4, 8, 6)),
         ] {
-            let mut l = with(&[c(4, 2, 4, 2), neighbor]);
+            let mut l = with(&[c(8, 4, 8, 4), neighbor]);
             let other = l.tile(1).unwrap().clone();
             let memory = l.memory["a1"].clone();
             assert!(l.keyboard_adjust(0, side, true).is_some());
@@ -1591,15 +1598,15 @@ pub(super) mod tests {
 
     #[test]
     fn keyboard_adjusts_the_active_tab_group_and_keeps_other_outputs_separate() {
-        let mut l = with(&[c(2, 1, 4, 3), c(2, 1, 4, 3), c(8, 0, 4, 6)]);
+        let mut l = with(&[c(4, 2, 8, 6), c(4, 2, 8, 6), c(16, 0, 8, 12)]);
         assert!(l.keyboard_adjust(0, Side::Right, false).is_none());
         assert!(l.keyboard_adjust(1, Side::Right, false).is_some());
-        assert_eq!(at(&l, 0), c(3, 1, 4, 3));
-        assert_eq!(at(&l, 1), c(3, 1, 4, 3));
+        assert_eq!(at(&l, 0), c(5, 2, 8, 6));
+        assert_eq!(at(&l, 1), c(5, 2, 8, 6));
         assert!(l.keyboard_adjust(1, Side::Right, true).is_some());
-        assert_eq!(at(&l, 0), c(3, 1, 5, 3));
-        assert_eq!(at(&l, 1), c(3, 1, 5, 3));
-        assert_eq!(at(&l, 2), c(8, 0, 4, 6));
+        assert_eq!(at(&l, 0), c(5, 2, 11, 6));
+        assert_eq!(at(&l, 1), c(5, 2, 11, 6));
+        assert_eq!(at(&l, 2), c(16, 0, 8, 12));
         assert!(l.visible(1));
         assert_valid(&l);
         let mut second = uw();
@@ -1608,15 +1615,15 @@ pub(super) mod tests {
         l.set_outputs(vec![uw(), second]);
         l.tile_mut(2).unwrap().output = "other".into();
         assert!(l.keyboard_adjust(1, Side::Right, true).is_some());
-        assert_eq!(at(&l, 1), c(3, 1, 9, 3));
+        assert_eq!(at(&l, 1), c(5, 2, 19, 6));
         assert_eq!(l.tile(2).unwrap().output, "other");
-        assert_eq!(at(&l, 2), c(8, 0, 4, 6));
+        assert_eq!(at(&l, 2), c(16, 0, 8, 12));
     }
 
     #[test]
     fn keyboard_leaves_hidden_maximized_fullscreen_and_missing_windows_alone() {
         for mode in 0..5 {
-            let mut l = with(&[c(3, 1, 6, 4)]);
+            let mut l = with(&[c(6, 2, 12, 8)]);
             match mode {
                 0 => {
                     l.minimize(0);
@@ -1646,18 +1653,18 @@ pub(super) mod tests {
     #[test]
     fn edge_expansion_honors_neighbors_panels_and_output_origin() {
         let mut l = halves();
-        let p = (1714, 700);
+        let p = (1718, 700);
         let mut clicks = EdgeClicks::default();
         edge_click(&mut l, &mut clicks, p, 0);
         assert_eq!(
             what(edge_click(&mut l, &mut clicks, p, 100)),
             Some("expanded")
         );
-        assert_eq!(at(&l, 0), c(0, 0, 10, 6));
-        assert_eq!(at(&l, 1), c(10, 0, 2, 6));
+        assert_eq!(at(&l, 0), c(0, 0, 21, 12));
+        assert_eq!(at(&l, 1), c(21, 0, 3, 12));
         assert_valid(&l);
 
-        let mut l = with(&[c(3, 1, 6, 4)]);
+        let mut l = with(&[c(6, 2, 12, 8)]);
         let mut o = uw();
         o.full.x = -3440;
         o.full.y = -1440;
@@ -1673,7 +1680,7 @@ pub(super) mod tests {
             edge_click(&mut l, &mut clicks, p, 0);
             edge_click(&mut l, &mut clicks, p, 100);
         }
-        assert_eq!(at(&l, 0), c(3, 0, 6, 6));
+        assert_eq!(at(&l, 0), c(6, 0, 12, 12));
         let rect = l.rect(0).unwrap();
         assert!(rect.y >= o.area.y && rect.y + rect.h <= o.area.y + o.area.h);
     }
@@ -1681,7 +1688,7 @@ pub(super) mod tests {
     #[test]
     fn double_click_rejects_delays_other_edges_intervening_clicks_and_motion() {
         for scenario in 0..5 {
-            let mut l = with(&[c(3, 1, 6, 4)]);
+            let mut l = with(&[c(6, 2, 12, 8)]);
             let mut clicks = EdgeClicks::default();
             let p = l.zone(Hit::Edge(0, Side::Right)).unwrap().center();
             edge_click(&mut l, &mut clicks, p, 0);
@@ -1700,12 +1707,12 @@ pub(super) mod tests {
                 _ => next.1 += 8,
             }
             assert!(edge_click(&mut l, &mut clicks, next, time).is_none());
-            assert_eq!(at(&l, 0), c(3, 1, 6, 4));
+            assert_eq!(at(&l, 0), c(6, 2, 12, 8));
         }
         let mut l = halves();
-        let p = (1714, 700);
+        let p = (1718, 700);
         let mut d = Drag::press(&l, p).unwrap();
-        d.motion(&mut l, col(8), 0);
+        d.motion(&mut l, col(16), 0);
         d.motion(&mut l, p, 1);
         assert!(
             d.edge_click(&l, p).is_none(),
@@ -1722,17 +1729,17 @@ pub(super) mod tests {
         l.remove(0);
         d.motion(&mut l, (3000, 700), 10);
         assert!(d.release(&mut l, (3000, 700), 20).is_none());
-        assert_eq!(at(&l, 1), c(6, 0, 6, 6));
+        assert_eq!(at(&l, 1), c(12, 0, 12, 12));
 
         // A resize undoes what it did to the others.
         let mut l = halves();
-        let mut d = Drag::press(&l, (1714, 700)).unwrap();
-        d.motion(&mut l, col(8), 0);
-        assert_eq!(at(&l, 1), c(8, 0, 4, 6));
+        let mut d = Drag::press(&l, (1718, 700)).unwrap();
+        d.motion(&mut l, col(16), 0);
+        assert_eq!(at(&l, 1), c(16, 0, 8, 12));
         l.remove(0);
-        assert!(d.motion(&mut l, col(9), 10));
-        assert!(d.release(&mut l, col(9), 20).is_none());
-        assert_eq!(at(&l, 1), c(6, 0, 6, 6));
+        assert!(d.motion(&mut l, col(18), 10));
+        assert!(d.release(&mut l, col(18), 20).is_none());
+        assert_eq!(at(&l, 1), c(12, 0, 12, 12));
 
         // An armed press too.
         let mut l = halves();
@@ -1748,9 +1755,9 @@ pub(super) mod tests {
         // A resize mid-way: both tiles return to where they were.
         let mut l = halves();
         let tiles = l.tiles.clone();
-        let mut d = Drag::press(&l, (1714, 700)).unwrap();
-        d.motion(&mut l, col(9), 0);
-        assert_eq!(at(&l, 1), c(9, 0, 3, 6));
+        let mut d = Drag::press(&l, (1718, 700)).unwrap();
+        d.motion(&mut l, col(18), 0);
+        assert_eq!(at(&l, 1), c(18, 0, 6, 12));
         assert!(d.cancel(&mut l));
         assert_eq!(l.tiles, tiles);
 
@@ -1769,7 +1776,7 @@ pub(super) mod tests {
         let strip = Rect {
             x: 4,
             y: 0,
-            w: 1708,
+            w: 1712,
             h: GAP,
         };
         assert_eq!(zones(&l, None, A_STRIP, 0), vec![(strip, accent(1.0))]);
@@ -1792,7 +1799,7 @@ pub(super) mod tests {
         assert!(lines.iter().all(|(r, _)| r.w == 1 || r.h == 1));
         assert!(lines.iter().all(|&(_, k)| k == accent(GRID_ALPHA)));
         // The preview is where the window itself would go: the tile rect.
-        assert_eq!(rects.last().unwrap().0, uw().tile_rect(c(6, 0, 6, 6)));
+        assert_eq!(rects.last().unwrap().0, uw().tile_rect(c(12, 0, 12, 12)));
         assert_eq!(rects.last().unwrap().1, accent(PREVIEW_ALPHA));
 
         // Swap and tab previews look different: more solid once the hold has elapsed.
@@ -1804,10 +1811,10 @@ pub(super) mod tests {
         assert_eq!(preview_at(1499).1, rgba(ACCENT, 0.35));
         assert_eq!(preview_at(1500).1, rgba(ACCENT, 0.55));
         // Job 003: a tab group has a bar, so the tab-in preview sits below one.
-        assert_eq!(preview_at(1499).0, uw().tile_rect(c(6, 0, 6, 6)));
+        assert_eq!(preview_at(1499).0, uw().tile_rect(c(12, 0, 12, 12)));
         assert_eq!(
             preview_at(1500).0,
-            uw().window_rect(c(6, 0, 6, 6), super::super::BAR)
+            uw().window_rect(c(12, 0, 12, 12), super::super::BAR)
         );
     }
 

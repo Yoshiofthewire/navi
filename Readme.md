@@ -14,7 +14,7 @@ and physical input still need hardware validation. See [limitations](#limitation
 
 ## What works
 
-- A 12 × 6 grid on each monitor, with predictable placement and remembered app sizes/positions.
+- A 24 × 12 grid on each monitor, with predictable placement and remembered app sizes/positions.
 - Drag to move, resize edges or corners, swap tiles, and group windows into tabs.
 - Keyboard moves and directional expansion with Alt/Super + Arrow.
 - A rounded dock with persistent app pins, categorized app folders, search, and scrolling.

@@ -101,11 +101,11 @@ fn load(path: &Path, layout: &mut Layout) {
         Err(e) => Err(e),
     };
     match loaded {
-        Ok((entries, skipped)) => {
+        Ok((format, entries, skipped)) => {
             if skipped > 0 {
                 warn!(path = %shown, skipped, "memory: bad lines skipped");
             }
-            info!(path = %shown, entries, skipped, "memory loaded");
+            info!(path = %shown, format, entries, skipped, "memory loaded");
         }
         Err(e) => warn!(path = %shown, "memory file ignored: {e}"),
     }
@@ -213,7 +213,7 @@ pub mod tests {
         l
     }
 
-    const EMPTY: &str = "navi-memory 1\n";
+    const EMPTY: &str = "navi-memory 2\n";
 
     #[test]
     fn path_follows_xdg_and_rejects_relative() {
@@ -272,8 +272,36 @@ pub mod tests {
         let big = format!("{EMPTY}{}", "a uw 0 0 6 6 1720 1440\n".repeat(50_000));
         fs::write(&file, big).unwrap();
         check("over 1 MiB");
-        fs::write(&file, b"navi-memory 1\n\xff\xfe uw 0 0 6 6 1720 1440\n").unwrap();
+        fs::write(&file, b"navi-memory 2\n\xff\xfe uw 0 0 6 6 1720 1440\n").unwrap();
         check("not UTF-8");
+    }
+
+    #[test]
+    fn version_1_file_converts_in_ram_and_stays_until_saved() {
+        let tmp = Tmp::new("v1");
+        let file = tmp.0.join("navi/memory");
+        let v1 = "navi-memory 1\na uw 6 0 6 6 1720 1440\n";
+        write(&file, v1).unwrap();
+        let mut l = remembering();
+        load(&file, &mut l);
+        assert_eq!(
+            l.memory_text(),
+            "navi-memory 2\na uw 12 0 12 12 1720 1440\n"
+        );
+        assert_eq!(fs::read_to_string(&file).unwrap(), v1);
+
+        let mut store = Store {
+            path: Some(file.clone()),
+            saved: l.memory_text(),
+        };
+        store.sync(&l);
+        assert_eq!(fs::read_to_string(&file).unwrap(), v1, "no change, no save");
+        l.place("b", (10, 10)).unwrap();
+        store.sync(&l);
+        let saved = fs::read_to_string(&file).unwrap();
+        assert!(saved.starts_with("navi-memory 2\n"), "{saved}");
+        assert!(saved.contains("a uw 12 0 12 12 1720 1440\n"), "{saved}");
+        assert_eq!(mode(&file), 0o600);
     }
 
     #[test]
