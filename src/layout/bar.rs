@@ -170,7 +170,7 @@ pub fn draw(l: &Layout, id: WinId, bar: &Bar, hover: Option<Hit>) -> Vec<(Rect, 
 #[cfg(test)]
 mod tests {
     use super::super::{
-        Cells, FULL, GAP, MIN_H, MIN_W, Output, Tile,
+        COLS, Cells, FULL, GAP, MIN_H, MIN_W, Output, ROWS, Tile,
         drag::{
             Done, Drag,
             tests::{assert_valid, at, c, drag, uw, with, zones},
@@ -268,14 +268,12 @@ mod tests {
     const HALF_L: Cells = Cells {
         col: 0,
         row: 0,
-        cols: 6,
-        rows: 6,
+        cols: COLS / 2,
+        rows: ROWS,
     };
     const HALF_R: Cells = Cells {
-        col: 6,
-        row: 0,
-        cols: 6,
-        rows: 6,
+        col: COLS / 2,
+        ..HALF_L
     };
 
     #[test]
@@ -472,7 +470,7 @@ mod tests {
         assert_eq!(click_button(&mut l, 0, Button::Maximize), Some("maximized"));
         assert_eq!(l.rect(0), Some(uw().window_rect(FULL, BAR)));
         assert!(!l.visible(1));
-        assert_eq!(l.hit((1716, 700)), None, "b's left edge");
+        assert_eq!(l.hit((1720, 700)), None, "b's left edge");
         assert_eq!(l.hit((2500, 1437)), None, "b's bottom edge");
         // b's strip is under a's bar now; nothing anywhere is b's, and a has no edges.
         let all = hits(&l);
@@ -630,7 +628,12 @@ mod tests {
 
     #[test]
     fn ac10_overlay() {
-        let mut l = with(&[c(0, 0, 4, 6), c(4, 0, 4, 6), c(8, 0, 4, 6), c(8, 0, 4, 6)]);
+        let mut l = with(&[
+            c(0, 0, 8, 12),
+            c(8, 0, 8, 12),
+            c(16, 0, 8, 12),
+            c(16, 0, 8, 12),
+        ]);
         l.set_decorated(1, true);
         let away = (500, 700);
         let drawn = zones(&l, None, away, 0);
@@ -754,12 +757,12 @@ mod tests {
     #[test]
     fn resizing_a_tab_group_resizes_the_group() {
         let mut l = with(&[HALF_L, HALF_L, HALF_R]);
-        drag(&mut l, (1714, 700), &[((uw().x_edge(8), 700), 0)]);
-        assert_eq!(at(&l, 0), c(0, 0, 8, 6));
-        assert_eq!(at(&l, 1), c(0, 0, 8, 6));
-        assert_eq!(at(&l, 2), c(8, 0, 4, 6));
+        drag(&mut l, (1718, 700), &[((uw().x_edge(16), 700), 0)]);
+        assert_eq!(at(&l, 0), c(0, 0, 16, 12));
+        assert_eq!(at(&l, 1), c(0, 0, 16, 12));
+        assert_eq!(at(&l, 2), c(16, 0, 8, 12));
         // The group's edge zones belong to its active tab.
         let right = Some(Hit::Edge(1, crate::layout::drag::Side::Right));
-        assert_eq!(l.hit((uw().x_edge(8) - 2, 700)), right);
+        assert_eq!(l.hit((uw().x_edge(16) - 2, 700)), right);
     }
 }
