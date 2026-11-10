@@ -923,6 +923,21 @@ mod tests {
             !ask(&mut event_loop, &mut data),
             "bare Super doesn't lift the guard"
         );
+        // A second Super+Esc, with nothing fullscreen, is still navi's: kept from the app (the
+        // leak check below covers keycode 9) and no lift.
+        for (code, state) in [
+            (133u32, KeyState::Pressed),
+            (9, KeyState::Pressed),
+            (9, KeyState::Released),
+            (133, KeyState::Released),
+        ] {
+            data.state.keyboard_key(code.into(), state, 7);
+        }
+        assert!(data.state.suppressed.is_empty());
+        assert!(
+            !ask(&mut event_loop, &mut data),
+            "a second Super+Esc doesn't lift the guard"
+        );
         // A key press it receives lifts the guard.
         data.state.keyboard_key(38u32.into(), KeyState::Pressed, 7);
         data.state.keyboard_key(38u32.into(), KeyState::Released, 8);

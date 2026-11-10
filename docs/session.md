@@ -38,8 +38,8 @@ there, and Ctrl+Alt+Backspace brings the console back. Then pick "navi" on the l
 - **Ctrl+Alt+F2** (F1…F12) switches to a text console. **Ctrl+Alt+F1**, or the F-key of the VT
   the session runs on, goes back to navi, which picks up where it was.
 - **Super+Esc** takes a stuck fullscreen app on the focused monitor back to its tile and
-  brings the taskbar back; the app sees no key. It can't go fullscreen again until you type a
-  non-modifier key into it or click it.
+  brings the taskbar back. Apps never see Super+Esc. The app can't go fullscreen again until
+  you type into it (a key that is neither a modifier nor a navi shortcut) or click it.
 - If the keys do nothing (navi hung, or found no keyboard): log in over SSH, or from another
   machine, and `kill` navi; else hold the power button. Ctrl+Alt+SysRq+R, E, I, S, U, B is the
   last resort, where SysRq is enabled.

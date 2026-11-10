@@ -145,10 +145,11 @@ space when you want it.
   monitor the window is on, and hides the other windows there; the taskbar can't be seen or
   clicked meanwhile, but keeps its space. It ends when the app leaves fullscreen, closes or is
   minimized, when a new window opens on that monitor, when another window there is
-  activated, or when the user presses Super+Esc on that monitor (the focused window's, else the
-  pointer's); the window goes back to its tile. navi keeps Super+Esc from apps while it acts on
-  it. A window left by Super+Esc can't go fullscreen again until the user next types a
-  non-modifier key into it or clicks it; Super, Alt, Ctrl, Shift and the lock keys don't count. Its dialogs still float over it.
+  activated, or when the user presses Super+Esc on that monitor (the focused window's, else
+  the pointer's); the window goes back to its tile. Super+Esc is navi's: apps never see it,
+  whether or not anything is fullscreen. A window left by Super+Esc can't go fullscreen again
+  until the user types a non-modifier key that is no navi shortcut into it, or clicks it.
+  Its dialogs still float over it.
 
 ## Monitors
 

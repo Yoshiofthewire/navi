@@ -89,10 +89,11 @@ fn keep(
 }
 
 /// Whether a key press lifts the fullscreen re-entry guard on the window it reached: only a
-/// non-modifier key that navi forwarded. A bare Super, the first half of the next Super+Esc,
-/// must not let the app back into fullscreen. A delivered button press always lifts it.
-pub fn lifts_guard(sym: Keysym, forwarded: bool) -> bool {
-    forwarded && !sym.is_modifier_key()
+/// non-modifier key that navi forwarded and that is no navi chord. A bare Super, or any part of
+/// the next Super+Esc, must not let the app back into fullscreen. A delivered button press
+/// always lifts it.
+pub fn lifts_guard(sym: Keysym, binding: Option<Binding>, forwarded: bool) -> bool {
+    forwarded && binding.is_none() && !sym.is_modifier_key()
 }
 
 /// The output Super+Esc ends fullscreen on, if a window is fullscreen there: the focused
@@ -259,7 +260,7 @@ impl Navi {
             return;
         };
         let vt = self.session.is_some();
-        let mut sym = Keysym::NoSymbol;
+        let (mut sym, mut chord) = (Keysym::NoSymbol, None);
         let kept = kb.input::<Option<Binding>, _>(
             self,
             code,
@@ -289,12 +290,12 @@ impl Navi {
                     }
                     other => other,
                 };
+                chord = binding;
                 let usable = match binding {
                     Some(Binding::Vt(_)) => vt,
                     Some(Binding::Move(_) | Binding::Expand(_)) => {
                         navi.focused_tile().is_some() && navi.drag.is_none()
                     }
-                    Some(Binding::LeaveFullscreen) => navi.escape_target().is_some(),
                     _ => true,
                 };
                 // Once a press is ours, repeats and release remain ours.
@@ -310,7 +311,7 @@ impl Navi {
                 }
             },
         );
-        if state == KeyState::Pressed && lifts_guard(sym, kept.is_none()) {
+        if state == KeyState::Pressed && lifts_guard(sym, chord, kept.is_none()) {
             let focus = kb.current_focus().and_then(|f| f.surface());
             self.user_pressed(focus);
         }
@@ -720,14 +721,26 @@ mod tests {
             Keysym::Caps_Lock,
             Keysym::Num_Lock,
         ] {
-            assert!(!lifts_guard(sym, true), "{sym:?}");
+            assert!(!lifts_guard(sym, None, true), "{sym:?}");
         }
         // Keys navi kept: Super+Esc itself and the window shortcuts.
-        assert!(!lifts_guard(Keysym::Escape, false));
-        assert!(!lifts_guard(Keysym::Right, false));
-        assert!(!lifts_guard(Keysym::l, false));
-        // An ordinary key the app received.
-        assert!(lifts_guard(Keysym::a, true));
-        assert!(lifts_guard(Keysym::Escape, true));
+        let esc = Some(Binding::LeaveFullscreen);
+        assert!(!lifts_guard(Keysym::Escape, esc, false));
+        assert!(!lifts_guard(
+            Keysym::Right,
+            Some(Binding::Move(Side::Right)),
+            false
+        ));
+        assert!(!lifts_guard(Keysym::l, Some(Binding::Lock), false));
+        // A navi chord that reached the app anyway (Alt+Right with no focused tile).
+        assert!(!lifts_guard(
+            Keysym::Right,
+            Some(Binding::Move(Side::Right)),
+            true
+        ));
+        assert!(!lifts_guard(Keysym::Escape, esc, true));
+        // An ordinary key the app received, a bare Esc included.
+        assert!(lifts_guard(Keysym::a, None, true));
+        assert!(lifts_guard(Keysym::Escape, None, true));
     }
 }
