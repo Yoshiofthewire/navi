@@ -118,7 +118,9 @@ Every press changes exactly one grid cell.
 - Growing or moving into touching tiles takes the cell from them: each tile touching that side
   (minimized ones included) moves its touching edge one cell away, and its other edges stay. If
   any of them would drop below the minimum size, nothing changes. Neither crosses the monitor's
-  usable edge.
+  usable edge. A press that does nothing means a touching tile is already at its minimum size
+  (shrink or move that tile first) or the tile reached the edge or its own minimum; the debug log
+  says which.
 - All three act on the active tab group, keep keyboard focus, and remember the focused group's
   change: moves preserve its remembered size, growing and shrinking update it. Tiles that gave up
   a cell keep what navi remembers for them.

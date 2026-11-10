@@ -373,12 +373,18 @@ impl Layout {
 
     /// Moves the focused group one cell, or grows or shrinks its `side` by one. Growing or moving
     /// takes the cell from every tile touching that side, or does nothing if one can't spare it.
-    pub fn keyboard_adjust(&mut self, id: WinId, side: Side, op: Nudge) -> Option<Done> {
-        let t = self.tile(id)?;
+    /// `Err` says why nothing changed.
+    pub fn keyboard_adjust(
+        &mut self,
+        id: WinId,
+        side: Side,
+        op: Nudge,
+    ) -> Result<Done, &'static str> {
+        let t = self.tile(id).ok_or("no tile")?;
         if !self.visible(id) || self.maximized(t) || t.fullscreen {
-            return None;
+            return Err("not a shown tile");
         }
-        let o = self.output(&t.output)?;
+        let o = self.output(&t.output).ok_or("no output")?;
         let x = matches!(side, Side::Left | Side::Right);
         let far = matches!(side, Side::Right | Side::Bottom);
         let (min_c, min_r) = o.span_for((MIN_W, MIN_H));
@@ -393,8 +399,11 @@ impl Layout {
             (Nudge::Move, false) => (start - 1, len),
             (Nudge::Move, true) => (start + 1, len),
         };
-        if (op == Nudge::Shrink && len < min) || start < 0 || start + len > n {
-            return None;
+        if op == Nudge::Shrink && len < min {
+            return Err("tile at minimum");
+        }
+        if start < 0 || start + len > n {
+            return Err("monitor edge");
         }
         let mut changes = vec![(group.clone(), with_span(before, x, start, len))];
         if op != Nudge::Shrink {
@@ -406,7 +415,7 @@ impl Layout {
             }) {
                 let (s, l) = span(u.cells, x);
                 if l - 1 < min {
-                    return None;
+                    return Err("neighbour at minimum");
                 }
                 let s = if far { s + 1 } else { s };
                 changes.push((vec![u.id], with_span(u.cells, x, s, l - 1)));
@@ -424,7 +433,7 @@ impl Layout {
             Nudge::Grow => "expanded",
             Nudge::Shrink => "shrunk",
         };
-        Some(Done::Layout(what, self.tiles_in(&ids)))
+        Ok(Done::Layout(what, self.tiles_in(&ids)))
     }
 }
 
@@ -1527,25 +1536,25 @@ pub(super) mod tests {
 
     /// A nudge that keeps the layout valid, as it is logged.
     fn nudge(l: &mut Layout, id: WinId, side: Side, op: Nudge) -> Option<&'static str> {
-        let what = what(l.keyboard_adjust(id, side, op));
+        let what = what(l.keyboard_adjust(id, side, op).ok());
         assert_valid(l);
         what
     }
 
-    /// A nudge that changes nothing: no result, and tiles and memory as they were.
-    fn unchanged(l: &mut Layout, id: WinId, side: Side, op: Nudge) {
+    /// A nudge that changes nothing: why, with tiles and memory as they were.
+    fn unchanged(l: &mut Layout, id: WinId, side: Side, op: Nudge) -> &'static str {
         let (tiles, memory) = (l.tiles.clone(), l.memory.clone());
-        assert!(
-            l.keyboard_adjust(id, side, op).is_none(),
-            "{id} {side:?} {op:?}"
-        );
+        let why = l
+            .keyboard_adjust(id, side, op)
+            .expect_err(&format!("{id} {side:?} {op:?}"));
         assert_eq!(l.tiles, tiles, "{id} {side:?} {op:?}");
         assert_eq!(l.memory, memory, "{id} {side:?} {op:?}");
+        why
     }
 
     /// The ids and cells a nudge reports, sorted by id.
     fn changed(l: &mut Layout, id: WinId, side: Side, op: Nudge) -> Vec<(WinId, Cells)> {
-        let Some(Done::Layout(_, tiles)) = l.keyboard_adjust(id, side, op) else {
+        let Ok(Done::Layout(_, tiles)) = l.keyboard_adjust(id, side, op) else {
             panic!("{id} {side:?} {op:?} changed nothing");
         };
         assert_valid(l);
@@ -1589,7 +1598,7 @@ pub(super) mod tests {
     fn keyboard_growth_stops_at_each_usable_monitor_edge() {
         let mut l = with(&[c(0, 0, 24, 12)]);
         for side in SIDES {
-            unchanged(&mut l, 0, side, Nudge::Grow);
+            assert_eq!(unchanged(&mut l, 0, side, Nudge::Grow), "monitor edge");
         }
         for (cells, side) in [
             (c(0, 2, 6, 4), Side::Left),
@@ -1661,9 +1670,11 @@ pub(super) mod tests {
     #[test]
     fn keyboard_growth_never_shrinks_a_neighbor_below_the_minimum() {
         let mut l = with(&[c(0, 0, 21, 12), c(21, 0, 3, 12)]);
-        unchanged(&mut l, 0, Side::Right, Nudge::Grow);
+        let why = unchanged(&mut l, 0, Side::Right, Nudge::Grow);
+        assert_eq!(why, "neighbour at minimum");
         let mut l = with(&[c(0, 0, 24, 10), c(0, 10, 24, 2)]);
-        unchanged(&mut l, 0, Side::Bottom, Nudge::Grow);
+        let why = unchanged(&mut l, 0, Side::Bottom, Nudge::Grow);
+        assert_eq!(why, "neighbour at minimum");
     }
 
     #[test]
@@ -1719,7 +1730,7 @@ pub(super) mod tests {
         assert_eq!(at(&l, 1), c(12, 0, 12, 12));
         let mut l = with(&[c(6, 2, 3, 2)]);
         for side in SIDES {
-            unchanged(&mut l, 0, side, Nudge::Shrink);
+            assert_eq!(unchanged(&mut l, 0, side, Nudge::Shrink), "tile at minimum");
         }
     }
 
@@ -1823,7 +1834,7 @@ pub(super) mod tests {
             ..Tile::default()
         });
         // assert_valid ignores outputs, so check this one by hand.
-        assert!(l.keyboard_adjust(0, Side::Right, Nudge::Grow).is_some());
+        assert!(l.keyboard_adjust(0, Side::Right, Nudge::Grow).is_ok());
         assert_eq!((at(&l, 0), at(&l, 1)), (c(0, 0, 13, 12), c(13, 0, 11, 12)));
         assert_eq!(at(&l, 2), c(12, 0, 12, 12));
         assert_eq!(l.tile(2).unwrap().output, "other");

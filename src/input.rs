@@ -18,7 +18,7 @@ use smithay::{
     utils::{Logical, Point, SERIAL_COUNTER},
 };
 
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     layout::{Action, Done, Drag, Layout, Nudge, Rect, Side, WinId},
@@ -213,7 +213,7 @@ impl Navi {
                     } else {
                         Side::Bottom
                     };
-                    if self.layout.keyboard_adjust(id, side, Nudge::Move).is_some() {
+                    if self.layout.keyboard_adjust(id, side, Nudge::Move).is_ok() {
                         self.memory.sync(&self.layout);
                         self.apply_layout();
                     }
@@ -406,14 +406,18 @@ impl Navi {
                 };
                 if self.drag.is_none()
                     && let Some(id) = self.focused_tile()
-                    && let Some(Done::Layout(what, tiles)) =
-                        self.layout.keyboard_adjust(id, side, op)
                 {
-                    let cells: Vec<_> = tiles.iter().map(|t| (t.id, t.cells)).collect();
-                    info!(id, by = "keyboard", ?cells, "{what}");
-                    self.edge_clicks = Default::default();
-                    self.memory.sync(&self.layout);
-                    self.apply_layout();
+                    match self.layout.keyboard_adjust(id, side, op) {
+                        Ok(Done::Layout(what, tiles)) => {
+                            let cells: Vec<_> = tiles.iter().map(|t| (t.id, t.cells)).collect();
+                            info!(id, by = "keyboard", ?cells, "{what}");
+                            self.edge_clicks = Default::default();
+                            self.memory.sync(&self.layout);
+                            self.apply_layout();
+                        }
+                        Ok(Done::Click(..)) => {}
+                        Err(why) => debug!(id, ?side, ?op, why, "keyboard nudge blocked"),
+                    }
                 }
             }
             None => {}

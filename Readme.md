@@ -88,7 +88,9 @@ Build as your normal user. For a debug build, use `cargo build --locked` and `./
 
 Each press changes one cell. Alt+Arrow keeps the size; Super+Arrow and Super+Shift+Arrow grow or
 shrink the selected side. Moving or growing into touching windows takes the cell from all of them,
-or does nothing if one is at its minimum size. All act on the focused tab group and remember it.
+or does nothing if one is at its minimum size. A press that does nothing means a touching window is
+already at its minimum size or the window hit the monitor edge. All act on the focused tab group
+and remember it.
 Maximized and fullscreen windows keep their geometry. Floating dialogs and the launcher retain
 their app shortcuts. A host compositor may intercept shortcuts while Navi is nested.
 

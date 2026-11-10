@@ -51,6 +51,8 @@ there, and Ctrl+Alt+Backspace brings the console back. Then pick "navi" on the l
   it by one.
 - Moving or growing into touching windows takes the cell from all of them, or does nothing if
   one is at its minimum size. Nothing crosses the monitor's usable edge; panels keep their space.
+  A press that does nothing means a touching window is already at its minimum size or the window
+  hit the edge.
 
 - **Super (tap):** open or close the app launcher. Type to search, arrows, PageUp/PageDown and
   Home/End to move, Enter to launch, Esc to close; the keyboard then returns to your window.
