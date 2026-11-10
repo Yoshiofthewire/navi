@@ -235,7 +235,9 @@ def expanded_settings(Gtk, Gdk, Gio, GLib):
             self.row('Layout',layout,'XKB layout names, such as us, gb, de, or us,de')
             self.row('Variant',variant,'Optional XKB variant, such as intl')
             self.row('Layout options',options,'For example grp:alt_shift_toggle to switch layouts')
-            modifier=self.selected_choice('Move windows',['Alt + Arrow','Super + Arrow'],['alt','super'],p.get('move_modifier','alt'),'Expand uses the other modifier. Lock and emergency shortcuts remain fixed.')
+            modifier=self.selected_choice('Move windows',['Alt + Arrow','Super + Arrow'],['alt','super'],p.get('move_modifier','alt'),shortcut_hint(p.get('move_modifier')))
+            hint=self.setting_rows[-1][2].get_last_child()
+            modifier.connect('notify::selected',lambda w,_:hint.set_label(shortcut_hint(['alt','super'][w.get_selected()])))
             self.content.append(self.button('Apply Layout & Device Preferences',lambda:self.apply_desktop(dict(swipe_moves=gestures.get_active(),left_handed=left.get_active(),flat_acceleration=flat.get_active(),disable_while_typing=typing.get_active(),
                 keyboard_layout=layout.get_text(),keyboard_variant=variant.get_text(),keyboard_options=options.get_text(),
                 move_modifier=['alt','super'][modifier.get_selected()],expand_modifier=['super','alt'][modifier.get_selected()])),True))

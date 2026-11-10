@@ -58,8 +58,9 @@ requirements only for this application. Closing it leaves no settings daemon.
   Hardware controls explicitly affect the computer; nested Navi cannot enable automatic actions.
 - **Mouse & Keyboard:** pointer speed, natural scroll, tap-to-click, left-handed buttons,
   flat/adaptive acceleration, disable-while-typing, repeat rate/delay, XKB layout/variant/options,
-  and swapping Alt/Super for move/expand shortcuts. Optional three-finger swipes move a focused
-  tile one cell through free space. Device controls need a full session.
+  and swapping Alt/Super for the move/grow/shrink shortcuts, with a hint naming the chords for
+  the picked modifier. Optional three-finger swipes move a focused tile one cell through free
+  space. Device controls need a full session.
 - **Accessibility:** larger text/cursor, high contrast, prominent visual notification borders,
   and one-shot sticky modifiers. Tapped Shift/Ctrl/Alt/Super applies to the next key; tapping it
   again cancels. Sticky state is cleared before locking and when preferences change. Animations

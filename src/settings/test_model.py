@@ -22,6 +22,19 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(model.matching_pages('unfindable'), [])
         self.assertEqual(len(model.matching_pages('')), len(model.PAGES))
 
+    def test_shortcut_hint_names_window_chords(self):
+        alt = model.shortcut_hint('alt')
+        self.assertIn('Alt + Arrow moves', alt)
+        self.assertIn('Super + Arrow grows', alt)
+        self.assertIn('Super + Shift + Arrow shrinks', alt)
+        superkey = model.shortcut_hint('super')
+        self.assertIn('Super + Arrow moves', superkey)
+        self.assertIn('Alt + Arrow grows', superkey)
+        self.assertIn('Alt + Shift + Arrow shrinks', superkey)
+        for value in (None, '', 'ctrl', 'Super', '$(reboot)'):
+            self.assertEqual(model.shortcut_hint(value), alt)
+        self.assertTrue(alt.endswith('Lock and emergency shortcuts remain fixed.'))
+
     def test_socket_request_and_service_errors(self):
         with tempfile.TemporaryDirectory() as directory:
             path = str(Path(directory) / 'navi-wayland-test.settings')
