@@ -341,7 +341,7 @@ fn bar_layer(
     let layer = layer_shell.create_layer_surface(qh, surface, Layer::Top, Some("navi-bar"), None);
     layer.set_anchor(Anchor::BOTTOM);
     layer.set_exclusive_zone(BAR_H);
-    layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+    layer.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
     layer.set_size(l.w as u32, l.h as u32);
     layer.commit();
     layer
@@ -463,10 +463,11 @@ impl Bar {
 
     /// Resizes the surface to what it now holds, or redraws it at its size.
     fn relayout(&mut self) {
-        // navi gives the open launcher the keyboard, and hands it back when it closes.
+        // navi gives the open launcher the keyboard, and hands it back when it closes. Closed,
+        // a click still focuses the taskbar, so a dock launch gets an activation token.
         self.layer.set_keyboard_interactivity(match self.menu {
             Some(_) => KeyboardInteractivity::Exclusive,
-            None => KeyboardInteractivity::None,
+            None => KeyboardInteractivity::OnDemand,
         });
         let rows = self.menu.as_ref().map_or(menu::ROWS, |m| m.rows().count());
         let l = Layout::new(self.dock_apps().len(), self.menu.is_some()).with_rows(rows);

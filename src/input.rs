@@ -482,7 +482,6 @@ impl Navi {
         let Some(pointer) = self.seat.get_pointer() else {
             return;
         };
-        let serial = SERIAL_COUNTER.next_serial();
         let pos = pointer.current_location();
         self.super_tap.button(button, pressed);
         if !left {
@@ -565,7 +564,9 @@ impl Navi {
             &ButtonEvent {
                 button,
                 state,
-                serial,
+                // After any focus change above: a click that focuses a surface carries a serial
+                // from its new focus period, so it can ask for an activation token.
+                serial: SERIAL_COUNTER.next_serial(),
                 time,
             },
         );

@@ -64,6 +64,15 @@ mod tests {
     const OTHER: u8 = 4;
 
     #[test]
+    fn a_dock_click_that_focuses_the_taskbar_can_get_a_token() {
+        // The click gives the taskbar the keyboard (enter serial 40); navi then sends the button
+        // press with the next serial, which the bar's token request carries.
+        assert!(may_issue(Some(41), Some(40), 41));
+        // A press serial made before the enter, as navi used to send, would be refused.
+        assert!(!may_issue(Some(39), Some(40), 41));
+    }
+
+    #[test]
     fn a_menu_launch_survives_navis_own_hand_back() {
         let back = after_focus_change(Some((BAR, KONSOLE)), Some(&KONSOLE));
         assert!(focus_kept(Some(&KONSOLE), Some(&BAR), &NEW, back.as_ref()));

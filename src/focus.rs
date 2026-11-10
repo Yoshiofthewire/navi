@@ -131,6 +131,14 @@ impl<L: PartialEq, W> Exclusive<L, W> {
         }
     }
 
+    /// `layer` holds the keyboard but its output now shows a fullscreen window, which hides it:
+    /// the window to give the keyboard back to, as on close. The layer still counts as asking,
+    /// so its next `Exclusive` commit can't take the keyboard again.
+    pub fn hidden(&mut self, layer: &L, shown: impl Fn(&W) -> bool) -> Option<Option<W>> {
+        let (_, back) = self.held.iter_mut().find(|(l, _)| l == layer)?;
+        Some(back.take().filter(shown))
+    }
+
     pub fn forget(&mut self, layer: &L) {
         self.held.retain(|(l, _)| l != layer);
     }
@@ -190,6 +198,25 @@ mod tests {
             x.commit(BAR, false, false, true, None, SHOWN),
             Some(Handoff::Return(Some(8)))
         );
+    }
+
+    #[test]
+    fn fullscreen_under_the_open_menu_gives_the_keyboard_back_once() {
+        let mut x = Exclusive::default();
+        assert_eq!(
+            x.hidden(&BAR, SHOWN),
+            None,
+            "not asking: nothing to give back"
+        );
+        x.commit(BAR, true, false, false, Some(7), SHOWN);
+        assert_eq!(x.hidden(&BAR, SHOWN), Some(Some(7)));
+        // The bar's commits before it closes the menu never take the keyboard again.
+        assert_eq!(x.commit(BAR, true, false, false, None, SHOWN), None);
+        // It closes on the keyboard leave; it no longer holds the keyboard.
+        assert_eq!(x.commit(BAR, false, false, false, None, SHOWN), None);
+        // A window gone by then gets nothing.
+        x.commit(BAR, true, false, false, Some(7), SHOWN);
+        assert_eq!(x.hidden(&BAR, |_| false), Some(None));
     }
 
     #[test]

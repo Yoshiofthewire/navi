@@ -138,6 +138,8 @@ pub struct Navi {
     pub(crate) exclusive: crate::focus::Exclusive<WlSurface, Window>,
     /// navi's last return of the keyboard from a layer to a window, until focus moves again.
     pub(crate) handback: Option<(WlSurface, WlSurface)>,
+    /// The window that held the keyboard when a layer last took it by a click.
+    before_layer: Option<Window>,
 
     compositor_state: CompositorState,
     xdg_shell_state: XdgShellState,
@@ -245,6 +247,7 @@ impl Navi {
             super_tap: Default::default(),
             exclusive: Default::default(),
             handback: None,
+            before_layer: None,
             seat_state,
             popups: PopupManager::default(),
             seat,
@@ -409,6 +412,7 @@ impl Navi {
         self.recenter_dialogs();
         self.recenter_x11();
         self.keep_focus_mapped(&shown);
+        self.hide_layer_focus();
         // Tiles moved: refocus a still pointer, so a click can't land in the window that left.
         if let Some(pointer) = self.seat.get_pointer() {
             let pos = pointer.current_location();
@@ -569,6 +573,9 @@ impl Navi {
                 t.send_pending_configure();
             }
         });
+        if let Some(w) = self.focused_window() {
+            self.before_layer = Some(w);
+        }
         let focus = Some(format!("layer {}", layer.namespace()));
         info!(?focus, "keyboard focus");
         kb.set_focus(
@@ -576,6 +583,42 @@ impl Navi {
             Some(Focus::Wayland(surface)),
             SERIAL_COUNTER.next_serial(),
         );
+    }
+
+    /// The toplevel window holding the keyboard, if one does.
+    fn focused_window(&self) -> Option<Window> {
+        let focus = self.seat.get_keyboard()?.current_focus()?.surface()?;
+        self.windows
+            .iter()
+            .find(|m| window_surface(&m.window).as_ref() == Some(&focus))
+            .map(|m| m.window.clone())
+    }
+
+    /// A fullscreen window now covers the launcher holding the keyboard: give the keyboard back,
+    /// as on close. The bar closes the menu when it loses the keyboard.
+    fn hide_layer_focus(&mut self) {
+        let Some(focus) = self
+            .seat
+            .get_keyboard()
+            .and_then(|kb| kb.current_focus())
+            .and_then(|f| f.surface())
+        else {
+            return;
+        };
+        let Some(output) = self.layer_output(&focus) else {
+            return;
+        };
+        if self.lock.active || !self.layout.fullscreen_on(&identity(&output)) {
+            return;
+        }
+        let space = &self.space;
+        if let Some(back) = self
+            .exclusive
+            .hidden(&focus, |w| space.element_location(w).is_some())
+        {
+            info!("launcher covered by fullscreen: keyboard returned");
+            self.focus(back);
+        }
     }
 
     fn is_mapped(&self, s: &WlSurface) -> bool {
@@ -1291,12 +1334,11 @@ impl CompositorHandler for Navi {
                 let focused = focus.as_ref() == Some(surface);
                 let exclusive =
                     l.cached_state().keyboard_interactivity == KeyboardInteractivity::Exclusive;
-                let window = focus.and_then(|s| {
-                    self.windows
-                        .iter()
-                        .find(|m| window_surface(&m.window).as_ref() == Some(&s))
-                        .map(|m| m.window.clone())
-                });
+                // Opened by a click on the taskbar, which already took the keyboard: the window
+                // before that click.
+                let window = self
+                    .focused_window()
+                    .or_else(|| self.before_layer.clone().filter(|_| focused));
                 let space = &self.space;
                 let handoff = self.exclusive.commit(
                     surface.clone(),

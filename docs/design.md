@@ -226,12 +226,13 @@ bundling a degoogled, resource-tested Chromium variant is reserved for a future 
   an empty search returns to folders. Typing searches all folders by app name or desktop ID.
   Up/Down selects, PageUp/PageDown move a page of rows, Home/End go to the first and last row,
   Enter opens the selected folder or launches the app, and Escape at the root or clicking
-  elsewhere closes the launcher. Tapping Super on its own (no other key or button pressed
-  before its release) opens or closes it on the taskbar's monitor; any Super chord never does,
-  and apps still see the Super press and release. While open the launcher holds the keyboard;
-  when it closes, the keyboard returns to the window that had it, if that's still shown. A tap
-  does nothing while locked or while the taskbar's monitor shows a fullscreen window (Super+Esc
-  first). With sticky keys on, a lone Super tap stays a latch. The mouse wheel and two-finger touchpad gestures
+  elsewhere closes the launcher. Tapping Super on its own (no other key or button pressed before
+  its release) opens or closes it on the taskbar's monitor; any Super chord never does, and apps
+  still see the Super press and release. While open the launcher holds the keyboard; when it
+  closes, the keyboard returns to the window that had it, if that's still shown. A tap does
+  nothing while locked or while the taskbar's monitor shows a fullscreen window (Super+Esc
+  first), and a window going fullscreen there closes it and returns the keyboard. With sticky
+  keys on, a lone Super tap stays a latch. The mouse wheel and two-finger touchpad gestures
   scroll both folders and app lists; small continuous movements accumulate across frames, and
   gesture end, pointer leave or navigation clears any remainder. Short result lists shrink the
   launcher to fit. The search, rows and pin buttons have distinct targets, and transparent space
