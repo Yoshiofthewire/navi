@@ -60,10 +60,11 @@ Python/PyGObject/GTK 4 runtime and default to Cairo unless a renderer preference
 After a debug build:
 
 ```sh
-CARGO_TARGET_DIR=/home/yoshi/git/navi/target python3 scripts/check-utilities.py --output /tmp/navi-utility-check
+python3 scripts/check-utilities.py
 ```
 
-Use a fresh, empty output directory. The check needs Thunar, Xvfb, GTK 3 GI and the normal Navi
+It writes into a new private temporary directory. `--output <dir>` must be empty, yours and mode
+700; a symlink is refused. The check needs Thunar, Xvfb, GTK 3 GI and the normal Navi
 dependencies. CI installs them and runs it explicitly, uploading native captures and results.
 A private session bus, Xvfb display, temporary Home/XDG roots and an unavailable
 system bus isolate the check from the host. The actual native module must apply live dark, light

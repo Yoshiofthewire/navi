@@ -227,8 +227,13 @@ def main():
     args=parser.parse_args()
     if args.probe:return probe(args.probe)
     if args.inside:return inside(args)
-    root=(args.output or Path(tempfile.mkdtemp(prefix='navi-utilities-'))).resolve()
-    root.mkdir(mode=0o700,parents=True,exist_ok=True)
+    output=args.output or Path(tempfile.mkdtemp(prefix='navi-utilities-'))
+    output.mkdir(mode=0o700,parents=True,exist_ok=True)
+    # Thunar later runs a handler written here, so another user must not control this directory.
+    if output.is_symlink():parser.error('the output directory must not be a symlink')
+    root=output.resolve();info=root.stat()
+    if info.st_uid!=os.getuid() or info.st_mode&0o077:
+        parser.error('the output directory must be yours and private (mode 700)')
     if any(root.iterdir()):parser.error('use a fresh, empty output directory')
     command=['dbus-run-session','--',sys.executable,str(Path(__file__).resolve()),'--inside',str(root),'--target',str(args.target.resolve()),'--xvfb',args.xvfb]
     if args.xfconfd:command+=['--xfconfd',args.xfconfd]
