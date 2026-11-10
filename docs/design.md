@@ -84,8 +84,9 @@ space when you want it.
 ### Dragging
 
 - **Move:** hover near a tile's top edge and a thin strip lights up. Left-drag it. The grid
-  appears faintly, and one glowing preview shows where the window will land. The preview is the
-  window's remembered size, snapped under the pointer, and it's clamped to stay on screen. Drop
+  appears faintly, fainter still where cells are under 80 px (a small or high-scale screen), and
+  one glowing preview shows where the window will land. The preview is the window's remembered
+  size, snapped under the pointer, and it's clamped to stay on screen. Drop
   the window onto another tile to swap them. Hold the window over the middle of a tile for about
   half a second, and the drop forms tabs instead.
 - **Resize:** drag any tile edge. It moves in whole cells. When two tiles share that edge, both
@@ -484,7 +485,6 @@ session.
 - Grid size: hard-coded at 24 × 12; no per-monitor or configurable grid.
 - More look references, beyond the logo.
 - Is this a daily driver? That decides whether laptop polish is in v1.
-- Multi-monitor test of COSMIC in a real session, after the running T3 tasks finish.
 - The dock's window slots need a pointer: there's no keyboard access to them yet, and the bar
   exposes nothing to screen readers.
 

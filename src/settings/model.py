@@ -27,6 +27,12 @@ PAGES = [
     ("Date, Time & Language", "preferences-system-time-symbolic", "clock timezone ntp locale region language date time"),
 ]
 
+def shortcut_hint(move_modifier):
+    """The window chords src/input.rs binds for this move modifier; anything else reads as alt."""
+    move, other = ('Super', 'Alt') if move_modifier == 'super' else ('Alt', 'Super')
+    return (f'{move} + Arrow moves, {other} + Arrow grows, {other} + Shift + Arrow shrinks. '
+            'Lock and emergency shortcuts remain fixed.')
+
 def matching_pages(query):
     query = query.casefold().strip()
     return [i for i, (name, _, words) in enumerate(PAGES) if query in (name + " " + words).casefold()]

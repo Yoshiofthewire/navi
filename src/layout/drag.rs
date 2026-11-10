@@ -14,6 +14,9 @@ const DOUBLE_CLICK_MS: u64 = 400;
 /// Holding a move over a tile's middle this long, in ms, tabs instead of swapping.
 const HOLD_MS: u64 = 500;
 const GRID_ALPHA: f32 = 0.2;
+/// Cells smaller than this, in logical px, fade the grid so it doesn't become a mesh.
+const GRID_FULL_PX: i32 = 80;
+const GRID_MIN_ALPHA: f32 = 0.06;
 const PREVIEW_ALPHA: f32 = 0.35;
 /// Once a hold over a tile's middle will tab, the preview turns this solid.
 const TAB_ALPHA: f32 = 0.55;
@@ -955,9 +958,16 @@ fn frame(r: Rect, px: i32) -> [Rect; 4] {
     ]
 }
 
+/// The grid's strength for a smallest cell side of `cell` logical px.
+fn grid_alpha(cell: i32) -> f32 {
+    let scale = cell.clamp(0, GRID_FULL_PX) as f32 / GRID_FULL_PX as f32;
+    (GRID_ALPHA * scale).max(GRID_MIN_ALPHA)
+}
+
 /// The output's interior cell boundaries, 1 px wide, and the preview where the window would go.
 fn move_overlay(o: &Output, target: Target, top: i32, alpha: f32) -> Vec<(Rect, [f32; 4])> {
     let a = o.area;
+    let grid = accent(grid_alpha(o.cell_w().min(o.cell_h())));
     let cols = (1..COLS).map(|k| Rect {
         x: o.x_edge(k),
         w: 1,
@@ -969,7 +979,7 @@ fn move_overlay(o: &Output, target: Target, top: i32, alpha: f32) -> Vec<(Rect, 
         ..a
     });
     cols.chain(rows)
-        .map(|r| (r, accent(GRID_ALPHA)))
+        .map(|r| (r, grid))
         .chain(
             target
                 .cells()
@@ -2018,6 +2028,40 @@ pub(super) mod tests {
         d.motion(&mut l, B_MIDDLE, 0);
         assert!(!d.cancel(&mut l));
         assert_eq!((l.tiles.clone(), l.memory.clone()), (tiles, memory));
+    }
+
+    #[test]
+    fn grid_fades_on_small_cells() {
+        assert_eq!(grid_alpha(80), GRID_ALPHA);
+        assert_eq!(grid_alpha(200), GRID_ALPHA);
+        assert!(grid_alpha(79) < GRID_ALPHA);
+        assert!(grid_alpha(46) <= 0.12);
+        assert_eq!(grid_alpha(1), GRID_MIN_ALPHA);
+        assert_eq!(grid_alpha(0), GRID_MIN_ALPHA);
+        assert_eq!(grid_alpha(i32::MIN), GRID_MIN_ALPHA);
+        let all: Vec<f32> = (0..=100).map(grid_alpha).collect();
+        assert!(all.windows(2).all(|w| w[0] <= w[1]));
+        assert!(all.iter().all(|a| a.is_finite() && *a >= GRID_MIN_ALPHA));
+    }
+
+    #[test]
+    fn laptop_grid_draws_fainter() {
+        let laptop = Output {
+            area: Rect {
+                x: 0,
+                y: 0,
+                w: 1125,
+                h: 703,
+            },
+            ..uw()
+        };
+        assert_eq!(laptop.cell_w().min(laptop.cell_h()), 46);
+        let rects = move_overlay(&laptop, Target::Free(c(0, 0, 6, 6)), 0, PREVIEW_ALPHA);
+        let (lines, preview) = rects.split_at(rects.len() - 1);
+        assert_eq!(lines.len(), (COLS - 1 + ROWS - 1) as usize);
+        assert!(lines.iter().all(|&(_, k)| k == accent(grid_alpha(46))));
+        assert!(grid_alpha(46) < GRID_ALPHA);
+        assert_eq!(preview[0].1, accent(PREVIEW_ALPHA));
     }
 
     #[test]
