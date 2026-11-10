@@ -110,6 +110,59 @@ pub fn escape_output(
     layout.fullscreen_on(output).then(|| output.to_string())
 }
 
+/// A lone tap of Super: pressed with no other key or button down and released with none pressed
+/// in between. It opens or closes the app menu; any chord cancels it.
+#[derive(Debug, Default)]
+pub struct SuperTap {
+    armed: Option<u32>,
+    buttons: Vec<u32>,
+}
+
+impl SuperTap {
+    /// A key press or release, intercepted or not. `alone`, on a press: no other key is down.
+    /// True on the release that completes a tap.
+    pub fn key(&mut self, code: u32, sym: Keysym, pressed: bool, alone: bool) -> bool {
+        if pressed {
+            let super_key = matches!(sym, Keysym::Super_L | Keysym::Super_R);
+            self.armed = (alone && self.buttons.is_empty() && super_key).then_some(code);
+            return false;
+        }
+        self.armed.take_if(|c| *c == code).is_some()
+    }
+
+    /// A pointer button press or release.
+    pub fn button(&mut self, code: u32, pressed: bool) {
+        self.buttons.retain(|&b| b != code);
+        if pressed {
+            self.cancel();
+            self.buttons.push(code);
+        }
+    }
+
+    pub fn cancel(&mut self) {
+        self.armed = None;
+    }
+}
+
+/// Whether a Super tap toggles the app menu: only unlocked, with navi-bar connected, and with
+/// no fullscreen window on the taskbar's output `bar_on`. `Err` is why not.
+pub fn menu_tap(
+    locked: bool,
+    layout: &Layout,
+    bar_on: Option<&str>,
+    connected: bool,
+) -> Result<(), &'static str> {
+    if locked {
+        Err("locked")
+    } else if !connected {
+        Err("no navi-bar")
+    } else if bar_on.is_some_and(|o| layout.fullscreen_on(o)) {
+        Err("fullscreen")
+    } else {
+        Ok(())
+    }
+}
+
 impl Navi {
     pub fn process_input_event<I: InputBackend>(&mut self, event: InputEvent<I>) {
         self.last_activity = std::time::Instant::now();
@@ -250,6 +303,8 @@ impl Navi {
     pub fn release_sticky(&mut self) {
         let codes = std::mem::take(&mut self.sticky).latched;
         self.swipe = None;
+        // Releasing a latched Super isn't a tap.
+        self.super_tap.cancel();
         for code in codes {
             self.keyboard_key_inner(code.into(), KeyState::Released, 0);
         }
@@ -311,7 +366,12 @@ impl Navi {
                 }
             },
         );
-        if state == KeyState::Pressed && lifts_guard(sym, chord, kept.is_none()) {
+        let pressed = state == KeyState::Pressed;
+        let alone = kb.pressed_keys().len() == 1;
+        if self.super_tap.key(code.raw(), sym, pressed, alone) {
+            self.super_tapped();
+        }
+        if pressed && lifts_guard(sym, chord, kept.is_none()) {
             let focus = kb.current_focus().and_then(|f| f.surface());
             self.user_pressed(focus);
         }
@@ -357,6 +417,23 @@ impl Navi {
                 }
             }
             None => {}
+        }
+    }
+
+    fn super_tapped(&mut self) {
+        let bar = self.bar_on();
+        let connected = self.bar_control.is_some();
+        match menu_tap(self.lock.active, &self.layout, bar.as_deref(), connected) {
+            Ok(()) => {
+                if self
+                    .bar_control
+                    .as_ref()
+                    .is_some_and(crate::shell::send_toggle)
+                {
+                    info!(by = "keyboard", "app menu toggle");
+                }
+            }
+            Err(reason) => info!(reason, "app menu tap ignored"),
         }
     }
 
@@ -407,6 +484,7 @@ impl Navi {
         };
         let serial = SERIAL_COUNTER.next_serial();
         let pos = pointer.current_location();
+        self.super_tap.button(button, pressed);
         if !left {
             self.edge_clicks = Default::default();
         }
@@ -569,6 +647,29 @@ mod accessibility_tests {
         assert_eq!(s.event(37, false), (true, vec![]));
         assert_eq!(s.event(38, false), (true, vec![]));
     }
+
+    #[test]
+    fn sticky_super_tap_latches_and_never_opens_the_menu() {
+        let (mut s, mut tap) = (Sticky::default(), SuperTap::default());
+        // keyboard_key: the detector sees what Sticky forwards, then the releases it hands back.
+        let mut feed = |code: u32, sym, pressed| {
+            let (forward, releases) = s.event(code, pressed);
+            let mut fired = forward && tap.key(code, sym, pressed, true);
+            for c in releases {
+                fired |= tap.key(c, Keysym::NoSymbol, false, true);
+            }
+            (forward, fired)
+        };
+        assert_eq!(feed(133, Keysym::Super_L, true), (true, false));
+        assert_eq!(
+            feed(133, Keysym::NoSymbol, false),
+            (false, false),
+            "latched"
+        );
+        // The latched Super then applies to the next key and is released after it.
+        assert_eq!(feed(38, Keysym::a, true), (true, false));
+        assert_eq!(feed(38, Keysym::NoSymbol, false), (true, false));
+    }
 }
 
 #[cfg(test)]
@@ -581,6 +682,102 @@ mod tests {
             alt,
             ..Default::default()
         }
+    }
+
+    const SUPER_L: u32 = 133;
+    const SUPER_R: u32 = 134;
+
+    /// Super press, the events in between, then Super release: whether the tap fired.
+    fn tap(between: impl FnOnce(&mut SuperTap)) -> bool {
+        let mut t = SuperTap::default();
+        assert!(!t.key(SUPER_L, Keysym::Super_L, true, true));
+        between(&mut t);
+        t.key(SUPER_L, Keysym::NoSymbol, false, true)
+    }
+
+    #[test]
+    fn a_lone_super_tap_fires_once() {
+        let mut t = SuperTap::default();
+        for (code, sym) in [(SUPER_L, Keysym::Super_L), (SUPER_R, Keysym::Super_R)] {
+            assert!(!t.key(code, sym, true, true));
+            assert!(t.key(code, Keysym::NoSymbol, false, true), "{sym:?}");
+            assert!(!t.key(code, Keysym::NoSymbol, false, true), "once");
+        }
+        // Pointer motion and scrolling never reach it, and there is no time limit.
+        assert!(tap(|_| {}));
+    }
+
+    #[test]
+    fn any_other_press_cancels_the_tap() {
+        for (code, sym) in [
+            (38, Keysym::a),
+            (46, Keysym::l),
+            (9, Keysym::Escape),
+            (113, Keysym::Left),
+            (SUPER_R, Keysym::Super_R),
+        ] {
+            assert!(
+                !tap(|t| {
+                    t.key(code, sym, true, false);
+                    t.key(code, Keysym::NoSymbol, false, false);
+                }),
+                "{sym:?}"
+            );
+        }
+        // Super+L released in the other order: Super first, then L.
+        let mut t = SuperTap::default();
+        t.key(SUPER_L, Keysym::Super_L, true, true);
+        t.key(46, Keysym::l, true, false);
+        assert!(!t.key(SUPER_L, Keysym::NoSymbol, false, false));
+        assert!(!t.key(46, Keysym::NoSymbol, false, true));
+        assert!(!tap(|t| t.button(0x110, true)), "pointer button");
+    }
+
+    #[test]
+    fn super_with_something_already_down_is_no_tap() {
+        let mut t = SuperTap::default();
+        assert!(!t.key(SUPER_L, Keysym::Super_L, true, false), "a key");
+        assert!(!t.key(SUPER_L, Keysym::NoSymbol, false, true));
+        t.button(0x110, true);
+        assert!(!t.key(SUPER_L, Keysym::Super_L, true, true), "a button");
+        assert!(!t.key(SUPER_L, Keysym::NoSymbol, false, true));
+        // Its release clears it.
+        t.button(0x110, false);
+        t.key(SUPER_L, Keysym::Super_L, true, true);
+        assert!(t.key(SUPER_L, Keysym::NoSymbol, false, true));
+    }
+
+    #[test]
+    fn stray_releases_never_fire_and_a_new_tap_works() {
+        let mut t = SuperTap::default();
+        assert!(
+            !t.key(SUPER_L, Keysym::NoSymbol, false, true),
+            "nothing armed"
+        );
+        t.key(SUPER_L, Keysym::Super_L, true, true);
+        assert!(!t.key(38, Keysym::NoSymbol, false, true), "another keycode");
+        assert!(t.key(SUPER_L, Keysym::NoSymbol, false, true), "still armed");
+        // After a cancelled tap.
+        t.key(SUPER_L, Keysym::Super_L, true, true);
+        t.key(38, Keysym::a, true, false);
+        assert!(!t.key(SUPER_L, Keysym::NoSymbol, false, false));
+        t.key(SUPER_L, Keysym::Super_L, true, true);
+        assert!(t.key(SUPER_L, Keysym::NoSymbol, false, true));
+    }
+
+    #[test]
+    fn menu_tap_needs_unlocked_bar_and_no_fullscreen_under_the_bar() {
+        let (mut l, uw, k) = two_outputs();
+        let bar = Some("uw");
+        assert_eq!(menu_tap(false, &l, bar, true), Ok(()));
+        assert_eq!(menu_tap(true, &l, bar, true), Err("locked"));
+        assert_eq!(menu_tap(false, &l, bar, false), Err("no navi-bar"));
+        // Fullscreen on another output than the taskbar's: still a toggle.
+        assert!(l.fullscreen(k));
+        assert_eq!(menu_tap(false, &l, bar, true), Ok(()));
+        assert!(l.fullscreen(uw));
+        assert_eq!(menu_tap(false, &l, bar, true), Err("fullscreen"));
+        assert_eq!(menu_tap(true, &l, bar, true), Err("locked"));
     }
 
     #[test]

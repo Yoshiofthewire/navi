@@ -107,6 +107,18 @@ impl Menu {
         self.stop_scroll();
         self.select(self.selected as isize + by);
     }
+    /// PageUp/PageDown: a page of rows at a time.
+    pub fn page(&mut self, pages: isize) {
+        self.step(pages * ROWS as isize);
+    }
+    pub fn home(&mut self) {
+        self.stop_scroll();
+        self.select(0);
+    }
+    pub fn end(&mut self) {
+        self.stop_scroll();
+        self.select(isize::MAX);
+    }
     fn select(&mut self, at: isize) {
         self.selected = (at.max(0) as usize).min(self.matches.len().saturating_sub(1));
         self.top = self.top.min(self.selected);
@@ -382,5 +394,47 @@ mod tests {
         assert_eq!(m.scroll_pos().0, 1);
         assert!(!m.scroll_axis(f64::NAN, 0, false));
         assert_eq!(m.scroll_pixels, 0.0);
+    }
+
+    #[test]
+    fn page_home_and_end_move_by_pages_and_to_the_ends() {
+        let names: Vec<String> = (0..20).map(|i| format!("App {i:02}")).collect();
+        let e = entries(&names.iter().map(String::as_str).collect::<Vec<_>>());
+        let mut m = Menu::new(&e);
+        m.open(Category::Other, &e);
+        assert_eq!(ROWS, 8);
+        m.page(1);
+        assert_eq!(m.selected(), Some(Row::App(8)));
+        assert_eq!(m.scroll_pos().0, 1, "PageDown scrolls");
+        m.page(-1);
+        assert_eq!((m.selected(), m.scroll_pos().0), (Some(Row::App(0)), 0));
+        m.page(-1);
+        assert_eq!((m.selected(), m.scroll_pos().0), (Some(Row::App(0)), 0));
+        m.page(1);
+        m.page(1);
+        assert_eq!(m.selected(), Some(Row::App(16)));
+        m.page(1);
+        assert_eq!(m.selected(), Some(Row::App(19)), "clamps at the bottom");
+        assert_eq!(m.scroll_pos().0, 12);
+        m.home();
+        assert_eq!((m.selected(), m.scroll_pos().0), (Some(Row::App(0)), 0));
+        m.end();
+        assert_eq!(
+            (m.selected(), m.scroll_pos().0),
+            (Some(Row::App(19)), 20 - ROWS)
+        );
+
+        m.set_query("zzz", &e);
+        let empty = (m.selected(), m.scroll_pos());
+        for key in [
+            Menu::home,
+            Menu::end,
+            |m: &mut Menu| m.page(1),
+            |m: &mut Menu| m.page(-1),
+        ] {
+            key(&mut m);
+            assert_eq!((m.selected(), m.scroll_pos()), empty);
+        }
+        assert_eq!(empty, (None, (0, 0)));
     }
 }

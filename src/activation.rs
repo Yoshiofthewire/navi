@@ -27,9 +27,79 @@ pub fn may_redeem(first_use: bool, age: Duration, focus_kept: bool) -> bool {
     first_use && age <= TTL && focus_kept
 }
 
+/// Whether focus stayed for a token from `asker` that activates `target`: the keyboard (`focus`)
+/// is still on either of them. One exception: a launch from the menu closes it, and navi hands
+/// the keyboard back before the app redeems. `handback` is navi's last return of the keyboard
+/// from a layer to a window, kept only until focus next moves; the token works if it came from
+/// that layer and the keyboard is still on that window.
+pub fn focus_kept<S: PartialEq>(
+    focus: Option<&S>,
+    asker: Option<&S>,
+    target: &S,
+    handback: Option<&(S, S)>,
+) -> bool {
+    let Some(focus) = focus else {
+        return false;
+    };
+    asker == Some(focus)
+        || focus == target
+        || handback.is_some_and(|(layer, window)| asker == Some(layer) && focus == window)
+}
+
+/// Keeps the hand-back only while focus stays on the window it went to.
+pub fn after_focus_change<S: PartialEq>(
+    handback: Option<(S, S)>,
+    focus: Option<&S>,
+) -> Option<(S, S)> {
+    handback.filter(|(_, window)| focus == Some(window))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const BAR: u8 = 1;
+    const KONSOLE: u8 = 2;
+    const NEW: u8 = 3;
+    const OTHER: u8 = 4;
+
+    #[test]
+    fn a_menu_launch_survives_navis_own_hand_back() {
+        let back = after_focus_change(Some((BAR, KONSOLE)), Some(&KONSOLE));
+        assert!(focus_kept(Some(&KONSOLE), Some(&BAR), &NEW, back.as_ref()));
+        // Without a hand-back, the same redeem is refused, as before.
+        assert!(!focus_kept(Some(&KONSOLE), Some(&BAR), &NEW, None));
+    }
+
+    #[test]
+    fn any_other_focus_change_ends_the_hand_back() {
+        // The user clicked another window, even if they clicked back.
+        let back = after_focus_change(Some((BAR, KONSOLE)), Some(&OTHER));
+        assert_eq!(back, None);
+        let back = after_focus_change(back, Some(&KONSOLE));
+        assert!(!focus_kept(Some(&KONSOLE), Some(&BAR), &NEW, back.as_ref()));
+        // The keyboard went to nobody.
+        assert_eq!(after_focus_change(Some((BAR, KONSOLE)), None), None);
+        // A token from another surface, or the keyboard elsewhere, isn't covered.
+        let back = Some((BAR, KONSOLE));
+        assert!(!focus_kept(
+            Some(&KONSOLE),
+            Some(&OTHER),
+            &NEW,
+            back.as_ref()
+        ));
+        assert!(!focus_kept(Some(&OTHER), Some(&BAR), &NEW, back.as_ref()));
+        assert!(!focus_kept(None, Some(&BAR), &NEW, back.as_ref()));
+    }
+
+    #[test]
+    fn focus_is_kept_on_the_asker_or_the_target() {
+        assert!(focus_kept(Some(&BAR), Some(&BAR), &NEW, None));
+        assert!(focus_kept(Some(&NEW), Some(&BAR), &NEW, None));
+        assert!(!focus_kept(Some(&OTHER), Some(&BAR), &NEW, None));
+        assert!(!focus_kept(None, None, &NEW, None));
+        assert!(!focus_kept(Some(&OTHER), None, &NEW, None));
+    }
 
     #[test]
     fn ac9_tokens_need_a_real_serial_from_the_focus() {

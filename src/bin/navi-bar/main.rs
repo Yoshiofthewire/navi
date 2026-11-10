@@ -149,9 +149,7 @@ fn run() -> Result<(), String> {
             .open("/dev/null")
             .map_err(|e| e.to_string())?;
         rustix::stdio::dup2_stdout(&null).map_err(|e| e.to_string())?;
-        Some(std::sync::Arc::new(std::sync::Mutex::new(
-            UnixStream::from(fd),
-        )))
+        Some(UnixStream::from(fd))
     } else {
         None
     };
@@ -218,6 +216,24 @@ fn run() -> Result<(), String> {
             }
         })
         .map_err(|e| e.to_string())?;
+    let (toggle_tx, toggle_rx) = channel::channel();
+    event_loop
+        .handle()
+        .insert_source(toggle_rx, |event, _, bar| {
+            if let channel::Event::Msg(()) = event {
+                bar.toggle_menu();
+            }
+        })
+        .map_err(|e| e.to_string())?;
+    let control = match control {
+        Some(stream) => Some(std::sync::Arc::new(std::sync::Mutex::new(
+            control::reader(stream, move || {
+                let _ = toggle_tx.send(());
+            })
+            .map_err(|e| e.to_string())?,
+        ))),
+        None => None,
+    };
     let (session_tx, session_rx) = channel::channel();
     event_loop
         .handle()
@@ -325,7 +341,7 @@ fn bar_layer(
     let layer = layer_shell.create_layer_surface(qh, surface, Layer::Top, Some("navi-bar"), None);
     layer.set_anchor(Anchor::BOTTOM);
     layer.set_exclusive_zone(BAR_H);
-    layer.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
+    layer.set_keyboard_interactivity(KeyboardInteractivity::None);
     layer.set_size(l.w as u32, l.h as u32);
     layer.commit();
     layer
@@ -372,7 +388,7 @@ struct Bar {
     status: String,
     battery: Option<status::Battery>,
     session: session::Menu,
-    control: Option<std::sync::Arc<std::sync::Mutex<UnixStream>>>,
+    control: Option<std::sync::Arc<std::sync::Mutex<control::Control>>>,
     band_hover: bool,
     session_tx: channel::Sender<session::Reply>,
     full_session: bool,
@@ -447,6 +463,11 @@ impl Bar {
 
     /// Resizes the surface to what it now holds, or redraws it at its size.
     fn relayout(&mut self) {
+        // navi gives the open launcher the keyboard, and hands it back when it closes.
+        self.layer.set_keyboard_interactivity(match self.menu {
+            Some(_) => KeyboardInteractivity::Exclusive,
+            None => KeyboardInteractivity::None,
+        });
         let rows = self.menu.as_ref().map_or(menu::ROWS, |m| m.rows().count());
         let l = Layout::new(self.dock_apps().len(), self.menu.is_some()).with_rows(rows);
         if l == self.layout {
@@ -699,6 +720,10 @@ impl Bar {
             }
             Keysym::Up => menu.step(-1),
             Keysym::Down => menu.step(1),
+            Keysym::Page_Up | Keysym::KP_Page_Up => menu.page(-1),
+            Keysym::Page_Down | Keysym::KP_Page_Down => menu.page(1),
+            Keysym::Home | Keysym::KP_Home => menu.home(),
+            Keysym::End | Keysym::KP_End => menu.end(),
             Keysym::Escape | Keysym::Return | Keysym::KP_Enter => return,
             _ => {
                 let text = event.utf8.unwrap_or_default();

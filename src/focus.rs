@@ -82,3 +82,130 @@ impl KeyboardTarget<Navi> for Focus {
         }
     }
 }
+
+/// What a layer's change of keyboard interactivity does to focus.
+#[derive(Debug, PartialEq)]
+pub enum Handoff<W> {
+    /// It asked for `Exclusive`: give it the keyboard.
+    Take,
+    /// It stopped asking while holding the keyboard: give it back to this window, or nobody.
+    Return(Option<W>),
+}
+
+/// The layers whose last commit asked for `Exclusive`, each with the window that held the
+/// keyboard before. Only a change acts, so a stale commit can't grab the keyboard again.
+#[derive(Debug)]
+pub struct Exclusive<L, W> {
+    held: Vec<(L, Option<W>)>,
+}
+
+impl<L, W> Default for Exclusive<L, W> {
+    fn default() -> Self {
+        Self { held: Vec::new() }
+    }
+}
+
+impl<L: PartialEq, W> Exclusive<L, W> {
+    /// A commit of `layer`. `holds`: it has the keyboard; `focused`: the toplevel that has it;
+    /// `shown`: a window is still mapped and visible. Locked, nothing moves.
+    pub fn commit(
+        &mut self,
+        layer: L,
+        exclusive: bool,
+        locked: bool,
+        holds: bool,
+        focused: Option<W>,
+        shown: impl Fn(&W) -> bool,
+    ) -> Option<Handoff<W>> {
+        let at = self.held.iter().position(|(l, _)| *l == layer);
+        match (at, exclusive) {
+            (None, true) => {
+                self.held.push((layer, focused.filter(|_| !locked)));
+                (!locked).then_some(Handoff::Take)
+            }
+            (Some(i), false) => {
+                let (_, back) = self.held.swap_remove(i);
+                (holds && !locked).then(|| Handoff::Return(back.filter(shown)))
+            }
+            _ => None,
+        }
+    }
+
+    pub fn forget(&mut self, layer: &L) {
+        self.held.retain(|(l, _)| l != layer);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BAR: u8 = 1;
+    const SHOWN: fn(&u32) -> bool = |_| true;
+
+    #[test]
+    fn exclusive_takes_the_keyboard_and_gives_it_back() {
+        let mut x = Exclusive::default();
+        assert_eq!(
+            x.commit(BAR, true, false, false, Some(7), SHOWN),
+            Some(Handoff::Take)
+        );
+        // Repeated Exclusive commits do nothing.
+        assert_eq!(x.commit(BAR, true, false, true, Some(9), SHOWN), None);
+        assert_eq!(
+            x.commit(BAR, false, false, true, None, SHOWN),
+            Some(Handoff::Return(Some(7)))
+        );
+        assert_eq!(x.commit(BAR, false, false, true, None, SHOWN), None);
+    }
+
+    #[test]
+    fn a_gone_or_hidden_window_gets_nothing_back() {
+        let mut x = Exclusive::default();
+        x.commit(BAR, true, false, false, Some(7), SHOWN);
+        assert_eq!(
+            x.commit(BAR, false, false, true, None, |_| false),
+            Some(Handoff::Return(None))
+        );
+        // Nobody had the keyboard before.
+        x.commit(BAR, true, false, false, None, SHOWN);
+        assert_eq!(
+            x.commit(BAR, false, false, true, None, SHOWN),
+            Some(Handoff::Return(None))
+        );
+    }
+
+    #[test]
+    fn focus_moved_elsewhere_changes_nothing() {
+        let mut x = Exclusive::default();
+        x.commit(BAR, true, false, false, Some(7), SHOWN);
+        // The user clicked a window: the layer no longer holds the keyboard.
+        assert_eq!(x.commit(BAR, false, false, false, None, SHOWN), None);
+        // And the next open starts afresh.
+        assert_eq!(
+            x.commit(BAR, true, false, false, Some(8), SHOWN),
+            Some(Handoff::Take)
+        );
+        assert_eq!(
+            x.commit(BAR, false, false, true, None, SHOWN),
+            Some(Handoff::Return(Some(8)))
+        );
+    }
+
+    #[test]
+    fn locked_nothing_moves() {
+        let mut x = Exclusive::default();
+        assert_eq!(x.commit(BAR, true, true, false, Some(7), SHOWN), None);
+        assert_eq!(x.commit(BAR, false, true, true, None, SHOWN), None);
+        // Opened before the lock, closed while locked.
+        x.commit(BAR, true, false, false, Some(7), SHOWN);
+        assert_eq!(x.commit(BAR, false, true, true, None, SHOWN), None);
+        // A layer that's gone is forgotten.
+        x.commit(BAR, true, false, false, Some(7), SHOWN);
+        x.forget(&BAR);
+        assert_eq!(
+            x.commit(BAR, true, false, false, None, SHOWN),
+            Some(Handoff::Take)
+        );
+    }
+}

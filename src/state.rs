@@ -51,8 +51,8 @@ use smithay::{
         },
         shell::{
             wlr_layer::{
-                Layer, LayerSurface as WlrLayerSurface, LayerSurfaceData, WlrLayerShellHandler,
-                WlrLayerShellState,
+                KeyboardInteractivity, Layer, LayerSurface as WlrLayerSurface, LayerSurfaceData,
+                WlrLayerShellHandler, WlrLayerShellState,
             },
             xdg::{
                 PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
@@ -70,7 +70,7 @@ use tracing::{info, warn};
 
 use crate::CalloopData;
 use crate::activation::{self, may_issue, may_redeem};
-use crate::focus::Focus;
+use crate::focus::{Focus, Handoff};
 use crate::layout::{self, Decor, Drag, Layout, Rect, WinId, decoration};
 use crate::monitors::{BarHover, Hover};
 use crate::persist::{self, Store};
@@ -131,6 +131,13 @@ pub struct Navi {
     hover_timer: Option<RegistrationToken>,
     /// The output the taskbar goes on, as last moved there.
     bar_output: Option<String>,
+    /// The running navi-bar's control stream, for app menu toggles.
+    pub bar_control: Option<std::os::unix::net::UnixStream>,
+    pub super_tap: crate::input::SuperTap,
+    /// Layers whose last commit asked for `Exclusive` keyboard focus.
+    pub(crate) exclusive: crate::focus::Exclusive<WlSurface, Window>,
+    /// navi's last return of the keyboard from a layer to a window, until focus moves again.
+    pub(crate) handback: Option<(WlSurface, WlSurface)>,
 
     compositor_state: CompositorState,
     xdg_shell_state: XdgShellState,
@@ -234,6 +241,10 @@ impl Navi {
             bar_hover: BarHover::default(),
             hover_timer: None,
             bar_output: persist::load_bar(),
+            bar_control: None,
+            super_tap: Default::default(),
+            exclusive: Default::default(),
+            handback: None,
             seat_state,
             popups: PopupManager::default(),
             seat,
@@ -536,8 +547,9 @@ impl Navi {
             .cloned()
     }
 
-    /// A click on a layer surface: it gets the keyboard if it takes keyboard input at all.
-    /// `Exclusive` counts as `OnDemand`, so no layer surface holds the keyboard unasked.
+    /// Gives a layer surface the keyboard if it takes keyboard input at all: on a click, or when
+    /// it asks for `Exclusive` (only navi-bar has layer shell). Otherwise no layer surface holds
+    /// the keyboard unasked.
     pub fn click_layer(&mut self, layer: &LayerSurface) {
         if self.lock.active {
             return;
@@ -658,7 +670,7 @@ impl Navi {
     }
 
     /// The output with navi-bar's taskbar.
-    fn bar_on(&self) -> Option<String> {
+    pub fn bar_on(&self) -> Option<String> {
         self.space
             .outputs()
             .find(|o| {
@@ -1271,12 +1283,38 @@ impl CompositorHandler for Navi {
                     l.layer_surface().send_configure();
                 }
                 // A surface that stops taking keys loses the keyboard.
-                let kb = self.seat.get_keyboard();
-                let focused = kb.is_some_and(|kb| {
-                    kb.current_focus().and_then(|f| f.surface()).as_ref() == Some(surface)
+                let focus = self
+                    .seat
+                    .get_keyboard()
+                    .and_then(|kb| kb.current_focus())
+                    .and_then(|f| f.surface());
+                let focused = focus.as_ref() == Some(surface);
+                let exclusive =
+                    l.cached_state().keyboard_interactivity == KeyboardInteractivity::Exclusive;
+                let window = focus.and_then(|s| {
+                    self.windows
+                        .iter()
+                        .find(|m| window_surface(&m.window).as_ref() == Some(&s))
+                        .map(|m| m.window.clone())
                 });
-                if focused && !l.can_receive_keyboard_focus() {
-                    self.focus(None);
+                let space = &self.space;
+                let handoff = self.exclusive.commit(
+                    surface.clone(),
+                    exclusive,
+                    self.lock.active,
+                    focused,
+                    window,
+                    |w| space.element_location(w).is_some(),
+                );
+                match handoff {
+                    Some(Handoff::Take) => self.click_layer(&l),
+                    Some(Handoff::Return(back)) => {
+                        let to = back.as_ref().and_then(window_surface);
+                        self.focus(back);
+                        self.handback = to.map(|to| (surface.clone(), to));
+                    }
+                    None if focused && !l.can_receive_keyboard_focus() => self.focus(None),
+                    None => {}
                 }
             }
         }
@@ -1463,6 +1501,8 @@ impl SeatHandler for Navi {
     fn cursor_image(&mut self, _seat: &Seat<Self>, _image: CursorImageStatus) {}
 
     fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&Focus>) {
+        let surface = focused.and_then(Focus::surface);
+        self.handback = activation::after_focus_change(self.handback.take(), surface.as_ref());
         let dh = &self.display_handle;
         let client = (!self.lock.active)
             .then_some(focused)
@@ -1565,6 +1605,7 @@ impl WlrLayerShellHandler for Navi {
                 .cloned();
             if let Some(layer) = layer {
                 info!(namespace = layer.namespace(), "layer unmapped");
+                self.exclusive.forget(layer.wl_surface());
                 map.unmap_layer(&layer);
             }
         }
@@ -1621,8 +1662,12 @@ impl XdgActivationHandler for Navi {
             .get_keyboard()
             .and_then(|kb| kb.current_focus())
             .and_then(|f| f.surface());
-        let focus_kept =
-            focus.is_some() && (focus == data.surface || focus.as_ref() == Some(&surface));
+        let focus_kept = activation::focus_kept(
+            focus.as_ref(),
+            data.surface.as_ref(),
+            &surface,
+            self.handback.as_ref(),
+        );
         let age = data.timestamp.elapsed();
         match id.filter(|_| may_redeem(first_use, age, focus_kept)) {
             Some(id) => {

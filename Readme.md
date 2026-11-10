@@ -81,6 +81,7 @@ Build as your normal user. For a debug build, use `cargo build --locked` and `./
 | Expand to the next window or usable monitor edge | **Super + Left / Right / Up / Down** |
 | Lock screen / retry a crashed locker | **Super + L** |
 | Leave fullscreen on the focused monitor | **Super + Esc** |
+| Open or close the app launcher | **Super** (tap) |
 | Quit Navi while unlocked | **Ctrl + Alt + Backspace** |
 | Switch VT in a hardware session | **Ctrl + Alt + F1…F12** |
 
@@ -89,7 +90,8 @@ without shrinking neighbors. Both act on the focused tab group and remember succ
 Maximized and fullscreen windows keep their geometry. Floating dialogs and the launcher retain
 their app shortcuts. A host compositor may intercept shortcuts while Navi is nested.
 
-Click the Navi button to open the app launcher. Browse folders or type to search, use the
+Tap Super, or click the Navi button, to open the app launcher. Browse folders or type to search,
+move with the arrows, PageUp/PageDown and Home/End, launch with Enter and close with Esc. Use the
 Pin/Unpin controls to customize the dock, and scroll with a wheel or touchpad.
 
 ## Install as a login session
