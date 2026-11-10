@@ -109,15 +109,25 @@ space when you want it.
 
 ### Keyboard window controls
 
-- **Alt + Arrow** moves the focused tile one grid cell in that direction, preserving its size.
-  It stops at another tile or the current monitor's usable edge.
-- **Super + Arrow** expands only that side through free cells until another tile or the
-  monitor's usable edge. It keeps the opposite side and neighboring windows fixed.
-- Both act on the active tab group, keep keyboard focus, reserve minimized windows' cells,
-  and remember successful changes. Moves preserve remembered size; expansion updates it.
+Every press changes exactly one grid cell.
+
+- **Alt + Arrow** moves the focused tile one cell in that direction, preserving its size. Tiles
+  behind it stay put.
+- **Super + Arrow** grows that side by one cell; **Super + Shift + Arrow** shrinks it by one,
+  never below the minimum size. Shrinking never changes another tile.
+- Growing or moving into touching tiles takes the cell from them: each tile touching that side
+  (minimized ones included) moves its touching edge one cell away, and its other edges stay. If
+  any of them would drop below the minimum size, nothing changes. Neither crosses the monitor's
+  usable edge. A press that does nothing means a touching tile is already at its minimum size
+  (shrink or move that tile first) or the tile reached the edge or its own minimum; the debug log
+  says which.
+- All three act on the active tab group, keep keyboard focus, and remember the focused group's
+  change: moves preserve its remembered size, growing and shrinking update it. Tiles that gave up
+  a cell keep what navi remembers for them.
 - Maximized/fullscreen windows keep their mode and geometry. Floating dialogs and shell
   surfaces keep their app shortcuts; window shortcuts apply only to a focused tile. A mouse
-  drag takes precedence. Adding Ctrl, Shift, or the other modifier leaves the chord to apps.
+  drag takes precedence. Settings can swap the two modifiers; Shift goes with the grow one.
+  Ctrl, the other modifier, or Shift with the move modifier leave the chord to apps.
 
 ### Tabs
 

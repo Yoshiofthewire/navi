@@ -816,12 +816,30 @@ mod tests {
         }
         let expanded = data.state.layout.tile(id).unwrap().cells;
         assert_eq!(expanded.col, cells.col + 2);
-        assert_eq!(expanded.col + expanded.cols, crate::layout::COLS);
+        assert_eq!(expanded.cols, cells.cols + 1, "one column");
         assert_eq!(data.state.focused_tile(), Some(id));
         assert_eq!(
             surface.geometry().size.w,
             data.state.layout.rect(id).unwrap().w
         );
+        // Super+Shift+Right takes that column back.
+        for (code, state) in [
+            (133u32, KeyState::Pressed),
+            (50, KeyState::Pressed),
+            (114, KeyState::Pressed),
+            (114, KeyState::Released),
+            (50, KeyState::Released),
+            (133, KeyState::Released),
+        ] {
+            data.state.keyboard_key(code.into(), state, 3);
+        }
+        let shrunk = data.state.layout.tile(id).unwrap().cells;
+        assert_eq!((shrunk.col, shrunk.cols), (cells.col + 2, cells.cols));
+        assert_eq!(
+            surface.geometry().size.w,
+            data.state.layout.rect(id).unwrap().w
+        );
+        assert!(data.state.suppressed.is_empty());
         // With no tiled keyboard target, the compositor doesn't claim window shortcuts.
         data.state.focus(None);
         for (code, state) in [
@@ -832,7 +850,7 @@ mod tests {
         ] {
             data.state.keyboard_key(code.into(), state, 3);
         }
-        assert_eq!(data.state.layout.tile(id).unwrap().cells, expanded);
+        assert_eq!(data.state.layout.tile(id).unwrap().cells, shrunk);
         assert!(data.state.suppressed.is_empty());
         data.state.focus(data.state.window_of(id));
         let rect = data.state.layout.rect(id).unwrap();
