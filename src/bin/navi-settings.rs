@@ -22,6 +22,7 @@ fn main() {
     theme::configure(&desktop_config::load().unwrap_or_else(|_| desktop_config::defaults()));
     // Separate argv entries avoid Linux’s per-argument 128 KiB limit without temporary source files.
     let error = python_command()
+        .env("NAVI_WINDOW_CHROME", include_str!("../../assets/window-chrome.css"))
         .env("NAVI_SETTINGS_COLORS", format!("{{\"#0b0d12\":\"#{:06x}\",\"#d0d4dc\":\"#{:06x}\",\"#151922\":\"#{:06x}\",\"#303847\":\"#{:06x}\",\"#262c38\":\"#{:06x}\",\"#2ba3d8\":\"#{:06x}\"}}", theme::resolve(theme::BG),theme::resolve(theme::INK),theme::resolve(theme::BAR_BG),theme::resolve(theme::SHELL_EDGE),theme::resolve(theme::SELECTED),theme::resolve(theme::ACCENT)))
         .arg("-c")
         .arg("import sys; source='\\n'.join(sys.argv[1:]); sys.argv=[sys.argv[0]]; exec(source, {'__name__':'__main__'})")

@@ -74,6 +74,9 @@ def inside(args):
             if test(): return
             time.sleep(.05)
         raise AssertionError(description+'; inspect '+str(root/'services.log'))
+    import re
+    def log_text():
+        return re.sub(r'\x1b\[[0-9;]*m', '', (root/'services.log').read_text())
     bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
     def call(name, path, interface, method, signature=None, values=()):
         return bus.call_sync(name,path,interface,method,GLib.Variant(signature,values) if signature else None,
@@ -95,7 +98,7 @@ def inside(args):
         navi = start([str(target/'navi')])
         import re
         def display():
-            text=(root/'services.log').read_text()
+            text=log_text()
             return re.search(r'listening on WAYLAND_DISPLAY=(wayland-\d+)',text)
         wait(display,'Navi did not start')
         client = dict(env, WAYLAND_DISPLAY=display()[1], DISPLAY='', GDK_BACKEND='wayland')
@@ -143,7 +146,7 @@ def inside(args):
         import gi
         gi.require_version('GdkPixbuf', '2.0')
         from gi.repository import GdkPixbuf
-        geometry=re.search(r'placed app="thunar".*?Rect \{ x: (\d+), y: (\d+), w: (\d+), h: (\d+)',(root/'services.log').read_text())
+        geometry=re.search(r'placed app="thunar".*?Rect \{ x: (\d+), y: (\d+), w: (\d+), h: (\d+)',log_text())
         assert geometry,'No Thunar geometry'
         x,y,width,height=map(int,geometry.groups())
         def content_color():
@@ -186,16 +189,16 @@ def inside(args):
         wait(lambda:not owned('org.xfce.Thunar'),'Thunar retained its bus name')
         call('org.freedesktop.DBus','/org/freedesktop/DBus','org.freedesktop.DBus','RequestName','(su)',('org.xfce.Thunar',4))
         foreign=start([str(target/'navi-files')],client)
-        wait(lambda:'already running outside' in (root/'services.log').read_text(),'Foreign Thunar owner was not refused')
+        wait(lambda:'already running outside' in log_text(),'Foreign Thunar owner was not refused')
         assert foreign.poll() is None,'Foreign owner error was not visible'
-        wait(lambda:(root/'services.log').read_text().count('placed app="io.github.Yoshiofthewire.Navi.Files.Error"')==1,'Foreign owner error did not render')
+        wait(lambda:log_text().count('placed app="io.github.Yoshiofthewire.Navi.Files.Error"')==1,'Foreign owner error did not render')
         time.sleep(2);shutil.copyfile(root/'native.png',root/'foreign-owner.png')
         foreign.terminate();foreign.wait(timeout=5)
         call('org.freedesktop.DBus','/org/freedesktop/DBus','org.freedesktop.DBus','ReleaseName','(s)',('org.xfce.Thunar',))
         missing=start([str(target/'navi-files')],dict(client,PATH='/nonexistent'))
-        wait(lambda:'Install Thunar;' in (root/'services.log').read_text(),'Missing Thunar recovery was not shown')
+        wait(lambda:'Install Thunar;' in log_text(),'Missing Thunar recovery was not shown')
         assert missing.poll() is None,'Missing app error was not visible'
-        wait(lambda:(root/'services.log').read_text().count('placed app="io.github.Yoshiofthewire.Navi.Files.Error"')==2,'Missing app error did not render')
+        wait(lambda:log_text().count('placed app="io.github.Yoshiofthewire.Navi.Files.Error"')==2,'Missing app error did not render')
         time.sleep(2);shutil.copyfile(root/'native.png',root/'missing-thunar.png')
         missing.terminate();missing.wait(timeout=5)
         results['file_operations']=['copy','move','symlink','trash','MIME open','Desktop folder','second launch']

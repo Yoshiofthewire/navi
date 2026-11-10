@@ -1,0 +1,14 @@
+/* Window frame and title bar shared by Navi Settings and native utilities.
+   Navi draws the window frame, so the toolkit draws none. */
+window.csd, decoration { border: none; box-shadow: none; }
+headerbar {
+  background: #151922; color: #d0d4dc; border: none; border-bottom: 1px solid #262c38;
+  box-shadow: none; min-height: 44px; padding: 4px 6px;
+}
+headerbar label { font-weight: 600; }
+/* GTK 4 has an extra padded box inside the handle; GTK 3's header is direct. */
+headerbar > windowhandle > box { padding: 0; }
+/* Breeze gives GTK 4 header buttons vertical margins that make the bar taller than GTK 3's. */
+headerbar button { background: transparent; border-color: transparent; padding: 4px 8px; margin-top: 0; margin-bottom: 0; }
+headerbar button:hover { background: #262c38; }
+headerbar button image { color: #d0d4dc; }

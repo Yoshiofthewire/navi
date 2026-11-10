@@ -17,7 +17,7 @@ from gi.repository import Gtk, GLib
 root = Path(__file__).resolve().parent
 output = Path(os.environ['NAVI_UI_CHECK_OUTPUT'])
 assert Path(os.environ['XDG_CONFIG_HOME']).is_relative_to('/tmp'), 'Use disposable XDG configuration'
-namespace = {'__name__': 'settings_ui_check'}
+namespace = {'__name__': 'settings_ui_check', 'WINDOW_CHROME_CSS': (root.parents[1]/'assets/window-chrome.css').read_text()}
 exec('\n'.join((root / file).read_text() for file in ['model.py', 'system.py', 'services.py', 'extra_ui.py', 'app.py']), namespace)
 
 class Devices(namespace['DesktopServices']):

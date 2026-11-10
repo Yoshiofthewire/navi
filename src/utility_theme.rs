@@ -22,6 +22,7 @@ pub fn path() -> Option<PathBuf> {
 
 pub fn css(settings: &Value) -> String {
     let mut css = include_str!("../assets/utility.css").to_string();
+    css.push_str(include_str!("../assets/window-chrome.css"));
     // Placeholders keep a resolved color from being recolored as another source role.
     let colors = [
         theme::BG,
@@ -36,10 +37,21 @@ pub fn css(settings: &Value) -> String {
         css = css.replace(&format!("#{color:06x}"), &format!("NAVI_COLOR_{i}"));
     }
     for (i, color) in colors.iter().enumerate() {
-        css = css.replace(
-            &format!("NAVI_COLOR_{i}"),
-            &format!("#{:06X}", theme::resolve_for(settings, *color)),
-        );
+        // Utilities follow Navi Settings' DIM (src/settings/extra_ui.py), not the shell's.
+        let resolved = if *color == theme::DIM {
+            match (
+                settings["scheme"] == "light",
+                settings["high_contrast"] == true,
+            ) {
+                (true, true) => 0x333333,
+                (true, false) => 0x617084,
+                (false, true) => 0xc0c7d2,
+                (false, false) => *color,
+            }
+        } else {
+            theme::resolve_for(settings, *color)
+        };
+        css = css.replace(&format!("NAVI_COLOR_{i}"), &format!("#{resolved:06X}"));
     }
     css.replace("14px", &format!("{}px", settings["font_size"]))
 }

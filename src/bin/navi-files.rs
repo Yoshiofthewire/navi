@@ -91,7 +91,7 @@ fn launch() -> Result<(), String> {
     }
     compatible_owner(&path)?;
     let mut command = Command::new("thunar");
-    command.arg("--window").arg("--");
+    command.arg("--");
     let args: Vec<_> = std::env::args_os().skip(1).collect();
     if args.is_empty() {
         command.arg(std::env::var_os("HOME").unwrap_or_else(|| "/".into()));
