@@ -117,6 +117,7 @@ impl Navi {
             tile,
             last_size: x.geometry().size,
             want_fullscreen: false,
+            escaped: false,
             x11_parent,
         });
         self.apply_layout();
@@ -288,7 +289,14 @@ impl XwmHandler for Navi {
         self.x11_request(&x, Layout::unmaximize);
     }
     fn fullscreen_request(&mut self, _: XwmId, x: X11Surface) {
-        self.x11_request(&x, Layout::fullscreen);
+        let id = self
+            .windows
+            .iter()
+            .find(|m| m.window.x11_surface() == Some(&x))
+            .and_then(|m| m.tile);
+        if !self.refuse_escaped(id) {
+            self.x11_request(&x, Layout::fullscreen);
+        }
     }
     fn unfullscreen_request(&mut self, _: XwmId, x: X11Surface) {
         self.x11_request(&x, Layout::unfullscreen);
@@ -871,6 +879,55 @@ mod tests {
             !d.state.layout.is_fullscreen(id)
         });
         assert_eq!(surface.geometry().size, (rect.w, rect.h).into());
+        // Super+Esc ends it without the app; Esc never reaches the app.
+        request(1);
+        pump(&mut event_loop, &mut data, |d| {
+            d.state.layout.is_fullscreen(id)
+        });
+        for (code, state) in [
+            (133u32, KeyState::Pressed),
+            (9, KeyState::Pressed),
+            (9, KeyState::Released),
+            (133, KeyState::Released),
+        ] {
+            data.state.keyboard_key(code.into(), state, 6);
+        }
+        assert!(!data.state.layout.is_fullscreen(id));
+        assert!(data.state.suppressed.is_empty());
+        pump(&mut event_loop, &mut data, |_| {
+            surface.geometry().size == (rect.w, rect.h).into()
+        });
+        // Its next request is refused. The XWM handles this title change after it, in order.
+        request(1);
+        conn.change_property8(PropMode::REPLACE, window, name, utf8, b"escaped")
+            .unwrap();
+        conn.flush().unwrap();
+        pump(&mut event_loop, &mut data, |_| {
+            metadata.read(&mut queue);
+            metadata.titles.last().is_some_and(|t| t == "escaped")
+        });
+        assert!(!data.state.layout.is_fullscreen(id), "re-entry refused");
+        // A key press it receives lifts the guard.
+        data.state.keyboard_key(38u32.into(), KeyState::Pressed, 7);
+        data.state.keyboard_key(38u32.into(), KeyState::Released, 8);
+        let mut key = false;
+        pump(&mut event_loop, &mut data, |_| {
+            while let Some(event) = conn.poll_for_event().unwrap() {
+                if let Event::KeyPress(event) | Event::KeyRelease(event) = event {
+                    assert_ne!(event.detail, 9, "Super+Esc leaked to client");
+                    key |= event.detail == 38;
+                }
+            }
+            key
+        });
+        request(1);
+        pump(&mut event_loop, &mut data, |d| {
+            d.state.layout.is_fullscreen(id)
+        });
+        request(0);
+        pump(&mut event_loop, &mut data, |d| {
+            !d.state.layout.is_fullscreen(id)
+        });
         let wm_id = data.state.xwm.as_ref().unwrap().id();
         assert!(
             data.state

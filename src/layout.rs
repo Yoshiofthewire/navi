@@ -474,6 +474,19 @@ impl Layout {
         true
     }
 
+    /// Ends every fullscreen on `output`, as `unfullscreen` does; returns the windows it ended.
+    pub fn unfullscreen_output(&mut self, output: &str) -> Vec<WinId> {
+        let on = self
+            .tiles
+            .iter_mut()
+            .filter(|t| t.fullscreen && t.output == output);
+        on.map(|t| {
+            t.fullscreen = false;
+            t.id
+        })
+        .collect()
+    }
+
     /// Focus or restore: shows `id` as its group's active tile, restoring it if minimized, and
     /// ends any other maximize or fullscreen covering it on its output.
     pub fn activate(&mut self, id: WinId) -> bool {
@@ -1213,6 +1226,36 @@ mod tests {
         let (c, _) = l.place("c", (3400, 10)).unwrap();
         assert!(!l.is_fullscreen(a) && l.visible(a) && l.visible(c));
         assert!(!l.fullscreen_on("uw"));
+    }
+
+    #[test]
+    fn fullscreen_escape_ends_one_output_only() {
+        let (mut l, [a, b, c]) = rig_with_tiles();
+        let tile = l.rect(a);
+        assert!(l.fullscreen(a) && l.fullscreen(c));
+        assert!(!l.visible(b));
+
+        assert_eq!(l.unfullscreen_output("4k"), vec![a]);
+        assert!(!l.fullscreen_on("4k") && !l.is_fullscreen(a));
+        assert_eq!(l.rect(a), tile, "back to its tile");
+        assert!(l.visible(a) && l.visible(b), "hidden windows shown again");
+        assert!(
+            l.is_fullscreen(c) && l.fullscreen_on("uw"),
+            "other output untouched"
+        );
+        assert_eq!(
+            l.unfullscreen_output("4k"),
+            Vec::<WinId>::new(),
+            "no change"
+        );
+
+        // A maximize from before fullscreen survives it.
+        assert!(l.maximize(a) && l.fullscreen(a));
+        let maximized = l.output("4k").unwrap().window_rect(FULL, GAP);
+        assert_eq!(l.unfullscreen_output("4k"), vec![a]);
+        assert!(l.is_maximized(a) && !l.visible(b));
+        assert_eq!(l.rect(a), Some(maximized));
+        assert!(l.is_fullscreen(c));
     }
 
     #[test]

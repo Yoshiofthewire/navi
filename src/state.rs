@@ -88,6 +88,9 @@ pub struct Managed {
     pub(crate) last_size: Size<i32, Logical>,
     /// Asked for fullscreen before it was placed.
     pub(crate) want_fullscreen: bool,
+    /// Left fullscreen by Super+Esc: its fullscreen requests are refused until the user next
+    /// presses a key or button on it.
+    pub(crate) escaped: bool,
     pub(crate) x11_parent: Option<u32>,
 }
 
@@ -587,6 +590,71 @@ impl Navi {
     pub fn focused_tile(&self) -> Option<WinId> {
         let focus = self.seat.get_keyboard()?.current_focus()?.surface()?;
         self.tile_of(&focus)
+    }
+
+    /// The tile of the window holding the keyboard, a dialog counting as its parent's.
+    fn focused_window_tile(&self) -> Option<WinId> {
+        let focus = self.seat.get_keyboard()?.current_focus()?.surface()?;
+        let m = self
+            .windows
+            .iter()
+            .find(|m| window_surface(&m.window).as_ref() == Some(&focus))?;
+        if m.tile.is_some() {
+            return m.tile;
+        }
+        if let Some(parent) = m.window.toplevel().and_then(|t| t.parent()) {
+            return self.tile_of(&parent);
+        }
+        let parent = m.x11_parent?;
+        self.windows
+            .iter()
+            .find(|p| {
+                p.window
+                    .x11_surface()
+                    .is_some_and(|x| x.window_id() == parent)
+            })?
+            .tile
+    }
+
+    /// The output Super+Esc acts on now, if a window is fullscreen there.
+    pub fn escape_target(&self) -> Option<String> {
+        let pointer = self
+            .space
+            .output_under(self.pointer_location())
+            .next()
+            .map(identity);
+        crate::input::escape_output(&self.layout, self.focused_window_tile(), pointer.as_deref())
+    }
+
+    /// The user pressed a key or button that reached `surface`: its window may go fullscreen
+    /// again.
+    pub fn user_pressed(&mut self, surface: Option<WlSurface>) {
+        let Some(mut root) = surface else {
+            return;
+        };
+        while let Some(parent) = get_parent(&root) {
+            root = parent;
+        }
+        if let Some(m) = self.managed_mut(&root) {
+            m.escaped = false;
+        }
+    }
+
+    /// Refuses a fullscreen request from a window the user took out of fullscreen.
+    pub fn refuse_escaped(&self, id: Option<WinId>) -> bool {
+        let escaped = self
+            .windows
+            .iter()
+            .any(|m| m.escaped && m.tile.is_some() && m.tile == id);
+        if escaped {
+            info!(
+                ?id,
+                by = "app",
+                refused = "fullscreen",
+                "request refused: left by Super+Esc"
+            );
+        }
+        escaped
     }
 
     /// The output with navi-bar's taskbar.
@@ -1253,6 +1321,7 @@ impl XdgShellHandler for Navi {
             tile: None,
             last_size: Size::default(),
             want_fullscreen: false,
+            escaped: false,
             x11_parent: None,
         });
     }
@@ -1342,6 +1411,9 @@ impl XdgShellHandler for Navi {
             return;
         }
         match self.tile_of(s) {
+            id if self.refuse_escaped(id) => {
+                surface.send_configure();
+            }
             Some(id) if self.layout.fullscreen(id) => self.apply_layout(),
             id => {
                 info!(?id, by = "app", refused = "fullscreen", "request refused");

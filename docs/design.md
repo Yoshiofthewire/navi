@@ -144,8 +144,11 @@ space when you want it.
 - **Fullscreen** (the app asks for it) covers the whole monitor, taskbar included, on the
   monitor the window is on, and hides the other windows there; the taskbar can't be seen or
   clicked meanwhile, but keeps its space. It ends when the app leaves fullscreen, closes or is
-  minimized, when a new window opens on that monitor, or when another window there is
-  activated; the window goes back to its tile. Its dialogs still float over it.
+  minimized, when a new window opens on that monitor, when another window there is
+  activated, or when the user presses Super+Esc on that monitor (the focused window's, else the
+  pointer's); the window goes back to its tile. navi keeps Super+Esc from apps while it acts on
+  it. A window left by Super+Esc can't go fullscreen again until the user next presses a key
+  or button on it. Its dialogs still float over it.
 
 ## Monitors
 
@@ -459,8 +462,6 @@ session.
 - More look references, beyond the logo.
 - Is this a daily driver? That decides whether laptop polish is in v1.
 - Multi-monitor test of COSMIC in a real session, after the running T3 tasks finish.
-- An app that never leaves fullscreen holds its monitor until it exits or is closed elsewhere:
-  the taskbar is hidden, and there is no keyboard escape yet.
 - The taskbar and menu need a pointer to open: there's no keyboard shortcut for the menu or the
   window slots yet, and the bar exposes nothing to screen readers.
 
