@@ -46,10 +46,11 @@ there, and Ctrl+Alt+Backspace brings the console back. Then pick "navi" on the l
 
 ## Moving and resizing with the keyboard
 
-- **Alt + Left/Right/Up/Down:** move the focused tile one grid cell, preserving its size and
-  stopping at occupied cells or the current monitor's usable edge.
-- **Super + Left/Right/Up/Down:** expand that side to the next window or usable monitor edge.
-  Other windows stay put. Panels keep their space.
+- **Alt + Left/Right/Up/Down:** move the focused tile one grid cell, preserving its size.
+- **Super + Left/Right/Up/Down:** grow that side by one cell; **Super + Shift + Arrow** shrinks
+  it by one.
+- Moving or growing into touching windows takes the cell from all of them, or does nothing if
+  one is at its minimum size. Nothing crosses the monitor's usable edge; panels keep their space.
 
 - **Super (tap):** open or close the app launcher. Type to search, arrows, PageUp/PageDown and
   Home/End to move, Enter to launch, Esc to close; the keyboard then returns to your window.

@@ -16,7 +16,7 @@ and physical input still need hardware validation. See [limitations](#limitation
 
 - A 24 × 12 grid on each monitor, with predictable placement and remembered app sizes/positions.
 - Drag to move, resize edges or corners, swap tiles, and group windows into tabs.
-- Keyboard moves and directional expansion with Alt/Super + Arrow.
+- One-cell keyboard moves, grow and shrink with Alt/Super (+ Shift) + Arrow.
 - A rounded dock with persistent app pins, categorized app folders, search, and scrolling.
 - A top status bar with a clock and battery indicator, plus basic notifications.
 - Native Wayland apps and X11 apps through XWayland, including clipboard text transfer.
@@ -78,15 +78,17 @@ Build as your normal user. For a debug build, use `cargo build --locked` and `./
 | Swap windows | Drop one tile onto another |
 | Make a tab group | Hold a dragged tile over another tile's middle, then drop |
 | Move one grid cell | **Alt + Left / Right / Up / Down** |
-| Expand to the next window or usable monitor edge | **Super + Left / Right / Up / Down** |
+| Grow a side by one cell | **Super + Left / Right / Up / Down** |
+| Shrink a side by one cell | **Super + Shift + Left / Right / Up / Down** |
 | Lock screen / retry a crashed locker | **Super + L** |
 | Leave fullscreen on the focused monitor | **Super + Esc** |
 | Open or close the app launcher | **Super** (tap; with sticky keys on it latches instead) |
 | Quit Navi while unlocked | **Ctrl + Alt + Backspace** |
 | Switch VT in a hardware session | **Ctrl + Alt + F1…F12** |
 
-Alt+Arrow preserves size and stops at occupied cells. Super+Arrow expands the selected side
-without shrinking neighbors. Both act on the focused tab group and remember successful changes.
+Each press changes one cell. Alt+Arrow keeps the size; Super+Arrow and Super+Shift+Arrow grow or
+shrink the selected side. Moving or growing into touching windows takes the cell from all of them,
+or does nothing if one is at its minimum size. All act on the focused tab group and remember it.
 Maximized and fullscreen windows keep their geometry. Floating dialogs and the launcher retain
 their app shortcuts. A host compositor may intercept shortcuts while Navi is nested.
 

@@ -1,5 +1,5 @@
 //! Input from either backend. navi keeps quit/VT bindings, the fullscreen escape and
-//! focused-window move/expand shortcuts before clients see them.
+//! focused-window move/expand/shrink shortcuts before clients see them.
 
 use smithay::{
     backend::{
@@ -21,7 +21,7 @@ use smithay::{
 use tracing::{info, warn};
 
 use crate::{
-    layout::{Action, Done, Drag, Layout, Rect, Side, WinId},
+    layout::{Action, Done, Drag, Layout, Nudge, Rect, Side, WinId},
     monitors,
     state::{Navi, identity, px},
 };
@@ -34,13 +34,14 @@ pub enum Binding {
     Vt(i32),
     Move(Side),
     Expand(Side),
+    Shrink(Side),
     LeaveFullscreen,
 }
 
-/// Quit/VT bindings, Super+L, Super+Esc, Alt+Arrow to move, and Super+Arrow to expand. Extra
-/// modifiers on the window shortcuts are left for apps, including Ctrl+Alt+Arrow and
-/// Alt+Shift+Arrow.
-pub fn binding(mods: &ModifiersState, sym: Keysym) -> Option<Binding> {
+/// Quit/VT bindings, Super+L, Super+Esc, and the window shortcuts: the move modifier (Alt, or
+/// Super with `move_super`) + Arrow moves, the other one expands, and it with Shift shrinks.
+/// Ctrl, both modifiers, or Shift with the move modifier leave the chord to apps.
+pub fn binding(mods: &ModifiersState, sym: Keysym, move_super: bool) -> Option<Binding> {
     if mods.logo && !mods.ctrl && !mods.alt && !mods.shift {
         match sym {
             Keysym::l => return Some(Binding::Lock),
@@ -63,9 +64,14 @@ pub fn binding(mods: &ModifiersState, sym: Keysym) -> Option<Binding> {
         Keysym::Down => Side::Bottom,
         _ => return None,
     };
-    match (mods.ctrl, mods.alt, mods.logo, mods.shift) {
+    let (moving, expand) = match move_super {
+        true => (mods.logo, mods.alt),
+        false => (mods.alt, mods.logo),
+    };
+    match (mods.ctrl, moving, expand, mods.shift) {
         (false, true, false, false) => Some(Binding::Move(side)),
         (false, false, true, false) => Some(Binding::Expand(side)),
+        (false, false, true, true) => Some(Binding::Shrink(side)),
         _ => None,
     }
 }
@@ -207,7 +213,7 @@ impl Navi {
                     } else {
                         Side::Bottom
                     };
-                    if self.layout.keyboard_adjust(id, side, false).is_some() {
+                    if self.layout.keyboard_adjust(id, side, Nudge::Move).is_some() {
                         self.memory.sync(&self.layout);
                         self.apply_layout();
                     }
@@ -334,21 +340,11 @@ impl Navi {
                     };
                 }
                 sym = key.modified_sym();
-                let binding = binding(mods, sym);
-                // Move/Expand are remapped; Super+Esc and Super+L never are.
-                let binding = match binding {
-                    Some(Binding::Move(side)) if navi.desktop["move_modifier"] == "super" => {
-                        Some(Binding::Expand(side))
-                    }
-                    Some(Binding::Expand(side)) if navi.desktop["expand_modifier"] == "alt" => {
-                        Some(Binding::Move(side))
-                    }
-                    other => other,
-                };
+                let binding = binding(mods, sym, navi.desktop["move_modifier"] == "super");
                 chord = binding;
                 let usable = match binding {
                     Some(Binding::Vt(_)) => vt,
-                    Some(Binding::Move(_) | Binding::Expand(_)) => {
+                    Some(Binding::Move(_) | Binding::Expand(_) | Binding::Shrink(_)) => {
                         navi.focused_tile().is_some() && navi.drag.is_none()
                     }
                     _ => true,
@@ -402,12 +398,16 @@ impl Navi {
                     warn!(vt = n, "VT switch failed: {e}");
                 }
             }
-            Some(b @ (Binding::Move(side) | Binding::Expand(side))) => {
+            Some(b @ (Binding::Move(side) | Binding::Expand(side) | Binding::Shrink(side))) => {
+                let op = match b {
+                    Binding::Expand(_) => Nudge::Grow,
+                    Binding::Shrink(_) => Nudge::Shrink,
+                    _ => Nudge::Move,
+                };
                 if self.drag.is_none()
                     && let Some(id) = self.focused_tile()
                     && let Some(Done::Layout(what, tiles)) =
-                        self.layout
-                            .keyboard_adjust(id, side, matches!(b, Binding::Expand(_)))
+                        self.layout.keyboard_adjust(id, side, op)
                 {
                     let cells: Vec<_> = tiles.iter().map(|t| (t.id, t.cells)).collect();
                     info!(id, by = "keyboard", ?cells, "{what}");
@@ -735,6 +735,31 @@ mod tests {
     }
 
     #[test]
+    fn super_shift_arrow_is_no_tap_in_any_release_order() {
+        const SHIFT: u32 = 50;
+        const RIGHT: u32 = 114;
+        for order in [
+            [SUPER_L, SHIFT, RIGHT],
+            [RIGHT, SHIFT, SUPER_L],
+            [SHIFT, SUPER_L, RIGHT],
+            [RIGHT, SUPER_L, SHIFT],
+        ] {
+            let mut t = SuperTap::default();
+            assert!(!t.key(SUPER_L, Keysym::Super_L, true, true));
+            assert!(!t.key(SHIFT, Keysym::Shift_L, true, false));
+            assert!(!t.key(RIGHT, Keysym::Right, true, false));
+            for code in order {
+                assert!(!t.key(code, Keysym::NoSymbol, false, false), "{order:?}");
+            }
+            assert!(!t.key(SUPER_L, Keysym::Super_L, true, true));
+            assert!(
+                t.key(SUPER_L, Keysym::NoSymbol, false, true),
+                "a lone tap after"
+            );
+        }
+    }
+
+    #[test]
     fn super_with_something_already_down_is_no_tap() {
         let mut t = SuperTap::default();
         assert!(!t.key(SUPER_L, Keysym::Super_L, true, false), "a key");
@@ -784,44 +809,55 @@ mod tests {
     #[test]
     fn ac10_bindings() {
         let ca = mods(true, true);
-        assert_eq!(binding(&ca, Keysym::BackSpace), Some(Binding::Quit));
-        assert_eq!(binding(&ca, Keysym::XF86_Switch_VT_3), Some(Binding::Vt(3)));
-        assert_eq!(binding(&ca, Keysym::XF86_Switch_VT_1), Some(Binding::Vt(1)));
+        assert_eq!(binding(&ca, Keysym::BackSpace, false), Some(Binding::Quit));
         assert_eq!(
-            binding(&ca, Keysym::XF86_Switch_VT_12),
+            binding(&ca, Keysym::XF86_Switch_VT_3, false),
+            Some(Binding::Vt(3))
+        );
+        assert_eq!(
+            binding(&ca, Keysym::XF86_Switch_VT_1, false),
+            Some(Binding::Vt(1))
+        );
+        assert_eq!(
+            binding(&ca, Keysym::XF86_Switch_VT_12, false),
             Some(Binding::Vt(12))
         );
-        assert_eq!(binding(&mods(false, false), Keysym::BackSpace), None);
-        assert_eq!(binding(&mods(true, false), Keysym::BackSpace), None);
-        assert_eq!(binding(&mods(false, true), Keysym::BackSpace), None);
-        assert_eq!(binding(&mods(false, false), Keysym::XF86_Switch_VT_3), None);
+        assert_eq!(binding(&mods(false, false), Keysym::BackSpace, false), None);
+        assert_eq!(binding(&mods(true, false), Keysym::BackSpace, false), None);
+        assert_eq!(binding(&mods(false, true), Keysym::BackSpace, false), None);
+        assert_eq!(
+            binding(&mods(false, false), Keysym::XF86_Switch_VT_3, false),
+            None
+        );
         for other in [Keysym::F3, Keysym::Delete, Keysym::a, Keysym::XF86_Ungrab] {
-            assert_eq!(binding(&ca, other), None, "{other:?}");
+            assert_eq!(binding(&ca, other, false), None, "{other:?}");
         }
     }
 
     #[test]
-    fn window_shortcuts_use_only_alt_or_super_and_all_four_arrows() {
+    fn window_shortcuts_follow_the_move_modifier_setting_on_all_four_arrows() {
         for (sym, side) in [
             (Keysym::Left, Side::Left),
             (Keysym::Right, Side::Right),
             (Keysym::Up, Side::Top),
             (Keysym::Down, Side::Bottom),
         ] {
-            for mask in 0..16 {
-                let mods = ModifiersState {
-                    ctrl: mask & 1 != 0,
-                    alt: mask & 2 != 0,
-                    logo: mask & 4 != 0,
-                    shift: mask & 8 != 0,
-                    ..Default::default()
-                };
+            for (mask, mods) in masks() {
+                // Masks: Ctrl 1, Alt 2, Super 4, Shift 8.
                 let expected = match mask {
                     2 => Some(Binding::Move(side)),
                     4 => Some(Binding::Expand(side)),
+                    12 => Some(Binding::Shrink(side)),
                     _ => None,
                 };
-                assert_eq!(binding(&mods, sym), expected, "{sym:?}, mask {mask}");
+                assert_eq!(binding(&mods, sym, false), expected, "{sym:?}, mask {mask}");
+                let swapped = match mask {
+                    4 => Some(Binding::Move(side)),
+                    2 => Some(Binding::Expand(side)),
+                    10 => Some(Binding::Shrink(side)),
+                    _ => None,
+                };
+                assert_eq!(binding(&mods, sym, true), swapped, "{sym:?}, mask {mask}");
             }
         }
     }
@@ -841,12 +877,19 @@ mod tests {
 
     #[test]
     fn super_escape_is_only_super_escape() {
-        for (mask, mods) in masks() {
-            let expected = (mask == 4).then_some(Binding::LeaveFullscreen);
-            assert_eq!(binding(&mods, Keysym::Escape), expected, "mask {mask}");
+        // The move modifier setting never remaps them.
+        for swap in [false, true] {
+            for (mask, mods) in masks() {
+                let expected = (mask == 4).then_some(Binding::LeaveFullscreen);
+                assert_eq!(
+                    binding(&mods, Keysym::Escape, swap),
+                    expected,
+                    "mask {mask}"
+                );
+            }
+            let logo = masks().nth(4).unwrap().1;
+            assert_eq!(binding(&logo, Keysym::l, swap), Some(Binding::Lock));
         }
-        let logo = masks().nth(4).unwrap().1;
-        assert_eq!(binding(&logo, Keysym::l), Some(Binding::Lock));
     }
 
     /// Yoshi's ultrawide and the 4K above it, with a window on each.

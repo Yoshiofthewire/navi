@@ -23,6 +23,14 @@ const FOCUS_PX: i32 = 2;
 const IDLE_PX: i32 = 1;
 const IDLE_ALPHA: f32 = 0.3;
 
+/// A one-cell keyboard change to the focused group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Nudge {
+    Move,
+    Grow,
+    Shrink,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Side {
     Left,
@@ -363,56 +371,60 @@ impl Layout {
         self.finish_resize(&r.before, "expanded")
     }
 
-    /// Move the focused group one cell, or expand its selected side through free cells.
-    /// Other groups (including minimized windows' reserved cells) keep their positions and sizes.
-    pub fn keyboard_adjust(&mut self, id: WinId, side: Side, expand: bool) -> Option<Done> {
+    /// Moves the focused group one cell, or grows or shrinks its `side` by one. Growing or moving
+    /// takes the cell from every tile touching that side, or does nothing if one can't spare it.
+    pub fn keyboard_adjust(&mut self, id: WinId, side: Side, op: Nudge) -> Option<Done> {
         let t = self.tile(id)?;
         if !self.visible(id) || self.maximized(t) || t.fullscreen {
             return None;
         }
-        self.output(&t.output)?;
-        let output = t.output.clone();
-        let before = t.cells;
-        let group = self.group(id);
-        let mut cells = before;
-        for _ in 0..if expand { COLS.max(ROWS) } else { 1 } {
-            let mut next = cells;
-            match side {
-                Side::Left => next.col -= 1,
-                Side::Right if !expand => next.col += 1,
-                Side::Top => next.row -= 1,
-                Side::Bottom if !expand => next.row += 1,
-                _ => {}
-            }
-            if expand {
-                match side {
-                    Side::Left | Side::Right => next.cols += 1,
-                    Side::Top | Side::Bottom => next.rows += 1,
-                }
-            }
-            if next.col < 0
-                || next.row < 0
-                || next.col + next.cols > COLS
-                || next.row + next.rows > ROWS
-                || self.tiles.iter().any(|u| {
-                    u.output == output && !group.contains(&u.id) && next.overlaps(&u.cells)
-                })
-            {
-                break;
-            }
-            cells = next;
-        }
-        if cells == before {
+        let o = self.output(&t.output)?;
+        let x = matches!(side, Side::Left | Side::Right);
+        let far = matches!(side, Side::Right | Side::Bottom);
+        let (min_c, min_r) = o.span_for((MIN_W, MIN_H));
+        let (n, min) = if x { (COLS, min_c) } else { (ROWS, min_r) };
+        let (output, before, group) = (t.output.clone(), t.cells, self.group(id));
+        let (start, len) = span(before, x);
+        let (start, len) = match (op, far) {
+            (Nudge::Shrink, false) => (start + 1, len - 1),
+            (Nudge::Shrink, true) => (start, len - 1),
+            (Nudge::Grow, false) => (start - 1, len + 1),
+            (Nudge::Grow, true) => (start, len + 1),
+            (Nudge::Move, false) => (start - 1, len),
+            (Nudge::Move, true) => (start + 1, len),
+        };
+        if (op == Nudge::Shrink && len < min) || start < 0 || start + len > n {
             return None;
         }
-        self.put(&group, &output, cells);
+        let mut changes = vec![(group.clone(), with_span(before, x, start, len))];
+        if op != Nudge::Shrink {
+            // The one cell just outside `side`, across the group's span on the other axis.
+            let edge = if far { start + len - 1 } else { start };
+            let strip = with_span(before, x, edge, 1);
+            for u in self.tiles.iter().filter(|u| {
+                u.output == output && !group.contains(&u.id) && u.cells.overlaps(&strip)
+            }) {
+                let (s, l) = span(u.cells, x);
+                if l - 1 < min {
+                    return None;
+                }
+                let s = if far { s + 1 } else { s };
+                changes.push((vec![u.id], with_span(u.cells, x, s, l - 1)));
+            }
+        }
+        let mut ids = Vec::new();
+        for (who, cells) in changes {
+            self.put(&who, &output, cells);
+            ids.extend(who);
+        }
         self.stay(&group);
-        let tiles = self.tiles_in(&group);
-        self.learn(&tiles, expand);
-        Some(Done::Layout(
-            if expand { "expanded" } else { "moved" },
-            tiles,
-        ))
+        self.learn(&self.tiles_in(&group), op != Nudge::Move);
+        let what = match op {
+            Nudge::Move => "moved",
+            Nudge::Grow => "expanded",
+            Nudge::Shrink => "shrunk",
+        };
+        Some(Done::Layout(what, self.tiles_in(&ids)))
     }
 }
 
@@ -1510,144 +1522,372 @@ pub(super) mod tests {
         }
     }
 
-    #[test]
-    fn keyboard_moves_one_cell_and_preserves_the_remembered_size() {
-        for (side, expected) in [
-            (Side::Left, c(5, 2, 12, 8)),
-            (Side::Right, c(7, 2, 12, 8)),
-            (Side::Top, c(6, 1, 12, 8)),
-            (Side::Bottom, c(6, 3, 12, 8)),
-        ] {
-            let mut l = with(&[c(6, 2, 12, 8)]);
-            let size = l.memory["a0"].size;
-            l.tile_mut(0).unwrap().home = Some(("unplugged".into(), c(0, 0, 12, 12)));
-            assert_eq!(what(l.keyboard_adjust(0, side, false)), Some("moved"));
-            assert_eq!(at(&l, 0), expected);
-            assert_eq!(l.memory["a0"].cells, expected);
-            assert_eq!(l.memory["a0"].size, size);
-            assert!(l.tile(0).unwrap().home.is_none());
-            assert_valid(&l);
-        }
+    const SIDES: [Side; 4] = [Side::Left, Side::Right, Side::Top, Side::Bottom];
+    const OPS: [Nudge; 3] = [Nudge::Move, Nudge::Grow, Nudge::Shrink];
+
+    /// A nudge that keeps the layout valid, as it is logged.
+    fn nudge(l: &mut Layout, id: WinId, side: Side, op: Nudge) -> Option<&'static str> {
+        let what = what(l.keyboard_adjust(id, side, op));
+        assert_valid(l);
+        what
+    }
+
+    /// A nudge that changes nothing: no result, and tiles and memory as they were.
+    fn unchanged(l: &mut Layout, id: WinId, side: Side, op: Nudge) {
+        let (tiles, memory) = (l.tiles.clone(), l.memory.clone());
+        assert!(
+            l.keyboard_adjust(id, side, op).is_none(),
+            "{id} {side:?} {op:?}"
+        );
+        assert_eq!(l.tiles, tiles, "{id} {side:?} {op:?}");
+        assert_eq!(l.memory, memory, "{id} {side:?} {op:?}");
+    }
+
+    /// The ids and cells a nudge reports, sorted by id.
+    fn changed(l: &mut Layout, id: WinId, side: Side, op: Nudge) -> Vec<(WinId, Cells)> {
+        let Some(Done::Layout(_, tiles)) = l.keyboard_adjust(id, side, op) else {
+            panic!("{id} {side:?} {op:?} changed nothing");
+        };
+        assert_valid(l);
+        let mut out: Vec<_> = tiles.iter().map(|t| (t.id, t.cells)).collect();
+        out.sort_unstable_by_key(|&(id, _)| id);
+        out
+    }
+
+    fn assert_remembers(l: &Layout, app: &str, cells: Cells) {
+        let r = l.output("uw").unwrap().cells_rect(cells);
+        assert_eq!(l.memory[app].cells, cells);
+        assert_eq!(l.memory[app].size, (r.w, r.h));
     }
 
     #[test]
-    fn keyboard_expands_to_each_usable_monitor_edge_and_remembers_size() {
+    fn keyboard_grows_one_cell_per_side_up_to_the_grid_edge() {
         for (side, expected) in [
-            (Side::Left, c(0, 2, 18, 8)),
-            (Side::Right, c(6, 2, 18, 8)),
-            (Side::Top, c(6, 0, 12, 10)),
-            (Side::Bottom, c(6, 2, 12, 10)),
+            (Side::Left, c(5, 2, 13, 8)),
+            (Side::Right, c(6, 2, 13, 8)),
+            (Side::Top, c(6, 1, 12, 9)),
+            (Side::Bottom, c(6, 2, 12, 9)),
         ] {
+            let mut l = with(&[c(6, 2, 12, 8)]);
+            l.tile_mut(0).unwrap().home = Some(("unplugged".into(), c(0, 0, 12, 12)));
+            assert_eq!(nudge(&mut l, 0, side, Nudge::Grow), Some("expanded"));
+            assert_eq!(at(&l, 0), expected);
+            assert_remembers(&l, "a0", expected);
+            assert!(l.tile(0).unwrap().home.is_none());
+        }
+        let mut l = with(&[c(6, 2, 13, 8)]);
+        for right in 20..=24 {
+            assert_eq!(
+                changed(&mut l, 0, Side::Right, Nudge::Grow),
+                [(0, c(6, 2, right - 6, 8))]
+            );
+        }
+        unchanged(&mut l, 0, Side::Right, Nudge::Grow);
+    }
+
+    #[test]
+    fn keyboard_growth_stops_at_each_usable_monitor_edge() {
+        let mut l = with(&[c(0, 0, 24, 12)]);
+        for side in SIDES {
+            unchanged(&mut l, 0, side, Nudge::Grow);
+        }
+        for (cells, side) in [
+            (c(0, 2, 6, 4), Side::Left),
+            (c(18, 2, 6, 4), Side::Right),
+            (c(6, 0, 6, 4), Side::Top),
+            (c(6, 8, 6, 4), Side::Bottom),
+        ] {
+            let mut l = with(&[cells]);
+            unchanged(&mut l, 0, side, Nudge::Grow);
+        }
+        // Panels shrink the area; grown tiles stay inside it, also off the global origin.
+        for side in SIDES {
             let mut l = with(&[c(6, 2, 12, 8)]);
             let mut output = uw();
             output.area.x = -3440;
             output.area.y = -1408;
             output.area.h = 1344;
             l.set_outputs(vec![output.clone()]);
-            assert_eq!(what(l.keyboard_adjust(0, side, true)), Some("expanded"));
-            assert_eq!(at(&l, 0), expected);
-            assert_eq!(l.memory["a0"].cells, expected);
-            let size = output.cells_rect(expected);
-            assert_eq!(l.memory["a0"].size, (size.w, size.h));
+            while nudge(&mut l, 0, side, Nudge::Grow).is_some() {}
             let rect = l.rect(0).unwrap();
             assert!(rect.x >= output.area.x && rect.y >= output.area.y);
             assert!(rect.x + rect.w <= output.area.x + output.area.w);
             assert!(rect.y + rect.h <= output.area.y + output.area.h);
-            assert!(l.keyboard_adjust(0, side, true).is_none());
-            assert_valid(&l);
+            let k = at(&l, 0);
+            let (start, len) = span(k, matches!(side, Side::Left | Side::Right));
+            let n = if matches!(side, Side::Left | Side::Right) {
+                COLS
+            } else {
+                ROWS
+            };
+            match side {
+                Side::Left | Side::Top => assert_eq!(start, 0, "{side:?}"),
+                Side::Right | Side::Bottom => assert_eq!(start + len, n, "{side:?}"),
+            }
         }
     }
 
     #[test]
-    fn keyboard_expansion_stops_at_partial_neighbors_without_shrinking_them() {
-        for (side, neighbor, expected) in [
-            (Side::Left, c(2, 6, 4, 4), c(6, 4, 10, 4)),
-            (Side::Right, c(20, 6, 4, 4), c(8, 4, 12, 4)),
-            (Side::Top, c(12, 0, 4, 2), c(8, 2, 8, 6)),
-            (Side::Bottom, c(12, 10, 4, 2), c(8, 4, 8, 6)),
+    fn keyboard_growth_takes_a_cell_from_the_neighbor_and_leaves_its_memory() {
+        for (x, toward_b, toward_a) in [
+            (true, Side::Right, Side::Left),
+            (false, Side::Bottom, Side::Top),
         ] {
-            let mut l = with(&[c(8, 4, 8, 4), neighbor]);
-            let other = l.tile(1).unwrap().clone();
-            let memory = l.memory["a1"].clone();
-            assert!(l.keyboard_adjust(0, side, true).is_some());
+            let h = if x { COLS / 2 } else { ROWS / 2 };
+            let (a, b) = (
+                with_span(crate::layout::FULL, x, 0, h),
+                with_span(crate::layout::FULL, x, h, h),
+            );
+            let grown = |k: Cells, start: i32, len: i32| with_span(k, x, start, len);
+            for (id, side, mine, theirs) in [
+                (0, toward_b, grown(a, 0, h + 1), grown(b, h + 1, h - 1)),
+                (1, toward_a, grown(b, h - 1, h + 1), grown(a, 0, h - 1)),
+            ] {
+                let mut l = with(&[a, b]);
+                let other = 1 - id;
+                let home = Some(("unplugged".to_string(), c(0, 0, 3, 2)));
+                l.tile_mut(other).unwrap().home = home.clone();
+                let memory = l.memory[&format!("a{other}")].clone();
+                let mut expected = [(id, mine), (other, theirs)];
+                expected.sort_unstable_by_key(|&(id, _)| id);
+                assert_eq!(changed(&mut l, id, side, Nudge::Grow), expected);
+                assert_eq!(l.memory[&format!("a{other}")], memory);
+                assert_eq!(l.tile(other).unwrap().home, home);
+                assert_remembers(&l, &format!("a{id}"), mine);
+            }
+        }
+    }
+
+    #[test]
+    fn keyboard_growth_never_shrinks_a_neighbor_below_the_minimum() {
+        let mut l = with(&[c(0, 0, 21, 12), c(21, 0, 3, 12)]);
+        unchanged(&mut l, 0, Side::Right, Nudge::Grow);
+        let mut l = with(&[c(0, 0, 24, 10), c(0, 10, 24, 2)]);
+        unchanged(&mut l, 0, Side::Bottom, Nudge::Grow);
+    }
+
+    #[test]
+    fn keyboard_growth_takes_from_every_touching_tile_or_none() {
+        let mut l = with(&[c(0, 0, 12, 12), c(12, 0, 12, 6), c(12, 6, 12, 6)]);
+        assert_eq!(
+            changed(&mut l, 0, Side::Right, Nudge::Grow),
+            [
+                (0, c(0, 0, 13, 12)),
+                (1, c(13, 0, 11, 6)),
+                (2, c(13, 6, 11, 6))
+            ]
+        );
+        let mut l = with(&[c(0, 0, 12, 12), c(12, 0, 12, 6), c(12, 6, 3, 6)]);
+        unchanged(&mut l, 0, Side::Right, Nudge::Grow);
+    }
+
+    #[test]
+    fn keyboard_growth_moves_a_partial_neighbors_whole_side_and_skips_corners() {
+        let mut l = with(&[c(8, 4, 8, 4), c(16, 0, 8, 12)]);
+        assert_eq!(
+            changed(&mut l, 0, Side::Right, Nudge::Grow),
+            [(0, c(8, 4, 9, 4)), (1, c(17, 0, 7, 12))]
+        );
+        let mut l = with(&[c(8, 4, 8, 4), c(16, 8, 8, 4)]);
+        assert_eq!(
+            changed(&mut l, 0, Side::Right, Nudge::Grow),
+            [(0, c(8, 4, 9, 4))]
+        );
+        assert_eq!(at(&l, 1), c(16, 8, 8, 4));
+    }
+
+    #[test]
+    fn keyboard_shrinks_one_cell_and_never_touches_neighbors() {
+        for (side, expected) in [
+            (Side::Left, c(7, 2, 11, 8)),
+            (Side::Right, c(6, 2, 11, 8)),
+            (Side::Top, c(6, 3, 12, 7)),
+            (Side::Bottom, c(6, 2, 12, 7)),
+        ] {
+            let mut l = with(&[c(6, 2, 12, 8)]);
+            l.tile_mut(0).unwrap().home = Some(("unplugged".into(), c(0, 0, 12, 12)));
+            assert_eq!(nudge(&mut l, 0, side, Nudge::Shrink), Some("shrunk"));
             assert_eq!(at(&l, 0), expected);
-            assert_eq!(l.tile(1), Some(&other));
-            assert_eq!(l.memory["a1"], memory);
-            assert_valid(&l);
+            assert_remembers(&l, "a0", expected);
+            assert!(l.tile(0).unwrap().home.is_none());
         }
-    }
-
-    #[test]
-    fn keyboard_blocked_moves_and_expansion_do_not_change_layout_or_memory() {
         let mut l = halves();
-        for minimized in [false, true] {
-            if minimized {
-                l.minimize(1);
-            }
-            let tiles = l.tiles.clone();
-            let memory = l.memory.clone();
-            for side in [Side::Left, Side::Right, Side::Top, Side::Bottom] {
-                for expand in [false, true] {
-                    assert!(l.keyboard_adjust(0, side, expand).is_none());
-                }
-            }
-            assert_eq!(l.tiles, tiles);
-            assert_eq!(l.memory, memory);
+        assert_eq!(
+            changed(&mut l, 0, Side::Right, Nudge::Shrink),
+            [(0, c(0, 0, 11, 12))]
+        );
+        assert_eq!(at(&l, 1), c(12, 0, 12, 12));
+        let mut l = with(&[c(6, 2, 3, 2)]);
+        for side in SIDES {
+            unchanged(&mut l, 0, side, Nudge::Shrink);
         }
     }
 
     #[test]
-    fn keyboard_adjusts_the_active_tab_group_and_keeps_other_outputs_separate() {
-        let mut l = with(&[c(4, 2, 8, 6), c(4, 2, 8, 6), c(16, 0, 8, 12)]);
-        assert!(l.keyboard_adjust(0, Side::Right, false).is_none());
-        assert!(l.keyboard_adjust(1, Side::Right, false).is_some());
-        assert_eq!(at(&l, 0), c(5, 2, 8, 6));
-        assert_eq!(at(&l, 1), c(5, 2, 8, 6));
-        assert!(l.keyboard_adjust(1, Side::Right, true).is_some());
-        assert_eq!(at(&l, 0), c(5, 2, 11, 6));
-        assert_eq!(at(&l, 1), c(5, 2, 11, 6));
-        assert_eq!(at(&l, 2), c(16, 0, 8, 12));
-        assert!(l.visible(1));
-        assert_valid(&l);
+    fn keyboard_move_pushes_the_neighbor_until_its_minimum() {
+        let mut l = halves();
+        l.tile_mut(0).unwrap().home = Some(("unplugged".into(), c(0, 0, 12, 12)));
+        let (size, a1) = (l.memory["a0"].size, l.memory["a1"].clone());
+        assert_eq!(nudge(&mut l, 0, Side::Right, Nudge::Move), Some("moved"));
+        assert_eq!((at(&l, 0), at(&l, 1)), (c(1, 0, 12, 12), c(13, 0, 11, 12)));
+        assert_eq!(l.memory["a0"].cells, c(1, 0, 12, 12));
+        assert_eq!(l.memory["a0"].size, size);
+        assert_eq!(l.memory["a1"], a1);
+        assert!(l.tile(0).unwrap().home.is_none());
+        for _ in 0..8 {
+            assert_eq!(nudge(&mut l, 0, Side::Right, Nudge::Move), Some("moved"));
+        }
+        assert_eq!((at(&l, 0), at(&l, 1)), (c(9, 0, 12, 12), c(21, 0, 3, 12)));
+        unchanged(&mut l, 0, Side::Right, Nudge::Move);
+
+        let mut l = with(&[c(0, 0, 24, 6), c(0, 6, 24, 6)]);
+        for _ in 0..4 {
+            assert_eq!(nudge(&mut l, 0, Side::Bottom, Nudge::Move), Some("moved"));
+        }
+        assert_eq!((at(&l, 0), at(&l, 1)), (c(0, 4, 24, 6), c(0, 10, 24, 2)));
+        unchanged(&mut l, 0, Side::Bottom, Nudge::Move);
+        // Moving back leaves the pushed tile where it is, at its minimum.
+        assert_eq!(
+            changed(&mut l, 0, Side::Top, Nudge::Move),
+            [(0, c(0, 3, 24, 6))]
+        );
+    }
+
+    #[test]
+    fn keyboard_move_leaves_tiles_behind_and_stops_at_edges_and_minimums() {
+        let mut l = with(&[c(0, 0, 6, 12), c(6, 0, 6, 12), c(12, 0, 12, 12)]);
+        assert_eq!(
+            changed(&mut l, 1, Side::Right, Nudge::Move),
+            [(1, c(7, 0, 6, 12)), (2, c(13, 0, 11, 12))]
+        );
+        assert_eq!(at(&l, 0), c(0, 0, 6, 12));
+        let mut l = with(&[c(0, 0, 12, 12), c(12, 0, 12, 6), c(12, 6, 3, 6)]);
+        unchanged(&mut l, 0, Side::Right, Nudge::Move);
+        let mut l = with(&[c(0, 0, 6, 4), c(18, 8, 6, 4)]);
+        unchanged(&mut l, 0, Side::Left, Nudge::Move);
+        unchanged(&mut l, 0, Side::Top, Nudge::Move);
+        unchanged(&mut l, 1, Side::Right, Nudge::Move);
+        unchanged(&mut l, 1, Side::Bottom, Nudge::Move);
+    }
+
+    #[test]
+    fn keyboard_nudges_move_tab_groups_as_one_and_minimized_neighbors_give_way() {
+        // Tile 1 is the active tab of 0 and 1.
+        for (op, expected) in [
+            (Nudge::Move, c(5, 2, 8, 6)),
+            (Nudge::Grow, c(4, 2, 9, 6)),
+            (Nudge::Shrink, c(4, 2, 7, 6)),
+        ] {
+            let mut l = with(&[c(4, 2, 8, 6), c(4, 2, 8, 6), c(16, 0, 8, 12)]);
+            unchanged(&mut l, 0, Side::Right, op);
+            assert_eq!(
+                changed(&mut l, 1, Side::Right, op),
+                [(0, expected), (1, expected)]
+            );
+            assert!(l.visible(1));
+            assert_eq!(at(&l, 2), c(16, 0, 8, 12));
+        }
+        // A neighbor tab group gives up the cell with every tab.
+        let mut l = with(&[c(0, 0, 12, 12), c(12, 0, 12, 12), c(12, 0, 12, 12)]);
+        let theirs = c(13, 0, 11, 12);
+        assert_eq!(
+            changed(&mut l, 0, Side::Right, Nudge::Grow),
+            [(0, c(0, 0, 13, 12)), (1, theirs), (2, theirs)]
+        );
+        // A minimized neighbor too, unless it is at its minimum.
+        let mut l = halves();
+        assert!(l.minimize(1));
+        assert_eq!(
+            changed(&mut l, 0, Side::Right, Nudge::Grow),
+            [(0, c(0, 0, 13, 12)), (1, c(13, 0, 11, 12))]
+        );
+        let mut l = with(&[c(0, 0, 21, 12), c(21, 0, 3, 12)]);
+        assert!(l.minimize(1));
+        unchanged(&mut l, 0, Side::Right, Nudge::Grow);
+        unchanged(&mut l, 0, Side::Right, Nudge::Move);
+    }
+
+    #[test]
+    fn keyboard_nudges_keep_other_outputs_and_skip_hidden_windows() {
+        let mut l = halves();
         let mut second = uw();
         second.name = "other".into();
         second.area.x = 3440;
+        second.full.x = 3440;
         l.set_outputs(vec![uw(), second]);
-        l.tile_mut(2).unwrap().output = "other".into();
-        assert!(l.keyboard_adjust(1, Side::Right, true).is_some());
-        assert_eq!(at(&l, 1), c(5, 2, 19, 6));
+        l.tiles.push(Tile {
+            id: 2,
+            app: "a2".into(),
+            output: "other".into(),
+            cells: c(12, 0, 12, 12),
+            ..Tile::default()
+        });
+        // assert_valid ignores outputs, so check this one by hand.
+        assert!(l.keyboard_adjust(0, Side::Right, Nudge::Grow).is_some());
+        assert_eq!((at(&l, 0), at(&l, 1)), (c(0, 0, 13, 12), c(13, 0, 11, 12)));
+        assert_eq!(at(&l, 2), c(12, 0, 12, 12));
         assert_eq!(l.tile(2).unwrap().output, "other");
-        assert_eq!(at(&l, 2), c(16, 0, 8, 12));
+
+        for mode in 0..8 {
+            // Tile 0 is the one nudged; 1 is its tab, 2 an output-mate.
+            let mut l = with(&[c(6, 2, 8, 6), c(6, 2, 8, 6), c(16, 2, 6, 6)]);
+            let id = match mode {
+                0 => {
+                    assert!(l.minimize(1));
+                    1
+                }
+                1 => 0, // Hidden behind its active tab 1.
+                2 => {
+                    assert!(l.maximize(1));
+                    1
+                }
+                3 => {
+                    assert!(l.fullscreen(1));
+                    1
+                }
+                4 => {
+                    assert!(l.fullscreen(2));
+                    1
+                }
+                5 => {
+                    assert!(l.maximize(2));
+                    1
+                }
+                6 => {
+                    l.set_outputs(Vec::new());
+                    1
+                }
+                _ => 99,
+            };
+            for side in SIDES {
+                for op in OPS {
+                    unchanged(&mut l, id, side, op);
+                }
+            }
+        }
     }
 
     #[test]
-    fn keyboard_leaves_hidden_maximized_fullscreen_and_missing_windows_alone() {
-        for mode in 0..5 {
-            let mut l = with(&[c(6, 2, 12, 8)]);
-            match mode {
-                0 => {
-                    l.minimize(0);
-                }
-                1 => {
-                    l.maximize(0);
-                }
-                2 => {
-                    l.fullscreen(0);
-                }
-                3 => {
-                    l.set_outputs(Vec::new());
-                }
-                _ => {}
-            }
-            let tiles = l.tiles.clone();
-            let memory = l.memory.clone();
-            let id = if mode == 4 { 99 } else { 0 };
-            for expand in [false, true] {
-                assert!(l.keyboard_adjust(id, Side::Right, expand).is_none());
-            }
-            assert_eq!(l.tiles, tiles);
-            assert_eq!(l.memory, memory);
-        }
+    fn keyboard_nudges_use_the_laptop_minimum() {
+        let mut l = with(&[c(0, 0, 16, 12), c(16, 0, 8, 12)]);
+        let mut laptop = uw();
+        laptop.area = Rect {
+            x: 0,
+            y: 0,
+            w: 1125,
+            h: 703,
+        };
+        laptop.full = laptop.area;
+        assert_eq!(laptop.span_for((MIN_W, MIN_H)), (7, 5));
+        l.set_outputs(vec![laptop]);
+        assert_eq!(
+            changed(&mut l, 0, Side::Right, Nudge::Grow),
+            [(0, c(0, 0, 17, 12)), (1, c(17, 0, 7, 12))]
+        );
+        unchanged(&mut l, 0, Side::Right, Nudge::Grow);
+        unchanged(&mut l, 0, Side::Right, Nudge::Move);
+        unchanged(&mut l, 1, Side::Right, Nudge::Shrink);
+        unchanged(&mut l, 1, Side::Left, Nudge::Shrink);
     }
 
     #[test]
