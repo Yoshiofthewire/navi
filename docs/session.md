@@ -51,6 +51,11 @@ there, and Ctrl+Alt+Backspace brings the console back. Then pick "navi" on the l
 - **Super + Left/Right/Up/Down:** expand that side to the next window or usable monitor edge.
   Other windows stay put. Panels keep their space.
 
+- **Super (tap):** open or close the app launcher. Type to search, arrows, PageUp/PageDown and
+  Home/End to move, Enter to launch, Esc to close; the keyboard then returns to your window.
+  Not while locked, and not over a fullscreen app on the taskbar's monitor (Super+Esc first).
+  With sticky keys on, a lone Super tap latches Super instead.
+
 These work for native Wayland and X11 tiles and move/resize a tab group together. Changes are
 remembered. Maximized/fullscreen windows keep their geometry. Floating dialogs and launcher
 surfaces keep their app shortcuts. When testing nested, the host compositor may reserve these

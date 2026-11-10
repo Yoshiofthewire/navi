@@ -1,6 +1,9 @@
 #![forbid(unsafe_code)]
 
 mod activation;
+// navi-bar's end of the channel is unused here.
+#[allow(dead_code)]
+mod control;
 mod cursor;
 mod desktop_config;
 mod files;
@@ -171,7 +174,7 @@ fn run(backend: Backend) -> Result<(), Box<dyn Error>> {
     };
     // After the first output exists, so the bar lands on it.
     let xdisplay = xwayland::start(&handle, &data.state);
-    shell::start_bar(
+    data.state.bar_control = shell::start_bar(
         &handle,
         &mut data.state.display_handle,
         &socket_name,

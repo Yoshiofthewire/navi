@@ -24,7 +24,11 @@ use smithay::reexports::{
 };
 use tracing::{info, warn};
 
-use crate::{CalloopData, state::ClientState};
+use crate::{
+    CalloopData,
+    control::{LOCK, NO, TOGGLE_MENU, YES},
+    state::ClientState,
+};
 
 const MAX_STARTS: usize = 5;
 const WINDOW_MS: u64 = 60_000;
@@ -68,8 +72,27 @@ pub struct Bar {
     clock: Instant,
 }
 
+/// Tells navi-bar to open or close the app menu. Never blocks: a full or broken socket drops
+/// the toggle. Returns whether it was sent.
+pub fn send_toggle(control: &UnixStream) -> bool {
+    use rustix::net::{SendFlags, send};
+    match send(
+        control,
+        &[TOGGLE_MENU],
+        SendFlags::DONTWAIT | SendFlags::NOSIGNAL,
+    ) {
+        Ok(1) => true,
+        Ok(_) => false,
+        Err(e) => {
+            warn!("app menu toggle dropped: {e}");
+            false
+        }
+    }
+}
+
 /// Spawns `navi-bar` next to navi's own executable, with no shell and no `PATH` search, and
-/// restarts it when it exits. Without it, navi runs without a bar.
+/// restarts it when it exits. Without it, navi runs without a bar. Returns the first bar's
+/// control stream for `send_toggle`; `Navi::bar_control` follows each restart.
 pub fn start_bar(
     handle: &LoopHandle<'static, CalloopData>,
     dh: &mut DisplayHandle,
@@ -77,12 +100,12 @@ pub fn start_bar(
     cursor: Option<(String, u32)>,
     xdisplay: Option<String>,
     session: bool,
-) {
+) -> Option<UnixStream> {
     let path = match std::env::current_exe() {
         Ok(exe) => exe.with_file_name("navi-bar"),
         Err(e) => {
             warn!("navi-bar not started, navi's own path is unknown: {e}");
-            return;
+            return None;
         }
     };
     // Only a successful exit from our own shell means the user confirmed Log Out.
@@ -96,12 +119,13 @@ pub fn start_bar(
         respawn: Respawn::default(),
         clock: Instant::now(),
     }));
-    bar.borrow_mut().start(dh, &tx, handle);
+    let control = bar.borrow_mut().start(dh, &tx, handle);
     let h = handle.clone();
     let restart = handle.insert_source(rx, move |event, _, data| {
         let Event::Msg(logout) = event else {
             return;
         };
+        data.state.bar_control = None;
         if logout && !data.state.lock.active {
             info!("logout requested by navi-bar");
             data.state.loop_signal.stop();
@@ -110,8 +134,11 @@ pub fn start_bar(
         let (bar, tx) = (bar.clone(), tx.clone());
         let timer = Timer::from_duration(RESTART_DELAY);
         let queued = h.insert_source(timer, move |_, _, data| {
-            bar.borrow_mut()
-                .start(&mut data.state.display_handle, &tx, &data.state.loop_handle);
+            data.state.bar_control = bar.borrow_mut().start(
+                &mut data.state.display_handle,
+                &tx,
+                &data.state.loop_handle,
+            );
             TimeoutAction::Drop
         });
         if let Err(e) = queued {
@@ -121,23 +148,27 @@ pub fn start_bar(
     if let Err(e) = restart {
         warn!("navi-bar won't be restarted: {e}");
     }
+    control
 }
 
 impl Bar {
-    /// Starts navi-bar if the respawn limit allows; `exited` hears when it exits.
+    /// Starts navi-bar if the respawn limit allows; `exited` hears when it exits. Returns the
+    /// writer for its control stream.
     fn start(
         &mut self,
         dh: &mut DisplayHandle,
         exited: &channel::Sender<bool>,
         handle: &LoopHandle<'static, CalloopData>,
-    ) {
+    ) -> Option<UnixStream> {
         if !self.respawn.allow(self.clock.elapsed().as_millis() as u64) {
             warn!("navi-bar keeps crashing, running without a bar");
-            return;
+            return None;
         }
-        if let Err(e) = self.spawn(dh, exited.clone(), handle) {
-            warn!(path = %self.path.display(), "navi-bar not started, running without a bar: {e}");
-        }
+        self.spawn(dh, exited.clone(), handle)
+            .inspect_err(|e| {
+                warn!(path = %self.path.display(), "navi-bar not started, running without a bar: {e}");
+            })
+            .ok()
     }
 
     fn spawn(
@@ -145,9 +176,10 @@ impl Bar {
         dh: &mut DisplayHandle,
         exited: channel::Sender<bool>,
         handle: &LoopHandle<'static, CalloopData>,
-    ) -> io::Result<()> {
+    ) -> io::Result<UnixStream> {
         let (ours, theirs) = UnixStream::pair()?;
         let (mut control, child_control) = UnixStream::pair()?;
+        let toggles = control.try_clone()?;
         let (requests, events) = channel::channel::<(bool, std::sync::mpsc::Sender<bool>)>();
         handle
             .insert_source(events, |event, _, data| {
@@ -164,11 +196,11 @@ impl Bar {
             let mut request = [0];
             while control.read_exact(&mut request).is_ok() {
                 let (tx, rx) = std::sync::mpsc::channel();
-                if request[0] > 1 || requests.send((request[0] == 1, tx)).is_err() {
+                if request[0] > LOCK || requests.send((request[0] == LOCK, tx)).is_err() {
                     break;
                 }
                 let ok = rx.recv_timeout(Duration::from_secs(12)).unwrap_or(false);
-                if control.write_all(&[u8::from(ok)]).is_err() {
+                if control.write_all(&[if ok { YES } else { NO }]).is_err() {
                     break;
                 }
             }
@@ -220,7 +252,7 @@ impl Bar {
             // Fails only once navi is shutting down.
             let _ = exited.send(logout);
         });
-        Ok(())
+        Ok(toggles)
     }
 }
 
@@ -254,6 +286,22 @@ mod tests {
         assert!(r.allow(60_000));
         assert!(!r.allow(60_500));
         assert!(r.allow(61_000));
+    }
+
+    #[test]
+    fn toggles_never_block_and_drop_when_full() {
+        let (navi, bar) = UnixStream::pair().unwrap();
+        // The bar never reads: every send returns at once until the buffer fills.
+        let start = Instant::now();
+        let sent = (0..10_000_000).take_while(|_| send_toggle(&navi)).count();
+        assert!(sent > 0);
+        assert!(!send_toggle(&navi), "still full, still dropped");
+        assert!(start.elapsed() < Duration::from_secs(10));
+        let mut first = [0];
+        (&bar).read_exact(&mut first).unwrap();
+        assert_eq!(first, [TOGGLE_MENU]);
+        drop(bar);
+        assert!(!send_toggle(&navi), "broken socket");
     }
 
     #[test]
