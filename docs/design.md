@@ -186,6 +186,12 @@ space when you want it.
 ## Shell
 
 The screen shows a wallpaper, a taskbar and your apps. There are no desktop icons and no widgets.
+Desktop icons have no enablement option. Files in the user's Desktop directory are accessible
+through the file manager, like any other folder.
+
+Utility selection follows the [desktop application policy](../PRODUCT.md#desktop-application-policy):
+non-terminal Navi utilities must match Navi's selected appearance. Navi uses the user's browser;
+bundling a degoogled, resource-tested Chromium variant is reserved for a future distribution.
 
 - **Wallpaper:** set per monitor, independent of the taskbar, in `~/.config/navi/wallpaper`. The
   first run imports the image Plasma shows on each screen. PNG or JPEG only, scaled and cropped to
