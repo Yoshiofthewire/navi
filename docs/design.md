@@ -182,7 +182,8 @@ aspect, gravity, position) are ignored.
   counting as free and its centre standing in for the pointer, and navi remembers the new size; if
   nothing fits, it floats. A re-placed window leaves fullscreen and maximize. A relaxed minimum
   never moves anything: it only lowers the floor for later resizes and shrinking. A bar that
-  appears later (the app switches to navi's decorations) is checked the same way. One window is
+  appears later (the app switches to navi's decorations, or an X11 app changes its
+  `_MOTIF_WM_HINTS` after mapping, which also removes the bar) is checked the same way. One window is
   refitted at most once a second; hints that change faster are applied as they stand then, so an
   app flipping its minimum on every commit can't make navi re-place it and save memory each frame.
 - **Floats.** A window too big for any tile floats centred in what the panels leave of its
