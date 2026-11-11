@@ -1893,9 +1893,17 @@ impl Navi {
 
     /// Whether `popup`'s client already has `layout::CLIENT_POPUPS` popups tracked, under any of
     /// its toplevels or layer surfaces (every root a popup can have). Only tracked, live popups
-    /// count, so closing one frees its place.
-    fn client_popups_full(&self, popup: &PopupSurface) -> bool {
+    /// count, so closing one frees its place. navi-bar's popups can wait outside any tree
+    /// (parentless until a layer surface adopts one), so for navi-bar every live one counts.
+    fn client_popups_full(&self, popup: &PopupSurface, navi_bar: bool) -> bool {
         let client = popup.wl_surface().client();
+        if navi_bar {
+            return layout::popups_full(self.xdg_shell_state.popup_surfaces().iter().filter(|p| {
+                p.alive()
+                    && p.wl_surface() != popup.wl_surface()
+                    && p.wl_surface().client() == client
+            }));
+        }
         let toplevels = self.xdg_shell_state.toplevel_surfaces().iter();
         let roots = toplevels
             .map(|t| t.wl_surface().clone())
@@ -2139,6 +2147,13 @@ fn bounded(mut p: PositionerState) -> PositionerState {
     )
         .into();
     p
+}
+
+/// Whether a new popup is placed. A parentless one only from navi-bar, as only a layer surface
+/// (navi-bar's alone) can adopt it later; elsewhere it would sit uncounted in Smithay's unmapped
+/// list, which every loop scans. Never past the depth or count caps.
+fn admits_popup(has_parent: bool, navi_bar: bool, too_deep: bool, full: bool) -> bool {
+    (has_parent || navi_bar) && !too_deep && !full
 }
 
 /// Past `layout::POPUP_DEPTH`; such popups are dismissed and never tracked or placed.
@@ -2386,11 +2401,20 @@ impl XdgShellHandler for Navi {
     }
 
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
-        // A parentless popup would sit in the manager's unmapped list, uncounted, until it dies.
-        if surface.get_parent_surface().is_none()
-            || too_deep(&surface)
-            || self.client_popups_full(&surface)
-        {
+        let navi_bar = privileged(
+            surface
+                .wl_surface()
+                .client()
+                .as_ref()
+                .and_then(|c| c.get_data()),
+        );
+        let has_parent = surface.get_parent_surface().is_some();
+        if !admits_popup(
+            has_parent,
+            navi_bar,
+            too_deep(&surface),
+            self.client_popups_full(&surface, navi_bar),
+        ) {
             surface.send_popup_done();
             return;
         }
@@ -2767,6 +2791,18 @@ mod tests {
             anchor_rect: anchor,
             offset: offset.into(),
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn only_navi_bar_may_open_a_parentless_popup() {
+        assert!(admits_popup(true, false, false, false));
+        assert!(admits_popup(true, true, false, false));
+        assert!(admits_popup(false, true, false, false));
+        assert!(!admits_popup(false, false, false, false));
+        for (deep, full) in [(true, false), (false, true)] {
+            assert!(!admits_popup(true, false, deep, full));
+            assert!(!admits_popup(false, true, deep, full));
         }
     }
 
