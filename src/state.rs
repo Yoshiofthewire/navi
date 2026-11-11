@@ -115,8 +115,13 @@ pub struct Managed {
     /// A dialog refused the keyboard and not focused since: framed in accent, its root's dock
     /// entry and tab marked.
     pub(crate) waiting: bool,
-    /// Its last user raise (`Navi::raises` then); 0 if never. Only `focus` sets it.
+    /// Its last raise (`Navi::raises` then): any focus that put it in front, a user's or a new
+    /// window's (`Raise`); 0 if never.
     pub(crate) rank: u64,
+    /// Its last raise by the user alone; the only rank a closed window's dialogs inherit.
+    pub(crate) user_rank: u64,
+    /// An orphan family's least place: `dialog::Stacked::floor`.
+    pub(crate) floor: u64,
     /// `Navi::raises` when it appeared: a dialog's place within its family until it's raised.
     pub(crate) born: u64,
     /// The bounds a dialog's cap was last logged for.
@@ -167,7 +172,7 @@ pub struct Navi {
     pub(crate) exclusive: crate::focus::Exclusive<WlSurface, Window>,
     /// navi's last return of the keyboard from a layer to a window, until focus moves again.
     pub(crate) handback: Option<(WlSurface, WlSurface)>,
-    /// The user-raise clock: bumped by every `focus`, read by `Managed::rank`.
+    /// The raise clock, in steps of 2 so an orphan's floor fits just below a raise.
     pub(crate) raises: u64,
     /// The window that held the keyboard when a click gave it to a layer.
     before_layer: crate::focus::BeforeLayer<Window>,
@@ -745,7 +750,7 @@ impl Navi {
     }
 
     /// The toplevel window holding the keyboard, if one does.
-    fn focused_window(&self) -> Option<Window> {
+    pub(crate) fn focused_window(&self) -> Option<Window> {
         let focus = self.seat.get_keyboard()?.current_focus()?.surface()?;
         self.windows
             .iter()
@@ -1034,7 +1039,7 @@ impl Navi {
             self.apply_layout();
         }
         if self.layout.visible(id) {
-            self.focus(self.window_of(id));
+            self.focus_by(self.window_of(id), Raise::User);
         }
     }
 
@@ -1101,8 +1106,14 @@ impl Navi {
         }
     }
 
-    /// Gives `window` keyboard focus and activates it, or nobody.
+    /// Gives `window` keyboard focus and activates it, or nobody: navi's own refocus, which never
+    /// changes the stacking order.
     pub fn focus(&mut self, window: Option<Window>) {
+        self.focus_by(window, Raise::Not);
+    }
+
+    /// `focus`, raising `window` (and so its family) to the front as `by` says.
+    pub fn focus_by(&mut self, window: Option<Window>, by: Raise) {
         if self.lock.active {
             return;
         }
@@ -1123,13 +1134,20 @@ impl Navi {
         }
         match &window {
             Some(w) => {
+                // Activates it; `restack` puts it back in the one order.
                 self.space.raise_element(w, true);
-                // The one user raise: its family goes in front, its dialogs above it.
-                self.raises += 1;
+                if by != Raise::Not {
+                    self.raises += 2;
+                }
                 let clock = self.raises;
                 if let Some(m) = self.windows.iter_mut().find(|m| &m.window == w) {
-                    m.rank = clock;
                     m.waiting = false;
+                    if by != Raise::Not {
+                        m.rank = clock;
+                    }
+                    if by == Raise::User {
+                        m.user_rank = clock;
+                    }
                 }
                 self.restack();
                 self.sync_attention();
@@ -1310,7 +1328,7 @@ impl Navi {
                 return;
             }
         }
-        self.focus(Some(window));
+        self.focus_by(Some(window), Raise::New);
     }
 
     /// Dialog `i` maps without the keyboard: it waits, marked, until the user focuses it.
@@ -1535,57 +1553,72 @@ impl Navi {
     /// Sorts the shown windows into the one stacking order (`dialog::stack_order`): families by
     /// their newest user raise, so no map or re-show puts a family above a window raised later.
     pub(crate) fn restack(&mut self) {
-        let roots: Vec<Root> = (0..self.windows.len()).map(|j| self.root(j)).collect();
-        let client = |m: &Managed| {
-            window_surface(&m.window)
-                .and_then(|s| s.client())
-                .map(|c| c.id())
-        };
-        let clients: Vec<_> = self.windows.iter().map(client).collect();
-        let group = |j: usize| -> u64 {
-            let m = &self.windows[j];
-            if m.window
-                .x11_surface()
-                .is_some_and(|x| x.is_override_redirect())
-            {
-                return u64::MAX;
+        let mut wins: Vec<dialog::Stacked> =
+            (0..self.windows.len()).map(|i| self.stacked(i)).collect();
+        // A new orphan with nothing inherited goes just below the window on top.
+        let top = wins
+            .iter()
+            .filter(|w| matches!(w.kin, dialog::Kin::Tiled(_)))
+            .map(|w| w.rank)
+            .max()
+            .unwrap_or(0);
+        for (m, w) in self.windows.iter_mut().zip(wins.iter_mut()) {
+            if matches!(w.kin, dialog::Kin::Orphan(_)) && m.floor == 0 {
+                m.floor = top.saturating_sub(1).max(1);
+                w.floor = m.floor;
             }
-            // An orphan's family is its own app's windows.
-            let same = |k: usize| match roots[j] {
-                Root::Tiled(_) => roots[k] == roots[j],
-                Root::Orphan => k == j || clients[k].is_some() && clients[k] == clients[j],
-            };
-            (0..self.windows.len())
-                .filter(|&k| same(k))
-                .map(|k| self.windows[k].rank)
-                .max()
-                .unwrap_or(0)
-        };
+        }
+        let ranks = dialog::ranks(&wins);
         let shown: Vec<Window> = self.space.elements().cloned().collect();
-        let ranks: Vec<dialog::Rank> = shown
+        let shown_ranks: Vec<dialog::Rank> = shown
             .iter()
             .map(|w| {
                 let j = self.windows.iter().position(|m| &m.window == w);
-                match j {
-                    Some(j) => {
-                        let m = &self.windows[j];
-                        dialog::Rank {
-                            group: group(j),
-                            dialog: m.tile.is_none(),
-                            own: m.rank.max(m.born),
-                            seq: j,
-                        }
-                    }
-                    None => dialog::Rank {
+                j.map_or(
+                    dialog::Rank {
                         group: 0,
-                        dialog: false,
+                        layer: 0,
                         own: 0,
                         seq: usize::MAX,
                     },
-                }
+                    |j| ranks[j],
+                )
             })
             .collect();
-        restack_space(&mut self.space, &shown, &dialog::stack_order(&ranks));
+        restack_space(&mut self.space, &shown, &dialog::stack_order(&shown_ranks));
+    }
+
+    /// Window `i` as the stacking order sees it.
+    fn stacked(&self, i: usize) -> dialog::Stacked {
+        let m = &self.windows[i];
+        let index = |w: &Window| self.windows.iter().position(|m| &m.window == w);
+        let menu_parent = m
+            .window
+            .x11_surface()
+            .filter(|x| x.is_override_redirect())
+            .map(|_| {
+                let parent = m.x11_parent.and_then(|id| {
+                    self.windows
+                        .iter()
+                        .position(|p| p.window.x11_surface().is_some_and(|x| x.window_id() == id))
+                });
+                parent.unwrap_or(i)
+            });
+        let kin = match (menu_parent, self.root(i)) {
+            (Some(p), _) => dialog::Kin::Menu(p),
+            (None, Root::Tiled(id)) => dialog::Kin::Tiled(id),
+            (None, Root::Orphan) => {
+                dialog::Kin::Orphan(dialog::head(i, |j| index(self.windows[j].up.as_ref()?)))
+            }
+        };
+        dialog::Stacked {
+            kin,
+            dialog: m.tile.is_none(),
+            rank: m.rank,
+            user_rank: m.user_rank,
+            floor: m.floor,
+            born: m.born,
+        }
     }
 
     /// Marks each tile whose family has a waiting dialog, for its tab and dock entry.
@@ -1703,10 +1736,10 @@ impl Navi {
     /// none they're orphans); each dialog whose root changed logs its new one.
     pub(crate) fn forget(&mut self, i: usize) -> Managed {
         let mut roots: Vec<Root> = (0..self.windows.len()).map(|j| self.root(j)).collect();
-        // Its dialogs keep its family's place in the stacking order.
+        // Its dialogs keep its family's place only as far as the user raised it.
         let family = (0..self.windows.len())
             .filter(|&j| j == i || roots[i] != Root::Orphan && roots[j] == roots[i])
-            .map(|j| self.windows[j].rank)
+            .map(|j| self.windows[j].user_rank.max(self.windows[j].floor))
             .max()
             .unwrap_or(0);
         let had_keys = self.focused_window().as_ref() == Some(&self.windows[i].window);
@@ -1720,7 +1753,7 @@ impl Navi {
                 let moved = m.up.as_ref() == Some(&gone.window);
                 if moved {
                     m.up = gone.up.clone();
-                    m.rank = m.rank.max(family);
+                    m.floor = m.floor.max(family);
                 }
                 moved
             })
@@ -1897,6 +1930,18 @@ fn restack_space<E: smithay::desktop::space::SpaceElement + Clone + PartialEq>(
             .iter()
             .for_each(|&i| space.raise_element(&shown[i], false));
     }
+}
+
+/// Whether a focus raises the window to the front of the stacking order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Raise {
+    /// navi's own refocus (a hand-back, a hidden window's keyboard moving on): no raise.
+    Not,
+    /// A new window taking the keyboard (job 014): in front while it lives, but its dialogs
+    /// inherit nothing from it.
+    New,
+    /// A click, the dock, Super+N, an activation.
+    User,
 }
 
 /// The size `m` asks for: a Wayland window's geometry, an X11 window's request. Untrusted.
@@ -2127,6 +2172,8 @@ impl XdgShellHandler for Navi {
             fresh: false,
             waiting: false,
             rank: 0,
+            user_rank: 0,
+            floor: 0,
             born: self.raises,
             asked: None,
             placed: None,
@@ -2550,19 +2597,19 @@ mod tests {
         let rank = |e: &str| match e {
             "parent" => Rank {
                 group: 3,
-                dialog: false,
+                layer: 0,
                 own: 3,
                 seq: 0,
             },
             "dialog" => Rank {
                 group: 3,
-                dialog: true,
+                layer: 1,
                 own: 9,
                 seq: 2,
             },
             _ => Rank {
                 group: 5,
-                dialog: false,
+                layer: 0,
                 own: 5,
                 seq: 1,
             },

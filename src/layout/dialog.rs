@@ -80,24 +80,100 @@ pub fn may_focus_on_map(dialog: Root, focus: Option<Root>) -> bool {
     matches!(dialog, Root::Tiled(_)) && focus == Some(dialog)
 }
 
-/// A shown window's key in the one stacking order. `group` is the newest user raise of its
-/// family (root and dialogs); X11 menus use `u64::MAX`. Within a family the root is below its
-/// dialogs, and dialogs go by `own`: their last raise, else when they appeared.
+/// Where a window belongs in the stacking order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kin {
+    /// A tiled or floating window, or a dialog of one: the family of that tile.
+    Tiled(WinId),
+    /// A dialog without a tiled root: the family of the dialogs under the same `head`.
+    Orphan(usize),
+    /// An X11 override-redirect window (a menu): rides the window at this index, above its
+    /// family's dialogs.
+    Menu(usize),
+}
+
+/// A window as the stacking order sees it.
+#[derive(Clone, Copy, Debug)]
+pub struct Stacked {
+    pub kin: Kin,
+    pub dialog: bool,
+    /// Its last raise: any focus that put it in front (a click, the dock, a new window taking
+    /// the keyboard), never navi's own refocus.
+    pub rank: u64,
+    /// Its last raise by the user alone; the only rank a closed window's dialogs inherit.
+    pub user_rank: u64,
+    /// An orphan family's least group: inherited user raises, else just below the window on top
+    /// when it became an orphan.
+    pub floor: u64,
+    /// The clock when it appeared: a dialog's place in its family until it's raised.
+    pub born: u64,
+}
+
+/// A shown window's key in the one stacking order: its family's `group`, then its layer (root,
+/// dialog, menu), then its own raise, then open order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Rank {
     pub group: u64,
-    pub dialog: bool,
+    pub layer: u8,
     pub own: u64,
     /// Open order, so equal keys keep a stable order.
     pub seq: usize,
 }
 
-/// The shown windows' indices, back to front. Only a user raise moves a family up, so no map,
-/// re-show or commit puts one family above a window the user raised later.
+/// Each window's key: a tile family by its newest raise, an orphan family by its floor or its
+/// newest user raise, a menu with its parent's family.
+pub fn ranks(wins: &[Stacked]) -> Vec<Rank> {
+    let group = |kin: Kin| -> u64 {
+        let family = wins.iter().filter(|w| w.kin == kin);
+        match kin {
+            Kin::Tiled(_) => family.map(|w| w.rank).max().unwrap_or(0),
+            Kin::Orphan(_) => family.map(|w| w.floor.max(w.user_rank)).max().unwrap_or(0),
+            Kin::Menu(_) => 0,
+        }
+    };
+    wins.iter()
+        .enumerate()
+        .map(|(seq, w)| {
+            // A menu of a menu rides the first window up its chain that isn't one.
+            let mut kin = w.kin;
+            for _ in 0..DIALOG_DEPTH {
+                match kin {
+                    Kin::Menu(p) => kin = wins.get(p).map_or(kin, |p| p.kin),
+                    _ => break,
+                }
+            }
+            let layer = match w.kin {
+                Kin::Menu(_) => 2,
+                _ => u8::from(w.dialog),
+            };
+            Rank {
+                group: group(kin),
+                layer,
+                own: w.rank.max(w.born),
+                seq,
+            }
+        })
+        .collect()
+}
+
+/// The windows' indices, back to front.
 pub fn stack_order(ranks: &[Rank]) -> Vec<usize> {
     let mut order: Vec<usize> = (0..ranks.len()).collect();
     order.sort_by_key(|&i| ranks[i]);
     order
+}
+
+/// The last window up `start`'s parents: the head of an orphan's family. Capped and loop-safe
+/// like `root`.
+pub fn head<K: Copy + PartialEq>(start: K, mut parent_of: impl FnMut(K) -> Option<K>) -> K {
+    let mut seen = vec![start];
+    for _ in 0..DIALOG_DEPTH {
+        match seen.last().copied().and_then(&mut parent_of) {
+            Some(p) if !seen.contains(&p) => seen.push(p),
+            _ => break,
+        }
+    }
+    seen[seen.len() - 1]
 }
 
 #[cfg(test)]
@@ -246,45 +322,121 @@ mod tests {
         assert!(!may_focus_on_map(Root::Orphan, None));
     }
 
-    fn rank(group: u64, dialog: bool, own: u64, seq: usize) -> Rank {
-        Rank {
-            group,
+    fn win(kin: Kin, dialog: bool, rank: u64, user_rank: u64) -> Stacked {
+        Stacked {
+            kin,
             dialog,
-            own,
-            seq,
+            rank,
+            user_rank,
+            floor: 0,
+            born: 0,
         }
     }
 
-    /// Round 3/4: one order from user raises. A neighbour raised after a family stays above every
+    fn order(wins: &[Stacked]) -> Vec<usize> {
+        stack_order(&ranks(wins))
+    }
+
+    /// Round 3/4: one order from raises. A neighbour raised after a family stays above every
     /// window of that family, whatever order they are mapped or re-shown in.
     #[test]
-    fn one_stacking_order_from_user_raises() {
-        // 0 parent (raised at 3), 1 its refused dialog (appeared at 9), 2 neighbour (raised at 5),
-        // 3 a menu, 4 a never-raised window opened before the others.
-        let ranks = [
-            rank(3, false, 3, 0),
-            rank(3, true, 9, 1),
-            rank(5, false, 5, 2),
-            rank(u64::MAX, false, 0, 3),
-            rank(0, false, 0, 4),
+    fn one_stacking_order_from_raises() {
+        // 0 parent (raised at 4), 1 its refused dialog (appeared at 9), 2 neighbour (raised at 6),
+        // 3 a never-raised window opened first.
+        let mut wins = [
+            win(Kin::Tiled(0), false, 4, 4),
+            Stacked {
+                born: 9,
+                ..win(Kin::Tiled(0), true, 0, 0)
+            },
+            win(Kin::Tiled(2), false, 6, 6),
+            win(Kin::Tiled(3), false, 0, 0),
         ];
-        assert_eq!(stack_order(&ranks), [4, 0, 1, 2, 3]);
+        assert_eq!(order(&wins), [3, 0, 1, 2]);
         // Re-shown in any order (the fullscreen-exit hop), the result is the same.
-        let reversed: Vec<Rank> = ranks.iter().rev().copied().collect();
-        let back: Vec<usize> = stack_order(&reversed).iter().map(|&i| 4 - i).collect();
-        assert_eq!(back, [4, 0, 1, 2, 3]);
-        // The user clicks the dialog: its family's group passes the neighbour's.
-        let mut clicked = ranks;
-        clicked[0].group = 10;
-        clicked[1] = rank(10, true, 10, 1);
-        assert_eq!(stack_order(&clicked), [4, 2, 0, 1, 3]);
-        // Within a family, dialogs by their own rank, above the root.
+        let mut rev = wins;
+        rev.reverse();
+        let back: Vec<usize> = order(&rev).iter().map(|&i| 3 - i).collect();
+        assert_eq!(back, [3, 0, 1, 2]);
+        // The user clicks the dialog: its family passes the neighbour.
+        wins[1].rank = 10;
+        assert_eq!(order(&wins), [3, 2, 0, 1]);
+        // Within a family, dialogs by their own raise, above the root.
         let family = [
-            rank(7, true, 7, 0),
-            rank(7, true, 2, 1),
-            rank(7, false, 1, 2),
+            win(Kin::Tiled(7), true, 7, 0),
+            win(Kin::Tiled(7), true, 2, 0),
+            win(Kin::Tiled(7), false, 1, 0),
         ];
-        assert_eq!(stack_order(&family), [2, 1, 0]);
+        assert_eq!(order(&family), [2, 1, 0]);
+    }
+
+    /// Round 5 security (s15-flash): a dialog moved to a window that took the keyboard on its own
+    /// (raise 8, no user raise) inherits nothing when that window closes. As an orphan it sits
+    /// just below the window on top, the probe the user raised at 6.
+    #[test]
+    fn a_flash_window_passes_no_rank_to_its_orphans() {
+        let wins = [
+            win(Kin::Tiled(0), false, 6, 6),
+            // D0 after F closed: an orphan, its floor just below the top (6 - 1).
+            Stacked {
+                floor: 5,
+                ..win(Kin::Orphan(1), true, 0, 0)
+            },
+            win(Kin::Tiled(2), false, 2, 2),
+        ];
+        assert_eq!(
+            order(&wins),
+            [2, 1, 0],
+            "below the probe, above older windows"
+        );
+        // A user raise of its old family carries over, as the floor.
+        let inherited = [
+            win(Kin::Tiled(0), false, 6, 6),
+            Stacked {
+                floor: 8,
+                ..win(Kin::Orphan(1), true, 0, 0)
+            },
+        ];
+        assert_eq!(order(&inherited), [0, 1]);
+    }
+
+    /// Round 5 security (s16-xor): an X11 menu rides its parent's family, above its dialogs, and
+    /// a window the user raises later goes over it.
+    #[test]
+    fn a_menu_stacks_with_its_parent() {
+        let mut wins = [
+            win(Kin::Tiled(0), false, 4, 4),
+            win(Kin::Menu(0), false, 0, 0),
+            win(Kin::Tiled(0), true, 4, 0),
+            win(Kin::Tiled(2), false, 2, 2),
+        ];
+        assert_eq!(order(&wins), [3, 0, 2, 1]);
+        // A submenu (menu of the menu) rides the same family.
+        let with_sub = [
+            wins[0],
+            wins[1],
+            wins[2],
+            wins[3],
+            win(Kin::Menu(1), false, 0, 0),
+        ];
+        assert_eq!(order(&with_sub), [3, 0, 2, 1, 4]);
+        wins[3].rank = 9;
+        assert_eq!(
+            order(&wins),
+            [0, 2, 1, 3],
+            "the probe the user raised covers the menu"
+        );
+    }
+
+    #[test]
+    fn head_is_the_last_parent_within_the_cap() {
+        let parents = [None, Some(0), Some(1), Some(4), Some(3)];
+        assert_eq!(head(2, |i| parents[i]), 0);
+        assert_eq!(head(0, |i| parents[i]), 0);
+        // A loop stops before the repeat.
+        assert_eq!(head(3, |i| parents[i]), 4);
+        let chain: Vec<Option<usize>> = (0..20).map(|i: usize| i.checked_sub(1)).collect();
+        assert_eq!(head(19, |i| chain[i]), 19 - DIALOG_DEPTH);
     }
 
     #[test]

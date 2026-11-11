@@ -257,12 +257,16 @@ aspect, gravity, position) are ignored.
   hidden or minimized, and loses the keyboard; it comes back with it. When a dialog's parent
   closes, it hangs from that parent's own parent if it had one, else it is an orphan centred in
   its last bounds; a closed dialog that had the keyboard gives it back to its parent.
-- **Stacking order.** Windows stack by one rank: the last time the user raised them (a click, the
-  dock, Super+N, or a new window taking the keyboard). A family stacks by its newest raise, its
-  dialogs above its root. Nothing else moves a window up: a commit, a re-parent, a map or a
-  re-show (after a minimize, a fullscreen or maximize, a tab switch, an unplug) puts every window
-  back at its rank, so no app can put itself above a window the user raised later. X11 menus stay
-  on top.
+- **Stacking order.** Windows stack by one rank: the last time they were raised, by the user (a
+  click, the dock, Super+N, an activation) or by opening and taking the keyboard. navi's own
+  refocus (giving the keyboard back after a close or a hide) raises nothing. A family stacks by
+  its newest raise, its dialogs above its root, and an X11 menu (override-redirect) above its X11
+  parent's family, so a window the user raises later covers it. An orphan dialog's family is its
+  own parent chain: it keeps only what the user raised of its old family, else goes just below the
+  window on top when it becomes an orphan, so a window that opens and closes at once hands nothing
+  on. Nothing else moves a window up: a commit, a re-parent, a map or a re-show (after a minimize,
+  a fullscreen or maximize, a tab switch, an unplug) puts every window back at its rank, so no app
+  can put itself above a window the user raised later.
 - **Logs.** One `info` line per change: `client size hints` (app, id, min, max and the outcome),
   then `re-placed`, `floating: no tile fits` (and `floating: its minimum is bigger than the
   monitor` when it is) or `tiled again` with the cells or rect (`by="room freed"` when a float
