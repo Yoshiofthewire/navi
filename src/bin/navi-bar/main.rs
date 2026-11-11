@@ -268,7 +268,11 @@ fn run() -> Result<(), String> {
         band_w: 0,
         status: String::new(),
         battery: None,
-        session: session::Menu::default(),
+        session: session::Menu {
+            full: dbus::wants_export(var("NAVI_EXPORT_ENV").as_deref()),
+            ..Default::default()
+        },
+        session_since: 0,
         control,
         band_hover: false,
         session_tx,
@@ -388,6 +392,8 @@ struct Bar {
     status: String,
     battery: Option<status::Battery>,
     session: session::Menu,
+    /// When the session menu opened, in `now_ms`: cards hidden behind it don't expire meanwhile.
+    session_since: u64,
     control: Option<std::sync::Arc<std::sync::Mutex<control::Control>>>,
     band_hover: bool,
     session_tx: channel::Sender<session::Reply>,
@@ -822,14 +828,7 @@ impl Bar {
                         }
                     };
                     match px {
-                        Some(px) => {
-                            let paint = PixmapPaint {
-                                opacity: alpha,
-                                ..Default::default()
-                            };
-                            let t = Transform::identity();
-                            canvas.draw_pixmap(r.x, r.y, px.as_ref(), &paint, t, None);
-                        }
+                        Some(px) => draw_icon(&mut canvas, px, r, alpha, of.tint()),
                         None => placeholder(&mut canvas, r),
                     }
                 }
@@ -871,7 +870,7 @@ impl Bar {
         if self.session.open {
             self.session.close();
             self.draw_band();
-            self.show_cards();
+            self.resume_cards();
         }
     }
 
@@ -881,6 +880,7 @@ impl Bar {
         }
         self.close_menu();
         self.session.open = true;
+        self.session_since = self.now_ms();
         self.session.selected = 0;
         if !self.session.busy {
             self.session.busy = true;
@@ -1008,30 +1008,20 @@ impl Bar {
         });
         let lit = self.session.open || self.band_hover;
         let band = session::band(self.band_w, lit, clock, battery);
-        for item in band.into_iter().chain(self.session.draw(self.full_session)) {
+        for item in band.into_iter().chain(self.session.draw()) {
             if let Item::Icon(IconOf::Button, r, _) = item {
                 let r = scaled(r, s);
                 if let Some(icon) = self.icons.navi(r.w as u32) {
                     let (paint, t) = (PixmapPaint::default(), Transform::identity());
                     canvas.draw_pixmap(r.x, r.y, icon.as_ref(), &paint, t, None);
                 }
-            } else if let Item::Icon(IconOf::Session(name), r, alpha) = item {
+            } else if let Item::Icon(of @ IconOf::Session(name), r, alpha) = item {
                 let r = scaled(r, s);
                 if let Some(icon) =
                     self.icons
                         .get(name, &[name.into(), format!("{name}-symbolic")], r.w as u32)
                 {
-                    canvas.draw_pixmap(
-                        r.x,
-                        r.y,
-                        icon.as_ref(),
-                        &PixmapPaint {
-                            opacity: alpha,
-                            ..Default::default()
-                        },
-                        Transform::identity(),
-                        None,
-                    );
+                    draw_icon(&mut canvas, icon, r, alpha, of.tint());
                 } else {
                     placeholder(&mut canvas, r);
                 }
@@ -1160,19 +1150,7 @@ impl Bar {
                 }
                 self.emit(closed);
                 let at = self.notes.shown().iter().find(|n| n.id == id);
-                let wait = Duration::from_millis(at.map_or(0, |n| n.expires_ms - now));
-                let timer =
-                    self.loop_handle
-                        .insert_source(Timer::from_duration(wait), |_, _, bar| {
-                            let closed = bar.notes.expire(bar.now_ms());
-                            if !closed.is_empty() {
-                                bar.emit(closed);
-                            }
-                            TimeoutAction::Drop
-                        });
-                if let Err(e) = timer {
-                    warn!("notification timer: {e}");
-                }
+                self.expire_at(at.map_or(now, |n| n.expires_ms));
             }
             Call::Close(sender, id) => {
                 let closed = self.notes.close(&sender, id);
@@ -1187,6 +1165,37 @@ impl Bar {
             for c in closed {
                 dbus::emit(conn, c);
             }
+        }
+        self.show_cards();
+    }
+
+    /// Expires shown notes at `at` ms, or later while the session menu hides them.
+    fn expire_at(&mut self, at: u64) {
+        let wait = Duration::from_millis(at.saturating_sub(self.now_ms()));
+        let timer = self
+            .loop_handle
+            .insert_source(Timer::from_duration(wait), |_, _, bar| {
+                if bar.session.open {
+                    return TimeoutAction::ToDuration(Duration::from_millis(250));
+                }
+                let closed = bar.notes.expire(bar.now_ms());
+                if !closed.is_empty() {
+                    bar.emit(closed);
+                }
+                TimeoutAction::Drop
+            });
+        if let Err(e) = timer {
+            warn!("notification timer: {e}");
+        }
+    }
+
+    /// Shows the cards the session menu hid, giving back the time they were hidden.
+    fn resume_cards(&mut self) {
+        self.notes
+            .delay(self.now_ms().saturating_sub(self.session_since));
+        let expiries: Vec<u64> = self.notes.shown().iter().map(|n| n.expires_ms).collect();
+        for at in expiries {
+            self.expire_at(at);
         }
         self.show_cards();
     }
@@ -1284,7 +1293,9 @@ fn paint(canvas: &mut Pixmap, font: Option<&fontdue::Font>, item: Item, s: i32) 
     match item {
         Item::Fill(r, rgb) => fill(canvas, scaled(r, s), rgb, 1.0),
         Item::Round(r, radius, rgb) => rounded(canvas, scaled(r, s), radius * s, rgb),
-        Item::Panel(r, edge, border) => panel(canvas, scaled(r, s), edge, border * s, s),
+        Item::Panel(r, kind, edge, border) => {
+            panel(canvas, scaled(r, s), kind, edge, border * s, s)
+        }
         Item::Text(text, r, rgb) => {
             if let Some(font) = font {
                 draw_text(canvas, font, &text, scaled(r, s), text_px() * s as f32, rgb);
@@ -1335,11 +1346,11 @@ fn rounded(canvas: &mut Pixmap, r: Rect, radius: i32, rgb: u32) {
 }
 
 /// A floating panel: translucent body, opaque `border` px rim, both following the corners.
-fn panel(canvas: &mut Pixmap, r: Rect, edge: u32, border: i32, s: i32) {
+fn panel(canvas: &mut Pixmap, r: Rect, kind: theme::Panel, edge: u32, border: i32, s: i32) {
     let radius = theme::RADIUS * s;
     let mut body = tiny_skia::PathBuilder::new();
     round_rect(&mut body, r, radius);
-    fill_path(canvas, body, theme::BAR_BG, theme::panel_alpha());
+    fill_path(canvas, body, theme::BAR_BG, theme::panel_alpha(kind));
     let mut rim = tiny_skia::PathBuilder::new();
     round_rect(&mut rim, r, radius);
     let inner = Rect {
@@ -1402,6 +1413,36 @@ fn round_rect(path: &mut tiny_skia::PathBuilder, r: Rect, radius: i32) {
     path.line_to(x, y + radius);
     path.cubic_to(x, y + radius - k, x + radius - k, y, x + radius, y);
     path.close();
+}
+
+/// `icon` at `r`, its colour replaced by `tint` (its shape kept) when given.
+fn draw_icon(canvas: &mut Pixmap, icon: &Pixmap, r: Rect, alpha: f32, tint: Option<u32>) {
+    let paint = PixmapPaint {
+        opacity: alpha,
+        ..Default::default()
+    };
+    let t = Transform::identity();
+    match tint {
+        Some(rgb) => {
+            let tinted = tinted(icon, rgb);
+            canvas.draw_pixmap(r.x, r.y, tinted.as_ref(), &paint, t, None)
+        }
+        None => canvas.draw_pixmap(r.x, r.y, icon.as_ref(), &paint, t, None),
+    }
+}
+
+/// `icon`'s coverage in `rgb`.
+fn tinted(icon: &Pixmap, rgb: u32) -> Pixmap {
+    let mut out = icon.clone();
+    let [_, r, g, b] = theme::resolve(rgb).to_be_bytes();
+    for p in out.pixels_mut() {
+        let a = p.alpha();
+        let k = |c: u8| (u16::from(c) * u16::from(a) / 255) as u8;
+        if let Some(c) = PremultipliedColorU8::from_rgba(k(r), k(g), k(b), a) {
+            *p = c;
+        }
+    }
+    out
 }
 
 /// A dim outlined square where an icon couldn't be found.
@@ -1611,8 +1652,8 @@ impl LayerShellHandler for Bar {
             self.configured = false;
         } else if layer == &self.band {
             info!("status band closed by navi, making a new one");
-            self.session.close();
-            self.show_cards();
+            self.band_configured = false; // Nothing draws on the closed band.
+            self.close_session();
             match band_layer(&self.compositor, &self.layer_shell, &self.qh) {
                 Ok(b) => {
                     self.band = b;
@@ -1973,7 +2014,7 @@ mod tests {
     use super::*;
     use desktop::{Category, Entry};
     use layout::Hit;
-    use theme::{ACCENT, INSET, ON_FILL, PANEL_EDGE, PANEL_TEXT};
+    use theme::{ACCENT, INSET, ON_FILL, PANEL_EDGE, PANEL_TEXT, Panel};
 
     fn note(id: u32) -> notify::Note {
         notify::Note {
@@ -2046,16 +2087,22 @@ mod tests {
             s.capabilities.available = available;
             for selected in 0..6 {
                 s.selected = selected;
-                out.extend([s.draw(false), s.draw(true)]);
+                for full in [false, true] {
+                    s.full = full;
+                    out.push(s.draw());
+                }
             }
         }
         s.busy = true;
-        out.push(s.draw(true));
+        out.push(s.draw());
         s.busy = false;
         s.activate(session::Hit::Row(5));
         for selected in 0..2 {
             s.selected = selected;
-            out.extend([s.draw(false), s.draw(true)]);
+            for full in [false, true] {
+                s.full = full;
+                out.push(s.draw());
+            }
         }
 
         for lit in [false, true] {
@@ -2109,6 +2156,36 @@ mod tests {
         assert!(seen > 200, "{seen} texts");
     }
 
+    #[test]
+    fn folder_and_session_glyphs_are_ink() {
+        let mut seen = 0;
+        for items in every_state() {
+            for item in &items {
+                if let Item::Icon(of @ (IconOf::Folder(_) | IconOf::Session(_)), ..) = item {
+                    seen += 1;
+                    // INK is proven 4.5:1 on panels and their fills, so well over 3:1.
+                    assert!(
+                        of.tint().is_some_and(|c| PANEL_TEXT.contains(&c)),
+                        "{item:?}"
+                    );
+                }
+            }
+        }
+        assert!(seen > 50, "{seen}");
+        // The tint keeps the shape and replaces the colour.
+        let mut icon = Pixmap::new(2, 1).unwrap();
+        icon.pixels_mut()[0] = PremultipliedColorU8::from_rgba(40, 0, 80, 128).unwrap();
+        let t = tinted(&icon, theme::INK);
+        let [_, r, g, b] = theme::resolve(theme::INK).to_be_bytes();
+        let k = |c: u8| (u16::from(c) * 128 / 255) as u8;
+        let p = t.pixels()[0];
+        assert_eq!(
+            (p.red(), p.green(), p.blue(), p.alpha()),
+            (k(r), k(g), k(b), 128)
+        );
+        assert_eq!(t.pixels()[1].alpha(), 0);
+    }
+
     fn rendered(items: &[Item], w: i32, h: i32) -> Pixmap {
         let mut canvas = Pixmap::new(w as u32, h as u32).unwrap();
         for item in items {
@@ -2121,7 +2198,11 @@ mod tests {
     fn assert_panel(canvas: &Pixmap, r: Rect, body: (i32, i32), edge: u32, what: &str) {
         let px = |(x, y): (i32, i32)| canvas.pixel(x as u32, y as u32).unwrap();
         assert_eq!(px((r.x, r.y)).alpha(), 0, "{what}: corner");
-        let want = (255.0 * theme::panel_alpha()).round() as i32;
+        let kind = match what {
+            "dock" | "band" => Panel::Bar,
+            _ => Panel::Popup,
+        };
+        let want = (255.0 * theme::panel_alpha(kind)).round() as i32;
         let got = i32::from(px(body).alpha());
         assert!(
             (got - want).abs() <= 1,
@@ -2187,13 +2268,28 @@ mod tests {
             let canvas = rendered(&cards::draw(&cards, false), w, h);
             let c = cards[0].rect;
             assert_panel(&canvas, c, (c.x + c.w / 2, c.y + c.h / 2), ACCENT, "card");
+
+            let menu = session::Menu {
+                open: true,
+                ..Default::default()
+            };
+            let p = menu.panel();
+            let canvas = rendered(&menu.draw(), p.x + p.w, p.y + p.h);
+            assert_panel(
+                &canvas,
+                p,
+                (p.x + p.w - 20, p.y + 20),
+                PANEL_EDGE,
+                "session",
+            );
         };
         check();
         theme::configure(&serde_json::json!({"high_contrast": true}));
-        assert_eq!(theme::panel_alpha(), 1.0);
+        assert_eq!(theme::panel_alpha(Panel::Popup), 1.0);
         check();
         theme::configure(&serde_json::json!({}));
-        assert_eq!(theme::panel_alpha(), 0.85);
+        assert_eq!(theme::panel_alpha(Panel::Bar), 0.85);
+        assert_eq!(theme::panel_alpha(Panel::Popup), 0.98);
         assert_eq!(INSET, 12);
     }
 }

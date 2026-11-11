@@ -3,7 +3,7 @@
 use crate::{
     desktop::{Category, Entry},
     menu::{Menu, ROWS, Row},
-    theme::{ACCENT, BAR_BG, DIM, INK, INK_ON_ACCENT, INSET, PANEL_EDGE, SELECTED},
+    theme::{ACCENT, BAR_BG, DIM, INK, INK_ON_ACCENT, INSET, PANEL_EDGE, Panel, SELECTED},
 };
 
 /// 40 px of dock, floating `INSET` above the screen edge.
@@ -59,12 +59,19 @@ pub enum IconOf {
     Folder(Category),
     Session(&'static str),
 }
+impl IconOf {
+    /// Folder and session glyphs are UI marks, drawn in INK so they hold 3:1 on any panel and
+    /// scheme; app icons and the logo keep their colours.
+    pub fn tint(self) -> Option<u32> {
+        matches!(self, IconOf::Folder(_) | IconOf::Session(_)).then_some(INK)
+    }
+}
 #[derive(Clone, Debug, PartialEq)]
 pub enum Item {
     Fill(Rect, u32),
     Round(Rect, i32, u32),
     /// A floating panel: translucent `BAR_BG` with a rim of this colour and width.
-    Panel(Rect, u32, i32),
+    Panel(Rect, Panel, u32, i32),
     Icon(IconOf, Rect, f32),
     Text(String, Rect, u32),
     Field(String, Rect),
@@ -209,7 +216,7 @@ impl Layout {
     ) -> Vec<Item> {
         let mut out = Vec::new();
         if let (Some(p), Some(m)) = (self.panel(), menu) {
-            out.push(Item::Panel(p, PANEL_EDGE, 1));
+            out.push(Item::Panel(p, Panel::Popup, PANEL_EDGE, 1));
             let back = m.folder().is_some() || !m.query().is_empty();
             let mut title = self.header(p);
             if back {
@@ -229,7 +236,9 @@ impl Layout {
             }
             out.push(Item::Text(m.title().into(), title, INK));
             let search = self.search(p);
-            out.push(Item::Round(search, 8, BAR_BG));
+            // A rim gives the field its shape on any panel, high contrast included.
+            out.push(Item::Round(search, 8, PANEL_EDGE));
+            out.push(Item::Round(inset(search, 1), 7, SELECTED));
             out.push(Item::Field(m.query().into(), inset_x(search, 12)));
             if m.rows().next().is_none() {
                 out.push(Item::Text(
@@ -312,9 +321,9 @@ impl Layout {
                 out.push(Item::Fill(thumb, DIM));
             }
             let footer = Rect {
-                x: p.x + PAD + 4,
+                x: p.x + PAD,
                 y: p.h - PAD - FOOTER_H,
-                w: p.w - 2 * PAD - 8,
+                w: p.w - 2 * PAD,
                 h: FOOTER_H,
             };
             let hint = if message.is_empty() {
@@ -325,7 +334,7 @@ impl Layout {
             out.push(Item::Text(hint.into(), footer, DIM));
         }
         let b = self.bar();
-        out.push(Item::Panel(b, PANEL_EDGE, 1));
+        out.push(Item::Panel(b, Panel::Bar, PANEL_EDGE, 1));
         if hover == Some(Hit::Button) || self.open {
             out.push(Item::Round(self.target(0), 8, SELECTED));
         }
@@ -381,6 +390,14 @@ fn square(x: i32, r: Rect, size: i32) -> Rect {
         y: r.y + (r.h - size) / 2,
         w: size,
         h: size,
+    }
+}
+fn inset(r: Rect, by: i32) -> Rect {
+    Rect {
+        x: r.x + by,
+        y: r.y + by,
+        w: r.w - 2 * by,
+        h: r.h - 2 * by,
     }
 }
 fn inset_x(r: Rect, by: i32) -> Rect {

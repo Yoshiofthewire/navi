@@ -20,6 +20,9 @@ pub fn path() -> Option<PathBuf> {
     Some(PathBuf::from(runtime).join(format!("navi-{display}.utility/appearance.ini")))
 }
 
+/// The utilities' dark DIM, from before the shell's panel DIM was raised.
+const UTILITY_DIM: u32 = 0x7a8396;
+
 pub fn css(settings: &Value) -> String {
     let mut css = include_str!("../assets/utility.css").to_string();
     css.push_str(include_str!("../assets/window-chrome.css"));
@@ -46,7 +49,7 @@ pub fn css(settings: &Value) -> String {
                 (true, true) => 0x333333,
                 (true, false) => 0x617084,
                 (false, true) => 0xc0c7d2,
-                (false, false) => 0x7a8396,
+                (false, false) => UTILITY_DIM,
             }
         } else {
             theme::resolve_for(settings, *color)

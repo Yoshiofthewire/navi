@@ -148,7 +148,10 @@ Every press changes exactly one grid cell.
 
 - Apps that draw their own title bar (Konsole, Firefox) keep it. Apps that ask for server-side
   decorations get a 24 px bar with **minimize, maximize and close** buttons on the right; the rest
-  of the bar moves the window, like the strip above it. Close asks the app to close; navi never kills it.
+  of the bar moves the window, like the strip above it. The buttons are Breeze-like line
+  glyphs in the text colour, as in Navi Settings and the utilities: a chevron down, a chevron up
+  and a plain cross, antialiased at the output's scale, on a rounded selected fill under the
+  pointer. Close asks the app to close; navi never kills it.
 - **Maximize** covers the monitor's whole grid until clicked again; it isn't fullscreen. The
   window's cells and remembered size don't change, and the other windows on that monitor hide
   until it's undone. A new window on that monitor undoes it, so a new window is always visible.
@@ -276,9 +279,10 @@ bundling a degoogled, resource-tested Chromium variant is reserved for a future 
   system's batteries, read every 30 s; mice and headsets don't count. The bar takes space from
   the grid and hides in fullscreen. Only the Navi button and its open session menu take clicks;
   the rest of the band is transparent to input.
-  Notifications are top-left, 12 px below the band and from the left edge: panels with the
-  accent as their rim (3 px with visual alerts). They wait while the session menu, which shares
-  that corner, is open. Volume, network and tray come later. Volume has no
+  Notifications are top-left, 24 px below the band and from the left edge, so they float clear
+  of the corner of the tile under them: panels with the accent as their rim (3 px with visual
+  alerts). They wait, hidden and without expiring, while the session menu, which shares that
+  corner, is open, and come back with the time they had left. Volume, network and tray come later. Volume has no
   small route: PipeWire's native API is C (`libpipewire`, which needs `unsafe` and a new system
   library), pipewire-pulse has no D-Bus volume interface, and running `wpctl` would break the
   no-shell rule.
@@ -321,9 +325,14 @@ bundling a degoogled, resource-tested Chromium variant is reserved for a future 
   the shell's panels in front of all of them.
   The shell's panels (dock, launcher, status band, session menu and notification cards) float:
   12 px (`INSET`) from the screen edges and from what they sit next to, with 10 px corners
-  (`RADIUS`), the shell fill at 85 % opacity and a 1 px rim. That opacity alone keeps their text
-  4.5:1 and marks 3:1 over any wallpaper, white or black, so a later blur is only cosmetic; high
-  contrast makes them opaque. Pixels outside a panel are clear and take no clicks. Hover and
+  (`RADIUS`), the shell fill and a 1 px rim. The dock and band, which sit over the wallpaper,
+  are 85 % opaque; the launcher, session menu and cards, which sit over windows, are 98 %, so
+  window text doesn't ghost through them before the blur lands. That opacity alone keeps their
+  text 4.5:1 and marks 3:1 over any wallpaper, white or black; high contrast makes them opaque.
+  Panels pad their content 12 px. Folder and session glyphs draw in the text colour, so they
+  hold 3:1 in every scheme; app icons keep their own colours. The launcher's search field is
+  the selected fill with a rim, so it has a shape even in high contrast. The band is 32 px (one
+  line of text) and the dock 40 px (24 px icons in 32 px targets); they share radius and rim. Pixels outside a panel are clear and take no clicks. Hover and
   selected fills inside a panel stay opaque. Windows stay solid and square, with no translucency
   or shadows (rounded tiles are planned; see *Open questions*). No desktop widgets, dock
   magnification, reflection or bounce: it isn't Mac-like.
@@ -337,8 +346,8 @@ bundling a degoogled, resource-tested Chromium variant is reserved for a future 
 The default background, shell surface and text are `#0B0D12`, `#151922` and `#D0D4DC`;
 light mode uses `#F5F6F8`, white and `#202734`, with a darker blue accent (`#0077AA`).
 High contrast uses black/white surfaces and text in the selected scheme. Shell panels use
-`RADIUS` 10 and `INSET` 12, the `BAR_BG` fill at `panel_alpha()` (0.85, or 1.0 with high
-contrast), `DIM` `#A3ABBC` (light `#525E70`) for secondary text, and `PANEL_EDGE` `#848C9E`
+`RADIUS` 10 and `INSET` 12, the `BAR_BG` fill at `panel_alpha()` (0.85 for the dock and band,
+0.98 for pop-ups, 1.0 with high contrast), `DIM` `#A3ABBC` (light `#525E70`) for secondary text, and `PANEL_EDGE` `#848C9E`
 (light `#6B7689`) for their rims and the dock's pinned mark; `theme` tests prove both 4.5:1 text
 and 3:1 marks on a panel composited over white and black, for every scheme and accent. The GTK
 utilities keep `#7A8396` for `DIM` and `SHELL_EDGE` for their borders. Settings maps these

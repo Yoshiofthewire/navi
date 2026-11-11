@@ -1,11 +1,9 @@
 //! The bar above tabbed and server-decorated tiles: tabs, window buttons, and how they're drawn.
 
 use super::{BAR, Layout, Rect, WinId, drag::Hit};
-use crate::theme::{ACCENT, BAR_BG, INK, INK_ON_ACCENT, MINIMIZED, OUTLINE, TAB_BG, rgba};
+use crate::theme::{ACCENT, BAR_BG, MINIMIZED, OUTLINE, TAB_BG, rgba};
 
 const TAB_GAP: i32 = 2;
-/// The glyph box inside a button, in px.
-const GLYPH: i32 = 10;
 
 /// Who draws a toplevel's title bar and controls.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -23,7 +21,7 @@ pub fn decoration(has_parent: bool, requested: Decor) -> Decor {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Button {
     Minimize,
     Maximize,
@@ -96,30 +94,6 @@ fn partition(area: Rect, ids: &[WinId]) -> Vec<(WinId, Rect)> {
         .collect()
 }
 
-/// The rects of a button's glyph, centred in `r`.
-fn glyph(b: Button, r: Rect) -> Vec<Rect> {
-    let (x, y) = (r.x + (r.w - GLYPH) / 2, r.y + (r.h - GLYPH) / 2);
-    let at = |dx: i32, dy: i32, w: i32, h: i32| Rect {
-        x: x + dx,
-        y: y + dy,
-        w,
-        h,
-    };
-    match b {
-        Button::Minimize => vec![at(0, GLYPH - 2, GLYPH, 2)],
-        Button::Maximize => vec![
-            at(0, 0, GLYPH, 2),
-            at(0, 0, 1, GLYPH),
-            at(GLYPH - 1, 0, 1, GLYPH),
-            at(0, GLYPH - 1, GLYPH, 1),
-        ],
-        // Two diagonals of 2 px squares.
-        Button::Close => (0..GLYPH / 2)
-            .flat_map(|k| [at(2 * k, 2 * k, 2, 2), at(GLYPH - 2 - 2 * k, 2 * k, 2, 2)])
-            .collect(),
-    }
-}
-
 /// The 1 px border inside `r`.
 fn outline(r: Rect) -> [Rect; 4] {
     [
@@ -138,17 +112,9 @@ fn outline(r: Rect) -> [Rect; 4] {
     ]
 }
 
-/// Front to back: `bar` with `hover` (a tab or button id) lit.
+/// Front to back: `bar` with `hover` (a tab id) lit. Its buttons are drawn by `crate::glyph`.
 pub fn draw(l: &Layout, id: WinId, bar: &Bar, hover: Option<Hit>) -> Vec<(Rect, [f32; 4])> {
     let mut out = Vec::new();
-    for &(b, r) in &bar.buttons {
-        let lit = hover == Some(Hit::Button(id, b));
-        let ink = if lit { INK_ON_ACCENT } else { INK };
-        out.extend(glyph(b, r).into_iter().map(|g| (g, rgba(ink, 1.0))));
-        if lit {
-            out.push((r, rgba(ACCENT, 1.0)));
-        }
-    }
     let active = l.active(id);
     for &(t, r) in &bar.tabs {
         let minimized = l.tile(t).is_some_and(|t| t.minimized);
@@ -171,7 +137,7 @@ mod tests {
     use super::super::{
         COLS, Cells, FULL, MIN_H, MIN_W, Output, ROWS, STRIP, Tile,
         drag::{
-            Done, Drag,
+            Done, Drag, buttons,
             tests::{assert_valid, at, c, drag, uw, with, zones},
         },
     };
@@ -662,14 +628,17 @@ mod tests {
         assert!(drawn.contains(&(tab(&l, 2), rgba(TAB_BG, 1.0))));
         assert!(!drawn.contains(&(tab(&l, 2), rgba(ACCENT, 1.0))));
 
+        // Buttons are glyph textures, lit under the pointer or an armed press, in no overlay rect.
         let close = button(&l, 1, Button::Close);
         let lit = zones(&l, None, mid(close), 0);
-        assert!(lit.contains(&(close, rgba(ACCENT, 1.0))));
-        let ink_on_accent = lit.iter().filter(|&&(_, k)| k == rgba(INK_ON_ACCENT, 1.0));
-        assert_eq!(ink_on_accent.count(), 10, "the X's squares");
-        // Glyphs sit in front of the button, which sits in front of the bar.
-        let pos = |want: (Rect, [f32; 4])| lit.iter().position(|&x| x == want).unwrap();
-        assert!(pos((close, rgba(ACCENT, 1.0))) < pos((l.bar(1).unwrap().rect, rgba(BAR_BG, 1.0))));
+        assert!(!lit.iter().any(|&(r, _)| r == close));
+        let glyphs = buttons(&l, None, mid(close));
+        assert_eq!(glyphs.len(), 3);
+        assert!(glyphs.contains(&(1, Button::Close, close, true)));
+        assert!(glyphs.iter().filter(|g| g.3).count() == 1);
+        assert!(buttons(&l, None, away).iter().all(|g| !g.3));
+        let d = Drag::press(&l, mid(close)).unwrap();
+        assert!(buttons(&l, Some(&d), away).contains(&(1, Button::Close, close, true)));
 
         // Inactive tabs are outlined; minimized ones are the same dimmed accent as a strip.
         for side in outline(tab(&l, 2)) {
@@ -741,31 +710,6 @@ mod tests {
             zones(&l, None, (100, 2), 0),
             vec![(strip, rgba(ACCENT, 1.0))]
         );
-    }
-
-    #[test]
-    fn glyphs_fit_their_button() {
-        let r = Rect {
-            x: 100,
-            y: 0,
-            w: BAR,
-            h: BAR,
-        };
-        let inner = Rect {
-            x: 107,
-            y: 7,
-            w: GLYPH,
-            h: GLYPH,
-        };
-        for b in [Button::Minimize, Button::Maximize, Button::Close] {
-            for g in glyph(b, r) {
-                assert!(inner.contains((g.x, g.y)), "{b:?} {g:?}");
-                assert!(
-                    inner.contains((g.x + g.w - 1, g.y + g.h - 1)),
-                    "{b:?} {g:?}"
-                );
-            }
-        }
     }
 
     #[test]

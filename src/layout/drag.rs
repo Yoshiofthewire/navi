@@ -937,6 +937,25 @@ pub fn overlay(
     out
 }
 
+/// Every shown bar's window buttons, and whether each is lit: under the pointer, or pressed.
+pub fn buttons(l: &Layout, drag: Option<&Drag>, p: (i32, i32)) -> Vec<(WinId, Button, Rect, bool)> {
+    let hover = match drag.map(|d| &d.0) {
+        None => l.hit(p),
+        Some(State::Armed { hit, .. }) => Some(*hit),
+        Some(_) => None,
+    };
+    l.tiles
+        .iter()
+        .filter(|t| l.active(t.id) == Some(t.id) && !l.covered(t) && !t.fullscreen)
+        .filter_map(|t| Some((t.id, l.bar(t.id)?)))
+        .flat_map(|(id, bar)| {
+            bar.buttons
+                .into_iter()
+                .map(move |(b, r)| (id, b, r, hover == Some(Hit::Button(id, b))))
+        })
+        .collect()
+}
+
 /// `px` wide rects around `r`, just outside it: top, bottom, left, right.
 fn frame(r: Rect, px: i32) -> [Rect; 4] {
     let (x, w) = (r.x - px, r.w + 2 * px);

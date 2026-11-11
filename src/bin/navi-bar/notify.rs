@@ -146,6 +146,13 @@ impl Notes {
         Some((id, DISMISSED))
     }
 
+    /// Shown notes keep `by` ms more: the time they were hidden behind the session menu.
+    pub fn delay(&mut self, by: u64) {
+        for n in &mut self.shown {
+            n.expires_ms = n.expires_ms.saturating_add(by);
+        }
+    }
+
     pub fn expire(&mut self, now: u64) -> Vec<Closed> {
         let mut out = Vec::new();
         self.shown.retain(|n| {
@@ -377,6 +384,15 @@ mod tests {
         assert_eq!(ids(&n), [other]);
         // Replacing a closed one gets a new id.
         assert_ne!(n.notify(0, ":1.1", &again).0, id);
+    }
+
+    #[test]
+    fn hidden_time_is_given_back() {
+        let mut n = Notes::default();
+        n.notify(0, ":1.1", &req("a"));
+        n.delay(3_000);
+        assert_eq!(n.expire(5_000), vec![], "hidden 3 s of its 5");
+        assert_eq!(n.expire(8_000).len(), 1);
     }
 
     #[test]
