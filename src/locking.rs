@@ -43,7 +43,7 @@ use crate::{
     state::{ClientState, Navi},
 };
 
-mod background;
+pub(crate) mod background;
 pub mod logind;
 
 pub const SWAYLOCK: &str = "/usr/bin/swaylock";
@@ -199,19 +199,7 @@ impl Navi {
         if !executable().is_file() {
             return Err("Install the swaylock package first".into());
         }
-        let outputs = self
-            .space
-            .outputs()
-            .filter_map(|o| {
-                let geo = self.space.output_geometry(o)?;
-                Some((
-                    o.name(),
-                    self.priority_of(&crate::state::identity(o)),
-                    geo.size.w,
-                    geo.size.h,
-                ))
-            })
-            .collect();
+        let outputs = self.wallpaper_outputs();
         let (tx, rx) = channel::channel();
         self.loop_handle.insert_source(rx, |event, _, data| {
             if let channel::Event::Msg(backgrounds) = event

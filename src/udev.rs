@@ -682,6 +682,10 @@ fn render(data: &mut CalloopData, crtc: crtc::Handle) {
         }
         udev.wallpaper_epoch = data.state.wallpaper_epoch;
     }
+    data.state.frost_check();
+    let Some(udev) = data.udev.as_mut() else {
+        return;
+    };
     let Some(s) = udev.screens.iter_mut().find(|s| s.crtc == crtc) else {
         return;
     };

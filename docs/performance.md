@@ -80,6 +80,35 @@ four seconds; closing it returned the desktop to zero frames over a subsequent f
 A separate unchanged-desktop check saw zero new frames over five seconds. These frame-count
 checks used debug logging, separately from the resource samples.
 
+## Frosted panels (2026-11-11)
+
+Nested on X11 under KDE Plasma on Usagi, release builds, the dark `Next` 7680 × 2160 wallpaper,
+every XDG directory in a temporary one, a private session bus. `scripts/measure-idle.py`, 60 s
+after a 10 s warm-up, at the size KWin picked:
+
+| Build | Navi + bar CPU (% of one core) | Navi + bar PSS at end |
+| --- | ---: | ---: |
+| `main` before frost | 0.05 | 145.3 MiB |
+| With frost | 0.05 | 143.6 MiB |
+
+Idle frames are unchanged: `src/render.rs` is untouched, and the only per-frame addition is
+comparing the outputs' names and sizes with the last frost batch. At 3440 × 1440 with debug
+logging (`navi::winit=debug`), the nested backend drew no frames in 30 s of idle beyond the
+clock's minute tick, with frost as without. A frost batch (decode and blur, on its worker) took
+89–144 ms in release, 450–840 ms in a debug build, once at startup, once per output-size
+change and once per wallpaper change; never while idle.
+
+navi-bar's draw time (`navi_bar=debug`, the `dock drawn` and `band drawn` lines, after the
+first draw, which loads fonts and icons), 3440 × 1440 at scale 1:
+
+| Surface | Solid body | Frosted body |
+| --- | ---: | ---: |
+| Dock | 0.06–0.26 ms | 0.14–0.16 ms |
+| Status band (3416 px wide) | 0.34–0.69 ms | 1.0–1.8 ms |
+
+The bilinear pattern fill costs about 1 ms on the widest panel, only when navi-bar redraws
+(the clock's minute, hover, a menu), never per compositor frame.
+
 ## Settings memory (2026-11-10)
 
 The shipped Settings default is Cairo. On Usagi at 1280 × 800, the release entrypoint

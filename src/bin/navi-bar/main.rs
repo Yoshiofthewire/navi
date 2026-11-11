@@ -25,6 +25,7 @@ mod desktop_config;
 mod dock;
 mod exec;
 mod font;
+mod frost;
 mod icons;
 mod layout;
 mod menu;
@@ -87,6 +88,7 @@ use tracing::{debug, error, info, warn};
 use cards::Card;
 use dbus::Call;
 use desktop::Entry;
+use frost::Backdrop;
 use icons::{Icons, Themes};
 use layout::{BAR_H, IconOf, Item, Layout, Rect, Slot};
 use menu::{Menu, Row};
@@ -221,6 +223,7 @@ fn run() -> Result<(), String> {
             channel::Event::Msg(control::Command::ToggleMenu) => bar.toggle_menu(),
             channel::Event::Msg(control::Command::Dock(key)) => bar.dock_key(key),
             channel::Event::Msg(control::Command::WindowLimit) => bar.window_limit(),
+            channel::Event::Msg(control::Command::Frost) => bar.load_frost(),
             channel::Event::Closed => {}
         })
         .map_err(|e| e.to_string())?;
@@ -314,6 +317,12 @@ fn run() -> Result<(), String> {
         asks: 0,
         pending: Vec::new(),
         closed: false,
+        frost_dir: var("NAVI_FROST_DIR")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute()),
+        output: None,
+        output_size: (0, 0),
+        frost: None,
     };
     bar.refresh_status();
     bar.relayout();
@@ -446,6 +455,12 @@ struct Bar {
     /// What waits for a token, by number.
     pending: Vec<(u64, Pending)>,
     closed: bool,
+    /// navi's frost files, if it writes them.
+    frost_dir: Option<PathBuf>,
+    /// The output the surfaces are on, its logical size, and its frost.
+    output: Option<wl_output::WlOutput>,
+    output_size: (i32, i32),
+    frost: Option<Pixmap>,
 }
 
 /// What waits for a token.
@@ -803,6 +818,7 @@ impl Bar {
         if !self.configured {
             return;
         }
+        let started = Instant::now();
         let l = self.layout;
         let s = self.scale.max(1);
         let Some(mut canvas) = Pixmap::new((l.w * s) as u32, (l.h * s) as u32) else {
@@ -835,10 +851,15 @@ impl Bar {
                 .wl_surface()
                 .set_input_region(Some(region.wl_region()));
         }
+        let under = Backdrop {
+            frost: self.frost.as_ref(),
+            output: self.output_size,
+            at: self.origins().dock,
+        };
         for item in items {
             match item {
                 Item::Fill(..) | Item::Round(..) | Item::Panel(..) | Item::Text(..) => {
-                    paint(&mut canvas, self.font.as_ref(), item, s)
+                    paint(&mut canvas, self.font.as_ref(), item, s, under)
                 }
                 Item::Icon(of, r, alpha) => {
                     let r = scaled(r, s);
@@ -900,6 +921,8 @@ impl Bar {
             }
         }
         present(&mut self.pool, &self.layer, &canvas, s);
+        let us = started.elapsed().as_micros() as u64;
+        debug!(us, frost = self.frost.is_some(), "dock drawn");
     }
 
     fn now_ms(&self) -> u64 {
@@ -1008,6 +1031,7 @@ impl Bar {
         if !self.band_configured {
             return;
         }
+        let started = Instant::now();
         let s = self.scale.max(1);
         let h = self.session.height();
         self.band.set_size(0, h as u32);
@@ -1048,6 +1072,11 @@ impl Bar {
         });
         let lit = self.session.open || self.band_hover;
         let band = session::band(self.band_w, lit, clock, battery);
+        let under = Backdrop {
+            frost: self.frost.as_ref(),
+            output: self.output_size,
+            at: self.origins().band,
+        };
         for item in band.into_iter().chain(self.session.draw()) {
             if let Item::Icon(IconOf::Button, r, _) = item {
                 let r = scaled(r, s);
@@ -1066,10 +1095,12 @@ impl Bar {
                     placeholder(&mut canvas, r);
                 }
             } else {
-                paint(&mut canvas, self.font.as_ref(), item, s);
+                paint(&mut canvas, self.font.as_ref(), item, s, under);
             }
         }
         present(&mut self.pool, &self.band, &canvas, s);
+        let us = started.elapsed().as_micros() as u64;
+        debug!(us, frost = self.frost.is_some(), "band drawn");
     }
 
     fn call(&mut self, call: Call) {
@@ -1177,6 +1208,27 @@ impl Bar {
                 self.emit(closed.into_iter().collect());
             }
         }
+    }
+
+    /// Where the surfaces sit on their output.
+    fn origins(&self) -> layout::Origins {
+        let dock = (self.layout.w, self.layout.h);
+        layout::origins(self.output_size, dock, self.band_configured)
+    }
+
+    /// Reloads the frost of the output the surfaces are on, and redraws them.
+    fn load_frost(&mut self) {
+        let info = self.output.as_ref().and_then(|o| self.output_state.info(o));
+        let info = info.as_ref();
+        self.output_size = info.and_then(|i| i.logical_size).unwrap_or((0, 0));
+        let name = info.and_then(|i| i.name.as_deref());
+        self.frost = match (&self.frost_dir, name) {
+            (Some(dir), Some(name)) => frost::load(dir, name),
+            _ => None,
+        };
+        self.draw();
+        self.draw_band();
+        self.draw_cards();
     }
 
     /// navi closed a window past its client's limit.
@@ -1316,8 +1368,13 @@ impl Bar {
         let Some(mut canvas) = Pixmap::new((w * s) as u32, (h * s) as u32) else {
             return;
         };
+        let under = Backdrop {
+            frost: self.frost.as_ref(),
+            output: self.output_size,
+            at: self.origins().cards,
+        };
         for item in cards::draw(&self.cards, self.desktop_settings["visual_alerts"] == true) {
-            paint(&mut canvas, self.font.as_ref(), item, s);
+            paint(&mut canvas, self.font.as_ref(), item, s, under);
         }
         present(&mut self.pool, layer, &canvas, s);
     }
@@ -1344,13 +1401,11 @@ fn present(pool: &mut SlotPool, layer: &LayerSurface, canvas: &Pixmap, s: i32) {
 }
 
 /// A fill or a line of text; other items are the taskbar's.
-fn paint(canvas: &mut Pixmap, font: Option<&fontdue::Font>, item: Item, s: i32) {
+fn paint(canvas: &mut Pixmap, font: Option<&fontdue::Font>, item: Item, s: i32, under: Backdrop) {
     match item {
         Item::Fill(r, rgb) => fill(canvas, scaled(r, s), rgb, 1.0),
         Item::Round(r, radius, rgb) => rounded(canvas, scaled(r, s), radius * s, rgb),
-        Item::Panel(r, kind, edge, border) => {
-            panel(canvas, scaled(r, s), kind, edge, border * s, s)
-        }
+        Item::Panel(r, edge, border) => panel(canvas, scaled(r, s), edge, border * s, s, under),
         Item::Text(text, r, rgb) => {
             if let Some(font) = font {
                 draw_text(canvas, font, &text, scaled(r, s), text_px() * s as f32, rgb);
@@ -1400,12 +1455,23 @@ fn rounded(canvas: &mut Pixmap, r: Rect, radius: i32, rgb: u32) {
     fill_path(canvas, path, rgb, 1.0);
 }
 
-/// A floating panel: translucent body, opaque `border` px rim, both following the corners.
-fn panel(canvas: &mut Pixmap, r: Rect, kind: theme::Panel, edge: u32, border: i32, s: i32) {
+/// A floating panel: an opaque body, `BAR_BG` tint over the frost, and an opaque `border` px
+/// rim, all following the corners.
+fn panel(canvas: &mut Pixmap, r: Rect, edge: u32, border: i32, s: i32, under: Backdrop) {
     let radius = theme::RADIUS * s;
     let mut body = tiny_skia::PathBuilder::new();
     round_rect(&mut body, r, radius);
-    fill_path(canvas, body, theme::BAR_BG, theme::panel_alpha(kind));
+    let alpha = theme::panel_alpha();
+    if let Some(body) = body.finish() {
+        let rule = tiny_skia::FillRule::EvenOdd;
+        // High contrast's tint is opaque: no frost to draw under it.
+        if alpha < 1.0 {
+            canvas.fill_path(&body, &under.paint(s), rule, Transform::identity(), None);
+        }
+        let mut tint = Paint::default();
+        tint.set_color(color(theme::BAR_BG, alpha));
+        canvas.fill_path(&body, &tint, rule, Transform::identity(), None);
+    }
     let mut rim = tiny_skia::PathBuilder::new();
     round_rect(&mut rim, r, radius);
     let inner = Rect {
@@ -1573,6 +1639,7 @@ fn spawn(e: &Entry, token: Option<&str>) {
     cmd.args(args)
         .env_remove("WAYLAND_SOCKET")
         .env_remove("NAVI_CONTROL_FD")
+        .env_remove("NAVI_FROST_DIR")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1782,8 +1849,12 @@ impl CompositorHandler for Bar {
         _: &Connection,
         _: &QueueHandle<Self>,
         _: &wl_surface::WlSurface,
-        _: &wl_output::WlOutput,
+        output: &wl_output::WlOutput,
     ) {
+        if self.output.as_ref() != Some(output) {
+            self.output = Some(output.clone());
+            self.load_frost();
+        }
     }
 
     fn surface_leave(
@@ -2049,7 +2120,11 @@ impl OutputHandler for Bar {
 
     fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
 
-    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, o: wl_output::WlOutput) {
+        if self.output.as_ref() == Some(&o) {
+            self.load_frost();
+        }
+    }
 
     fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
 }
@@ -2083,7 +2158,7 @@ mod tests {
     use super::*;
     use desktop::{Category, Entry};
     use layout::Hit;
-    use theme::{ACCENT, INSET, ON_FILL, PANEL_EDGE, PANEL_TEXT, Panel};
+    use theme::{ACCENT, INSET, ON_FILL, PANEL_EDGE, PANEL_TEXT};
 
     fn note(id: u32) -> notify::Note {
         notify::Note {
@@ -2255,28 +2330,46 @@ mod tests {
         assert_eq!(t.pixels()[1].alpha(), 0);
     }
 
+    /// Held by tests that switch the process-wide theme, so they don't race.
+    static THEME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn rendered(items: &[Item], w: i32, h: i32) -> Pixmap {
+        rendered_on(items, w, h, Backdrop::SOLID)
+    }
+
+    fn rendered_on(items: &[Item], w: i32, h: i32, under: Backdrop) -> Pixmap {
         let mut canvas = Pixmap::new(w as u32, h as u32).unwrap();
         for item in items {
-            paint(&mut canvas, None, item.clone(), 1);
+            paint(&mut canvas, None, item.clone(), 1, under);
         }
         canvas
     }
 
-    /// Corner clear, body at the panel alpha, rim in `edge` at the middle of the top edge.
+    /// `BAR_BG` at the panel alpha over `rgb`, as tiny-skia blends it.
+    fn tinted_over(rgb: [u8; 3]) -> [u8; 3] {
+        let a = theme::panel_alpha();
+        let [_, r, g, b] = theme::resolve(theme::BAR_BG).to_be_bytes();
+        let mix = |t: u8, u: u8| (f32::from(t) * a + f32::from(u) * (1.0 - a)).round() as u8;
+        [mix(r, rgb[0]), mix(g, rgb[1]), mix(b, rgb[2])]
+    }
+
+    fn rgb_of(canvas: &Pixmap, (x, y): (i32, i32)) -> [u8; 3] {
+        let p = canvas.pixel(x as u32, y as u32).unwrap();
+        [p.red(), p.green(), p.blue()]
+    }
+
+    fn near(got: [u8; 3], want: [u8; 3]) -> bool {
+        got.iter().zip(want).all(|(&g, w)| g.abs_diff(w) <= 1)
+    }
+
+    /// Corner clear, body opaque, rim in `edge` at the middle of the top edge.
     fn assert_panel(canvas: &Pixmap, r: Rect, body: (i32, i32), edge: u32, what: &str) {
         let px = |(x, y): (i32, i32)| canvas.pixel(x as u32, y as u32).unwrap();
         assert_eq!(px((r.x, r.y)).alpha(), 0, "{what}: corner");
-        let kind = match what {
-            "dock" | "band" => Panel::Bar,
-            _ => Panel::Popup,
-        };
-        let want = (255.0 * theme::panel_alpha(kind)).round() as i32;
-        let got = i32::from(px(body).alpha());
-        assert!(
-            (got - want).abs() <= 1,
-            "{what}: body alpha {got}, want {want}"
-        );
+        assert_eq!(px(body).alpha(), 255, "{what}: body");
+        let [_, br, bg, bb] = theme::resolve(theme::BG).to_be_bytes();
+        let want = tinted_over([br, bg, bb]);
+        assert!(near(rgb_of(canvas, body), want), "{what}: body over BG");
         let top = px((r.x + r.w / 2, r.y));
         let [_, er, eg, eb] = theme::resolve(edge).to_be_bytes();
         assert_eq!(
@@ -2286,8 +2379,106 @@ mod tests {
         );
     }
 
+    /// A frost image: red on the left half, blue on the right.
+    fn split_frost() -> Pixmap {
+        let mut img = Pixmap::new(100, 50).unwrap();
+        let half = |x: f32, c: Color| {
+            let mut p = Paint::default();
+            p.set_color(c);
+            (tiny_skia::Rect::from_xywh(x, 0.0, 50.0, 50.0).unwrap(), p)
+        };
+        for (r, p) in [
+            half(0.0, Color::from_rgba8(255, 0, 0, 255)),
+            half(50.0, Color::from_rgba8(0, 0, 255, 255)),
+        ] {
+            img.fill_rect(r, &p, Transform::identity(), None);
+        }
+        img
+    }
+
     #[test]
-    fn ac6_panels_are_rounded_translucent_and_rimmed() {
+    fn ac6_frost_fills_the_panel_body_only_at_the_panels_place() {
+        let _theme = THEME.lock().unwrap_or_else(|e| e.into_inner());
+        let frost = split_frost();
+        let dock = Layout::new(1, false);
+        let items = dock.draw(&[Slot::default()], None, &[], &[], None, "");
+        let b = dock.bar();
+        // A 1000×500 output: the frost's halves meet at x = 500, under the dock's centre.
+        let output = (1000, 500);
+        let o = layout::origins(output, (dock.w, dock.h), true);
+        for s in [1, 2] {
+            let under = Backdrop {
+                frost: Some(&frost),
+                output,
+                at: o.dock,
+            };
+            let mut canvas = Pixmap::new((dock.w * s) as u32, (dock.h * s) as u32).unwrap();
+            for item in &items {
+                paint(&mut canvas, None, item.clone(), s, under);
+            }
+            let at = |x: i32, y: i32| (x * s, y * s);
+            let (mid_y, left, right) = (b.y + b.h / 2, b.x + 6, b.x + b.w - 6);
+            let red = tinted_over([255, 0, 0]);
+            let blue = tinted_over([0, 0, 255]);
+            assert!(
+                near(rgb_of(&canvas, at(left, mid_y)), red),
+                "s {s}: left end red"
+            );
+            assert!(
+                near(rgb_of(&canvas, at(right, mid_y)), blue),
+                "s {s}: right end blue"
+            );
+            // The split sits at the output's x = 500 (bilinear across one frost pixel, 10 px).
+            let split = 500 - o.dock.0;
+            let blend = rgb_of(&canvas, at(split, mid_y));
+            assert!(
+                blend[0] > red[0].min(blue[0]) && blend[0] < red[0].max(blue[0]),
+                "{blend:?}"
+            );
+            assert!(
+                near(rgb_of(&canvas, at(split - 12, mid_y)), red),
+                "s {s}: left of split"
+            );
+            assert!(
+                near(rgb_of(&canvas, at(split + 12, mid_y)), blue),
+                "s {s}: right of split"
+            );
+            let px = |(x, y)| canvas.pixel(x as u32, y as u32).unwrap();
+            assert_eq!(px(at(b.x, b.y)).alpha(), 0, "s {s}: corner clear");
+            assert_eq!(px(at(0, dock.h - 1)).alpha(), 0, "s {s}: below the dock");
+            for x in b.x + 2..b.x + b.w - 2 {
+                assert_eq!(px(at(x, mid_y)).alpha(), 255, "s {s}: body at {x}");
+            }
+        }
+        // Without frost, the body is the tint over BG.
+        let canvas = rendered(&items, dock.w, dock.h);
+        assert_panel(
+            &canvas,
+            b,
+            (b.x + b.w / 2, b.y + b.h / 2),
+            PANEL_EDGE,
+            "dock",
+        );
+
+        // High contrast: the opaque tint, frost ignored.
+        theme::configure(&serde_json::json!({"high_contrast": true}));
+        assert_eq!(theme::panel_alpha(), 1.0);
+        let under = Backdrop {
+            frost: Some(&frost),
+            output,
+            at: o.dock,
+        };
+        let canvas = rendered_on(&items, dock.w, dock.h, under);
+        let [_, r, g, bl] = theme::resolve(theme::BAR_BG).to_be_bytes();
+        for x in [b.x + 6, b.x + b.w - 6] {
+            assert_eq!(rgb_of(&canvas, (x, b.y + b.h / 2)), [r, g, bl], "hc body");
+        }
+        theme::configure(&serde_json::json!({}));
+    }
+
+    #[test]
+    fn ac6_panels_are_rounded_opaque_and_rimmed() {
+        let _theme = THEME.lock().unwrap_or_else(|e| e.into_inner());
         let check = || {
             let dock = Layout::new(1, false);
             let items = dock.draw(&[Slot::default()], None, &[], &[], None, "");
@@ -2354,11 +2545,10 @@ mod tests {
         };
         check();
         theme::configure(&serde_json::json!({"high_contrast": true}));
-        assert_eq!(theme::panel_alpha(Panel::Popup), 1.0);
+        assert_eq!(theme::panel_alpha(), 1.0);
         check();
         theme::configure(&serde_json::json!({}));
-        assert_eq!(theme::panel_alpha(Panel::Bar), 0.85);
-        assert_eq!(theme::panel_alpha(Panel::Popup), 0.98);
+        assert_eq!(theme::panel_alpha(), 0.85);
         assert_eq!(INSET, 12);
     }
 }

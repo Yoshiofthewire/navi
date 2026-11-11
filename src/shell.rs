@@ -68,6 +68,8 @@ pub struct Bar {
     /// Real hardware: the session's variables, and navi-bar exports them to D-Bus.
     session: bool,
     xdisplay: Option<String>,
+    /// Where navi writes each output's frost image.
+    frost: Option<PathBuf>,
     respawn: Respawn,
     clock: Instant,
 }
@@ -99,6 +101,7 @@ pub fn start_bar(
     wayland_display: &OsStr,
     cursor: Option<(String, u32)>,
     xdisplay: Option<String>,
+    frost: Option<PathBuf>,
     session: bool,
 ) -> Option<UnixStream> {
     let path = match std::env::current_exe() {
@@ -116,6 +119,7 @@ pub fn start_bar(
         cursor,
         session,
         xdisplay,
+        frost,
         respawn: Respawn::default(),
         clock: Instant::now(),
     }));
@@ -220,6 +224,10 @@ impl Bar {
                 cmd.env_remove("DISPLAY");
             }
         }
+        match &self.frost {
+            Some(dir) => cmd.env("NAVI_FROST_DIR", dir),
+            None => cmd.env_remove("NAVI_FROST_DIR"),
+        };
         let mut child = cmd
             // Its stdin is the socket; navi-bar moves it off fd 0 as it connects.
             .stdin(Stdio::from(OwnedFd::from(theirs)))

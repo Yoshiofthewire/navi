@@ -7,7 +7,7 @@ use zbus::blocking::{Connection, Proxy, connection::Builder};
 use crate::{
     layout::{IconOf, Item, Rect},
     status::Battery,
-    theme::{ACCENT, BAR_BG, DIM, INK, INSET, PANEL_EDGE, Panel, SELECTED},
+    theme::{ACCENT, BAR_BG, DIM, INK, INSET, PANEL_EDGE, SELECTED},
 };
 
 pub const BAND_H: i32 = 32;
@@ -260,7 +260,7 @@ impl Menu {
             return Vec::new();
         }
         let p = self.panel();
-        let mut out = vec![Item::Panel(p, Panel::Popup, PANEL_EDGE, 1)];
+        let mut out = vec![Item::Panel(p, PANEL_EDGE, 1)];
         let (x, w) = (p.x + PAD, WIDTH - 2 * PAD);
         let text = |label: &str, y, h, color| Item::Text(label.into(), Rect { x, y, w, h }, color);
         if let Some(action) = self.confirm {
@@ -352,7 +352,6 @@ pub fn band(
             w,
             h: BAND_H,
         },
-        Panel::Bar,
         PANEL_EDGE,
         1,
     )];

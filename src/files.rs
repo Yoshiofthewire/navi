@@ -60,3 +60,13 @@ pub fn read_bytes(path: &Path, max: u64) -> Result<Option<Vec<u8>>, String> {
     }
     Ok(Some(bytes))
 }
+
+/// Output `name`'s frost image in `dir`, if the name is `[A-Za-z0-9_-]{1,64}`, so it can't
+/// leave the directory.
+pub fn frost_file(dir: &Path, name: &str) -> Option<PathBuf> {
+    let ok = (1..=64).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+    ok.then(|| dir.join(format!("{name}.png")))
+}

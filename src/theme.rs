@@ -29,7 +29,7 @@ pub const RADIUS: i32 = 10;
 /// A floating panel's distance from the screen edge and from what it floats next to.
 pub const INSET: i32 = 12;
 
-/// Text (4.5:1) and marks (3:1) that may sit on a translucent panel, and text on each opaque
+/// Text (4.5:1) and marks (3:1) that may sit on a frosted panel, and text on each opaque
 /// fill inside one.
 #[cfg(test)]
 pub const PANEL_TEXT: [u32; 2] = [INK, DIM];
@@ -95,25 +95,13 @@ pub fn resolve(color: u32) -> u32 {
     resolve_flags(color, APPEARANCE.load(std::sync::atomic::Ordering::Relaxed))
 }
 
-/// Which shell panel: the dock and band, which sit over the wallpaper, or a pop-up (launcher,
-/// session menu, card), which sits over windows whose text would ghost through until blur.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Panel {
-    Bar,
-    Popup,
+/// A shell panel's tint over its frosted (or solid) body: translucent, opaque with high contrast.
+pub fn panel_alpha() -> f32 {
+    panel_alpha_flags(APPEARANCE.load(std::sync::atomic::Ordering::Relaxed))
 }
 
-/// A shell panel's opacity: translucent, opaque with high contrast.
-pub fn panel_alpha(panel: Panel) -> f32 {
-    panel_alpha_flags(panel, APPEARANCE.load(std::sync::atomic::Ordering::Relaxed))
-}
-
-fn panel_alpha_flags(panel: Panel, flags: u32) -> f32 {
-    match (flags & 32 != 0, panel) {
-        (true, _) => 1.0,
-        (false, Panel::Bar) => 0.85,
-        (false, Panel::Popup) => 0.98,
-    }
+fn panel_alpha_flags(flags: u32) -> f32 {
+    if flags & 32 != 0 { 1.0 } else { 0.85 }
 }
 
 fn resolve_flags(color: u32, flags: u32) -> u32 {
@@ -207,12 +195,8 @@ mod tests {
     fn ac1_panel_tokens() {
         assert_eq!((RADIUS, INSET), (10, 12));
         for flags in all_flags() {
-            let high = flags & 32 != 0;
-            let want = [(Panel::Bar, 0.85), (Panel::Popup, 0.98)];
-            for (panel, alpha) in want {
-                let alpha = if high { 1.0 } else { alpha };
-                assert_eq!(panel_alpha_flags(panel, flags), alpha, "flags {flags}");
-            }
+            let want = if flags & 32 != 0 { 1.0 } else { 0.85 };
+            assert_eq!(panel_alpha_flags(flags), want, "flags {flags}");
         }
     }
 
@@ -220,11 +204,9 @@ mod tests {
     fn ac2_panels_are_readable_over_any_wallpaper() {
         for flags in all_flags() {
             let r = |c| resolve_flags(c, flags);
-            let alphas = [Panel::Bar, Panel::Popup].map(|p| panel_alpha_flags(p, flags));
-            for (wallpaper, alpha) in [0xFFFFFF, 0x000000]
-                .into_iter()
-                .flat_map(|w| alphas.map(|a| (w, a)))
-            {
+            // A blurred wallpaper pixel lies between white and black.
+            let alpha = panel_alpha_flags(flags);
+            for wallpaper in [0xFFFFFF, 0x000000] {
                 let panel = over(r(BAR_BG), alpha, wallpaper);
                 let text = PANEL_TEXT.map(|fg| (fg, 4.5));
                 for (fg, min) in text.into_iter().chain(PANEL_MARKS.map(|fg| (fg, 3.0))) {

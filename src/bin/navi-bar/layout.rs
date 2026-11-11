@@ -3,7 +3,7 @@
 use crate::{
     desktop::{Category, Entry},
     menu::{Menu, ROWS, Row},
-    theme::{ACCENT, BAR_BG, DIM, INK, INK_ON_ACCENT, INSET, PANEL_EDGE, Panel, SELECTED},
+    theme::{ACCENT, BAR_BG, DIM, INK, INK_ON_ACCENT, INSET, PANEL_EDGE, SELECTED},
 };
 
 /// 40 px of dock, floating `INSET` above the screen edge.
@@ -74,8 +74,8 @@ impl IconOf {
 pub enum Item {
     Fill(Rect, u32),
     Round(Rect, i32, u32),
-    /// A floating panel: translucent `BAR_BG` with a rim of this colour and width.
-    Panel(Rect, Panel, u32, i32),
+    /// A floating panel: frosted body under `BAR_BG`, with a rim of this colour and width.
+    Panel(Rect, u32, i32),
     Icon(IconOf, Rect, f32),
     Text(String, Rect, u32),
     Field(String, Rect),
@@ -220,7 +220,7 @@ impl Layout {
     ) -> Vec<Item> {
         let mut out = Vec::new();
         if let (Some(p), Some(m)) = (self.panel(), menu) {
-            out.push(Item::Panel(p, Panel::Popup, PANEL_EDGE, 1));
+            out.push(Item::Panel(p, PANEL_EDGE, 1));
             let back = m.folder().is_some() || !m.query().is_empty();
             let mut title = self.header(p);
             if back {
@@ -338,7 +338,7 @@ impl Layout {
             out.push(Item::Text(hint.into(), footer, DIM));
         }
         let b = self.bar();
-        out.push(Item::Panel(b, Panel::Bar, PANEL_EDGE, 1));
+        out.push(Item::Panel(b, PANEL_EDGE, 1));
         if hover == Some(Hit::Button) || self.open {
             out.push(Item::Round(self.target(0), 8, SELECTED));
         }
@@ -419,6 +419,35 @@ fn inset_x(r: Rect, by: i32) -> Rect {
         x: r.x + by,
         w: r.w - 2 * by,
         ..r
+    }
+}
+
+/// Each of navi-bar's surfaces' top-left on its output, in logical px.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Origins {
+    pub dock: (i32, i32),
+    pub band: (i32, i32),
+    pub cards: (i32, i32),
+}
+
+/// Where navi's layer map (Smithay's `LayerMap::arrange`) puts navi-bar's surfaces on an output
+/// of logical size `output`, in the order navi-bar maps them: the dock (BOTTOM, centred, sized
+/// `dock`), the band (TOP|LEFT|RIGHT with `BAND_MARGIN`), then the cards (TOP|LEFT with
+/// `cards::MARGIN`), which the band's exclusive zone pushes down while it's `band` shown.
+pub fn origins(output: (i32, i32), dock: (i32, i32), band: bool) -> Origins {
+    let [band_top, _, _, band_left] = crate::session::BAND_MARGIN;
+    let [cards_top, _, _, cards_left] = crate::cards::MARGIN;
+    let (w, h) = (dock.0.min(output.0), dock.1.min(output.1));
+    let zone_top = if band {
+        crate::session::BAND_H + band_top
+    } else {
+        0
+    };
+    Origins {
+        // Smithay halves each width separately.
+        dock: (output.0 / 2 - w / 2, output.1 - h),
+        band: (band_left, band_top),
+        cards: (cards_left, zone_top + cards_top),
     }
 }
 
@@ -527,5 +556,21 @@ mod tests {
             );
         }
         assert!(items.iter().any(|i| matches!(i, Item::Panel(..))));
+    }
+
+    #[test]
+    fn ac7_surfaces_sit_where_navis_layer_map_puts_them() {
+        let (big_w, big_h) = (3440, 1440);
+        for dock in [Layout::new(3, false), Layout::new(3, true)] {
+            let o = origins((big_w, big_h), (dock.w, dock.h), true);
+            assert_eq!(o.dock, ((big_w - dock.w) / 2, big_h - dock.h));
+        }
+        let o = origins((big_w, big_h), (200, 52), true);
+        assert_eq!(o.band, (12, 12));
+        assert_eq!(o.cards, (24, 44 + 24));
+        assert_eq!(origins((big_w, big_h), (200, 52), false).cards, (24, 24));
+        // An odd width, and a dock wider than the output, as Smithay places them.
+        assert_eq!(origins((1125, 703), (201, 52), true).dock, (562 - 100, 651));
+        assert_eq!(origins((100, 703), (200, 52), true).dock, (0, 651));
     }
 }

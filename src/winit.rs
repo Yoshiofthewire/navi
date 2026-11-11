@@ -169,6 +169,7 @@ pub fn init(
                             .map(|img| Wallpaper::new(img));
                         wallpaper_epoch = state.wallpaper_epoch;
                     }
+                    state.frost_check();
                     debug!("nested frame");
                     clock.borrow_mut().last = Instant::now();
                     let mut backend = backend.borrow_mut();

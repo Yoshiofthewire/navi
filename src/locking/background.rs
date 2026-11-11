@@ -1,4 +1,4 @@
-//! Wallpaper-only lock backdrop. Prepared on a worker, never from desktop contents.
+//! Wallpaper-only lock backdrop and frost blur. Prepared on a worker, never from desktop contents.
 use crate::{
     image::{self, Image},
     wallpaper,
@@ -55,7 +55,7 @@ pub fn create(
     {
         return Err(io::Error::other("lock backdrop exceeds image size cap"));
     }
-    let (w, h, pixels) = render(image, width as i32, height as i32);
+    let (w, h, pixels) = render(image, width as i32, height as i32, 0.27);
     let backdrop = Pixmap::from_vec(pixels, IntSize::from_wh(w as u32, h as u32).unwrap()).unwrap();
     let mut canvas = Pixmap::new(width, height)
         .ok_or_else(|| io::Error::other("lock backdrop allocation failed"))?;
@@ -111,7 +111,14 @@ pub fn create(
     Ok(background)
 }
 
-fn render(image: Option<&Image>, width: i32, height: i32) -> (usize, usize, Vec<u8>) {
+/// The wallpaper's cover crop for a `width` × `height` output as a blurred thumbnail, long side at
+/// most 960 px, opaque, colours times `darken`. Without a wallpaper, solid `BG`.
+pub(crate) fn render(
+    image: Option<&Image>,
+    width: i32,
+    height: i32,
+    darken: f32,
+) -> (usize, usize, Vec<u8>) {
     // ponytail: blur a bounded thumbnail once, then scale the backdrop and add
     // crisp prompts. No screenshot protocol, imaging process or new dependency.
     let width = width.max(1);
@@ -132,7 +139,7 @@ fn render(image: Option<&Image>, width: i32, height: i32) -> (usize, usize, Vec<
                 let to = (y * w + x) * 4;
                 let alpha = image.rgba[from + 3] as f32 / 255.0;
                 for c in 0..3 {
-                    pixels[to + c] = (image.rgba[from + c] as f32 * alpha * 0.27) as u8;
+                    pixels[to + c] = (image.rgba[from + c] as f32 * alpha * darken) as u8;
                 }
                 pixels[to + 3] = 255;
             }
@@ -202,7 +209,7 @@ mod tests {
                 })
                 .collect(),
         };
-        let (w, h, pixels) = render(Some(&image), 100, 60);
+        let (w, h, pixels) = render(Some(&image), 100, 60, 0.27);
         assert_eq!((w, h), (100, 60));
         assert!(
             pixels
@@ -213,7 +220,7 @@ mod tests {
         );
         assert!(pixels[(30 * w + 49) * 4] > 0 && pixels[(30 * w + 49) * 4] < 68);
         assert!(pixels[(30 * w + 50) * 4] > 0 && pixels[(30 * w + 50) * 4] < 68);
-        let (w, h, pixels) = render(None, 7680, 4320);
+        let (w, h, pixels) = render(None, 7680, 4320, 0.27);
         assert!(w <= 960 && h <= 960);
         assert!(
             pixels

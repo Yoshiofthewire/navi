@@ -3,7 +3,7 @@
 
 use crate::layout::{Item, Rect};
 use crate::notify::Note;
-use crate::theme::{ACCENT, DIM, INK, INSET, Panel};
+use crate::theme::{ACCENT, DIM, INK, INSET};
 
 pub const CARD_W: i32 = 360;
 /// The cards layer's margins, top, right, bottom, left, from below the band's zone: twice the
@@ -81,7 +81,7 @@ pub fn draw(cards: &[Card], visual: bool) -> Vec<Item> {
     let mut out = Vec::new();
     for c in cards {
         let r = c.rect;
-        out.push(Item::Panel(r, Panel::Popup, ACCENT, border));
+        out.push(Item::Panel(r, ACCENT, border));
         let line = |k: i32| Rect {
             x: r.x + PAD,
             y: r.y + PAD + k * line_h(),
@@ -230,10 +230,10 @@ mod tests {
             DIM
         )));
         assert!(
-            items.contains(&Item::Panel(cards[0].rect, Panel::Popup, ACCENT, 1)),
+            items.contains(&Item::Panel(cards[0].rect, ACCENT, 1)),
             "the outline"
         );
-        assert!(draw(&cards, true).contains(&Item::Panel(cards[0].rect, Panel::Popup, ACCENT, 3)));
+        assert!(draw(&cards, true).contains(&Item::Panel(cards[0].rect, ACCENT, 3)));
         assert_eq!(MARGIN, [24, 0, 0, 24]);
     }
 

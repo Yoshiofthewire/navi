@@ -8,6 +8,7 @@ mod cursor;
 mod desktop_config;
 mod files;
 mod focus;
+mod frost;
 mod glyph;
 mod image;
 mod input;
@@ -175,12 +176,14 @@ fn run(backend: Backend) -> Result<(), Box<dyn Error>> {
     };
     // After the first output exists, so the bar lands on it.
     let xdisplay = xwayland::start(&handle, &data.state);
+    let frost = frost::start(&handle, &mut data.state);
     data.state.bar_control = shell::start_bar(
         &handle,
         &mut data.state.display_handle,
         &socket_name,
         theme,
         xdisplay,
+        frost,
         backend == Backend::Drm,
     );
     #[cfg(debug_assertions)]

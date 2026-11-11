@@ -534,10 +534,17 @@ bundling a degoogled, resource-tested Chromium variant is reserved for a future 
   front of everything.
   The shell's panels (dock, launcher, status band, session menu and notification cards) float:
   12 px (`INSET`) from the screen edges and from what they sit next to, with 10 px corners
-  (`RADIUS`), the shell fill and a 1 px rim. The dock and band, which sit over the wallpaper,
-  are 85 % opaque; the launcher, session menu and cards, which sit over windows, are 98 %, so
-  window text doesn't ghost through them before the blur lands. That opacity alone keeps their
-  text 4.5:1 and marks 3:1 over any wallpaper, white or black; high contrast makes them opaque.
+  (`RADIUS`), a frosted body and a 1 px rim. The body is the output's wallpaper, blurred, under
+  the shell fill at 85 %; it is opaque, so window text never ghosts through a launcher, session
+  menu or card over a window, which shows frosted wallpaper rather than the window behind it.
+  That tint alone keeps their text 4.5:1 and marks 3:1 over any blurred pixel, white or black.
+  Without a wallpaper or frost image the body is the solid background colour under the same
+  tint. High contrast draws an opaque fill and no frost. navi blurs each output's wallpaper once
+  per wallpaper or output-size change, on a worker (the lock backdrop's bounded box blur, not
+  darkened), and writes it as a PNG into a private 0700 directory under `XDG_RUNTIME_DIR`,
+  `NAVI_FROST_DIR`; a `FROST` control byte tells navi-bar to reload. navi-bar stretches it over
+  the output and offsets it by where navi's layer map puts each of its surfaces, so the frost
+  lines up with the wallpaper. Without an absolute `XDG_RUNTIME_DIR` frost is off.
   Panels pad their content 12 px. Folder and session glyphs draw in the text colour, so they
   hold 3:1 in every scheme; app icons keep their own colours. The launcher's search field is
   the selected fill with a rim, so it has a shape even in high contrast. The band is 32 px (one
@@ -555,8 +562,8 @@ bundling a degoogled, resource-tested Chromium variant is reserved for a future 
 The default background, shell surface and text are `#0B0D12`, `#151922` and `#D0D4DC`;
 light mode uses `#F5F6F8`, white and `#202734`, with a darker blue accent (`#0077AA`).
 High contrast uses black/white surfaces and text in the selected scheme. Shell panels use
-`RADIUS` 10 and `INSET` 12, the `BAR_BG` fill at `panel_alpha()` (0.85 for the dock and band,
-0.98 for pop-ups, 1.0 with high contrast), `DIM` `#A3ABBC` (light `#525E70`) for secondary text, and `PANEL_EDGE` `#848C9E`
+`RADIUS` 10 and `INSET` 12, the `BAR_BG` tint at `panel_alpha()` (0.85 over the frost for
+every panel, 1.0 with high contrast), `DIM` `#A3ABBC` (light `#525E70`) for secondary text, and `PANEL_EDGE` `#848C9E`
 (light `#6B7689`) for their rims and the dock's pinned mark; `theme` tests prove both 4.5:1 text
 and 3:1 marks on a panel composited over white and black, for every scheme and accent. The GTK
 utilities keep `#7A8396` for `DIM` and `SHELL_EDGE` for their borders. Settings maps these
@@ -774,11 +781,9 @@ session.
     are never clipped. It replaces the square crop each tiled and floating window already gets
     (`Layout::clip`, *Client sizes*), with the same one rect per window. Clipping can disable
     direct scanout for tiled windows.
-  - **Frosted panels.** Blur behind navi-bar's panels via `ext-background-effect-v1`, advertised
-    only to navi-bar like layer-shell, with each panel's region capped at 16 rectangles, clamped
-    to the surface and rounded by `RADIUS`. Only the wallpaper is blurred, once per output and
-    wallpaper change on a worker with the lock backdrop's bounded box blur, so a frame costs one
-    textured quad. Off in high contrast and over fullscreen.
+  - **Frosted panels** shipped client-side (see *Shell*): navi pre-blurs the wallpaper and
+    navi-bar paints it, with no protocol, global or compositor shader. A live GPU blur of what
+    is behind a panel, windows included, remains a later option.
 - Screen readers: navi-bar draws its own pixels with no toolkit, so it has no accessibility
   tree, and the dock and launcher button are invisible to them. Exposing them means building
   one, e.g. an AT-SPI adapter such as `accesskit_unix` (a new crate tree and D-Bus surface).

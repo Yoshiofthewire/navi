@@ -182,6 +182,7 @@ pub struct Navi {
     bar_output: Option<String>,
     /// The running navi-bar's control stream, for app menu toggles.
     pub bar_control: Option<std::os::unix::net::UnixStream>,
+    pub frost: crate::frost::Frost,
     pub super_tap: crate::input::SuperTap,
     /// Layers whose last commit asked for `Exclusive` keyboard focus.
     pub(crate) exclusive: crate::focus::Exclusive<WlSurface, Window>,
@@ -320,6 +321,7 @@ impl Navi {
             hover_timer: None,
             bar_output: persist::load_bar(),
             bar_control: None,
+            frost: Default::default(),
             super_tap: Default::default(),
             exclusive: Default::default(),
             handback: None,
