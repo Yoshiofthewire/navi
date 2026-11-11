@@ -1319,19 +1319,23 @@ mod tests {
         data.state.layout.activate(id);
         data.state.apply_layout();
         assert!(data.state.space.element_location(&dialog_window).is_some());
-        // A closed dialog that held the keyboard gives it back to its parent. navi's own focus
-        // (and the hand-back) raises nothing.
+        use crate::state::Raise;
+        // navi's own focus raises nothing.
         let raises = data.state.raises;
         data.state.focus(Some(dialog_window.clone()));
         assert_eq!(data.state.focused_window(), Some(dialog_window.clone()));
+        assert_eq!(data.state.raises, raises, "navi's own focus doesn't raise");
+        // A closed dialog the user focused gives the keyboard back to its parent, with no raise.
+        data.state
+            .focus_by(Some(dialog_window.clone()), Raise::User);
+        let raises = data.state.raises;
         conn.destroy_window(dialog).unwrap();
         conn.flush().unwrap();
         pump(&mut event_loop, &mut data, |d| d.state.windows.len() == 1);
         assert_eq!(data.state.focused_window(), data.state.window_of(id));
-        assert_eq!(data.state.raises, raises, "navi's own focus doesn't raise");
+        assert_eq!(data.state.raises, raises, "the hand-back doesn't raise");
         // Round 6/7 wiring: a user focus marks the keyboard as the user's; navi's refocus of the
         // same window keeps it and doesn't count as a move; any other move clears it.
-        use crate::state::Raise;
         let parent = data.state.window_of(id);
         data.state.focus_by(parent.clone(), Raise::User);
         assert!(data.state.focus_by_user);
@@ -1480,6 +1484,73 @@ mod tests {
         conn.flush().unwrap();
         pump(&mut event_loop, &mut data, |d| d.state.windows.len() == 1);
         data.state.focus(data.state.window_of(id));
+
+        // Round 12: a closed window hands the keyboard back only to the user's last choice.
+        let parent = data.state.window_of(id);
+        let close = |data: &mut CalloopData, event_loop: &mut EventLoop<CalloopData>, w: u32| {
+            conn.destroy_window(w).unwrap();
+            conn.flush().unwrap();
+            pump(event_loop, data, |d| d.state.windows.len() == 1);
+        };
+        let open = |data: &mut CalloopData, event_loop: &mut EventLoop<CalloopData>| {
+            let w = make(None);
+            pump(event_loop, data, |d| d.state.windows.len() == 2);
+            let win = data.state.windows[1].window.clone();
+            pump(event_loop, data, |d| {
+                d.state.space.element_location(&win).is_some()
+            });
+            (w, win)
+        };
+        // Allowed: the user was on the parent, then on B; B closes.
+        data.state.focus_by(parent.clone(), Raise::User);
+        let (b, b_win) = open(&mut data, &mut event_loop);
+        data.state.focus_by(Some(b_win), Raise::User);
+        close(&mut data, &mut event_loop, b);
+        assert_eq!(
+            data.state.focused_window(),
+            parent,
+            "back to the user's last choice"
+        );
+        // Refused: the parent took the keyboard on its own before the user went to B.
+        data.state.focus_by(parent.clone(), Raise::New);
+        let (b, b_win) = open(&mut data, &mut event_loop);
+        data.state.focus_by(Some(b_win), Raise::User);
+        close(&mut data, &mut event_loop, b);
+        assert_eq!(
+            data.state.focused_window(),
+            None,
+            "not a focus the user gave"
+        );
+        // Refused: the keyboard moved on (to nobody) after leaving the parent.
+        data.state.focus_by(parent.clone(), Raise::User);
+        let (b, b_win) = open(&mut data, &mut event_loop);
+        data.state.focus_by(Some(b_win.clone()), Raise::User);
+        data.state.focus(None);
+        data.state.focus_by(Some(b_win), Raise::User);
+        close(&mut data, &mut event_loop, b);
+        assert_eq!(data.state.focused_window(), None, "a gap since the parent");
+        // Refused: the parent is minimized (hidden) when B closes.
+        data.state.focus_by(parent.clone(), Raise::User);
+        let (b, b_win) = open(&mut data, &mut event_loop);
+        data.state.focus_by(Some(b_win), Raise::User);
+        data.state.layout.minimize(id);
+        data.state.apply_layout();
+        close(&mut data, &mut event_loop, b);
+        assert_eq!(data.state.focused_window(), None, "the parent is hidden");
+        data.state.layout.activate(id);
+        data.state.apply_layout();
+        // Refused: across the lock (it clears what the user left).
+        data.state.focus_by(parent.clone(), Raise::User);
+        let (b, b_win) = open(&mut data, &mut event_loop);
+        data.state.focus_by(Some(b_win), Raise::User);
+        data.state.before_focus = None;
+        close(&mut data, &mut event_loop, b);
+        assert_eq!(
+            data.state.focused_window(),
+            None,
+            "nothing left to go back to"
+        );
+        data.state.focus(parent);
         let menu = conn.generate_id().unwrap();
         conn.create_window(
             smithay::reexports::x11rb::COPY_DEPTH_FROM_PARENT,

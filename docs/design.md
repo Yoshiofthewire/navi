@@ -256,10 +256,13 @@ aspect, gravity, position) are ignored.
   dialog is focused. An orphan never takes the keyboard on map. A dialog hides while its root is
   hidden or minimized, and loses the keyboard; it comes back with it. When a dialog's parent
   closes, it hangs from that parent's own parent if it had one, else it is an orphan centred in
-  its last bounds; a closed window that had the keyboard gives it back: a dialog to its parent,
-  any other window to the window that had it before, if that one is shown. Every hide (a dialog
-  with its parent, a re-parent to a hidden window, an X11 menu with its parent) takes the keyboard
-  off the hidden window before the next key.
+  its last bounds; a closed window that had the keyboard gives it back only to the user's last
+  choice: a dialog to its parent, any other window to the window that had the keyboard right
+  before it, and only if the user gave that focus, the keyboard hasn't moved since, and that
+  window is still visible (not hidden, minimized or wholly covered) on the same monitor, outside
+  the lock; otherwise to nobody. Every hide (a dialog with its parent, a re-parent to a hidden
+  window, an X11 menu with its parent) takes the keyboard off the hidden window before the next
+  key.
 - **Stacking order.** Windows stack by one rank: the last time they were raised, by the user (a
   click, the dock, Super+N, or an activation whose token came from the dock or from a window the
   user focused) or by opening and taking the keyboard. Any other activation (a token minted by a

@@ -71,7 +71,7 @@ use tracing::{info, warn};
 
 use crate::CalloopData;
 use crate::activation::{self, may_issue, may_redeem};
-use crate::focus::{Focus, Handoff};
+use crate::focus::{Focus, HandBack, Handoff, may_hand_back};
 use crate::layout::dialog::{self, Root};
 use crate::layout::{self, Decor, Drag, Fit, Layout, Rect, WinId, decoration};
 use crate::monitors::{BarHover, Hover};
@@ -178,8 +178,9 @@ pub struct Navi {
     /// Counts keyboard moves: a token is the user's only while the keyboard hasn't moved since
     /// it was made.
     pub(crate) focus_moves: u64,
-    /// The window that held the keyboard before the one holding it now.
-    pub(crate) before_focus: Option<Window>,
+    /// The window that held the keyboard before the one holding it now, whether the user gave
+    /// it that focus, and `focus_moves` once the keyboard left it.
+    pub(crate) before_focus: Option<(Window, bool, u64)>,
     /// The raise clock, in steps of 2 so an orphan's floor fits just below a raise.
     pub(crate) raises: u64,
     /// The window that held the keyboard when a click gave it to a layer.
@@ -1175,8 +1176,10 @@ impl Navi {
             }),
         }
         let moved = kb.current_focus() != target;
-        if moved && let Some(was) = self.focused_window() {
-            self.before_focus = Some(was);
+        if moved {
+            // A move from nobody clears it: a hand-back never skips past a gap.
+            let user = self.focus_by_user;
+            self.before_focus = self.focused_window().map(|w| (w, user, 0));
         }
         // `focus_changed` counts moves to a surface; this also counts the move to nobody.
         self.focus_moves += u64::from(moved);
@@ -1191,6 +1194,9 @@ impl Navi {
             });
             info!(?focus, "keyboard focus");
             kb.set_focus(self, target, SERIAL_COUNTER.next_serial());
+            if let Some(b) = self.before_focus.as_mut() {
+                b.2 = self.focus_moves;
+            }
         }
         self.space.elements().for_each(|w| {
             if let Some(t) = w.toplevel() {
@@ -1345,14 +1351,19 @@ impl Navi {
             }
             return;
         }
-        if m.tile.is_none() {
+        let dialog = m.tile.is_none();
+        if dialog {
             let root = self.root(i);
             if !dialog::may_focus_on_map(root, self.focus_root()) {
                 self.refuse(i);
                 return;
             }
         }
+        // A dialog takes the keyboard only from its own family, so it carries on whatever the
+        // user gave that family; a new window of its own has nothing from the user.
+        let user = dialog && self.focus_by_user;
         self.focus_by(Some(window), Raise::New);
+        self.focus_by_user = user;
     }
 
     /// Dialog `i` maps without the keyboard: it waits, marked, until the user focuses it.
@@ -1784,6 +1795,13 @@ impl Navi {
                 .map(|m| (m.user_rank, m.floor)),
         );
         let had_keys = self.focused_window().as_ref() == Some(&self.windows[i].window);
+        // What the hand-back needs, before the close moves anything.
+        let (user, moves, before) = (
+            self.focus_by_user,
+            self.focus_moves,
+            self.before_focus.take(),
+        );
+        let outputs = self.space.outputs_for_element(&self.windows[i].window);
         roots.remove(i);
         let gone = self.windows.remove(i);
         self.space.unmap_elem(&gone.window);
@@ -1808,22 +1826,48 @@ impl Navi {
         }
         self.recenter_dialogs();
         self.sync_attention();
-        // A closed window that had the keyboard gives it back: a dialog to its parent, else to
-        // the window that had it before, if either is shown.
-        let shown = |w: &Window| self.space.element_location(w).is_some();
-        let back = gone
-            .up
-            .clone()
-            .filter(|_| gone.tile.is_none())
-            .filter(shown);
-        let back = back.or_else(|| self.before_focus.clone().filter(shown));
-        if self.before_focus.as_ref() == Some(&gone.window) {
-            self.before_focus = None;
-        }
-        if had_keys && back.is_some() {
-            self.focus(back);
+        // A closed window that had the keyboard gives it back, only to a focus the user gave:
+        // a dialog to its parent, else to the window that had it just before (`may_hand_back`).
+        let check = |w: &Window, user_gave: bool, moved_since: bool| HandBack {
+            user_gave,
+            moved_since,
+            exposed: self.exposed(w),
+            // (Both on none only in the headless test.)
+            same_output: {
+                let on = self.space.outputs_for_element(w);
+                on.iter().any(|o| outputs.contains(o)) || on.is_empty() && outputs.is_empty()
+            },
+            locked: self.lock.active,
+        };
+        let parent = gone.up.clone().filter(|_| gone.tile.is_none());
+        let back = match (parent, before) {
+            (Some(up), _) => Some((up, user, false)),
+            (None, Some((w, user, at))) => Some((w, user, at != moves)),
+            (None, None) => None,
+        };
+        let back = back.filter(|(w, user, moved)| may_hand_back(check(w, *user, *moved)));
+        if had_keys && let Some((w, ..)) = back {
+            self.focus(Some(w));
         }
         gone
+    }
+
+    /// Whether a click could reach some of `w`: shown, and not wholly under other windows.
+    fn exposed(&self, w: &Window) -> bool {
+        let Some(g) = self.space.element_geometry(w) else {
+            return false;
+        };
+        let steps = 12;
+        (0..=steps).any(|i| {
+            (0..=steps).any(|j| {
+                let x = g.loc.x as f64
+                    + f64::from(g.size.w.max(1) - 1) * f64::from(i) / f64::from(steps);
+                let y = g.loc.y as f64
+                    + f64::from(g.size.h.max(1) - 1) * f64::from(j) / f64::from(steps);
+                self.window_under((x, y).into())
+                    .is_some_and(|(u, _)| u == w)
+            })
+        })
     }
 
     fn unconstrain_popup(&self, popup: &PopupSurface) {
