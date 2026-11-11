@@ -3572,7 +3572,7 @@ mod tests {
     fn cursor_ac2_top_corners_are_as_visible_as_bottom_ones() {
         use drag::tests::{c, with};
         let at = |l: &Layout, p| l.hit(p).map(Hit::cursor);
-        for row in [0, 12] {
+        for row in [0, 6] {
             let l = with(&[c(6, row, 12, 6)]);
             let (o, _) = l.frame(0).unwrap();
             let bottom = l.zone(Hit::Edge(0, Side::Bottom)).unwrap();
