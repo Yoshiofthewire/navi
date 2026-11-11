@@ -1032,7 +1032,7 @@ pub fn overlay(
     // A float's zones light in its own layer.
     let hover = hover.filter(|h| !l.tile(h.id()).is_some_and(|t| t.floating));
     light(l, hover, &mut out);
-    decorations(l, false, hover, focused, &mut out);
+    decorations(l, |t| !t.floating, hover, focused, &mut out);
     out
 }
 
@@ -1059,14 +1059,15 @@ fn light(l: &Layout, hover: Option<Hit>, out: &mut Vec<(Rect, [f32; 4])>) {
     }
 }
 
-/// What `overlay` draws for floats, which go above every tile and its decorations: a hovered or
-/// pressed float zone, then the floats' bars and frames.
+/// What `overlay` draws for floats, which go above every tile and its decorations, by float,
+/// front float first (`Layout::floats`): its hovered or pressed zone, then its bar and frame.
+/// Each float's go right above its own window, so a float in front covers them.
 pub fn float_overlay(
     l: &Layout,
     drag: Option<&Drag>,
     p: (i32, i32),
     focused: Option<WinId>,
-) -> Vec<(Rect, [f32; 4])> {
+) -> Vec<(WinId, Rect, [f32; 4])> {
     let mut out = Vec::new();
     let hover = match drag.map(|d| &d.0) {
         None => l.hit(p),
@@ -1075,20 +1076,24 @@ pub fn float_overlay(
         Some(_) => None,
     };
     let hover = hover.filter(|h| l.tile(h.id()).is_some_and(|t| t.floating));
-    light(l, hover, &mut out);
-    decorations(l, true, hover, focused, &mut out);
+    for id in l.floats() {
+        let mut one = Vec::new();
+        light(l, hover.filter(|h| h.id() == id), &mut one);
+        decorations(l, |t| t.id == id, hover, focused, &mut one);
+        out.extend(one.into_iter().map(|(r, k)| (id, r, k)));
+    }
     out
 }
 
 /// Appends the bars, minimized strips and frames of the tiles, or of the floats.
 fn decorations(
     l: &Layout,
-    floats: bool,
+    which: impl Fn(&Tile) -> bool,
     hover: Option<Hit>,
     focused: Option<WinId>,
     out: &mut Vec<(Rect, [f32; 4])>,
 ) {
-    let tiles = || l.tiles.iter().filter(|t| t.floating == floats);
+    let tiles = || l.tiles.iter().filter(|t| which(t));
     // Where a frame's top goes when it runs along the top of a bar, in front of it.
     let front = out.len();
     for t in tiles() {

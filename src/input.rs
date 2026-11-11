@@ -22,7 +22,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     control::{Command, DockKey},
-    layout::{Action, Done, Drag, Layout, Nudge, Rect, Side, WinId},
+    layout::{Action, Done, Drag, Hit, Layout, Nudge, Rect, Side, WinId},
     monitors,
     state::{Navi, identity, px},
 };
@@ -612,6 +612,12 @@ impl Navi {
             // its release reaches a client.
             if hit.is_some() && left {
                 self.drag = Drag::press(&self.layout, px(pos));
+                if let Some(h @ (Hit::Strip(id) | Hit::Edge(id, _) | Hit::Corner(id, ..))) = hit
+                    && self.layout.too_small(id)
+                {
+                    // A drag there may do nothing; say why.
+                    info!(id, hit = ?h, "float pressed: its minimum is bigger than the monitor, so that axis can't move or resize");
+                }
                 return;
             }
         }

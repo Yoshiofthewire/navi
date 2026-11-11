@@ -194,7 +194,12 @@ aspect, gravity, position) are ignored.
   tile. A 6 px band around its bar and window resizes it: each side is an edge, and the 32 px of a
   band nearest a corner is that corner. The band takes the pointer from whatever is under it, a
   tile or another float, and is drawn only while hovered or pressed, lit like a tile's edge. The
-  window itself is the app's. The front float's window hides the zones of a float behind it.
+  window itself is the app's.
+- **Float order.** Floats have one front-to-back order, used for drawing, navi's zones and the
+  apps' input alike. Focusing a float (a click, the dock, a dialog of it) brings it to the
+  front. A float in front covers the window, bar, buttons and zones of any float behind it, so
+  what you see is always what you click. On an axis a float's minimum doesn't fit, a press on its
+  bar or band logs that it can't move or resize that way.
 - **Float bounds.** A float stays inside its *bounds*, the area the panels leave, 8 px in, on each
   axis its bar and window fit: no move, resize, hints change or panel change puts it under a panel
   or off its monitor. On an axis its minimum doesn't fit, it keeps the spot above and can't be
@@ -209,6 +214,8 @@ aspect, gravity, position) are ignored.
   their own float (xdg `move`/`resize` and X11 `_NET_WM_MOVERESIZE` are ignored); every float has
   navi's bar for that. Its new rect is kept, clamped to new hints at once with its top-left in
   place, until it tiles or its monitor goes (it is centred again there). It is never remembered.
+  Unplugging a monitor ends a drag on it first, and a float is never left on a monitor that is
+  gone.
 - **Floats tile when room frees.** After every layout event (a window closes, a drag or key
   ends, a monitor or its panels change, hints change, a window is restored) each shown float,
   most recent first, tiles if free cells on its own monitor hold it: the span of its current size
@@ -216,6 +223,7 @@ aspect, gravity, position) are ignored.
   another window, never tabs, never picks another monitor, and waits while a drag is in progress,
   while it is minimized or fullscreen, and while its monitor has a maximized group. A float
   dropped on a monitor with room tiles there this way. Memory learns its spot, as for any tile.
+  This is deliberate (principle 5), even when an app in the background frees the room.
   Otherwise a float tiles again when its hints change and a step fits, or when it reopens, and
   doesn't change what navi remembers. Unplugging its monitor runs the placement order again from
   the main monitor.

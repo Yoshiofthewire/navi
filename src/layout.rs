@@ -7,7 +7,7 @@ mod drag;
 mod float;
 mod memory;
 pub use bar::{Button, Decor, decoration};
-pub use drag::{Action, Done, Drag, EdgeClicks, Nudge, Side, buttons, float_overlay, overlay};
+pub use drag::{Action, Done, Drag, EdgeClicks, Hit, Nudge, Side, buttons, float_overlay, overlay};
 use memory::MAX_PX;
 pub use memory::safe;
 
@@ -2568,6 +2568,86 @@ mod tests {
         }
     }
 
+    /// Round 1 (security probe): one float order. A rear float's bar and buttons under the
+    /// front window are drawn below it and take no clicks; focusing the rear float swaps both.
+    #[test]
+    fn floats_draw_hit_and_raise_in_one_order() {
+        let (mut l, [a, _], f) = blocked(vec![], fixed());
+        let (g, _) = l.place_with("upd2", (1720, 600), fixed(), true).unwrap();
+        for _ in 0..3 {
+            l.keyboard_adjust(f, Side::Left, Nudge::Move).unwrap();
+        }
+        for _ in 0..2 {
+            l.keyboard_adjust(f, Side::Bottom, Nudge::Move).unwrap();
+        }
+        assert_eq!(l.floats(), [g, f], "front first");
+        let front = l.clip(g).unwrap();
+        let rear_bar = l.bar(f).unwrap();
+        let close = rear_bar.buttons[2].1;
+        let x = (close.x + close.w / 2, close.y + close.h / 2);
+        assert!(front.contains(x), "the rear ✕ lies under the front window");
+        assert_eq!(l.hit(x), None, "the front window's client, not the rear ✕");
+        // Render draws each float's decorations right above its window, front float first.
+        let drawn: Vec<WinId> = float_overlay(&l, None, (0, 0), None)
+            .into_iter()
+            .map(|(id, ..)| id)
+            .collect();
+        let last_g = drawn.iter().rposition(|&id| id == g).unwrap();
+        assert!(drawn[..=last_g].iter().all(|&id| id == g), "{drawn:?}");
+        assert!(drawn[last_g + 1..].iter().all(|&id| id == f), "{drawn:?}");
+
+        // Focusing the rear float brings it in front for drawing and hits alike.
+        assert!(l.raise(f));
+        assert!(!l.raise(f), "already in front");
+        assert!(!l.raise(a), "tiles don't take part");
+        assert_eq!(l.floats(), [f, g]);
+        let strip = (
+            rear_bar.rect.x + rear_bar.rect.w - 300,
+            rear_bar.rect.y + 12,
+        );
+        assert!(front.contains(strip));
+        assert_eq!(l.hit(strip), Some(Hit::Strip(f)));
+        assert_eq!(l.hit(x), Some(Hit::Button(f, Button::Close)));
+        let g_bar = l.bar(g).unwrap().rect;
+        let under = (g_bar.x + 10, g_bar.y + 12);
+        if l.clip(f).unwrap().contains(under) {
+            assert_eq!(l.hit(under), None);
+        }
+        let drawn: Vec<WinId> = float_overlay(&l, None, (0, 0), None)
+            .into_iter()
+            .map(|(id, ..)| id)
+            .collect();
+        assert_eq!(drawn.first(), Some(&f));
+    }
+
+    /// Round 1 (security probe): unplugging the monitor under a float drag leaves the float on a
+    /// live monitor, whether the drag is cancelled or released.
+    #[test]
+    fn unplug_mid_drag_keeps_the_float_on_a_live_monitor() {
+        for cancel in [true, false] {
+            // The laptop is left, too narrow for it: it stays a float there.
+            let lp = out("laptop", -1125, 600, 1125, 703, 1);
+            let (mut l, _, f) = blocked(vec![lp], fixed());
+            let start = outer_of(&l, f);
+            let from = (start.x + 300, start.y + 12);
+            let mut d = Drag::press(&l, from).unwrap();
+            d.motion(&mut l, (from.0 + 40, from.1 + 40), 0);
+            l.remove_output("uwp");
+            assert!(l.tile(f).unwrap().floating);
+            if cancel {
+                d.cancel(&mut l);
+            } else {
+                // Over the laptop, where 1220 px doesn't fit.
+                d.motion(&mut l, (-600, 900), 0);
+                d.release(&mut l, (-600, 900), 0);
+            }
+            let t = l.tile(f).unwrap();
+            assert!(l.output(&t.output).is_some(), "cancel={cancel}: {t:?}");
+            assert!(l.rect(f).is_some(), "cancel={cancel}");
+            assert_floats_contained(&l);
+        }
+    }
+
     #[test]
     fn ac1_float_zones() {
         let (mut l, [a, _], f) = blocked(vec![], fixed());
@@ -2643,7 +2723,7 @@ mod tests {
         // A hovered band lights in the float layer, above the tiles, and not below them.
         let lit = crate::theme::rgba(crate::theme::ACCENT, 1.0);
         let zone = l.zone(Hit::Edge(f, Side::Top)).unwrap();
-        assert!(float_overlay(&l, None, p, None).contains(&(zone, lit)));
+        assert!(float_overlay(&l, None, p, None).contains(&(f, zone, lit)));
         assert!(
             !overlay(&l, None, p, 0, None)
                 .iter()
@@ -2653,7 +2733,7 @@ mod tests {
         let glow = float_overlay(&l, None, corner, None);
         for s in [Side::Left, Side::Top] {
             assert!(
-                glow.contains(&(l.zone(Hit::Edge(f, s)).unwrap(), lit)),
+                glow.contains(&(f, l.zone(Hit::Edge(f, s)).unwrap(), lit)),
                 "{s:?}"
             );
         }

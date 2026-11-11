@@ -173,6 +173,24 @@ fn corner(band: Rect, id: WinId, side: Side, p: (i32, i32)) -> Hit {
 }
 
 impl Layout {
+    /// Every float, the front one first: the one order floats are drawn, hit and given input in.
+    pub fn floats(&self) -> Vec<WinId> {
+        let mut floats: Vec<&Tile> = self.tiles.iter().filter(|t| t.floating).collect();
+        floats.sort_by_key(|t| std::cmp::Reverse(t.stamp));
+        floats.into_iter().map(|t| t.id).collect()
+    }
+
+    /// Brings float `id` to the front, as focusing it does. Returns whether it moved; a tile or
+    /// the front float doesn't.
+    pub fn raise(&mut self, id: WinId) -> bool {
+        let front = self.floats().first() == Some(&id);
+        let float = self.tile(id).is_some_and(|t| t.floating);
+        if float && !front {
+            self.touch(id);
+        }
+        float && !front
+    }
+
     /// Stores each user rect as it shows, so new hints or a smaller area apply at once.
     pub(super) fn pin_floats(&mut self) {
         let ids: Vec<WinId> = self
@@ -193,13 +211,9 @@ impl Layout {
     /// the rest of its bar, an edge or corner, or `None` inside its window. `None` if no float is
     /// there.
     pub(super) fn float_hit(&self, p: (i32, i32)) -> Option<Option<Hit>> {
-        let mut floats: Vec<&Tile> = self
-            .tiles
-            .iter()
-            .filter(|t| t.floating && self.visible(t.id) && !t.fullscreen)
-            .collect();
-        floats.sort_by_key(|t| std::cmp::Reverse(t.stamp));
-        floats.into_iter().find_map(|f| {
+        let floats = self.floats().into_iter().filter_map(|id| self.tile(id));
+        let mut shown = floats.filter(|t| self.visible(t.id) && !t.fullscreen);
+        shown.find_map(|f| {
             let (o, r) = self.frame(f.id)?;
             if r.contains(p) {
                 return Some(None);
@@ -250,6 +264,9 @@ impl Layout {
         let Some(was) = self.tile(id).filter(|t| t.floating).cloned() else {
             return false;
         };
+        if self.output(output).is_none() {
+            return false;
+        }
         let shown = self.frame(id).map(|f| f.1);
         let Some(t) = self.tile_mut(id) else {
             return false;
@@ -414,7 +431,11 @@ impl FloatDrag {
             i64::from(p.0) - i64::from(self.press.0),
             i64::from(p.1) - i64::from(self.press.1),
         );
-        let own = &self.before.output;
+        // Its own output, or where an unplug moved it meanwhile.
+        let own = match l.output(&self.before.output) {
+            Some(_) => &self.before.output,
+            None => &t.output,
+        };
         let (output, r) = match self.hit {
             Hit::Edge(_, side) | Hit::Corner(_, side, _) => {
                 let Some(o) = l.output(own) else {
@@ -443,9 +464,17 @@ impl FloatDrag {
         l.put_float(self.id(), &output, r)
     }
 
-    /// Puts the float back as it was at the press. Returns whether it changed.
+    /// Puts the float back as it was at the press, unless its output went meanwhile (it stays
+    /// where the unplug put it). Returns whether it changed.
     pub(super) fn cancel(self, l: &mut Layout) -> bool {
-        let Some(t) = l.tiles.iter_mut().find(|t| t.id == self.before.id) else {
+        if l.output(&self.before.output).is_none() {
+            return false;
+        }
+        let Some(t) = l
+            .tiles
+            .iter_mut()
+            .find(|t| t.id == self.before.id && t.floating)
+        else {
             return false;
         };
         let changed = (&t.output, t.user_rect) != (&self.before.output, self.before.user_rect);

@@ -168,6 +168,9 @@ impl Wallpaper {
     }
 }
 
+/// A frame of a float's, tagged with the float.
+type Owned<R> = (Option<layout::WinId>, Frame<R>);
+
 /// How the pointer is drawn on this output.
 pub enum Arrow<'a> {
     /// The host draws it (nested, no theme).
@@ -276,40 +279,57 @@ where
     );
     // Float decorations follow the tiles', so one buffer list keeps every id stable.
     let tile_decorations = decorations.len();
-    decorations.extend(
-        layout::float_overlay(
-            &state.layout,
-            state.drag.as_ref(),
-            pointer,
-            state.focused_tile(),
-        )
-        .into_iter()
-        .filter(|(r, _)| overlaps(*r, full))
-        .map(|(r, color)| (rect(r), color)),
+    let float_overlay = layout::float_overlay(
+        &state.layout,
+        state.drag.as_ref(),
+        pointer,
+        state.focused_tile(),
     );
+    let float_overlay = float_overlay
+        .into_iter()
+        .filter(|(_, r, _)| overlaps(*r, full));
+    let (owners, float_decorations): (Vec<layout::WinId>, Vec<_>) = float_overlay
+        .map(|(id, r, color)| (id, (rect(r), color)))
+        .unzip();
+    decorations.extend(float_decorations);
     let buttons = layout::buttons(&state.layout, state.drag.as_ref(), pointer)
         .into_iter()
         .filter(|&(.., r, _)| overlaps(r, full))
         .map(|(id, b, r, lit)| (id, b, lit, rect(r)))
         .collect();
     let floating = |id| state.layout.tile(id).is_some_and(|t| t.floating);
-    let (mut float_glyphs, mut glyphs): (Vec<_>, Vec<_>) = solids
+    let (float_glyphs, mut glyphs): (Vec<_>, Vec<_>) = solids
         .glyphs(renderer, buttons)
         .into_iter()
         .partition(|(id, _)| floating(*id));
     // `Solids::elements` keeps order, and the square pointer is the first decoration.
     let mut tiles = solids.elements(decorations);
-    let mut floats = tiles.split_off(tile_decorations);
+    let float_decorations = owners.into_iter().zip(tiles.split_off(tile_decorations));
     let mut pointer: Vec<_> = tiles.drain(..above_panels).collect();
     let (mut panels, mut lower) = surfaces(renderer, state, output, scale);
-    let (mut float_windows, mut windows) = windows(renderer, state, geo, scale, rect);
+    let (float_windows, mut windows) = windows(renderer, state, geo, scale, rect);
+    // Each float's buttons, bar and frame right above its own window and dialogs, front float
+    // first, so a float in front covers all of a float behind it.
+    let mut float_frames: Vec<Owned<R>> = float_glyphs
+        .into_iter()
+        .map(|(id, e)| (Some(id), Frame::from(e)))
+        .chain(float_decorations.map(|(id, e)| (Some(id), Frame::from(e))))
+        .chain(float_windows)
+        .collect();
+    let mut floats = Vec::new();
+    for id in state.layout.floats().into_iter().map(Some).chain([None]) {
+        let (mine, rest) = std::mem::take(&mut float_frames)
+            .into_iter()
+            .partition(|(o, _)| *o == id);
+        float_frames = rest;
+        floats.extend(mine.into_iter().map(|(_, f): (_, Frame<R>)| f));
+    }
+    floats.extend(float_frames.into_iter().map(|(_, f)| f));
     for part in STACK {
         match part {
             Part::Pointer => out.extend(pointer.drain(..).map(Frame::from)),
             Part::Panels => out.extend(panels.drain(..).map(Frame::from)),
-            Part::FloatGlyphs => out.extend(float_glyphs.drain(..).map(|(_, e)| Frame::from(e))),
-            Part::FloatDecorations => out.extend(floats.drain(..).map(Frame::from)),
-            Part::Floats => out.append(&mut float_windows),
+            Part::Floats => out.append(&mut floats),
             Part::Glyphs => out.extend(glyphs.drain(..).map(|(_, e)| Frame::from(e))),
             Part::Decorations => out.extend(tiles.drain(..).map(Frame::from)),
             Part::Windows => {
@@ -338,11 +358,8 @@ enum Part {
     Pointer,
     /// The Overlay and Top layers: navi-bar's panels.
     Panels,
-    /// The window buttons on floats' bars.
-    FloatGlyphs,
-    /// Floats' bars and frames.
-    FloatDecorations,
-    /// Floating windows, their dialogs and popups.
+    /// Floats, front first, each with its buttons, bar and frame above its window, dialogs and
+    /// popups.
     Floats,
     /// The window buttons on navi's bars.
     Glyphs,
@@ -353,11 +370,9 @@ enum Part {
 }
 
 /// Top first, above the wallpaper.
-const STACK: [Part; 8] = [
+const STACK: [Part; 6] = [
     Part::Pointer,
     Part::Panels,
-    Part::FloatGlyphs,
-    Part::FloatDecorations,
     Part::Floats,
     Part::Glyphs,
     Part::Decorations,
@@ -401,16 +416,16 @@ pub fn send_frames(state: &mut Navi, output: &Output) {
     layers.cleanup();
 }
 
-/// The floating and the tiled windows over `geo`, each top first. A window's own surfaces are
-/// cropped to its clip rect, its popups to their configured geometry on their output. `rect`
-/// maps a global logical rect to `geo`'s physical px.
+/// The floating windows, by the float they belong to, and the tiled ones over `geo`, each top
+/// first. A window's own surfaces are cropped to its clip rect, its popups to their configured
+/// geometry on their output. `rect` maps a global logical rect to `geo`'s physical px.
 fn windows<R>(
     renderer: &mut R,
     state: &Navi,
     geo: Rectangle<i32, smithay::utils::Logical>,
     scale: f64,
     rect: impl Fn(layout::Rect) -> Physical,
-) -> (Vec<Frame<R>>, Vec<Frame<R>>)
+) -> (Vec<Owned<R>>, Vec<Frame<R>>)
 where
     R: Renderer + ImportAll + ImportMem,
     R::TextureId: Texture + Clone + Send + 'static,
@@ -427,7 +442,7 @@ where
         }
         let loc = (loc - w.geometry().loc - geo.loc).to_physical_precise_round(scale);
         let (float, clip) = state.stacking(w);
-        let out = if float { &mut floats } else { &mut tiles };
+        let mut out = Vec::new();
         for (surface, at, popup) in state.popups(w) {
             let at = (at - geo.loc).to_physical_precise_round(scale);
             let k = Kind::Unspecified;
@@ -446,6 +461,13 @@ where
                     .map(Frame::from),
             ),
             None => out.extend(own.into_iter().map(Frame::from)),
+        }
+        match float {
+            true => {
+                let owner = state.float_owner(w);
+                floats.extend(out.into_iter().map(|f| (owner, f)));
+            }
+            false => tiles.extend(out),
         }
     }
     (floats, tiles)
@@ -558,16 +580,11 @@ mod tests {
         let at = |p| STACK.iter().position(|&q| q == p).unwrap();
         assert_eq!(at(Part::Pointer), 0);
         assert!(at(Part::Panels) < at(Part::Glyphs));
-        assert!(
-            at(Part::Panels) < at(Part::FloatGlyphs),
-            "floats below navi"
-        );
+        assert!(at(Part::Panels) < at(Part::Floats), "floats below navi");
         assert!(
             at(Part::Glyphs) < at(Part::Decorations),
             "buttons on their bar"
         );
-        assert!(at(Part::FloatGlyphs) < at(Part::FloatDecorations));
-        assert!(at(Part::FloatDecorations) < at(Part::Floats));
         assert!(
             at(Part::Floats) < at(Part::Glyphs),
             "floats above every tile's decorations"

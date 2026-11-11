@@ -308,15 +308,16 @@ impl Navi {
             let (s, p) = inside.then(|| w.surface_under(pos - loc.to_f64(), own))??;
             Some((s, (p + loc).to_f64()))
         };
-        let pass = |floats: bool| {
+        let floats = self.float_windows().into_iter().find_map(|w| {
+            let clip = self.stacking(w).1;
+            Some((w, under(w, clip)?))
+        });
+        floats.or_else(|| {
             self.space.elements().rev().find_map(|w| {
                 let (float, clip) = self.stacking(w);
-                (float == floats)
-                    .then(|| Some((w, under(w, clip)?)))
-                    .flatten()
+                (!float).then(|| Some((w, under(w, clip)?))).flatten()
             })
-        };
-        pass(true).or_else(|| pass(false))
+        })
     }
 
     /// `w`'s popups, top first: each surface, where its tree is drawn (global) and the rect it's
@@ -359,6 +360,34 @@ impl Navi {
         let o = self.space.output_under(g.loc.to_f64()).next()?;
         let g = self.space.output_geometry(o)?;
         Some(Rect::new(g.loc.x, g.loc.y, g.size.w, g.size.h))
+    }
+
+    /// The float `w` is, or whose dialog it is.
+    pub fn float_owner(&self, w: &Window) -> Option<WinId> {
+        let m = self.windows.iter().find(|m| &m.window == w)?;
+        self.owner(m)
+            .filter(|&id| self.layout.tile(id).is_some_and(|t| t.floating))
+    }
+
+    /// The windows that stack with the floats, top first: by their float's place in
+    /// `Layout::floats`, and within one float (its dialogs) by the space's order.
+    pub fn float_windows(&self) -> Vec<&Window> {
+        let order = self.layout.floats();
+        let rank = |w: &Window| {
+            let id = self.float_owner(w);
+            order
+                .iter()
+                .position(|&f| Some(f) == id)
+                .unwrap_or(order.len())
+        };
+        let mut floats: Vec<&Window> = self
+            .space
+            .elements()
+            .rev()
+            .filter(|w| self.stacking(w).0)
+            .collect();
+        floats.sort_by_key(|w| rank(w));
+        floats
     }
 
     /// Whether `w` stacks with the floats (a float or a float's dialog), and the rect its own
@@ -573,6 +602,8 @@ impl Navi {
                 map.unmap_layer(&l);
             }
         }
+        // A drag on this output would put its float back here once the output is gone.
+        self.cancel_drag();
         self.space.unmap_output(output);
         self.lock_outputs_changed();
         self.grid.retain(|o| o.name != name);
@@ -1043,7 +1074,13 @@ impl Navi {
             warn!("X11 raise: {e}");
         }
         match &window {
-            Some(w) => self.space.raise_element(w, true),
+            Some(w) => {
+                self.space.raise_element(w, true);
+                // A float (or a float's dialog) comes to the front of the floats' one order.
+                if let Some(id) = self.float_owner(w) {
+                    self.layout.raise(id);
+                }
+            }
             None => self.space.elements().for_each(|w| {
                 w.set_activated(false);
             }),
