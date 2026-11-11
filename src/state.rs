@@ -198,6 +198,8 @@ pub struct Navi {
     pub(crate) layers_shown: Vec<(WlSurface, std::time::Instant)>,
     /// When an X11 menu past `layout::CLIENT_POPUPS` was last logged (`log_due`).
     pub(crate) menus_capped: Option<std::time::Instant>,
+    /// When a toplevel past `layout::CLIENT_TOPLEVELS` was last logged and carded (`log_due`).
+    pub(crate) toplevels_capped: Option<std::time::Instant>,
     /// Counts left-button presses, delivered or not: a press token dies with the next one.
     pub(crate) presses: u64,
     /// The window that held the keyboard before the one holding it now, whether the user gave
@@ -324,6 +326,7 @@ impl Navi {
             last_press: None,
             layers_shown: Vec::new(),
             menus_capped: None,
+            toplevels_capped: None,
             presses: 0,
             before_focus: None,
             before_layer: Default::default(),
@@ -2014,7 +2017,7 @@ pub fn window_surface(w: &Window) -> Option<WlSurface> {
 }
 /// Keep X11 text valid and small enough for Wayland's 4096-byte event buffer, including
 /// the string length, terminator, padding, and event header.
-fn x11_text(text: String) -> String {
+pub(crate) fn x11_text(text: String) -> String {
     let mut text = text.replace('\0', "\u{fffd}");
     text.truncate(text.floor_char_boundary(2048));
     text
@@ -2163,6 +2166,27 @@ fn want(m: &Managed) -> (i32, i32) {
         None => m.window.geometry().size,
     };
     (g.w, g.h)
+}
+
+impl Navi {
+    /// A toplevel was closed past `layout::CLIENT_TOPLEVELS`: logs it and has navi-bar show its
+    /// card, at most once a second. `x_client` is an X11 client's resource-ID base.
+    pub(crate) fn toplevel_refused(
+        &mut self,
+        app: &str,
+        x_client: Option<u32>,
+        now: std::time::Instant,
+    ) {
+        if !log_due(&mut self.toplevels_capped, now) {
+            return;
+        }
+        let x_client = x_client.map(|c| format!("{c:#x}"));
+        let cap = layout::CLIENT_TOPLEVELS;
+        info!(app, cap, x_client, "toplevel refused: too many open");
+        if let Some(c) = &self.bar_control {
+            crate::shell::send_command(c, crate::control::Command::WindowLimit);
+        }
+    }
 }
 
 /// Whether a log paced like refits, one a second, may fire `now`; notes the time if so.
@@ -2410,6 +2434,20 @@ impl XdgShellHandler for Navi {
     }
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
+        // Not managed, so never configured: every handler that later sees it finds no window.
+        let client = surface.wl_surface().client();
+        let mut mine = self.windows.iter().filter(|m| {
+            m.window
+                .toplevel()
+                .is_some_and(|t| t.wl_surface().client() == client)
+        });
+        // Its own app ID isn't set yet; its siblings' is.
+        let app = mine.clone().next().map(|m| window_app(&m.window));
+        if layout::toplevels_full(&mut mine) {
+            surface.send_close();
+            self.toplevel_refused(&app.unwrap_or_default(), None, std::time::Instant::now());
+            return;
+        }
         self.windows.push(Managed {
             window: Window::new_wayland_window(surface),
             tile: None,
@@ -3009,6 +3047,267 @@ mod tests {
         assert_eq!(popups.len() - c.done, layout::CLIENT_POPUPS);
     }
 
+    /// Real clients on an in-process navi: client A's 257th toplevel is closed and never
+    /// configured, whatever it asks for; a dialog counts; a closed window frees a slot; client B
+    /// is unaffected.
+    #[test]
+    fn toplevels_past_the_client_cap_are_closed_never_configured() {
+        use smithay::reexports::calloop::EventLoop;
+        use smithay_client_toolkit::reexports::client::{
+            Connection, Dispatch, EventQueue, QueueHandle, delegate_noop,
+            protocol::{wl_callback, wl_compositor, wl_registry, wl_surface},
+        };
+        use smithay_client_toolkit::reexports::protocols::xdg::{
+            decoration::zv1::client::{zxdg_decoration_manager_v1, zxdg_toplevel_decoration_v1},
+            shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base},
+        };
+        use zxdg_toplevel_decoration_v1::Mode;
+
+        #[derive(Default)]
+        struct Client {
+            compositor: Option<wl_compositor::WlCompositor>,
+            wm: Option<xdg_wm_base::XdgWmBase>,
+            deco: Option<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1>,
+            /// Configures and closes per toplevel, by its index.
+            configures: Vec<usize>,
+            closes: Vec<usize>,
+            synced: bool,
+        }
+        impl Dispatch<wl_registry::WlRegistry, ()> for Client {
+            fn event(
+                c: &mut Self,
+                r: &wl_registry::WlRegistry,
+                e: wl_registry::Event,
+                _: &(),
+                _: &Connection,
+                qh: &QueueHandle<Self>,
+            ) {
+                if let wl_registry::Event::Global {
+                    name, interface, ..
+                } = e
+                {
+                    match interface.as_str() {
+                        "wl_compositor" => c.compositor = Some(r.bind(name, 4, qh, ())),
+                        "xdg_wm_base" => c.wm = Some(r.bind(name, 3, qh, ())),
+                        "zxdg_decoration_manager_v1" => c.deco = Some(r.bind(name, 1, qh, ())),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        impl Dispatch<xdg_surface::XdgSurface, usize> for Client {
+            fn event(
+                c: &mut Self,
+                s: &xdg_surface::XdgSurface,
+                e: xdg_surface::Event,
+                &i: &usize,
+                _: &Connection,
+                _: &QueueHandle<Self>,
+            ) {
+                if let xdg_surface::Event::Configure { serial } = e {
+                    s.ack_configure(serial);
+                    c.configures[i] += 1;
+                }
+            }
+        }
+        impl Dispatch<xdg_toplevel::XdgToplevel, usize> for Client {
+            fn event(
+                c: &mut Self,
+                _: &xdg_toplevel::XdgToplevel,
+                e: xdg_toplevel::Event,
+                &i: &usize,
+                _: &Connection,
+                _: &QueueHandle<Self>,
+            ) {
+                if let xdg_toplevel::Event::Close = e {
+                    c.closes[i] += 1;
+                }
+            }
+        }
+        impl Dispatch<wl_callback::WlCallback, ()> for Client {
+            fn event(
+                c: &mut Self,
+                _: &wl_callback::WlCallback,
+                _: wl_callback::Event,
+                _: &(),
+                _: &Connection,
+                _: &QueueHandle<Self>,
+            ) {
+                c.synced = true;
+            }
+        }
+        delegate_noop!(Client: ignore wl_compositor::WlCompositor);
+        delegate_noop!(Client: ignore wl_surface::WlSurface);
+        delegate_noop!(Client: ignore xdg_wm_base::XdgWmBase);
+        delegate_noop!(Client: ignore zxdg_decoration_manager_v1::ZxdgDecorationManagerV1);
+        delegate_noop!(Client: ignore zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1);
+
+        struct Conn {
+            conn: Connection,
+            queue: EventQueue<Client>,
+            c: Client,
+            /// Each toplevel and its xdg and wl surface, by index.
+            tops: Vec<(
+                xdg_toplevel::XdgToplevel,
+                xdg_surface::XdgSurface,
+                wl_surface::WlSurface,
+            )>,
+        }
+        impl Conn {
+            /// Until the server has answered everything sent so far.
+            fn sync(&mut self, event_loop: &mut EventLoop<CalloopData>, data: &mut CalloopData) {
+                let (queue, c) = (&mut self.queue, &mut self.c);
+                c.synced = false;
+                self.conn.display().sync(&queue.handle(), ());
+                queue.flush().unwrap();
+                crate::xwayland::tests::pump(event_loop, data, |_| {
+                    if let Some(read) = queue.prepare_read() {
+                        let _ = read.read();
+                    }
+                    queue.dispatch_pending(c).unwrap();
+                    c.synced
+                });
+            }
+            /// A new toplevel with app ID `app`, under `parent` if any, committed once.
+            fn open(&mut self, app: &str, parent: Option<usize>) -> usize {
+                let (qh, i) = (self.queue.handle(), self.tops.len());
+                let (comp, wm) = (self.c.compositor.as_ref(), self.c.wm.as_ref());
+                let surface = comp.unwrap().create_surface(&qh, ());
+                let xdg = wm.unwrap().get_xdg_surface(&surface, &qh, i);
+                let top = xdg.get_toplevel(&qh, i);
+                top.set_app_id(app.into());
+                top.set_parent(parent.map(|p| &self.tops[p].0));
+                surface.commit();
+                self.c.configures.push(0);
+                self.c.closes.push(0);
+                self.tops.push((top, xdg, surface));
+                i
+            }
+        }
+        let (mut event_loop, mut data) = crate::xwayland::tests::harness();
+        let connect = |data: &mut CalloopData, event_loop: &mut EventLoop<CalloopData>| {
+            let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
+            data.state
+                .display_handle
+                .insert_client(server, std::sync::Arc::new(ClientState::default()))
+                .unwrap();
+            let conn = Connection::from_socket(client).unwrap();
+            let queue = conn.new_event_queue::<Client>();
+            conn.display().get_registry(&queue.handle(), ());
+            let mut c = Conn {
+                conn,
+                queue,
+                c: Client::default(),
+                tops: Vec::new(),
+            };
+            c.sync(event_loop, data);
+            c
+        };
+        let (bar, navi) = std::os::unix::net::UnixStream::pair().unwrap();
+        bar.set_nonblocking(true).unwrap();
+        data.state.bar_control = Some(navi);
+        let cards = || {
+            let mut buf = [0; 64];
+            let n = std::io::Read::read(&mut &bar, &mut buf).unwrap_or(0);
+            buf[..n].to_vec()
+        };
+        let mut a = connect(&mut data, &mut event_loop);
+
+        // AC2: 256 admitted and configured, the 257th closed.
+        let cap = layout::CLIENT_TOPLEVELS;
+        for _ in 0..=cap {
+            a.open("flood", None);
+        }
+        a.sync(&mut event_loop, &mut data);
+        let r = cap;
+        assert!(a.c.configures[..cap].iter().all(|&n| n >= 1));
+        assert_eq!((a.c.configures[r], a.c.closes[r]), (0, 1));
+        assert!(a.c.closes[..cap].iter().all(|&n| n == 0));
+        assert_eq!(data.state.windows.len(), cap);
+        assert_eq!(data.state.layout.tiles().len(), cap);
+        assert!(data.state.windows.iter().all(|m| m.tile.is_some()));
+        assert_eq!(cards(), [crate::control::WINDOW_LIMIT], "one card");
+        let refused = data
+            .state
+            .xdg_shell_state
+            .toplevel_surfaces()
+            .iter()
+            .map(|t| t.wl_surface().clone())
+            .find(|s| {
+                let ws = data.state.windows.iter();
+                !ws.into_iter()
+                    .any(|m| window_surface(&m.window).as_ref() == Some(s))
+            })
+            .expect("its toplevel is Smithay's, not navi's");
+
+        // AC3: whatever it asks, it stays unknown.
+        let windows = |d: &CalloopData| -> Vec<_> {
+            let ws = d.state.windows.iter();
+            ws.map(|m| (m.window.clone(), m.tile)).collect()
+        };
+        let tiles = |d: &CalloopData| -> Vec<_> {
+            let ts = d.state.layout.tiles().iter();
+            ts.map(|t| (t.id, t.cells, t.floating)).collect()
+        };
+        data.state.refresh_toplevels();
+        let before = (windows(&data), tiles(&data), data.state.toplevels.ids());
+        let qh = a.queue.handle();
+        let (top, _, surface) = &a.tops[r];
+        top.set_parent(Some(&a.tops[0].0));
+        top.set_fullscreen(None);
+        top.set_maximized();
+        top.unset_maximized();
+        top.set_minimized();
+        let deco =
+            a.c.deco
+                .as_ref()
+                .unwrap()
+                .get_toplevel_decoration(top, &qh, ());
+        deco.set_mode(Mode::ServerSide);
+        deco.unset_mode();
+        surface.commit();
+        a.sync(&mut event_loop, &mut data);
+        data.state.refresh_toplevels();
+        assert_eq!(a.c.configures[r], 0, "never configured");
+        let after = (windows(&data), tiles(&data), data.state.toplevels.ids());
+        assert!(before == after, "windows, layout and window list unchanged");
+        for x in (0..1280).step_by(16) {
+            for y in (0..720).step_by(16) {
+                let under = data.state.window_under((x as f64, y as f64).into());
+                assert!(under.is_none_or(|(w, _)| window_surface(w).as_ref() != Some(&refused)));
+            }
+        }
+
+        // AC4: B isn't affected by A's cap.
+        let mut b = connect(&mut data, &mut event_loop);
+        let bi = b.open("other", None);
+        b.sync(&mut event_loop, &mut data);
+        assert!(b.c.configures[bi] >= 1 && b.c.closes[bi] == 0);
+        assert_eq!(data.state.windows.len(), cap + 1);
+        let other = data
+            .state
+            .windows
+            .iter()
+            .find(|m| window_app(&m.window) == "other");
+        assert!(other.unwrap().tile.is_some(), "placed");
+
+        // AC4: a closed window frees a slot; a dialog takes it and counts.
+        let (top, xdg, surface) = a.tops[1].clone();
+        top.destroy();
+        xdg.destroy();
+        surface.destroy();
+        a.sync(&mut event_loop, &mut data);
+        assert_eq!(data.state.windows.len(), cap);
+        let dialog = a.open("flood", Some(0));
+        a.sync(&mut event_loop, &mut data);
+        assert!(a.c.configures[dialog] >= 1 && a.c.closes[dialog] == 0);
+        assert_eq!(data.state.windows.len(), cap + 1);
+        let next = a.open("flood", None);
+        a.sync(&mut event_loop, &mut data);
+        assert_eq!((a.c.configures[next], a.c.closes[next]), (0, 1));
+        assert_eq!(data.state.windows.len(), cap + 1);
+    }
+
     #[test]
     fn only_navi_bar_may_open_a_parentless_popup() {
         assert!(admits_popup(true, false, false, false));
@@ -3211,6 +3510,22 @@ mod tests {
         let other = layout::Hints::new((400, 200), (0, 0));
         assert!(refit_due(&t, other, Some(true)), "only the hints differ");
         assert!(refit_due(&t, other, None), "Wayland: only the hints differ");
+    }
+
+    #[test]
+    fn a_refusal_flood_cards_navi_bar_at_most_once_a_second() {
+        let (_event_loop, mut data) = crate::xwayland::tests::harness();
+        let (bar, navi) = std::os::unix::net::UnixStream::pair().unwrap();
+        bar.set_nonblocking(true).unwrap();
+        data.state.bar_control = Some(navi);
+        let (t, ms) = (std::time::Instant::now(), std::time::Duration::from_millis);
+        for n in (0..2500).step_by(10) {
+            data.state.toplevel_refused("flood", None, t + ms(n));
+        }
+        let mut sent = [0; 16];
+        let n = std::io::Read::read(&mut &bar, &mut sent).unwrap();
+        // At 0, 1000 and 2000 ms.
+        assert_eq!(sent[..n], [crate::control::WINDOW_LIMIT; 3]);
     }
 
     #[test]

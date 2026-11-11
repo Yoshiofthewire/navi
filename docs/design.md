@@ -91,6 +91,14 @@ the app's limits.
 When a window closes, its cells stay empty. Other windows don't jump to fill them. You use the
 space when you want it.
 
+**The window cap.** An app keeps at most 256 toplevels open, dialogs and not-yet-shown windows
+included. Under Xwayland the cap is per X client, by the resource-ID base the X server assigned
+(window ID & ~`0x1FFFFF`), never by `_NET_WM_PID`, `WM_CLASS` or app ID: one X11 app can't use up
+another's. navi closes a window past the cap before it is placed or shown (`xdg_toplevel.close`;
+X11: left unmapped, then `WM_DELETE_WINDOW`, or destroyed without it). The app's other windows
+stay usable, and closing one lets the next in. navi-bar shows a *Window limit reached* card
+(see *Notifications*). X11 menus keep their own shared cap, below.
+
 ### Dragging
 
 - **Move:** hover near a tile's top edge and a thin strip lights up. Left-drag it. The grid
@@ -303,7 +311,8 @@ aspect, gravity, position) are ignored.
   its rect, once per dialog per bounds), `dialog: focus refused` (app and root) when a new dialog
   maps without the keyboard, and `dialog: re-resolved` (old and new root) when a parent closes.
   `X11 menu not shown: too many open` (the cap) at most once a second while X11 menus are
-  refused at the cap.
+  refused at the cap. `toplevel refused: too many open` (app, cap; X11 also the client base) at
+  most once a second while windows are refused at the window cap.
 
 ### Tabs
 
@@ -497,7 +506,11 @@ bundling a degoogled, resource-tested Chromium variant is reserved for a future 
   History/actions require an unlocked compositor settings check. Fullscreen and locking hide
   notification surfaces. Optional UnifiedPush is a separate, owned external distributor,
   disabled by default; payloads reach their participating apps, which decide whether to notify.
-  See [Settings](settings.md) and [UnifiedPush](unifiedpush.md).
+  See [Settings](settings.md) and [UnifiedPush](unifiedpush.md). navi-bar's own *Window limit
+  reached* card (sender `navi`, no actions, the default lifetime) says navi closed a window past
+  the window cap. navi asks for it at most once a second, over the private control channel and
+  with no app text. A repeat replaces the shown card silently, so a flood shows one card. No bus
+  sender can close or replace it.
 - **Laptop alone:** the same layout with a slimmer taskbar.
 - **No virtual desktops.**
 - **Look:** cyberpunk, with no animations: every state change is instant. (The half-second hold

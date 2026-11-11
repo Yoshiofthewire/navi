@@ -43,6 +43,12 @@ pub struct Toplevels {
 }
 
 impl Toplevels {
+    /// The windows the list shows, in open order.
+    #[cfg(test)]
+    pub fn ids(&self) -> Vec<WinId> {
+        self.windows.iter().map(|(id, _)| *id).collect()
+    }
+
     /// Brings every manager up to date with `now`, the tiled windows in open order: announces
     /// new ones, sends what changed and `done`, and `closed` for the ones gone.
     pub fn refresh(&mut self, dh: &DisplayHandle, now: Vec<(WinId, Info)>) {

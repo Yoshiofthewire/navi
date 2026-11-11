@@ -2,8 +2,11 @@
 
 use crate::{
     CalloopData,
-    layout::{CLIENT_POPUPS, Hints, Layout, Rect, Step, WinId, intersect, menu_owner, popups_full},
-    state::{Managed, Navi, log_due, window_app},
+    layout::{
+        CLIENT_POPUPS, Hints, Layout, Rect, Step, WinId, intersect, menu_owner, popups_full,
+        toplevels_full,
+    },
+    state::{Managed, Navi, log_due, window_app, x11_text},
 };
 use smithay::wayland::selection::{
     SelectionTarget,
@@ -86,7 +89,40 @@ fn min_max(h: Option<WmSizeHints>) -> ((i32, i32), (i32, i32)) {
     )
 }
 
+/// The X server's default resource-ID mask; navi starts Xwayland without `-maxclients`.
+pub(crate) const XWAYLAND_RESOURCE_ID_MASK: u32 = 0x001F_FFFF;
+
+/// The X client that created window `id`: its resource-ID base. The server rejects IDs outside a
+/// client's own range, so no client can name another's.
+fn x_client(id: u32) -> u32 {
+    id & !XWAYLAND_RESOURCE_ID_MASK
+}
+
 impl Navi {
+    /// Whether `x`'s X client already has `CLIENT_TOPLEVELS` managed windows, dialogs included and
+    /// menus aside. If so, `x` is left unmapped and asked to close.
+    fn x11_refused(&mut self, x: &X11Surface) -> bool {
+        let client = x_client(x.window_id());
+        let mut mine = self
+            .windows
+            .iter()
+            .filter(|m| !m.is_menu())
+            .filter_map(|m| m.window.x11_surface())
+            .filter(|o| x_client(o.window_id()) == client);
+        if !toplevels_full(&mut mine) {
+            return false;
+        }
+        if x.is_mapped() {
+            let _ = x.set_mapped(false);
+        }
+        if let Err(e) = x.close() {
+            warn!("X11 close: {e}");
+        }
+        let app = x11_text(x.class());
+        self.toplevel_refused(&app, Some(client), std::time::Instant::now());
+        true
+    }
+
     pub fn map_x11(&mut self, x: X11Surface) {
         if x.wl_surface().is_none()
             || self
@@ -118,6 +154,10 @@ impl Navi {
             if log_due(&mut self.menus_capped, std::time::Instant::now()) {
                 info!(cap = CLIENT_POPUPS, "X11 menu not shown: too many open");
             }
+            return;
+        }
+        // Map requests come before their surfaces, so a burst passes `map_window_request`.
+        if !x.is_override_redirect() && self.x11_refused(&x) {
             return;
         }
         let floating = x.is_override_redirect() || x11_parent.is_some();
@@ -267,6 +307,9 @@ impl XwmHandler for Navi {
     fn new_window(&mut self, _: XwmId, _: X11Surface) {}
     fn new_override_redirect_window(&mut self, _: XwmId, _: X11Surface) {}
     fn map_window_request(&mut self, _: XwmId, x: X11Surface) {
+        if self.x11_refused(&x) {
+            return;
+        }
         if let Err(e) = x.set_mapped(true) {
             warn!("X11 map: {e}");
             return;
@@ -2789,5 +2832,142 @@ pub(crate) mod tests {
         }
         destroy(&mut event_loop, &mut data, dialog);
         destroy(&mut event_loop, &mut data, plain);
+    }
+
+    /// Job 029: each X client may have `CLIENT_TOPLEVELS` managed windows; past that a window
+    /// stays unmapped and gets WM_DELETE_WINDOW. Another X client is unaffected, and a closed
+    /// window frees a slot. Named so CI's `x11_lifecycle_and_input` filter runs it.
+    #[test]
+    #[ignore = "requires the Xwayland executable"]
+    fn x11_lifecycle_and_input_toplevel_cap() {
+        let (mut event_loop, mut data) = harness();
+        let (bar, navi) = std::os::unix::net::UnixStream::pair().unwrap();
+        data.state.bar_control = Some(navi);
+        let xdisplay = start(&event_loop.handle(), &data.state).expect("spawn Xwayland");
+        pump(&mut event_loop, &mut data, |d| d.state.xwm.is_some());
+        let connect = || smithay::reexports::x11rb::connect(Some(&xdisplay)).unwrap();
+        let ((a, screen), (b, _)) = (connect(), connect());
+        assert_eq!(a.setup().resource_id_mask, XWAYLAND_RESOURCE_ID_MASK);
+        let (base_a, base_b) = (a.setup().resource_id_base, b.setup().resource_id_base);
+        assert_ne!(base_a, base_b);
+        assert_eq!(base_a & XWAYLAND_RESOURCE_ID_MASK, 0);
+        let root = a.setup().roots[screen].root;
+        let atom = |name: &[u8]| a.intern_atom(false, name).unwrap().reply().unwrap().atom;
+        let (protocols, delete) = (atom(b"WM_PROTOCOLS"), atom(b"WM_DELETE_WINDOW"));
+        let create = |conn: &smithay::reexports::x11rb::rust_connection::RustConnection,
+                      transient: Option<u32>| {
+            let win = conn.generate_id().unwrap();
+            conn.create_window(
+                smithay::reexports::x11rb::COPY_DEPTH_FROM_PARENT,
+                win,
+                root,
+                0,
+                0,
+                64,
+                48,
+                0,
+                WindowClass::INPUT_OUTPUT,
+                0,
+                &CreateWindowAux::new().background_pixel(0x6688aa),
+            )
+            .unwrap();
+            conn.change_property32(PropMode::REPLACE, win, protocols, AtomEnum::ATOM, &[delete])
+                .unwrap();
+            if let Some(p) = transient {
+                conn.change_property32(
+                    PropMode::REPLACE,
+                    win,
+                    AtomEnum::WM_TRANSIENT_FOR,
+                    AtomEnum::WINDOW,
+                    &[p],
+                )
+                .unwrap();
+            }
+            conn.map_window(win).unwrap();
+            conn.flush().unwrap();
+            win
+        };
+        let managed = |d: &CalloopData, win: u32| {
+            d.state
+                .windows
+                .iter()
+                .any(|m| m.window.x11_surface().is_some_and(|x| x.window_id() == win))
+        };
+        let of = |d: &CalloopData, base: u32| {
+            let xs = d
+                .state
+                .windows
+                .iter()
+                .filter_map(|m| m.window.x11_surface());
+            xs.filter(|x| x_client(x.window_id()) == base).count()
+        };
+
+        // A maps 257: 256 managed, the 257th unmapped and asked to close.
+        let cap = crate::layout::CLIENT_TOPLEVELS;
+        let flood: Vec<u32> = (0..=cap).map(|_| create(&a, None)).collect();
+        pump(&mut event_loop, &mut data, |d| {
+            of(d, base_a) == cap && d.state.toplevels_capped.is_some()
+        });
+        let refused: Vec<u32> = flood
+            .iter()
+            .copied()
+            .filter(|&w| !managed(&data, w))
+            .collect();
+        let [refused] = refused[..] else {
+            panic!("one refused: {refused:?}");
+        };
+        let mut asked = false;
+        pump(&mut event_loop, &mut data, |_| {
+            while let Some(event) = a.poll_for_event().unwrap() {
+                if let Event::ClientMessage(e) = event {
+                    asked |= e.window == refused
+                        && e.type_ == protocols
+                        && e.data.as_data32()[0] == delete;
+                }
+            }
+            asked
+        });
+        let attrs = a.get_window_attributes(refused).unwrap().reply().unwrap();
+        assert_ne!(attrs.map_state, MapState::VIEWABLE, "never shown");
+        assert_eq!(of(&data, base_a), cap);
+        assert_eq!(data.state.layout.tiles().len(), cap);
+        let mut card = [0];
+        std::io::Read::read_exact(&mut &bar, &mut card).unwrap();
+        assert_eq!(card, [crate::control::WINDOW_LIMIT]);
+
+        // B still gets a window and its dialog.
+        let bw = create(&b, None);
+        pump(&mut event_loop, &mut data, |d| managed(d, bw));
+        let dialog = create(&b, Some(bw));
+        pump(&mut event_loop, &mut data, |d| managed(d, dialog));
+        let tile = |d: &CalloopData, win: u32| {
+            let m = d
+                .state
+                .windows
+                .iter()
+                .find(|m| m.window.x11_surface().is_some_and(|x| x.window_id() == win));
+            m.and_then(|m| m.tile)
+        };
+        assert!(tile(&data, bw).is_some());
+        assert_eq!(tile(&data, dialog), None, "floating over its parent");
+        assert_eq!(of(&data, base_b), 2);
+
+        // A closes one; its next window is managed.
+        let gone = flood[0];
+        a.destroy_window(gone).unwrap();
+        a.flush().unwrap();
+        pump(&mut event_loop, &mut data, |d| of(d, base_a) == cap - 1);
+        let next = create(&a, None);
+        pump(&mut event_loop, &mut data, |d| managed(d, next));
+        assert_eq!(of(&data, base_a), cap);
+        assert!(!managed(&data, refused));
+        for w in flood.into_iter().skip(1).chain([next]) {
+            a.destroy_window(w).unwrap();
+        }
+        a.flush().unwrap();
+        b.destroy_window(dialog).unwrap();
+        b.destroy_window(bw).unwrap();
+        b.flush().unwrap();
+        pump(&mut event_loop, &mut data, |d| d.state.windows.is_empty());
     }
 }

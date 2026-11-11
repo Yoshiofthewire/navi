@@ -92,6 +92,14 @@ pub fn popups_full<T>(open: impl Iterator<Item = T>) -> bool {
     open.take(CLIENT_POPUPS).count() == CLIENT_POPUPS
 }
 
+/// How many toplevels (dialogs included) one client may have open at once; more are closed.
+pub const CLIENT_TOPLEVELS: usize = 256;
+
+/// Whether a client with these `open` toplevels is at `CLIENT_TOPLEVELS`. Counts at most that many.
+pub fn toplevels_full<T>(open: impl Iterator<Item = T>) -> bool {
+    open.take(CLIENT_TOPLEVELS).count() == CLIENT_TOPLEVELS
+}
+
 /// Whether the popup chain from `popup` up through `parent` (the next popup, if any) is too deep.
 /// Walks at most `POPUP_DEPTH` steps.
 pub fn popup_too_deep<T>(popup: T, parent: impl Fn(&T) -> Option<T>) -> bool {
@@ -1215,6 +1223,16 @@ mod tests {
         assert!(popups_full(0..CLIENT_POPUPS));
         assert!(popups_full(0..CLIENT_POPUPS + 1));
         assert!(popups_full(0..)); // stops counting at the limit
+    }
+
+    #[test]
+    fn a_client_is_full_at_the_toplevel_limit() {
+        assert_eq!(CLIENT_TOPLEVELS, 256);
+        assert!(!toplevels_full(0..0));
+        assert!(!toplevels_full(0..255));
+        assert!(toplevels_full(0..256));
+        assert!(toplevels_full(0..257));
+        assert!(toplevels_full(0..)); // stops counting at the limit
     }
 
     #[test]
