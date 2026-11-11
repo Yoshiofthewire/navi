@@ -1320,6 +1320,32 @@ mod tests {
         pump(&mut event_loop, &mut data, |d| d.state.windows.len() == 1);
         assert_eq!(data.state.focused_window(), data.state.window_of(id));
         assert_eq!(data.state.raises, raises, "navi's own focus doesn't raise");
+        // Round 6/7 wiring: a user focus marks the keyboard as the user's; navi's refocus of the
+        // same window keeps it and doesn't count as a move; any other move clears it.
+        use crate::state::Raise;
+        let parent = data.state.window_of(id);
+        data.state.focus_by(parent.clone(), Raise::User);
+        assert!(data.state.focus_by_user);
+        let moves = data.state.focus_moves;
+        data.state.focus(parent.clone());
+        assert!(
+            data.state.focus_by_user,
+            "navi's refocus of the same window keeps it"
+        );
+        assert_eq!(
+            data.state.focus_moves, moves,
+            "and the keyboard didn't move"
+        );
+        data.state.focus(None);
+        assert!(!data.state.focus_by_user);
+        assert!(data.state.focus_moves > moves);
+        data.state.focus_by(parent.clone(), Raise::New);
+        assert!(
+            !data.state.focus_by_user,
+            "a window that took the keyboard on its own"
+        );
+        data.state.focus_by(parent, Raise::User);
+        assert!(data.state.focus_by_user);
         let menu = conn.generate_id().unwrap();
         conn.create_window(
             smithay::reexports::x11rb::COPY_DEPTH_FROM_PARENT,

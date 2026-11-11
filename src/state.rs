@@ -175,6 +175,9 @@ pub struct Navi {
     /// Whether the keyboard's holder got it from the user (`Raise::User`): tokens it mints then
     /// raise as the user would.
     pub(crate) focus_by_user: bool,
+    /// Counts keyboard moves: a token is the user's only while the keyboard hasn't moved since
+    /// it was made.
+    pub(crate) focus_moves: u64,
     /// The raise clock, in steps of 2 so an orphan's floor fits just below a raise.
     pub(crate) raises: u64,
     /// The window that held the keyboard when a click gave it to a layer.
@@ -288,6 +291,7 @@ impl Navi {
             handback: None,
             raises: 0,
             focus_by_user: false,
+            focus_moves: 0,
             before_layer: Default::default(),
             seat_state,
             popups: PopupManager::default(),
@@ -1165,6 +1169,8 @@ impl Navi {
             }),
         }
         let moved = kb.current_focus() != target;
+        // `focus_changed` counts moves to a surface; this also counts the move to nobody.
+        self.focus_moves += u64::from(moved);
         // navi's own refocus of the same window keeps what the user gave it.
         if moved || by == Raise::User {
             self.focus_by_user = by == Raise::User && target.is_some();
@@ -1942,8 +1948,15 @@ fn restack_space<E: smithay::desktop::space::SpaceElement + Clone + PartialEq>(
     }
 }
 
-/// On an activation token: whether it was minted from a focus the user gave.
-struct UserToken(bool);
+/// On an activation token: who asked for it, and the keyboard as it was then.
+struct UserToken {
+    /// navi-bar asked (the dock, the launcher).
+    bar: bool,
+    /// The asker held a keyboard focus the user gave it.
+    user: bool,
+    /// `Navi::focus_moves` when it was made.
+    moves: u64,
+}
 
 /// Whether a focus raises the window to the front of the stacking order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2344,6 +2357,7 @@ impl SeatHandler for Navi {
     fn cursor_image(&mut self, _seat: &Seat<Self>, _image: CursorImageStatus) {}
 
     fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&Focus>) {
+        self.focus_moves += 1;
         let surface = focused.and_then(Focus::surface);
         self.handback = activation::after_focus_change(self.handback.take(), surface.as_ref());
         let to_layer = surface
@@ -2489,7 +2503,12 @@ impl XdgActivationHandler for Navi {
             .and_then(|c| self.display_handle.backend_handle().get_client_data(c).ok());
         let navi_bar = privileged(asker.as_ref().and_then(|d| d.downcast_ref::<ClientState>()));
         let user = activation::minted_by_user(navi_bar, self.focus_by_user);
-        data.user_data.insert_if_missing(|| UserToken(user));
+        let token = UserToken {
+            bar: navi_bar,
+            user,
+            moves: self.focus_moves,
+        };
+        data.user_data.insert_if_missing(|| token);
         info!(
             app = data.app_id,
             ?serial,
@@ -2526,9 +2545,11 @@ impl XdgActivationHandler for Navi {
         let age = data.timestamp.elapsed();
         match id.filter(|_| may_redeem(first_use, age, focus_kept)) {
             Some(id) => {
-                // Only a token from a focus the user gave raises; any other moves the keyboard
-                // but leaves the stacking order as it is.
-                let user = data.user_data.get::<UserToken>().is_some_and(|t| t.0);
+                // Only a token from a focus the user gave, still held, raises; any other moves the
+                // keyboard but leaves the stacking order as it is.
+                let user = data.user_data.get::<UserToken>().is_some_and(|t| {
+                    activation::user_raise(t.bar, t.user, t.moves, self.focus_moves)
+                });
                 info!(id, by = "activation", user, "activate");
                 let by = if user { Raise::User } else { Raise::Not };
                 self.focus_or_restore(id, by);

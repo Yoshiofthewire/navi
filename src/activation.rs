@@ -30,6 +30,14 @@ pub fn minted_by_user(navi_bar: bool, focus_by_user: bool) -> bool {
     navi_bar || focus_by_user
 }
 
+/// Whether redeeming a token raises as the user would: navi-bar's always; another only if it was
+/// minted from a focus the user gave and the keyboard hasn't moved since (`moves`, counted at
+/// mint and now). A stale user token, redeemed after the user went elsewhere, still activates
+/// but raises nothing.
+pub fn user_raise(bar: bool, user: bool, minted_at: u64, now: u64) -> bool {
+    bar || user && minted_at == now
+}
+
 /// A token works once, up to `TTL` after it was made, and only while focus hasn't moved away:
 /// the surface that asked for it, or the one it activates, still holds the keyboard.
 pub fn may_redeem(first_use: bool, age: Duration, focus_kept: bool) -> bool {
@@ -91,6 +99,23 @@ mod tests {
         assert!(!minted_by_user(false, false));
         assert!(minted_by_user(false, true), "a window the user clicked");
         assert!(minted_by_user(true, false), "navi-bar");
+    }
+
+    /// Round 7 security (s18-stale): a user token redeemed after the keyboard moved (the user went
+    /// to another app, a new window took it) raises nothing; navi-bar's always does.
+    #[test]
+    fn a_user_token_raises_only_while_its_focus_holds() {
+        assert!(
+            user_raise(false, true, 5, 5),
+            "asker still holds the user's focus"
+        );
+        assert!(!user_raise(false, true, 5, 6), "the keyboard moved since");
+        assert!(
+            !user_raise(false, true, 5, 9),
+            "moved to the target, a new window"
+        );
+        assert!(!user_raise(false, false, 5, 5), "never the user's");
+        assert!(user_raise(true, false, 5, 9), "navi-bar");
     }
 
     #[test]
