@@ -3541,4 +3541,149 @@ mod tests {
         }
         assert!(checked > 100, "{checked}");
     }
+
+    /// Job 025 AC1: each zone's cursor names its direction; a strip grabs; tabs and buttons
+    /// keep the arrow.
+    #[test]
+    fn cursor_ac1_zone_cursors() {
+        use Side::*;
+        for (hit, want) in [
+            (Hit::Edge(0, Left), "w-resize"),
+            (Hit::Edge(0, Right), "e-resize"),
+            (Hit::Edge(0, Top), "n-resize"),
+            (Hit::Edge(0, Bottom), "s-resize"),
+            (Hit::Corner(0, Left, Top), "nw-resize"),
+            (Hit::Corner(0, Right, Top), "ne-resize"),
+            (Hit::Corner(0, Left, Bottom), "sw-resize"),
+            (Hit::Corner(0, Right, Bottom), "se-resize"),
+            (Hit::Strip(0), "grab"),
+            (Hit::Tab(0), "default"),
+            (Hit::Button(0, Button::Minimize), "default"),
+            (Hit::Button(0, Button::Maximize), "default"),
+            (Hit::Button(0, Button::Close), "default"),
+        ] {
+            assert_eq!(hit.cursor(), want, "{hit:?}");
+        }
+    }
+
+    /// Job 025 AC2: through `Layout::hit`, a tile's strip ends (row 0 and lower) and a float's
+    /// band corners show the same corner cursors as the bottom corners.
+    #[test]
+    fn cursor_ac2_top_corners_are_as_visible_as_bottom_ones() {
+        use drag::tests::{c, with};
+        let at = |l: &Layout, p| l.hit(p).map(Hit::cursor);
+        for row in [0, 12] {
+            let l = with(&[c(6, row, 12, 6)]);
+            let (o, _) = l.frame(0).unwrap();
+            let bottom = l.zone(Hit::Edge(0, Side::Bottom)).unwrap();
+            let (left, right) = (o.x + 2, o.x + o.w - 3);
+            let (strip, low) = (o.y + 3, bottom.y + bottom.h / 2);
+            let name = format!("row {row}");
+            assert_eq!(at(&l, (left, strip)), Some("nw-resize"), "{name}");
+            assert_eq!(at(&l, (right, strip)), Some("ne-resize"), "{name}");
+            assert_eq!(at(&l, (o.x + o.w / 2, strip)), Some("grab"), "{name}");
+            assert_eq!(at(&l, (left, low)), Some("sw-resize"), "{name}");
+            assert_eq!(at(&l, (right, low)), Some("se-resize"), "{name}");
+            let side = l.zone(Hit::Edge(0, Side::Left)).unwrap();
+            let mid = o.y + o.h / 2;
+            assert_eq!(at(&l, (side.x + 1, mid)), Some("w-resize"), "{name}");
+            let side = l.zone(Hit::Edge(0, Side::Right)).unwrap();
+            assert_eq!(at(&l, (side.x + 1, mid)), Some("e-resize"), "{name}");
+            assert_eq!(at(&l, (o.x + o.w / 2, low)), Some("s-resize"), "{name}");
+            // No top edge on the monitor's top row.
+            let top = l.zone(Hit::Edge(0, Side::Top));
+            assert_eq!(top.is_none(), row == 0, "{name}");
+            if let Some(t) = top {
+                assert_eq!(at(&l, (o.x + o.w / 2, t.y + t.h / 2)), Some("n-resize"));
+            }
+        }
+        let (l, _, f) = blocked_small();
+        for (sx, sy, want) in [
+            (Side::Left, Side::Top, "nw-resize"),
+            (Side::Right, Side::Top, "ne-resize"),
+            (Side::Left, Side::Bottom, "sw-resize"),
+            (Side::Right, Side::Bottom, "se-resize"),
+        ] {
+            assert_eq!(at(&l, band(&l, f, Hit::Corner(f, sx, sy))), Some(want));
+        }
+    }
+
+    /// Job 025 AC3: a resize keeps the pressed zone's cursor off the zone; a pressed strip and
+    /// every move grab; a cancelled drag is the arrow.
+    #[test]
+    fn cursor_ac3_a_drag_keeps_its_cursor() {
+        use drag::tests::{c, with};
+        let far = (3300, 1350);
+        let off = |l: &Layout, p, want| {
+            assert_ne!(
+                l.hit(p).map(Hit::cursor),
+                Some(want),
+                "{p:?} is off the zone"
+            );
+        };
+        // A tile edge and a tile corner (its strip's end).
+        for (pick, want) in [(0, "w-resize"), (1, "nw-resize")] {
+            let mut l = with(&[c(6, 3, 12, 6)]);
+            let (o, _) = l.frame(0).unwrap();
+            let p = match pick {
+                0 => {
+                    let z = l.zone(Hit::Edge(0, Side::Left)).unwrap();
+                    (z.x + 1, o.y + o.h / 2)
+                }
+                _ => (o.x + 2, o.y + 3),
+            };
+            let mut d = Drag::press(&l, p).unwrap();
+            assert_eq!(d.cursor(), want);
+            d.motion(&mut l, far, 0);
+            off(&l, far, want);
+            assert_eq!(d.cursor(), want);
+        }
+        // A float corner, pushed past its minimum so the pointer leaves the band.
+        let (mut l, _, f) = blocked_small();
+        let p = band(&l, f, Hit::Corner(f, Side::Right, Side::Bottom));
+        let mut d = Drag::press(&l, p).unwrap();
+        let to = (p.0 - 400, p.1 - 300);
+        d.motion(&mut l, to, 0);
+        off(&l, to, "se-resize");
+        assert_eq!(d.cursor(), "se-resize");
+
+        // A tile strip: pressed, then moving.
+        let mut l = with(&[c(6, 3, 12, 6)]);
+        let (o, _) = l.frame(0).unwrap();
+        let strip = (o.x + o.w / 2, o.y + 3);
+        let mut d = Drag::press(&l, strip).unwrap();
+        assert_eq!(d.cursor(), "grabbing", "armed");
+        d.motion(&mut l, (strip.0 + 300, strip.1 + 200), 0);
+        assert_eq!(d.cursor(), "grabbing", "moving");
+        // A tab, once it moves.
+        let mut l = with(&[c(6, 3, 12, 6), c(6, 3, 12, 6)]);
+        let tab = l.bar(1).unwrap().tabs[0].1;
+        let p = (tab.x + tab.w / 2, tab.y + tab.h / 2);
+        assert!(matches!(l.hit(p), Some(Hit::Tab(_))));
+        let mut d = Drag::press(&l, p).unwrap();
+        assert_eq!(
+            d.cursor(),
+            "default",
+            "a tab press is a click until it moves"
+        );
+        d.motion(&mut l, (p.0 + 300, p.1 + 200), 0);
+        assert_eq!(d.cursor(), "grabbing", "tab move");
+        // A float by its bar.
+        let (mut l, _, f) = blocked_small();
+        let o = outer_of(&l, f);
+        let p = (o.x + 40, o.y + 10);
+        assert_eq!(l.hit(p), Some(Hit::Strip(f)));
+        let mut d = Drag::press(&l, p).unwrap();
+        assert_eq!(d.cursor(), "grabbing");
+        d.motion(&mut l, (p.0 + 100, p.1 + 50), 0);
+        assert_eq!(d.cursor(), "grabbing", "float move");
+        // A maximized tile's strip drag is cancelled.
+        let mut l = with(&[c(6, 3, 12, 6)]);
+        assert!(l.maximize(0));
+        let (o, _) = l.frame(0).unwrap();
+        let p = (o.x + o.w / 2, o.y + 3);
+        let mut d = Drag::press(&l, p).unwrap();
+        d.motion(&mut l, (p.0 + 300, p.1 + 200), 0);
+        assert_eq!(d.cursor(), "default", "cancelled");
+    }
 }

@@ -63,6 +63,30 @@ impl Hit {
         | Hit::Button(id, _)) = self;
         id
     }
+
+    /// The cursor over this zone: which way it resizes, or that it moves.
+    pub fn cursor(self) -> &'static str {
+        match self {
+            Hit::Edge(_, Side::Left) => "w-resize",
+            Hit::Edge(_, Side::Right) => "e-resize",
+            Hit::Edge(_, Side::Top) => "n-resize",
+            Hit::Edge(_, Side::Bottom) => "s-resize",
+            Hit::Corner(_, Side::Left, Side::Top) => "nw-resize",
+            Hit::Corner(_, Side::Right, Side::Top) => "ne-resize",
+            Hit::Corner(_, Side::Left, _) => "sw-resize",
+            Hit::Corner(_, _, _) => "se-resize",
+            Hit::Strip(_) => "grab",
+            Hit::Tab(_) | Hit::Button(..) => "default",
+        }
+    }
+
+    /// The cursor while this zone is pressed.
+    fn pressed(self) -> &'static str {
+        match self {
+            Hit::Strip(_) => "grabbing",
+            hit => hit.cursor(),
+        }
+    }
 }
 
 /// A click on navi's controls, as `Drag::release` reports it.
@@ -784,6 +808,17 @@ impl Drag {
             hit @ (Hit::Edge(..) | Hit::Corner(..)) => State::Resize(Resize::new(l, hit, p)?),
         };
         Some(Drag(state))
+    }
+
+    /// The cursor for the whole drag, wherever the pointer is: the pressed zone's.
+    pub fn cursor(&self) -> &'static str {
+        match &self.0 {
+            State::Armed { hit, .. } => hit.pressed(),
+            State::Move { .. } => "grabbing",
+            State::Resize(r) => r.hit.cursor(),
+            State::Float(f) => f.hit.pressed(),
+            State::Cancelled => "default",
+        }
     }
 
     /// A stationary edge press/release; moving away and back must still count as a drag.
