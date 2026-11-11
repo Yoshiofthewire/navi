@@ -122,6 +122,9 @@ impl Layout {
         let Hit::Strip(id) = hit else {
             return Some(self.corner_hit(hit, p));
         };
+        if let Some(side) = self.strip_corner(id, p) {
+            return Some(Hit::Corner(id, side, Side::Top));
+        }
         let Some(bar) = self.bar(id) else {
             return Some(hit);
         };
@@ -156,6 +159,38 @@ impl Layout {
             }
             _ => hit,
         }
+    }
+
+    /// The end of `id`'s strip row that `p` is in, within `CORNER_PX` of the cells' side: a top
+    /// corner, so the strip's ends resize as the bottom corners do.
+    fn strip_corner(&self, id: WinId, p: (i32, i32)) -> Option<Side> {
+        let (c, _) = self.frame(id).filter(|_| !self.is_maximized(id))?;
+        match p {
+            (_, y) if y >= c.y + STRIP => None,
+            (x, _) if x < c.x + CORNER_PX => Some(Side::Left),
+            (x, _) if x >= c.x + c.w - CORNER_PX => Some(Side::Right),
+            _ => None,
+        }
+    }
+
+    /// The strip-row px a top corner owns; `None` for a bottom corner.
+    fn corner_strip(&self, id: WinId, x: Side, y: Side) -> Option<Rect> {
+        let (c, r) = self
+            .frame(id)
+            .filter(|_| y == Side::Top && !self.is_maximized(id))?;
+        let strip = Rect { h: STRIP, ..c };
+        Some(match x {
+            Side::Left => Rect {
+                x: r.x,
+                w: c.x + CORNER_PX - r.x,
+                ..strip
+            },
+            _ => Rect {
+                x: c.x + c.w - CORNER_PX,
+                w: r.x + r.w - (c.x + c.w - CORNER_PX),
+                ..strip
+            },
+        })
     }
 
     /// The px of a zone, all inside the gaps around the tile's window.
@@ -252,9 +287,15 @@ impl Layout {
         }
     }
 
-    /// Where a move of `moving` (`id`'s group, or `id` alone out of it) lands with the pointer at
-    /// `p`, on which output.
-    fn move_target(&self, id: WinId, moving: &[WinId], p: (i32, i32)) -> Option<(String, Target)> {
+    /// Where a move of `moving` (`id`'s group, or `id` alone out of it), grabbed `grab` px from
+    /// its cells' origin, lands with the pointer at `p`, on which output.
+    fn move_target(
+        &self,
+        id: WinId,
+        moving: &[WinId],
+        p: (i32, i32),
+        grab: (i32, i32),
+    ) -> Option<(String, Target)> {
         let t = self.tile(id)?;
         let o = self
             .outputs
@@ -266,25 +307,37 @@ impl Layout {
             .tiles
             .iter()
             .find(|u| u.output == o.name && o.cells_rect(u.cells).contains(p));
-        let target = match under {
-            Some(u) if group.contains(&u.id) => Target::Own(u.cells),
-            Some(u) => Target::Onto(u.id, u.cells),
-            None => {
-                // The moving tiles' cells count as free.
-                let rest = Layout {
-                    tiles: self
-                        .tiles
-                        .iter()
-                        .filter(|u| !moving.contains(&u.id))
-                        .cloned()
-                        .collect(),
-                    ..Layout::default()
-                };
-                let size = self.memory.get(&t.app).map_or((MIN_W, MIN_H), |m| m.size);
-                rest.nearest_free(o, size, p)
-                    .or_else(|| rest.smaller_free(o, size, p))
-                    .map_or(Target::Nowhere, Target::Free)
-            }
+        if let Some(u) = under.filter(|u| !group.contains(&u.id)) {
+            return Some((o.name.clone(), Target::Onto(u.id, u.cells)));
+        }
+        // The moving tiles' cells count as free.
+        let rest = Layout {
+            tiles: self
+                .tiles
+                .iter()
+                .filter(|u| !moving.contains(&u.id))
+                .cloned()
+                .collect(),
+            ..Layout::default()
+        };
+        let size = self.memory.get(&t.app).map_or((MIN_W, MIN_H), |m| m.size);
+        let want = candidate(o, o.span_for(size), p, grab);
+        let own = (t.output == o.name).then_some(t.cells);
+        // Under half a cell from the press, whatever the remembered size: no move.
+        if own.is_some_and(|c| (c.col, c.row) == (want.col, want.row)) {
+            return Some((o.name.clone(), Target::Own(t.cells)));
+        }
+        let centre = o.cells_rect(want).center();
+        let cells = match rest.is_free(&o.name, want) {
+            true => Some(want),
+            false => rest
+                .nearest_free(o, size, centre)
+                .or_else(|| rest.smaller_free(o, size, centre)),
+        };
+        let target = match cells {
+            Some(c) if Some(c) == own => Target::Own(c),
+            Some(c) => Target::Free(c),
+            None => Target::Nowhere,
         };
         Some((o.name.clone(), target))
     }
@@ -499,6 +552,32 @@ fn with_span(c: Cells, x: bool, start: i32, len: i32) -> Cells {
     }
 }
 
+/// The `cols` x `rows` cells on `o` whose origin is the cell boundary nearest `p - grab`: the
+/// grabbed point stays under the pointer, a cell at a time, clamped to the grid.
+fn candidate(o: &Output, (cols, rows): (i32, i32), p: (i32, i32), grab: (i32, i32)) -> Cells {
+    Cells {
+        col: nearest_start(|k| o.x_edge(k), COLS, cols, p.0, grab.0),
+        row: nearest_start(|k| o.y_edge(k), ROWS, rows, p.1, grab.1),
+        cols,
+        rows,
+    }
+}
+
+/// The start in `0..=n - span` whose boundary is nearest `at - grab`. A `grab` beyond the span
+/// (a smaller remembered size) is clamped into it, and then starts that keep `at` inside win.
+fn nearest_start(edge: impl Fn(i32) -> i32, n: i32, span: i32, at: i32, grab: i32) -> i32 {
+    let e = |k| i64::from(edge(k));
+    let (at, grab) = (i64::from(at), i64::from(grab));
+    let inside = grab.clamp(0, (e(span) - e(0) - 1).max(0));
+    let want = at - inside;
+    (0..=n - span)
+        .min_by_key(|&k| {
+            let off = inside != grab && !(e(k) <= at && at < e(k + span));
+            (off, (e(k) - want).abs())
+        })
+        .unwrap_or(0)
+}
+
 /// Whether the pointer has been in a tile's middle long enough for the drop to tab.
 fn held(middle: Option<(WinId, u64)>, now_ms: u64) -> bool {
     middle.is_some_and(|(_, since)| now_ms.saturating_sub(since) >= HOLD_MS)
@@ -645,6 +724,8 @@ enum State {
         id: WinId,
         /// A tab dragged out of its group, alone.
         tab: bool,
+        /// The press point minus the group's cells origin, kept under the pointer.
+        grab: (i32, i32),
         output: String,
         target: Target,
         /// The tile whose middle the pointer is in, and since when.
@@ -693,12 +774,16 @@ impl Drag {
                 Hit::Tab(id) => (id, true),
                 _ => (hit.id(), false),
             };
+            let grab = l.frame(id).map_or((0, 0), |(c, _)| {
+                (from.0.saturating_sub(c.x), from.1.saturating_sub(c.y))
+            });
             self.0 = match hit {
                 // A maximized group doesn't move; a button press stays a click.
                 Hit::Strip(_) | Hit::Tab(_) if l.is_maximized(id) => State::Cancelled,
                 Hit::Strip(_) | Hit::Tab(_) => State::Move {
                     id,
                     tab,
+                    grab,
                     output: String::new(),
                     target: Target::Nowhere,
                     middle: None,
@@ -711,10 +796,11 @@ impl Drag {
             State::Move {
                 id,
                 tab,
+                grab,
                 output,
                 target,
                 middle,
-            } => match l.move_target(*id, &l.moving(*id, *tab), p) {
+            } => match l.move_target(*id, &l.moving(*id, *tab), p, *grab) {
                 Some((o, t)) => {
                     let mid = match t {
                         Target::Onto(u, c) => l
@@ -762,6 +848,7 @@ impl Drag {
                 output,
                 target,
                 middle,
+                ..
             } => {
                 let moving = l.moving(id, tab);
                 let held = held(middle, now_ms);
@@ -852,6 +939,7 @@ pub fn overlay(
             output,
             target,
             middle,
+            ..
         }) => {
             let held = held(*middle, now_ms);
             // The preview is where the window lands: below a bar if it will have one.
@@ -891,6 +979,7 @@ pub fn overlay(
         for side in [x, y] {
             out.extend(l.zone(Hit::Edge(id, side)).map(|z| (z, accent(1.0))));
         }
+        out.extend(l.corner_strip(id, x, y).map(|z| (z, accent(1.0))));
     }
     // Where a frame's top goes when it runs along the top of a bar, in front of it.
     let front = out.len();
@@ -1154,7 +1243,11 @@ pub(super) mod tests {
         let l = halves();
         // a's window spans x 6..1714, y 8..1436; b's starts at x 1726.
         assert_eq!(l.hit(A_STRIP), Some(Hit::Strip(0)));
-        assert_eq!(l.hit((1713, 7)), Some(Hit::Strip(0)));
+        assert_eq!(l.hit((1687, 7)), Some(Hit::Strip(0)));
+        assert_eq!(
+            l.hit((1713, 7)),
+            Some(Hit::Corner(0, Side::Right, Side::Top))
+        );
         assert_eq!(l.hit((1720, 700)), Some(Hit::Edge(1, Side::Left)));
         assert_eq!(l.hit((1725, 700)), Some(Hit::Edge(1, Side::Left)));
         assert_eq!(l.hit((1714, 700)), Some(Hit::Edge(0, Side::Right)));
@@ -1353,11 +1446,10 @@ pub(super) mod tests {
         }
         drop(d);
 
+        // A drop within half a cell of the press cancels, however far the drag went first.
         let tiles = l.tiles.clone();
-        assert_eq!(
-            drag(&mut l, A_STRIP, &[((3000, 700), 0), ((800, 700), 10)]),
-            None
-        );
+        let back = (A_STRIP.0 + 71, A_STRIP.1 + 59);
+        assert_eq!(drag(&mut l, A_STRIP, &[((3000, 700), 0), (back, 10)]), None);
         assert_eq!(l.tiles, tiles);
 
         // A laptop right of it, whose only empty column is below its 4-column minimum: no
@@ -2314,6 +2406,344 @@ pub(super) mod tests {
         assert_eq!(o.iter().filter(|&&(_, k)| k == accent(1.0)).count(), 4);
     }
 
+    /// The output and target of a move in progress.
+    fn moving_to(d: &Drag) -> Option<(&str, Target)> {
+        match &d.0 {
+            State::Move { output, target, .. } => Some((output, *target)),
+            _ => None,
+        }
+    }
+
+    /// A point on `id`'s strip row, `dx` px from the cells' left edge.
+    fn on_strip(l: &Layout, id: WinId, dx: i32) -> (i32, i32) {
+        let (c, _) = l.frame(id).unwrap();
+        (c.x + dx, c.y + 3)
+    }
+
+    /// Job 016 AC4: the preview moves a cell for every cell the pointer does, from the first one,
+    /// until the grid's edge; under half a cell it is the tile's own cells and the drop cancels.
+    #[test]
+    fn ac4_move_follows_the_pointer_cell_by_cell() {
+        let start = c(9, 3, 6, 6);
+        let (cell_w, cell_h) = (3440.0 / 24.0, 120.0);
+        for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+            let mut l = with(&[start]);
+            let press = on_strip(&l, 0, uw().cells_rect(start).w / 2);
+            assert_eq!(l.hit(press), Some(Hit::Strip(0)));
+            let near = (press.0 + dx * 70 + dy * 9, press.1 + dy * 59 + dx * 9);
+            let mut d = Drag::press(&l, press).unwrap();
+            d.motion(&mut l, near, 0);
+            assert_eq!(moving_to(&d), Some(("uw", Target::Own(start))));
+            assert!(d.release(&mut l, near, 10).is_none());
+            assert_eq!(at(&l, 0), start);
+
+            let mut d = Drag::press(&l, press).unwrap();
+            let mut p = press;
+            for k in 1..=24 {
+                let off = |cell: f64, d: i32| (f64::from(k * d) * cell).round() as i32;
+                p = (press.0 + off(cell_w, dx), press.1 + off(cell_h, dy));
+                d.motion(&mut l, p, 0);
+                let want = Cells {
+                    col: (start.col + k * dx).clamp(0, COLS - start.cols),
+                    row: (start.row + k * dy).clamp(0, ROWS - start.rows),
+                    ..start
+                };
+                assert_eq!(
+                    moving_to(&d),
+                    Some(("uw", Target::Free(want))),
+                    "{dx},{dy} k {k}"
+                );
+            }
+            assert_eq!(what(d.release(&mut l, p, 10)), Some("moved"));
+            let end = |n: i32, d: i32| if d > 0 { n } else { 0 };
+            let (col, row) = match (dx, dy) {
+                (0, _) => (start.col, end(ROWS - start.rows, dy)),
+                _ => (end(COLS - start.cols, dx), start.row),
+            };
+            assert_eq!(at(&l, 0), Cells { col, row, ..start });
+        }
+    }
+
+    /// Job 016 AC5: unclamped, the preview's origin is within half a cell of `pointer - grab`;
+    /// a smaller remembered size keeps the pointer on the preview.
+    #[test]
+    fn ac5_the_grabbed_point_stays_under_the_pointer() {
+        let o = uw();
+        let (cols, rows) = (6, 6);
+        let size = o.cells_rect(c(0, 0, cols, rows));
+        for grab in [(430, 3), (40, 3), (size.w - 40, 3), (300, 34)] {
+            for x in (-200..3640).step_by(7) {
+                for y in (-100..1540).step_by(13) {
+                    let k = candidate(&o, (cols, rows), (x, y), grab);
+                    let (wx, wy) = (x - grab.0, y - grab.1);
+                    if (o.x_edge(0)..=o.x_edge(COLS - cols)).contains(&wx) {
+                        let off = (o.x_edge(k.col) - wx).abs();
+                        assert!(off <= o.cell_w() / 2 + 1, "{x},{y} {grab:?}: {off}");
+                    }
+                    if (o.y_edge(0)..=o.y_edge(ROWS - rows)).contains(&wy) {
+                        let off = (o.y_edge(k.row) - wy).abs();
+                        assert!(off <= o.cell_h() / 2, "{x},{y} {grab:?}: {off}");
+                    }
+                }
+            }
+        }
+        // Grabbed 1600 px in, remembering 3 x 2 cells: the pointer stays over the preview.
+        let mut l = with(&[c(0, 0, 12, 12)]);
+        l.memory.get_mut("a0").unwrap().size = (430, 240);
+        let press = on_strip(&l, 0, 1600);
+        let mut d = Drag::press(&l, press).unwrap();
+        for k in 1..40 {
+            let p = (press.0 + 37 * k, press.1 + 29 * k);
+            d.motion(&mut l, p, 0);
+            let Some((_, Target::Free(cells))) = moving_to(&d) else {
+                panic!("no free preview at {p:?}");
+            };
+            assert_eq!((cells.cols, cells.rows), (3, 2));
+            let r = o.cells_rect(cells);
+            assert!(r.x <= p.0 && p.0 < r.x + r.w, "{p:?} outside {cells:?}");
+        }
+    }
+
+    /// Job 016 AC6: over another tile it is still a swap or a tab; a candidate that would overlap a
+    /// tile falls back to the nearest free rect, or to none.
+    #[test]
+    fn ac6_blocked_candidates_fall_back_and_never_overlap() {
+        let mut l = with(&[c(0, 0, 6, 12), c(12, 0, 12, 12)]);
+        let press = on_strip(&l, 0, 430);
+        let mut d = Drag::press(&l, press).unwrap();
+        // Four cells right is free; eight would overlap b, with the pointer still left of it.
+        d.motion(&mut l, (press.0 + 573, press.1), 0);
+        assert_eq!(moving_to(&d), Some(("uw", Target::Free(c(4, 0, 6, 12)))));
+        let p = (press.0 + 1147, press.1 + 300);
+        assert!(p.0 < uw().x_edge(12));
+        d.motion(&mut l, p, 0);
+        assert_eq!(moving_to(&d), Some(("uw", Target::Free(c(6, 0, 6, 12)))));
+        assert_eq!(what(d.release(&mut l, p, 10)), Some("moved"));
+        assert_eq!(at(&l, 0), c(6, 0, 6, 12));
+        assert_eq!(at(&l, 1), c(12, 0, 12, 12));
+
+        // Over b it swaps, and a hold tabs.
+        let moved = || with(&[c(6, 0, 6, 12), c(12, 0, 12, 12)]);
+        let (l, over_b, middle) = (moved(), (2500, 300), (2580, 700));
+        let press = on_strip(&l, 0, 430);
+        let mut d = Drag::press(&l, press).unwrap();
+        let mut l = l;
+        d.motion(&mut l, over_b, 0);
+        assert_eq!(
+            moving_to(&d),
+            Some(("uw", Target::Onto(1, c(12, 0, 12, 12))))
+        );
+        assert_eq!(what(d.release(&mut l, over_b, 10)), Some("swapped"));
+        let hold = [(middle, 0), (middle, HOLD_MS)];
+        assert_eq!(drag(&mut moved(), press, &hold), Some("tabbed"));
+
+        // A tab pulled out of a full grid, pointer over its own group: nowhere to go.
+        let mut l = with(&[c(0, 0, 12, 12), c(0, 0, 12, 12), c(12, 0, 12, 12)]);
+        let tiles = l.tiles.clone();
+        let from = l.zone(Hit::Tab(1)).unwrap().center();
+        let mut d = Drag::press(&l, from).unwrap();
+        d.motion(&mut l, (1600, 700), 0);
+        assert_eq!(moving_to(&d), Some(("uw", Target::Nowhere)));
+        assert!(d.release(&mut l, (1600, 700), 10).is_none());
+        assert_eq!(l.tiles, tiles);
+    }
+
+    /// Job 016 AC7: on another monitor the candidate is clamped to that monitor's grid.
+    #[test]
+    fn ac7_a_move_to_another_monitor_clamps_to_its_grid() {
+        let mut l = with(&[c(0, 0, 6, 6)]);
+        let mut uhd = uw();
+        uhd.name = "uhd".into();
+        uhd.area = Rect {
+            x: 3440,
+            y: 0,
+            w: 3840,
+            h: 2160,
+        };
+        uhd.full = uhd.area;
+        l.set_outputs(vec![uw(), uhd.clone()]);
+        let (cols, rows) = uhd.span_for(l.memory["a0"].size);
+        assert_eq!((cols, rows), (5, 4));
+        let press = on_strip(&l, 0, 430);
+        let mut d = Drag::press(&l, press).unwrap();
+        for (p, want) in [
+            ((3460, 50), c(0, 0, cols, rows)),
+            ((3460, 100), c(0, 1, cols, rows)),
+            ((3440 + 3839, 2159), c(COLS - cols, ROWS - rows, cols, rows)),
+            ((3440 + 2000, 920), c(10, 5, cols, rows)),
+        ] {
+            d.motion(&mut l, p, 0);
+            assert_eq!(moving_to(&d), Some(("uhd", Target::Free(want))), "{p:?}");
+        }
+        assert_eq!(
+            what(d.release(&mut l, (3440 + 2000, 920), 0)),
+            Some("moved")
+        );
+        assert_eq!(l.tile(0).unwrap().output, "uhd");
+        assert_eq!(at(&l, 0), c(10, 5, cols, rows));
+    }
+
+    /// Strip-row and bar-row hits for one tile, `id`'s group: corners at the strip's ends only.
+    fn assert_strip_corners(l: &Layout, id: WinId, name: &str) {
+        let (c, r) = l.frame(id).unwrap();
+        for x in c.x..c.x + c.w {
+            for y in c.y..c.y + STRIP {
+                let want = match x {
+                    _ if x < c.x + CORNER_PX => Hit::Corner(id, Side::Left, Side::Top),
+                    _ if x >= c.x + c.w - CORNER_PX => Hit::Corner(id, Side::Right, Side::Top),
+                    _ => Hit::Strip(id),
+                };
+                assert_eq!(l.hit((x, y)), Some(want), "{name} {x},{y}");
+                assert!(!r.contains((x, y)));
+            }
+        }
+        if let Some(bar) = l.bar(id) {
+            assert!(bar.rect.y >= c.y + STRIP, "{name}");
+            for x in bar.rect.x..bar.rect.x + bar.rect.w {
+                for y in bar.rect.y..bar.rect.y + bar.rect.h {
+                    let want = bar
+                        .buttons
+                        .iter()
+                        .find(|(_, b)| b.contains((x, y)))
+                        .map(|&(b, _)| Hit::Button(id, b))
+                        .or_else(|| match bar.tabs.is_empty() {
+                            true => Some(Hit::Strip(id)),
+                            false => bar
+                                .tabs
+                                .iter()
+                                .find(|(_, t)| t.contains((x, y)))
+                                .map(|&(t, _)| Hit::Tab(t)),
+                        });
+                    assert_eq!(l.hit((x, y)), want, "{name} bar {x},{y}");
+                }
+            }
+        }
+    }
+
+    /// Job 016 AC8: the strip's outer 26 px at each end are top corners, at row 0 and below it,
+    /// plain, decorated and tabbed; the bar row keeps its tabs and buttons.
+    #[test]
+    fn ac8_strip_ends_are_top_corners() {
+        for row in [0, 3] {
+            let cells = c(6, row, 12, 6);
+            let mut plain = with(&[cells]);
+            assert_strip_corners(&plain, 0, &format!("plain row {row}"));
+            plain.set_decorated(0, true);
+            assert_strip_corners(&plain, 0, &format!("decorated row {row}"));
+            let mut tabbed = with(&[cells, cells]);
+            assert_strip_corners(&tabbed, 1, &format!("tabbed row {row}"));
+            tabbed.set_decorated(1, true);
+            assert_strip_corners(&tabbed, 1, &format!("tabbed decorated row {row}"));
+        }
+        // The 320 px minimum tile keeps 256 px of strip that moves.
+        let l = with(&[c(6, 3, 3, 2)]);
+        let (c, _) = l.frame(0).unwrap();
+        let moves = (c.x..c.x + c.w)
+            .filter(|&x| l.hit((x, c.y)) == Some(Hit::Strip(0)))
+            .count();
+        assert!(moves >= 256 - GAP as usize, "{moves}");
+    }
+
+    /// Job 016 AC9: a strip-end corner resizes both axes by whole cells, stops at the minimum and
+    /// is remembered; on row 0 the top only moves down; a maximized tile has no top corners.
+    #[test]
+    fn ac9_strip_corners_resize_both_axes() {
+        let o = uw();
+        let to = |col, row| (o.x_edge(col), o.y_edge(row));
+        for (dx, side, step, end) in [
+            (20, Side::Left, c(8, 5, 10, 4), c(15, 7, 3, 2)),
+            (12 * 143 - 20, Side::Right, c(6, 5, 10, 4), c(6, 7, 3, 2)),
+        ] {
+            let mut l = with(&[c(6, 3, 12, 6)]);
+            let from = on_strip(&l, 0, dx);
+            assert_eq!(l.hit(from), Some(Hit::Corner(0, side, Side::Top)));
+            let (mid, far) = match side {
+                Side::Left => (to(8, 5), to(23, 11)),
+                _ => (to(16, 5), to(1, 11)),
+            };
+            let mut d = Drag::press(&l, from).unwrap();
+            d.motion(&mut l, mid, 0);
+            assert_eq!(at(&l, 0), step);
+            d.motion(&mut l, far, 0);
+            assert_eq!(at(&l, 0), end, "stops at the 3 x 2 minimum");
+            assert_eq!(what(d.release(&mut l, far, 0)), Some("resized"));
+            assert_eq!(l.memory["a0"].cells, end);
+            let r = o.cells_rect(end);
+            assert_eq!(l.memory["a0"].size, (r.w, r.h));
+        }
+
+        let mut l = with(&[c(6, 0, 12, 6)]);
+        assert_eq!(l.zone(Hit::Edge(0, Side::Top)), None);
+        let from = on_strip(&l, 0, 20);
+        assert_eq!(drag(&mut l, from, &[(to(8, 2), 0)]), Some("resized"));
+        assert_eq!(at(&l, 0), c(8, 2, 10, 4));
+        let from = on_strip(&l, 0, 20);
+        assert_eq!(
+            drag(&mut l, from, &[((o.x_edge(4), -500), 0)]),
+            Some("resized")
+        );
+        assert_eq!(at(&l, 0), c(4, 0, 14, 6));
+
+        assert!(l.maximize(0));
+        let (c, _) = l.frame(0).unwrap();
+        for x in c.x..c.x + c.w {
+            assert!(!matches!(l.hit((x, c.y + 2)), Some(Hit::Corner(..))), "{x}");
+        }
+    }
+
+    /// Job 016 AC10: a top corner, hovered or pressed, lights its side zone, its top zone where
+    /// there is one, and its strip segment.
+    #[test]
+    fn ac10_top_corners_light_side_top_and_strip() {
+        for row in [0, 3] {
+            let mut l = with(&[c(6, row, 12, 6)]);
+            let (c, r) = l.frame(0).unwrap();
+            for (side, p, segment) in [
+                (
+                    Side::Left,
+                    on_strip(&l, 0, 20),
+                    Rect {
+                        x: r.x,
+                        y: c.y,
+                        w: CORNER_PX - GAP / 2,
+                        h: STRIP,
+                    },
+                ),
+                (
+                    Side::Right,
+                    (c.x + c.w - 2, c.y + 20),
+                    Rect {
+                        x: c.x + c.w - CORNER_PX,
+                        y: c.y,
+                        w: CORNER_PX - GAP / 2,
+                        h: STRIP,
+                    },
+                ),
+            ] {
+                assert_eq!(l.hit(p), Some(Hit::Corner(0, side, Side::Top)));
+                let mut want: Vec<Rect> = [side, Side::Top]
+                    .into_iter()
+                    .filter_map(|s| l.zone(Hit::Edge(0, s)))
+                    .collect();
+                want.push(segment);
+                assert_eq!(want.len(), if row == 0 { 2 } else { 3 });
+                let lit = |l: &Layout, d: Option<&Drag>| {
+                    zones(l, d, p, 0)
+                        .into_iter()
+                        .map(|(z, k)| {
+                            assert_eq!(k, accent(1.0));
+                            z
+                        })
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(lit(&l, None), want, "row {row} {side:?} hovered");
+                let d = Drag::press(&l, p).unwrap();
+                assert_eq!(lit(&l, Some(&d)), want, "row {row} {side:?} pressed");
+                d.cancel(&mut l);
+            }
+        }
+    }
+
     #[test]
     fn degenerate_output_and_wild_pointers_dont_panic() {
         let mut l = Layout::default();
@@ -2348,5 +2778,32 @@ pub(super) mod tests {
                 d.release(&mut l, (i32::MIN, i32::MAX), u64::MAX);
             }
         }
+        // Job 016 AC7: grab offsets and pointers at the extremes, on a tiny and a real grid.
+        let wild = [0, 1, -1, i32::MIN, i32::MAX];
+        for o in [l.outputs[0].clone(), uw()] {
+            for &(x, y, gx, gy) in &[(0, 0, 0, 0), (i32::MIN, i32::MAX, i32::MAX, i32::MIN)] {
+                for span in [(1, 1), (COLS, ROWS), (3, 2)] {
+                    for v in wild {
+                        let k = candidate(&o, span, (x ^ v, y), (gx, gy ^ v));
+                        assert!(k.col >= 0 && k.col + k.cols <= COLS, "{k:?}");
+                        assert!(k.row >= 0 && k.row + k.rows <= ROWS, "{k:?}");
+                    }
+                }
+            }
+        }
+        let mut l = with(&[c(6, 3, 12, 6)]);
+        let mut d = Drag::press(&l, on_strip(&l, 0, 400)).unwrap();
+        for p in [
+            (i32::MIN, i32::MIN),
+            (i32::MAX, i32::MAX),
+            (i32::MIN, 0),
+            (0, i32::MAX),
+        ] {
+            d.motion(&mut l, p, 0);
+            let k = preview(&d).unwrap();
+            assert!(k.col >= 0 && k.col + k.cols <= COLS && k.row + k.rows <= ROWS);
+        }
+        d.release(&mut l, (i32::MAX, i32::MIN), 0);
+        assert_valid(&l);
     }
 }

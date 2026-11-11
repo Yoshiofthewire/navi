@@ -1013,9 +1013,13 @@ impl Navi {
         changed
     }
 
-    /// Records a toplevel's decoration mode, as `layout::decoration` decides it.
-    fn set_decoration(&mut self, toplevel: ToplevelSurface, requested: Decoration) {
-        let mode = wire(decoration(toplevel.parent().is_some(), decor(requested)));
+    /// Records a toplevel's decoration mode, as `layout::decoration` decides it; `None` is no
+    /// preference.
+    fn set_decoration(&mut self, toplevel: ToplevelSurface, requested: Option<Decoration>) {
+        let mode = wire(decoration(
+            toplevel.parent().is_some(),
+            requested.map(decor),
+        ));
         let changed = toplevel.with_pending_state(|s| {
             let changed = s.decoration_mode != Some(mode);
             s.decoration_mode = Some(mode);
@@ -1043,7 +1047,9 @@ impl Navi {
         // Re-applied now that the parent is known: set_parent may come after the mode request.
         let parent = surface.parent().is_some();
         let mode = surface.with_pending_state(|s| {
-            let mode = s.decoration_mode.map(|m| decoration(parent, decor(m)));
+            let mode = s
+                .decoration_mode
+                .map(|m| decoration(parent, Some(decor(m))));
             s.decoration_mode = mode.map(wire);
             mode
         });
@@ -1536,15 +1542,15 @@ impl XdgShellHandler for Navi {
 
 impl XdgDecorationHandler for Navi {
     fn new_decoration(&mut self, toplevel: ToplevelSurface) {
-        self.set_decoration(toplevel, Decoration::ClientSide);
+        self.set_decoration(toplevel, None);
     }
 
     fn request_mode(&mut self, toplevel: ToplevelSurface, mode: Decoration) {
-        self.set_decoration(toplevel, mode);
+        self.set_decoration(toplevel, Some(mode));
     }
 
     fn unset_mode(&mut self, toplevel: ToplevelSurface) {
-        self.set_decoration(toplevel, Decoration::ClientSide);
+        self.set_decoration(toplevel, None);
     }
 }
 
