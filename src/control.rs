@@ -25,6 +25,10 @@ pub const ATTENTION: u32 = 0x6e61_7601;
 /// Slot n (1..=9) is `SLOT_1 + n - 1`.
 pub const SLOT_1: u8 = 5;
 const SLOT_9: u8 = SLOT_1 + 8;
+/// navi → navi-bar, unsolicited: navi closed a client's toplevel past `CLIENT_TOPLEVELS`.
+pub const WINDOW_LIMIT: u8 = SLOT_9 + 1;
+/// How many toplevels (dialogs included) one client may have open at once; more are closed.
+pub const CLIENT_TOPLEVELS: usize = 256;
 
 /// A dock key: Super+1..9 or Super+(Shift+)Tab.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -38,6 +42,7 @@ pub enum DockKey {
 pub enum Command {
     ToggleMenu,
     Dock(DockKey),
+    WindowLimit,
 }
 
 impl Command {
@@ -49,6 +54,7 @@ impl Command {
             Command::Dock(DockKey::Cycle { forward: true }) => CYCLE_NEXT,
             Command::Dock(DockKey::Cycle { forward: false }) => CYCLE_PREV,
             Command::Dock(DockKey::Slot(n)) => SLOT_1 + n.clamp(1, 9) - 1,
+            Command::WindowLimit => WINDOW_LIMIT,
         }
     }
 
@@ -58,6 +64,7 @@ impl Command {
             CYCLE_NEXT => Command::Dock(DockKey::Cycle { forward: true }),
             CYCLE_PREV => Command::Dock(DockKey::Cycle { forward: false }),
             SLOT_1..=SLOT_9 => Command::Dock(DockKey::Slot(byte - SLOT_1 + 1)),
+            WINDOW_LIMIT => Command::WindowLimit,
             _ => return None,
         })
     }
@@ -155,7 +162,7 @@ mod tests {
         let (tx, commands) = mpsc::channel();
         let control = reader(bar, move |c| tx.send(c).unwrap()).unwrap();
         let mut sent: Vec<u8> = (SLOT_1..=SLOT_1 + 8).collect();
-        sent.extend([CYCLE_NEXT, CYCLE_PREV, 14, 255, TOGGLE_MENU]);
+        sent.extend([CYCLE_NEXT, CYCLE_PREV, WINDOW_LIMIT, 15, 255, TOGGLE_MENU]);
         // They all arrive before the reply, and the request still gets it.
         let waiting = std::thread::spawn(move || request(&control, false));
         assert_eq!(answer(&mut navi, &sent, YES), CAN_LOCK);
@@ -164,17 +171,18 @@ mod tests {
         want.extend([
             Command::Dock(DockKey::Cycle { forward: true }),
             Command::Dock(DockKey::Cycle { forward: false }),
+            Command::WindowLimit,
             Command::ToggleMenu,
         ]);
         for w in &want {
             assert_eq!(commands.recv_timeout(Duration::from_secs(5)).unwrap(), *w);
         }
-        assert!(commands.try_recv().is_err(), "14 and 255 ignored");
+        assert!(commands.try_recv().is_err(), "15 and 255 ignored");
         // navi's encoding is the reader's decoding.
         for c in want {
             assert_eq!(Command::from_byte(c.byte()), Some(c));
         }
-        for b in [NO, YES, 14, 255] {
+        for b in [NO, YES, 15, 255] {
             assert_eq!(Command::from_byte(b), None);
         }
     }

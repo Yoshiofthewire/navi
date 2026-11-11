@@ -220,6 +220,7 @@ fn run() -> Result<(), String> {
         .insert_source(command_rx, |event, _, bar| match event {
             channel::Event::Msg(control::Command::ToggleMenu) => bar.toggle_menu(),
             channel::Event::Msg(control::Command::Dock(key)) => bar.dock_key(key),
+            channel::Event::Msg(control::Command::WindowLimit) => bar.window_limit(),
             channel::Event::Closed => {}
         })
         .map_err(|e| e.to_string())?;
@@ -1169,34 +1170,47 @@ impl Bar {
                 };
                 let lens = (r.app_name.len(), r.summary.len(), r.body.len());
                 info!(id, sender, ?lens, "notification");
-                let blocked = self.desktop_settings["blocked_apps"]
-                    .as_array()
-                    .is_some_and(|a| a.iter().any(|v| v == &r.app_id));
-                let suppressed = blocked
-                    || self.desktop_settings["dnd"] == true
-                    || self.desktop_settings["notifications"] != true;
-                if suppressed {
-                    self.notes.hide(id);
-                }
-                if blocked || self.desktop_settings["history"] != true {
-                    self.notes.history.retain(|n| n.id != id);
-                }
-                if !suppressed {
-                    runtime::play(&self.desktop_settings, "notification");
-                }
-                let mut closed = closed;
-                if suppressed {
-                    closed.push((id, notify::EXPIRED));
-                }
-                self.emit(closed);
-                let at = self.notes.shown().iter().find(|n| n.id == id);
-                self.expire_at(at.map_or(now, |n| n.expires_ms));
+                self.posted(now, id, closed, &r.app_id, true);
             }
             Call::Close(sender, id) => {
                 let closed = self.notes.close(&sender, id);
                 self.emit(closed.into_iter().collect());
             }
         }
+    }
+
+    /// navi closed a window past its client's limit.
+    fn window_limit(&mut self) {
+        let now = self.now_ms();
+        // A flood replaces the card each second; only the first one sounds.
+        let repeat = self.notes.shown().iter().any(|n| n.sender == notify::LOCAL);
+        let (id, closed) = self.notes.window_limit(now);
+        info!(id, repeat, "window limit card");
+        self.posted(now, id, closed, "", !repeat);
+    }
+
+    /// Applies the notification settings to note `id`, just posted, then shows it.
+    fn posted(&mut self, now: u64, id: u32, mut closed: Vec<Closed>, app_id: &str, sound: bool) {
+        let blocked = self.desktop_settings["blocked_apps"]
+            .as_array()
+            .is_some_and(|a| a.iter().any(|v| v == app_id));
+        let suppressed = blocked
+            || self.desktop_settings["dnd"] == true
+            || self.desktop_settings["notifications"] != true;
+        if suppressed {
+            self.notes.hide(id);
+        }
+        if blocked || self.desktop_settings["history"] != true {
+            self.notes.history.retain(|n| n.id != id);
+        }
+        if suppressed {
+            closed.push((id, notify::EXPIRED));
+        } else if sound {
+            runtime::play(&self.desktop_settings, "notification");
+        }
+        self.emit(closed);
+        let at = self.notes.shown().iter().find(|n| n.id == id);
+        self.expire_at(at.map_or(now, |n| n.expires_ms));
     }
 
     /// Sends `NotificationClosed` for each, and shows what is left.

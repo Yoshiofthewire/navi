@@ -18,6 +18,9 @@ pub const EXPIRED: u32 = 1;
 pub const DISMISSED: u32 = 2;
 pub const CLOSED: u32 = 3;
 
+/// The sender of navi-bar's own cards.
+pub const LOCAL: &str = "navi";
+
 /// What navi keeps of a `Notify` call. The icon, actions and hints have no field: the D-Bus glue
 /// drops them, so nothing a notification names is ever opened or decoded.
 #[derive(Clone, Debug, Default)]
@@ -82,6 +85,30 @@ impl Notes {
             return (self.fresh(), None);
         }
         self.recent.push((sender.to_string(), now));
+        let (id, closed) = self.post(now, sender, r);
+        (id, Some(closed))
+    }
+
+    /// navi closed a window past its client's limit: one card from `LOCAL`, past the rate limit
+    /// (navi paces it). A repeat replaces the one shown. Bus senders start with `:`, so none can
+    /// replace or close it.
+    pub fn window_limit(&mut self, now: u64) -> (u32, Vec<Closed>) {
+        let shown = self.shown.iter().find(|n| n.sender == LOCAL);
+        let r = Request {
+            app_name: "Navi".into(),
+            replaces_id: shown.map_or(0, |n| n.id),
+            summary: "Window limit reached".into(),
+            body: format!(
+                "An app tried to open more than {} windows. Close some of its windows to open more.",
+                crate::control::CLIENT_TOPLEVELS
+            ),
+            expire_timeout: -1,
+            ..Request::default()
+        };
+        self.post(now, LOCAL, &r)
+    }
+
+    fn post(&mut self, now: u64, sender: &str, r: &Request) -> (u32, Vec<Closed>) {
         let replaced = (r.replaces_id != 0)
             .then(|| {
                 self.shown
@@ -108,14 +135,14 @@ impl Notes {
             note.id = r.replaces_id;
             self.remember(&note);
             self.shown[at] = note;
-            return (r.replaces_id, Some(Vec::new()));
+            return (r.replaces_id, Vec::new());
         }
         note.id = self.fresh();
         let id = note.id;
         self.remember(&note);
         self.shown.insert(0, note);
         let evicted = self.shown.split_off(self.shown.len().min(MAX_SHOWN));
-        (id, Some(evicted.iter().map(|n| (n.id, EXPIRED)).collect()))
+        (id, evicted.iter().map(|n| (n.id, EXPIRED)).collect())
     }
 
     fn remember(&mut self, note: &Note) {
@@ -488,6 +515,39 @@ mod tests {
         }
         assert_eq!(n.notify(9_999, ":1.99", &req("x")).1, None, "the 21st");
         assert!(n.notify(10_000, ":1.99", &req("x")).1.is_some());
+    }
+
+    #[test]
+    fn a_window_limit_flood_shows_one_card_no_bus_client_can_close() {
+        let mut n = Notes::default();
+        for k in 0..10 {
+            n.window_limit(k * 1_000);
+        }
+        let [card] = n.shown() else {
+            panic!("one card: {:?}", n.shown());
+        };
+        let id = card.id;
+        assert_eq!(card.sender, LOCAL);
+        assert_eq!(card.summary, "Window limit reached");
+        assert_eq!(
+            card.body,
+            "An app tried to open more than 256 windows. Close some of its windows to open more."
+        );
+        assert!(card.actions.is_empty());
+        assert_eq!(card.expires_ms, 9_000 + DEFAULT_MS);
+        for sender in [":1.1", ":1.99", ":navi"] {
+            assert_eq!(n.close(sender, id), None);
+        }
+        // Two, so the card isn't simply pushed out past `MAX_SHOWN`.
+        for sender in [":1.1", ":navi"] {
+            let replace = Request {
+                replaces_id: id,
+                ..req("spoof")
+            };
+            n.notify(9_000, sender, &replace);
+        }
+        assert!(n.shown().iter().any(|c| c.id == id && c.sender == LOCAL));
+        assert_eq!(n.shown().iter().filter(|c| c.sender == LOCAL).count(), 1);
     }
 
     #[test]
