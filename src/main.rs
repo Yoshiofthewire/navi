@@ -186,13 +186,18 @@ fn run(backend: Backend) -> Result<(), Box<dyn Error>> {
     #[cfg(debug_assertions)]
     replay::start(&handle);
     // Clients must receive replies even while the host throttles an obscured nested window.
-    event_loop.run(None, &mut data, |data| {
-        data.state.space.refresh();
-        data.state.popups.cleanup();
-        data.state.refresh_toplevels();
-        let _ = data.display.flush_clients();
-    })?;
+    event_loop.run(None, &mut data, after_dispatch)?;
     Ok(())
+}
+
+/// Runs after every event-loop dispatch, so whatever a dispatch changed under a still pointer
+/// gets it before clients hear back.
+pub fn after_dispatch(data: &mut CalloopData) {
+    data.state.space.refresh();
+    data.state.popups.cleanup();
+    data.state.refresh_toplevels();
+    data.state.repick_pointer();
+    let _ = data.display.flush_clients();
 }
 
 #[cfg(test)]

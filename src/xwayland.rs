@@ -680,7 +680,7 @@ pub(crate) mod tests {
         while !done(data) {
             assert!(Instant::now() < deadline, "XWayland operation timed out");
             event_loop.dispatch(Duration::from_millis(5), data).unwrap();
-            data.display.flush_clients().unwrap();
+            crate::after_dispatch(data);
         }
     }
 
