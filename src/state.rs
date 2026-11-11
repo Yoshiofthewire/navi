@@ -1893,11 +1893,11 @@ impl Navi {
 
     /// Whether `popup`'s client already has `layout::CLIENT_POPUPS` other live popups, wherever
     /// they sit: under a live or destroyed root, parentless, or dismissed but kept alive. Closing
-    /// one frees its place.
+    /// one frees its place. Each xdg_popup counts, even several sharing one surface.
     fn client_popups_full(&self, popup: &PopupSurface) -> bool {
         let client = popup.wl_surface().client();
         let others = self.xdg_shell_state.popup_surfaces().iter().filter(|p| {
-            p.alive() && p.wl_surface() != popup.wl_surface() && p.wl_surface().client() == client
+            p.alive() && p.xdg_popup() != popup.xdg_popup() && p.wl_surface().client() == client
         });
         layout::popups_full(others)
     }
@@ -2778,6 +2778,121 @@ mod tests {
             offset: offset.into(),
             ..Default::default()
         }
+    }
+
+    /// A real client on an in-process navi: 66 `get_popup`s on one xdg_surface are 66 popups,
+    /// so the 65th and 66th are dismissed.
+    #[test]
+    fn popups_sharing_a_surface_each_count() {
+        use smithay_client_toolkit::reexports::client::{
+            Connection, Dispatch, QueueHandle, delegate_noop,
+            protocol::{wl_callback, wl_compositor, wl_registry, wl_surface},
+        };
+        use smithay_client_toolkit::reexports::protocols::xdg::shell::client::{
+            xdg_popup, xdg_positioner, xdg_surface, xdg_toplevel, xdg_wm_base,
+        };
+
+        #[derive(Default)]
+        struct Client {
+            compositor: Option<wl_compositor::WlCompositor>,
+            wm: Option<xdg_wm_base::XdgWmBase>,
+            done: usize,
+            synced: bool,
+        }
+        impl Dispatch<wl_registry::WlRegistry, ()> for Client {
+            fn event(
+                c: &mut Self,
+                r: &wl_registry::WlRegistry,
+                e: wl_registry::Event,
+                _: &(),
+                _: &Connection,
+                qh: &QueueHandle<Self>,
+            ) {
+                if let wl_registry::Event::Global {
+                    name, interface, ..
+                } = e
+                {
+                    match interface.as_str() {
+                        "wl_compositor" => c.compositor = Some(r.bind(name, 4, qh, ())),
+                        "xdg_wm_base" => c.wm = Some(r.bind(name, 3, qh, ())),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        impl Dispatch<xdg_popup::XdgPopup, ()> for Client {
+            fn event(
+                c: &mut Self,
+                _: &xdg_popup::XdgPopup,
+                e: xdg_popup::Event,
+                _: &(),
+                _: &Connection,
+                _: &QueueHandle<Self>,
+            ) {
+                if let xdg_popup::Event::PopupDone = e {
+                    c.done += 1;
+                }
+            }
+        }
+        impl Dispatch<wl_callback::WlCallback, ()> for Client {
+            fn event(
+                c: &mut Self,
+                _: &wl_callback::WlCallback,
+                _: wl_callback::Event,
+                _: &(),
+                _: &Connection,
+                _: &QueueHandle<Self>,
+            ) {
+                c.synced = true;
+            }
+        }
+        delegate_noop!(Client: ignore wl_compositor::WlCompositor);
+        delegate_noop!(Client: ignore wl_surface::WlSurface);
+        delegate_noop!(Client: ignore xdg_wm_base::XdgWmBase);
+        delegate_noop!(Client: ignore xdg_surface::XdgSurface);
+        delegate_noop!(Client: ignore xdg_toplevel::XdgToplevel);
+        delegate_noop!(Client: ignore xdg_positioner::XdgPositioner);
+
+        let (mut event_loop, mut data) = crate::xwayland::tests::harness();
+        let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
+        data.state
+            .display_handle
+            .insert_client(server, std::sync::Arc::new(ClientState::default()))
+            .unwrap();
+        let conn = Connection::from_socket(client).unwrap();
+        let mut queue = conn.new_event_queue::<Client>();
+        let qh = queue.handle();
+        let mut c = Client::default();
+        // Until the server has answered everything sent so far.
+        let mut sync = |c: &mut Client,
+                        queue: &mut smithay_client_toolkit::reexports::client::EventQueue<
+            Client,
+        >| {
+            c.synced = false;
+            conn.display().sync(&qh, ());
+            queue.flush().unwrap();
+            crate::xwayland::tests::pump(&mut event_loop, &mut data, |_| {
+                if let Some(read) = queue.prepare_read() {
+                    let _ = read.read();
+                }
+                queue.dispatch_pending(c).unwrap();
+                c.synced
+            });
+        };
+        conn.display().get_registry(&qh, ());
+        sync(&mut c, &mut queue);
+        let (comp, wm) = (c.compositor.clone().unwrap(), c.wm.clone().unwrap());
+        let top = wm.get_xdg_surface(&comp.create_surface(&qh, ()), &qh, ());
+        top.get_toplevel(&qh, ());
+        let pos = wm.create_positioner(&qh, ());
+        pos.set_size(8, 8);
+        pos.set_anchor_rect(0, 0, 1, 1);
+        let shared = wm.get_xdg_surface(&comp.create_surface(&qh, ()), &qh, ());
+        let popups: Vec<_> = (0..layout::CLIENT_POPUPS + 2)
+            .map(|_| shared.get_popup(Some(&top), &pos, &qh, ()))
+            .collect();
+        sync(&mut c, &mut queue);
+        assert_eq!(popups.len() - c.done, layout::CLIENT_POPUPS);
     }
 
     #[test]

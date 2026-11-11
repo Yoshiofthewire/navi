@@ -445,7 +445,7 @@ impl XWaylandShellHandler for CalloopData {
 delegate_xwayland_shell!(Navi);
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use smithay::{
         backend::input::KeyState,
@@ -607,7 +607,7 @@ mod tests {
     }
 
     #[track_caller]
-    fn pump(
+    pub(crate) fn pump(
         event_loop: &mut EventLoop<CalloopData>,
         data: &mut CalloopData,
         mut done: impl FnMut(&CalloopData) -> bool,
@@ -636,7 +636,7 @@ mod tests {
     }
 
     /// navi with one 1280 × 720 test output and a fresh layout, not yet running Xwayland.
-    fn harness() -> (EventLoop<'static, CalloopData>, CalloopData) {
+    pub(crate) fn harness() -> (EventLoop<'static, CalloopData>, CalloopData) {
         let event_loop = EventLoop::try_new().unwrap();
         let mut display = Display::new().unwrap();
         let mut state = Navi::new(
