@@ -1891,29 +1891,15 @@ impl Navi {
         })
     }
 
-    /// Whether `popup`'s client already has `layout::CLIENT_POPUPS` popups tracked, under any of
-    /// its toplevels or layer surfaces (every root a popup can have). Only tracked, live popups
-    /// count, so closing one frees its place. navi-bar's popups can wait outside any tree
-    /// (parentless until a layer surface adopts one), so for navi-bar every live one counts.
-    fn client_popups_full(&self, popup: &PopupSurface, navi_bar: bool) -> bool {
+    /// Whether `popup`'s client already has `layout::CLIENT_POPUPS` other live popups, wherever
+    /// they sit: under a live or destroyed root, parentless, or dismissed but kept alive. Closing
+    /// one frees its place.
+    fn client_popups_full(&self, popup: &PopupSurface) -> bool {
         let client = popup.wl_surface().client();
-        if navi_bar {
-            return layout::popups_full(self.xdg_shell_state.popup_surfaces().iter().filter(|p| {
-                p.alive()
-                    && p.wl_surface() != popup.wl_surface()
-                    && p.wl_surface().client() == client
-            }));
-        }
-        let toplevels = self.xdg_shell_state.toplevel_surfaces().iter();
-        let roots = toplevels
-            .map(|t| t.wl_surface().clone())
-            .chain(
-                self.layer_shell_state
-                    .layer_surfaces()
-                    .map(|l| l.wl_surface().clone()),
-            )
-            .filter(|s| s.client() == client);
-        layout::popups_full(roots.flat_map(|s| PopupManager::popups_for_surface(&s)))
+        let others = self.xdg_shell_state.popup_surfaces().iter().filter(|p| {
+            p.alive() && p.wl_surface() != popup.wl_surface() && p.wl_surface().client() == client
+        });
+        layout::popups_full(others)
     }
 
     fn unconstrain_popup(&self, popup: &PopupSurface) {
@@ -2413,7 +2399,7 @@ impl XdgShellHandler for Navi {
             has_parent,
             navi_bar,
             too_deep(&surface),
-            self.client_popups_full(&surface, navi_bar),
+            self.client_popups_full(&surface),
         ) {
             surface.send_popup_done();
             return;

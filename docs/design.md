@@ -233,9 +233,10 @@ aspect, gravity, position) are ignored.
   shrinks it there when it's placed, and draws and hits it only there, whatever size the app asks
   for or attaches. So a popup, with or without a grab, can't cover or take input meant for a
   neighbouring tile. An app keeps at most 64 popups open and nests them at most 16 deep; navi
-  dismisses any more, and any popup without a parent except navi-bar's. A window that draws larger, such as a CSD shadow or a buffer bigger than its
-  configure, is cropped there, and a click just outside it reaches what's below. So no app draws
-  over, or takes clicks meant for, another tile or navi's zones, except through a dialog, below.
+  dismisses any more, and any popup without a parent except navi-bar's. A window that draws
+  larger, such as a CSD shadow or a buffer bigger than its configure, is cropped there, and a
+  click just outside it reaches what's below. So no app draws over, or takes clicks meant for,
+  another tile or navi's zones, except through a dialog, below.
 - **Dialogs.** A dialog (an xdg toplevel with a parent, or an X11 `WM_TRANSIENT_FOR` window) has a
   *root*: the first tiled or floating window up its parents. The walk stops after 8 steps or on a
   loop; a chain that ends without a tiled window, is too deep or loops makes an *orphan*. Its
