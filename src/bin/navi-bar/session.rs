@@ -6,10 +6,13 @@ use zbus::blocking::{Connection, Proxy, connection::Builder};
 
 use crate::{
     layout::{IconOf, Item, Rect},
-    theme::{BAR_BG, BG, DIM, INK, SELECTED, SHELL_EDGE},
+    status::Battery,
+    theme::{ACCENT, BAR_BG, DIM, INK, INSET, PANEL_EDGE, SELECTED},
 };
 
 pub const BAND_H: i32 = 32;
+/// The band's layer margins, top, right, bottom, left: it floats `INSET` from the screen edges.
+pub const BAND_MARGIN: [i32; 4] = [INSET, INSET, 0, INSET];
 pub const BUTTON: Rect = Rect {
     x: 4,
     y: 0,
@@ -18,7 +21,7 @@ pub const BUTTON: Rect = Rect {
 };
 const WIDTH: i32 = 300;
 const ROW_H: i32 = 40;
-const TOP: i32 = BAND_H + 8;
+const TOP: i32 = BAND_H + INSET;
 const LIST_Y: i32 = TOP + 44;
 const LOGIN: &str = "org.freedesktop.login1";
 const LOGIN_PATH: &str = "/org/freedesktop/login1";
@@ -126,7 +129,7 @@ impl Menu {
     }
     pub fn panel(&self) -> Rect {
         Rect {
-            x: 8,
+            x: 0,
             y: TOP,
             w: WIDTH,
             h: if self.confirm.is_some() {
@@ -139,14 +142,20 @@ impl Menu {
     pub fn height(&self) -> i32 {
         if self.open {
             let p = self.panel();
-            p.y + p.h + 8
+            p.y + p.h
         } else {
             BAND_H
         }
     }
+    /// The band's input region: the Navi button, and the menu while it's open.
+    pub fn input(&self) -> Vec<Rect> {
+        let mut r = vec![BUTTON];
+        r.extend(self.open.then(|| self.panel()));
+        r
+    }
     fn row(&self, i: usize) -> Rect {
         Rect {
-            x: 16,
+            x: 8,
             y: LIST_Y + i as i32 * ROW_H,
             w: WIDTH - 16,
             h: ROW_H,
@@ -227,19 +236,7 @@ impl Menu {
             return Vec::new();
         }
         let p = self.panel();
-        let mut out = vec![
-            Item::Round(p, 14, SHELL_EDGE),
-            Item::Round(
-                Rect {
-                    x: p.x + 1,
-                    y: p.y + 1,
-                    w: p.w - 2,
-                    h: p.h - 2,
-                },
-                13,
-                BG,
-            ),
-        ];
+        let mut out = vec![Item::Panel(p, PANEL_EDGE, 1)];
         let text =
             |label: &str, x, y, w, h, color| Item::Text(label.into(), Rect { x, y, w, h }, color);
         if let Some(action) = self.confirm {
@@ -331,6 +328,102 @@ impl Menu {
         }
         out
     }
+}
+
+/// The status band, `w` wide: the Navi button (`lit` when hovered or open), the clock and
+/// the battery, each text with its width in px.
+pub fn band(
+    w: i32,
+    lit: bool,
+    clock: (String, i32),
+    battery: Option<(String, i32, Battery)>,
+) -> Vec<Item> {
+    let text = |t, x, w| {
+        Item::Text(
+            t,
+            Rect {
+                x,
+                y: 0,
+                w,
+                h: BAND_H,
+            },
+            INK,
+        )
+    };
+    let mut out = vec![Item::Panel(
+        Rect {
+            x: 0,
+            y: 0,
+            w,
+            h: BAND_H,
+        },
+        PANEL_EDGE,
+        1,
+    )];
+    if lit {
+        out.push(Item::Round(
+            Rect {
+                y: 4,
+                h: BAND_H - 8,
+                ..BUTTON
+            },
+            8,
+            SELECTED,
+        ));
+    }
+    out.push(Item::Icon(
+        IconOf::Button,
+        Rect {
+            x: 12,
+            y: 8,
+            w: 16,
+            h: 16,
+        },
+        1.0,
+    ));
+    out.push(text("Navi".into(), 36, 64));
+    let (clock, clock_w) = clock;
+    out.push(text(clock, (w - clock_w) / 2, clock_w + 1));
+    if let Some((label, label_w, b)) = battery {
+        let x = w - 12 - label_w;
+        out.push(text(label, x, label_w + 1));
+        let r = Rect {
+            x: x - 27,
+            y: 11,
+            w: 18,
+            h: 10,
+        };
+        for edge in [
+            Rect { h: 1, ..r },
+            Rect {
+                y: r.y + r.h - 1,
+                h: 1,
+                ..r
+            },
+            Rect { w: 1, ..r },
+            Rect {
+                x: r.x + r.w - 1,
+                w: 1,
+                ..r
+            },
+            Rect {
+                x: r.x + r.w,
+                y: r.y + 3,
+                w: 2,
+                h: 4,
+            },
+        ] {
+            out.push(Item::Fill(edge, DIM));
+        }
+        let charge = Rect {
+            x: r.x + 2,
+            y: r.y + 2,
+            w: (14 * b.percent as i32 / 100).max(1),
+            h: 6,
+        };
+        out.push(Item::Fill(charge, if b.charging { ACCENT } else { INK }));
+    }
+    out
 }
 
 pub enum Reply {
@@ -498,6 +591,25 @@ mod tests {
             [false, true, false, true, false, false]
         );
     }
+    #[test]
+    fn ac7_band_and_menu_float_inset() {
+        assert_eq!(BAND_MARGIN, [12, 12, 0, 12]);
+        let mut m = Menu::default();
+        assert_eq!(m.input(), [BUTTON]);
+        m.open = true;
+        let band = band(800, false, ("12:00".into(), 40), None);
+        let Some(&Item::Panel(b, ..)) = band.first() else {
+            panic!("the band is a panel")
+        };
+        for confirm in [None, Some(Action::Logout)] {
+            m.confirm = confirm;
+            let p = m.panel();
+            assert_eq!((p.x, p.y), (b.x, b.y + b.h + INSET));
+            assert_eq!(m.input(), [BUTTON, p]);
+            assert_eq!(m.height(), p.y + p.h);
+        }
+    }
+
     #[test]
     fn menu_geometry_keyboard_and_hit_targets_match() {
         let mut m = Menu::default();

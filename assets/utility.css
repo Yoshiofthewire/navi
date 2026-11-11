@@ -13,13 +13,13 @@ headerbar { min-height: 44px; }
 label, image { color: inherit; }
 button, entry, spinbutton, combobox button {
   background-image: none; box-shadow: none; text-shadow: none;
-  border: 1px solid #7a8396; border-radius: 8px;
+  border: 1px solid #a3abbc; border-radius: 8px;
   padding: 6px 10px; min-height: 24px; color: #d0d4dc;
 }
 button, combobox button { background-color: #262c38; }
 button:hover, combobox button:hover { background-color: #303847; }
 button:active, button:checked { background-color: #151922; }
-button:disabled, entry:disabled, spinbutton:disabled { color: #7a8396; background-color: #151922; border-color: #303847; }
+button:disabled, entry:disabled, spinbutton:disabled { color: #a3abbc; background-color: #151922; border-color: #303847; }
 button:focus, entry:focus, spinbutton:focus, combobox:focus, .view:focus {
   outline: 2px solid #2ba3d8; outline-offset: -2px;
 }
@@ -35,16 +35,16 @@ menu, menuitem, popover, popover contents { background-color: #151922; color: #d
 menuitem:hover { background-color: #262c38; }
 separator { background-color: #303847; min-height: 1px; min-width: 1px; }
 scrollbar { background-color: #151922; }
-scrollbar slider { background-color: #7a8396; border: none; border-radius: 6px; min-width: 6px; min-height: 6px; }
+scrollbar slider { background-color: #a3abbc; border: none; border-radius: 6px; min-width: 6px; min-height: 6px; }
 tooltip, tooltip label { background-color: #151922; color: #d0d4dc; }
 progressbar progress, scale highlight { background-color: #2ba3d8; }
-check, radio { background-image: none; background-color: #0b0d12; border: 1px solid #7a8396; }
+check, radio { background-image: none; background-color: #0b0d12; border: 1px solid #a3abbc; }
 check { border-radius: 4px; }
 radio { border-radius: 50%; }
 check:checked, check:indeterminate, radio:checked {
   background-color: #2ba3d8; border-color: #2ba3d8; color: #0b0d12;
 }
-switch { background-color: #303847; background-image: none; border: 1px solid #7a8396; border-radius: 14px; }
+switch { background-color: #303847; background-image: none; border: 1px solid #a3abbc; border-radius: 14px; }
 switch:checked { background-color: #2ba3d8; border-color: #2ba3d8; }
 switch slider { background-color: #d0d4dc; background-image: none; border-radius: 50%; }
 switch:checked slider { background-color: #0b0d12; }

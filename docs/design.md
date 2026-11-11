@@ -33,15 +33,17 @@ Cells may be empty. There is no split tree, so nothing can flip orientation (pri
 
 | Monitor | Grid area | Cell | Minimum span (MIN 320 × 240) | Most side by side |
 |---|---|---|---|---|
-| Ultrawide 3440×1440 | 3440×1440 (no bars) | 143⅓×120 | 3 × 2 | 8 (3 cols each) |
-| Ultrawide, taskbar 48 + band 32 | 3440×1360 | 143⅓×113⅓ | 3 × 3 | 8 |
-| 4K 3840×2160 @1 | 3840×2160 | 160×180 | 2 × 2 | 12 |
-| Laptop 1800×1125 @1.6 | 1125×703 | 46.9×58.6 | 7 × 5 | 3 |
+| Ultrawide 3440×1440 | 3428×1428 (no panels) | 142⅚×119 | 3 × 3 | 8 (3 cols each) |
+| Ultrawide, dock 52 + band 44 | 3428×1332 | 142⅚×111 | 3 × 3 | 8 |
+| 4K 3840×2160 @1 | 3828×2148 | 159½×179 | 3 × 2 | 8 |
+| Laptop 1800×1125 @1.6 | 1113×691 | 46⅜×57⅗ | 7 × 5 | 3 |
 
 Cell boundaries are spread evenly: boundary `k` is at `k × width ÷ 24` px, rounded down, so every
-cell is within 1 px of the others and nothing collects at the last column. Tiles have a
-small gap around them. The gap at the top of each tile is 6–8 px, and only the compositor draws
-there (see *Grab strip*).
+cell is within 1 px of the others and nothing collects at the last column. Tiles are 12 px
+(`GAP`) apart, and 12 px from the screen edges and the panels. Each tile keeps 6 px of its cells
+beside its window, 4 px below it and the 8 px grab strip above it, where only the compositor
+draws (see *Dragging*); the grid is inset from what the panels leave by the rest: 6 px at the
+sides, 4 at the top and 8 at the bottom. Sizes in memory still snap to whole cells.
 
 ### Remembered size
 
@@ -99,7 +101,8 @@ space when you want it.
   to extend that side to the monitor's usable edge. The opposite side stays put. It uses the same
   grid, neighbor and minimum-size rules as dragging, so another tile can stop it short. Panels
   keep their space. This is a resize and is remembered, rather than a maximize toggle.
-- The strip is the 8 px gap above a window; the edges are the 4 px gaps beside and below it.
+- The strip is the 8 px gap above a window, or above its bar; the edges are the 6 px gaps beside
+  it and the 4 px gap below. The inset between the grid and a screen edge or panel is no target.
 - A click on the strip without moving (under 8 px) moves nothing.
 - Once a hold will form tabs, the preview turns more solid, so swap and tab look different.
 - Dragging a tab moves only that tab; resizing a tab group's edge resizes the group.
@@ -132,8 +135,8 @@ Every press changes exactly one grid cell.
 
 ### Tabs
 
-- A tab group shows one window at a time. Above it, a 24 px bar replaces the strip and holds one
-  tab per window, left to right in the order they opened. The active tab is accent blue, inactive
+- A tab group shows one window at a time. Above it, a 24 px bar sits between the strip and the
+  window and holds one tab per window, left to right in the order they opened. The active tab is accent blue, inactive
   tabs are outlined, and minimized ones are a dimmed blue. Tabs have no titles or icons yet; those
   come later, since titles would need fonts in the compositor and fonts stay out of it. For now a
   tab tells you its window only by position.
@@ -145,7 +148,7 @@ Every press changes exactly one grid cell.
 
 - Apps that draw their own title bar (Konsole, Firefox) keep it. Apps that ask for server-side
   decorations get a 24 px bar with **minimize, maximize and close** buttons on the right; the rest
-  of the bar is the grab strip. Close asks the app to close; navi never kills it.
+  of the bar moves the window, like the strip above it. Close asks the app to close; navi never kills it.
 - **Maximize** covers the monitor's whole grid until clicked again; it isn't fullscreen. The
   window's cells and remembered size don't change, and the other windows on that monitor hide
   until it's undone. A new window on that monitor undoes it, so a new window is always visible.
@@ -222,9 +225,9 @@ bundling a degoogled, resource-tested Chromium variant is reserved for a future 
   `<monitor> <absolute path>` line per monitor, where monitor 0 is the main one and the rest
   follow by priority, e.g. `0 /home/me/Pictures/city.jpg`. Edits apply on restart. Delete the
   file to import from Plasma again.
-- **Taskbar:** a compact, rounded dock centered 8 logical px above the bottom of its monitor.
-  Its visible body is 40 px high, with 24 px icons in 36 px slots, a subtle outline, and a blue
-  active-window indicator. The logo opens the launcher. Pinned apps come first, in pin order;
+- **Taskbar:** a compact floating dock centered 12 logical px above the bottom of its monitor,
+  reserving 52 px. Its visible body is a 40 px high panel (see *Look*), with 24 px icons in 36 px
+  slots and a blue active-window indicator. The launcher opens 12 px above it. The logo opens the launcher. Pinned apps come first, in pin order;
   other running apps follow in opening order. Each app has one icon, with up to three dots for
   its windows. Click an app to launch it if closed, focus or restore it if running, or cycle its
   windows when already focused. Minimized apps are dimmed. **Super+1…9** focuses or restores
@@ -266,18 +269,22 @@ bundling a degoogled, resource-tested Chromium variant is reserved for a future 
   category names), falling back to their non-symbolic name and then a generic folder.
 - **Corners:** on the main monitor, and they stay there when the taskbar moves or the main
   monitor changes. A 32 px status
-  bar runs across the top, with the same opaque dark surface and outline as the dock. Navi's logo
+  band floats 12 px below the top edge and 12 px in from the sides, the same panel as the dock;
+  with its margin it reserves 44 px. Navi's logo
   and name align left, the local date and 24-hour clock sit in the center, and a battery glyph
   and percentage align right, labeled while charging. Battery capacity is the mean of the
   system's batteries, read every 30 s; mice and headsets don't count. The bar takes space from
   the grid and hides in fullscreen. Only the Navi button and its open session menu take clicks;
   the rest of the band is transparent to input.
-  Notifications are top-left, below the band. Volume, network and tray come later. Volume has no
+  Notifications are top-left, 12 px below the band and from the left edge: panels with the
+  accent as their rim (3 px with visual alerts). They wait while the session menu, which shares
+  that corner, is open. Volume, network and tray come later. Volume has no
   small route: PipeWire's native API is C (`libpipewire`, which needs `unsafe` and a new system
   library), pipewire-pulse has no D-Bus volume interface, and running `wpctl` would break the
   no-shell rule.
 - **Session menu:** click Navi at the upper left to open Sleep, Lock Screen, Switch User,
-  Log Out, Restart, and Shutdown. Up/Down or Tab selects, Enter opens a confirmation with Cancel
+  Log Out, Restart, and Shutdown, in a panel 12 px below the band, aligned with its left edge.
+  Up/Down or Tab selects, Enter opens a confirmation with Cancel
   selected, and Escape cancels or closes. Clicking elsewhere closes the menu. All actions need
   explicit confirmation; holding Enter never accepts one. Errors appear in the menu and are
   logged. System services are queried off the UI thread with bounded method timeouts.
@@ -310,7 +317,16 @@ bundling a degoogled, resource-tested Chromium variant is reserved for a future 
   of the same system, preserving geometry, hierarchy and instant state changes. The
   window with the keyboard has a 2 px accent frame just outside it, in the gap; every other shown
   window has a dim 1 px one, so the gaps read as thin neon lines and the grab strips stay easy to
-  find. A lit strip or edge, the bars and the minimized strips draw in front of the frames.
+  find. A lit strip or edge, the bars and the minimized strips draw in front of the frames, and
+  the shell's panels in front of all of them.
+  The shell's panels (dock, launcher, status band, session menu and notification cards) float:
+  12 px (`INSET`) from the screen edges and from what they sit next to, with 10 px corners
+  (`RADIUS`), the shell fill at 85 % opacity and a 1 px rim. That opacity alone keeps their text
+  4.5:1 and marks 3:1 over any wallpaper, white or black, so a later blur is only cosmetic; high
+  contrast makes them opaque. Pixels outside a panel are clear and take no clicks. Hover and
+  selected fills inside a panel stay opaque. Windows stay solid and square, with no translucency
+  or shadows (rounded tiles are planned; see *Open questions*). No desktop widgets, dock
+  magnification, reflection or bounce: it isn't Mac-like.
 - **App menu button:** the navi logo, under the icon name `navi` (in `assets/icons/hicolor`). It's
   installed into `hicolor`, so an icon theme can replace it. A hand-simplified version with
   single lines is used at 16–32 px, where the full logo's double lines blur together.
@@ -320,7 +336,12 @@ bundling a degoogled, resource-tested Chromium variant is reserved for a future 
 `src/theme.rs` owns the compositor/shell palette and its scheme-dependent accent values.
 The default background, shell surface and text are `#0B0D12`, `#151922` and `#D0D4DC`;
 light mode uses `#F5F6F8`, white and `#202734`, with a darker blue accent (`#0077AA`).
-High contrast uses black/white surfaces and text in the selected scheme. Settings maps these
+High contrast uses black/white surfaces and text in the selected scheme. Shell panels use
+`RADIUS` 10 and `INSET` 12, the `BAR_BG` fill at `panel_alpha()` (0.85, or 1.0 with high
+contrast), `DIM` `#A3ABBC` (light `#525E70`) for secondary text, and `PANEL_EDGE` `#848C9E`
+(light `#6B7689`) for their rims and the dock's pinned mark; `theme` tests prove both 4.5:1 text
+and 3:1 marks on a panel composited over white and black, for every scheme and accent. The GTK
+utilities keep `#7A8396` for `DIM` and `SHELL_EDGE` for their borders. Settings maps these
 same roles onto native GTK controls in `app.py` and `extra_ui.py`, with separate control borders
 and secondary-text values for legibility. Noto Sans remains the Settings/shell typeface; the
 default text size is 14 logical px, adjustable from 12 to 24 without changing the layout model.
@@ -493,6 +514,18 @@ session.
 - Grid size: hard-coded at 24 × 12; no per-monitor or configurable grid.
 - More look references, beyond the logo.
 - Is this a daily driver? That decides whether laptop polish is in v1.
+- Planned look work, after the floating panels:
+  - **Rounded tiles.** A 10 px radius needs the client clipped too: the focus frame sits 2 px
+    outside the window, and a square window corner pokes outside any 10 px outer arc. GLES custom
+    elements in `render::Frame` for both backends: one antialiased rounded-rect shader for frames,
+    strips, tab bars and drag previews, one rounded-clip texture shader around each tiled window
+    (top corners only where no bar sits above). Dialogs, popups, fullscreen and the lock surface
+    are never clipped. Clipping can disable direct scanout for tiled windows.
+  - **Frosted panels.** Blur behind navi-bar's panels via `ext-background-effect-v1`, advertised
+    only to navi-bar like layer-shell, with each panel's region capped at 16 rectangles, clamped
+    to the surface and rounded by `RADIUS`. Only the wallpaper is blurred, once per output and
+    wallpaper change on a worker with the lock backdrop's bounded box blur, so a frame costs one
+    textured quad. Off in high contrast and over fullscreen.
 - Screen readers: navi-bar draws its own pixels with no toolkit, so it has no accessibility
   tree, and the dock and launcher button are invisible to them. Exposing them means building
   one, e.g. an AT-SPI adapter such as `accesskit_unix` (a new crate tree and D-Bus surface).
