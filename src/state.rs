@@ -407,9 +407,13 @@ impl Navi {
     }
 
     /// Sends every visible tiled window its layout size and state and moves it to its rect;
-    /// unmaps hidden ones, and their dialogs.
+    /// unmaps hidden ones, and their dialogs. Every layout event ends here, so floats that free
+    /// cells now hold tile first, unless a drag is in progress (its end catches up).
     pub fn apply_layout(&mut self) {
         self.request_redraw();
+        if self.drag.is_none() {
+            self.tile_floats();
+        }
         let (mut hidden, mut shown) = (Vec::new(), Vec::new());
         for m in &self.windows {
             let Some(id) = m.tile else {
@@ -1290,6 +1294,17 @@ impl Navi {
             self.memory.sync(&self.layout);
         }
         self.apply_layout();
+    }
+
+    fn tile_floats(&mut self) {
+        let tiled = self.layout.tile_floats();
+        for (id, output, cells) in &tiled {
+            let app = self.layout.tile(*id).map(|t| t.app.as_str());
+            info!(app, id, output, ?cells, by = "room freed", "tiled again");
+        }
+        if !tiled.is_empty() {
+            self.memory.sync(&self.layout);
+        }
     }
 
     pub(crate) fn log_float(&self, id: WinId, app: &str) {

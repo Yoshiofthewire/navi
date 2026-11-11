@@ -277,10 +277,15 @@ where
     // Float decorations follow the tiles', so one buffer list keeps every id stable.
     let tile_decorations = decorations.len();
     decorations.extend(
-        layout::float_overlay(&state.layout, state.focused_tile())
-            .into_iter()
-            .filter(|(r, _)| overlaps(*r, full))
-            .map(|(r, color)| (rect(r), color)),
+        layout::float_overlay(
+            &state.layout,
+            state.drag.as_ref(),
+            pointer,
+            state.focused_tile(),
+        )
+        .into_iter()
+        .filter(|(r, _)| overlaps(*r, full))
+        .map(|(r, color)| (rect(r), color)),
     );
     let buttons = layout::buttons(&state.layout, state.drag.as_ref(), pointer)
         .into_iter()

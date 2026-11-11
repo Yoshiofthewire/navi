@@ -127,6 +127,8 @@ space when you want it.
 - The top edge of a tile on the monitor's top border isn't draggable; the strip owns that gap.
 - Drop a window within half a cell of where you grabbed it to cancel a move. A drag also cancels, putting everything back,
   when the pointer leaves every monitor or the nested window loses focus.
+- A float moves by its bar and resizes by the 6 px band around it, px for px with no grid or
+  preview (see *Client sizes → Floats*).
 
 ### Keyboard window controls
 
@@ -146,8 +148,10 @@ Every press changes exactly one grid cell.
 - All three act on the active tab group, keep keyboard focus, and remember the focused group's
   change: moves preserve its remembered size, growing and shrinking update it. Tiles that gave up
   a cell keep what navi remembers for them.
+- A focused float moves or resizes by one cell of its monitor per press, or by what is left to
+  its bounds; nothing else changes and nothing is remembered.
 - Maximized/fullscreen windows keep their mode and geometry. Floating dialogs and shell
-  surfaces keep their app shortcuts; window shortcuts apply only to a focused tile. A mouse
+  surfaces keep their app shortcuts; window shortcuts apply only to a focused tile or float. A mouse
   drag takes precedence. Settings can swap the two modifiers; Shift goes with the grow one.
   Ctrl, the other modifier, or Shift with the move modifier leave the chord to apps.
 
@@ -181,14 +185,40 @@ aspect, gravity, position) are ignored.
   to see the tiles behind it; the dock brings it back. Where the app's minimum is larger than that
   area, the float takes what the minimum needs of the monitor below the top panel, past the
   bottom one, which stays on top of it; its bar never goes under the top panel. Only a minimum
-  larger than that is cut, which is logged. It holds no cells, so tiles
-  are placed under it; it has no strip, edges or corners, and only its bar's buttons take clicks
-  over it. Minimize hides it, fullscreen covers the monitor and returns it to floating, and
+  larger than that is cut, which is logged. It holds no cells, so tiles are placed under it.
+  Minimize hides it, fullscreen covers the monitor and returns it to floating, and
   maximize does nothing. It never tabs and isn't a move or swap target. It draws, with its bar and
   frame, above every tile and its decorations and below the panels and the lock screen; its
-  dialogs draw above it. It tiles again only when its hints change and a step fits, or when it
-  reopens, and doesn't change what navi remembers. Unplugging its monitor runs the placement order
-  again from the main monitor. Floats can't be moved or resized yet.
+  dialogs draw above it.
+- **Float zones.** A shown float's bar moves it (a click focuses it) and its buttons work as on a
+  tile. A 6 px band around its bar and window resizes it: each side is an edge, and the 32 px of a
+  band nearest a corner is that corner. The band takes the pointer from whatever is under it, a
+  tile or another float, and is drawn only while hovered or pressed, lit like a tile's edge. The
+  window itself is the app's. The front float's window hides the zones of a float behind it.
+- **Float bounds.** A float stays inside its *bounds*, the area the panels leave, 8 px in, on each
+  axis its bar and window fit: no move, resize, hints change or panel change puts it under a panel
+  or off its monitor. On an axis its minimum doesn't fit, it keeps the spot above and can't be
+  moved or resized. Its window is never smaller than the app's minimum (else 320 × 240) or larger
+  than the app's maximum or the bounds.
+- **Moving and resizing a float.** After 8 px the float follows the pointer 1:1: the grabbed point
+  stays under it, clamped to the bounds, with no grid and no snapping. Over another monitor it
+  moves there if its minimum fits that monitor's bounds; otherwise it stops at its own monitor's
+  edge. An edge moves only that side, a corner two, px for px, and the opposite sides stay put.
+  Double-clicking an edge fills that side to the bounds or the app's maximum. A cancel puts it
+  back. The keyboard steps it a cell (*Keyboard window controls*). Apps can't move or resize
+  their own float (xdg `move`/`resize` and X11 `_NET_WM_MOVERESIZE` are ignored); every float has
+  navi's bar for that. Its new rect is kept, clamped to new hints at once with its top-left in
+  place, until it tiles or its monitor goes (it is centred again there). It is never remembered.
+- **Floats tile when room frees.** After every layout event (a window closes, a drag or key
+  ends, a monitor or its panels change, hints change, a window is restored) each shown float,
+  most recent first, tiles if free cells on its own monitor hold it: the span of its current size
+  nearest its centre, else the largest free span down to its minimum. It never shrinks or moves
+  another window, never tabs, never picks another monitor, and waits while a drag is in progress,
+  while it is minimized or fullscreen, and while its monitor has a maximized group. A float
+  dropped on a monitor with room tiles there this way. Memory learns its spot, as for any tile.
+  Otherwise a float tiles again when its hints change and a step fits, or when it reopens, and
+  doesn't change what navi remembers. Unplugging its monitor runs the placement order again from
+  the main monitor.
 - **The clip.** Every tiled or floating window's own surfaces are drawn and take pointer input
   only inside its rect: the clamped tile rect, the float's rect, or the monitor while fullscreen.
   A popup (menu, tooltip) of a tiled or floating window is kept inside that window's rect: navi
@@ -201,7 +231,8 @@ aspect, gravity, position) are ignored.
   and take their clicks while it's shown.
 - **Logs.** One `info` line per change: `client size hints` (app, id, min, max and the outcome),
   then `re-placed`, `floating: no tile fits` (and `floating: its minimum is bigger than the
-  monitor` when it is) or `tiled again` with the cells or rect, and `clipped`
+  monitor` when it is) or `tiled again` with the cells or rect (`by="room freed"` when a float
+  takes freed cells), `float moved` / `float resized` with the rect, and `clipped`
   with both sizes when a window's geometry is larger than its clip rect. An app that alternates its
   hints logs at most one refit a second.
 
@@ -227,6 +258,7 @@ aspect, gravity, position) are ignored.
   pointer. They are 24 px squares, flush right and touching, as tight as KWin's. Navi Settings'
   and the GTK utilities' header buttons use the same 24 px boxes with no space between them.
   Close asks the app to close; navi never kills it.
+- A float always has this bar, whatever the app draws, and the bar moves it.
 - **Maximize** covers the monitor's whole grid until clicked again; it isn't fullscreen. The
   window's cells and remembered size don't change, and the other windows on that monitor hide
   until it's undone. A new window on that monitor undoes it, so a new window is always visible.

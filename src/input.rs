@@ -435,7 +435,13 @@ impl Navi {
                     match self.layout.keyboard_adjust(id, side, op) {
                         Ok(Done::Layout(what, tiles)) => {
                             let cells: Vec<_> = tiles.iter().map(|t| (t.id, t.cells)).collect();
-                            info!(id, by = "keyboard", ?cells, "{what}");
+                            match self.layout.tile(id).filter(|t| t.floating) {
+                                Some(_) => {
+                                    let rect = self.layout.rect(id);
+                                    info!(id, by = "keyboard", ?rect, "{what}");
+                                }
+                                None => info!(id, by = "keyboard", ?cells, "{what}"),
+                            }
                             self.edge_clicks = Default::default();
                             self.memory.sync(&self.layout);
                             self.apply_layout();
@@ -545,8 +551,17 @@ impl Navi {
                 let done = done.or(expanded);
                 match &done {
                     Some(Done::Layout(what, tiles)) => {
-                        let tiles: Vec<_> = tiles.iter().map(|t| (t.id, &t.cells)).collect();
-                        info!(?tiles, "{what}");
+                        match tiles.as_slice() {
+                            [t] if t.floating => {
+                                let (id, rect) = (t.id, self.layout.rect(t.id));
+                                info!(id, by = "pointer", ?rect, "{what}");
+                            }
+                            _ => {
+                                let tiles: Vec<_> =
+                                    tiles.iter().map(|t| (t.id, &t.cells)).collect();
+                                info!(?tiles, "{what}");
+                            }
+                        }
                         self.memory.sync(&self.layout);
                     }
                     Some(Done::Click(action, id)) => info!(id, by = "navi", "{}", action.log()),
@@ -625,9 +640,9 @@ impl Navi {
         self.edge_clicks = Default::default();
         if let Some(d) = self.drag.take() {
             info!("drag cancelled");
-            if d.cancel(&mut self.layout) {
-                self.apply_layout();
-            }
+            d.cancel(&mut self.layout);
+            // Also catches up the layout events the drag held back.
+            self.apply_layout();
         }
     }
 }
