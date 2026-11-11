@@ -282,6 +282,7 @@ fn run() -> Result<(), String> {
         cards_size: (0, 0),
         cards_configured: false,
         cards: Vec::new(),
+        cards_changed_ms: 0,
         compositor,
         layer_shell,
         qh: qh.clone(),
@@ -406,6 +407,8 @@ struct Bar {
     cards_size: (i32, i32),
     cards_configured: bool,
     cards: Vec<Card>,
+    /// `now_ms` when `cards` last changed, for `cards::armed`.
+    cards_changed_ms: u64,
     notes: Notes,
     /// The bus connection, while serving notifications.
     dbus: Option<zbus::blocking::Connection>,
@@ -1257,6 +1260,7 @@ impl Bar {
             return;
         }
         self.cards = cards;
+        self.cards_changed_ms = self.now_ms();
         if self.cards.is_empty() {
             // Dropping it destroys the surface.
             self.cards_layer = None;
@@ -1955,14 +1959,19 @@ impl PointerHandler for Bar {
                     let clicked = cards::hit(&self.cards, x, y);
                     let action = clicked.and_then(|id| self.notes.default_action(id));
                     let dismissed = clicked.and_then(|id| self.notes.dismiss(id));
+                    let armed = cards::armed(self.cards_changed_ms, self.now_ms());
                     match action.filter(|_| self.dbus.is_some()) {
                         // The token lets the app raise itself. Its card hides now; its
                         // `NotificationClosed` follows the action, or clients waiting on the
                         // card would quit before it.
-                        Some((id, sender)) => {
+                        Some((id, sender)) if armed => {
                             let action = Pending::Action(id, sender, dismissed);
                             self.ask_token(action, None, serial, e.surface.clone(), qh);
                             self.show_cards();
+                        }
+                        // Cards that just appeared or moved: the action alone, as from Settings.
+                        Some((id, sender)) => {
+                            self.go_on(Pending::Action(id, sender, dismissed), None)
                         }
                         None => self.emit(dismissed.into_iter().collect()),
                     }

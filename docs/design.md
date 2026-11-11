@@ -468,16 +468,18 @@ bundling a degoogled, resource-tested Chromium variant is reserved for a future 
   plain-text cards use the existing 1–10 second lifetime and per-sender/global rate limits.
   Images, icon paths and sound hints remain ignored. Live actions emit only to the original
   unique sender; a default action runs on a card click, and other actions are explicit in
-  Settings. A card click first asks navi for an activation token for that press and sends it
-  to the sender as `ActivationToken`, then `ActionInvoked`, so the app can raise itself as a dock
+  Settings. A card click first asks navi for an activation token for that press and sends it to
+  the sender as `ActivationToken`, then `ActionInvoked`, so the app can raise itself as a dock
   click would; with no token within 1 s it sends `ActionInvoked` alone, which only marks the
   window. Actions from Settings never carry a token: that click is in another process. The
-  card's `NotificationClosed` follows the action. Replacing/closing is still sender-scoped.
-  Global enable, Do Not Disturb, per-app blocking and a 50-entry in-memory history are
-  configurable. Blocked notifications never enter history. History/actions require an unlocked
-  compositor settings check. Fullscreen and locking hide notification surfaces. Optional UnifiedPush is a separate,
-  owned external distributor, disabled by default; payloads reach their participating apps,
-  which decide whether to notify. See [Settings](settings.md) and [UnifiedPush](unifiedpush.md).
+  card's `NotificationClosed` follows the action. A click within 500 ms of the cards appearing
+  or changing gets no token, so an app can't slip a card under a click aimed elsewhere.
+  Replacing/closing is still sender-scoped. Global enable, Do Not Disturb, per-app blocking and
+  a 50-entry in-memory history are configurable. Blocked notifications never enter history.
+  History/actions require an unlocked compositor settings check. Fullscreen and locking hide
+  notification surfaces. Optional UnifiedPush is a separate, owned external distributor,
+  disabled by default; payloads reach their participating apps, which decide whether to notify.
+  See [Settings](settings.md) and [UnifiedPush](unifiedpush.md).
 - **Laptop alone:** the same layout with a slimmer taskbar.
 - **No virtual desktops.**
 - **Look:** cyberpunk, with no animations: every state change is instant. (The half-second hold

@@ -10,6 +10,14 @@ pub const CARD_W: i32 = 360;
 /// inset, so a card floats clear of the corner of the tile under it.
 pub const MARGIN: [i32; 4] = [2 * INSET, 0, 0, 2 * INSET];
 const GAP: i32 = 8;
+/// How long after the cards last appeared or changed a click on them earns no activation token:
+/// an app can't slip a card under a click aimed elsewhere and take the keyboard with it.
+pub const ARM_MS: u64 = 500;
+
+/// Whether a press at `press_ms` on cards last changed at `changed_ms` may ask for a token.
+pub fn armed(changed_ms: u64, press_ms: u64) -> bool {
+    press_ms.saturating_sub(changed_ms) >= ARM_MS
+}
 const PAD: i32 = 8;
 fn line_h() -> i32 {
     (crate::text_px() as i32 + 6).max(20)
@@ -137,6 +145,16 @@ pub fn wrap(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_click_right_after_the_cards_change_earns_no_token() {
+        use super::armed;
+        assert!(!armed(1000, 1000), "the card just appeared");
+        assert!(!armed(1000, 1499), "changed 499 ms ago");
+        assert!(armed(1000, 1500));
+        assert!(armed(1000, 9000));
+        assert!(!armed(1000, 900), "clock before the change");
+    }
+
     use super::*;
 
     /// Every glyph 10 px: 34 per card line.
