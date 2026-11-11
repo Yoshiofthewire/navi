@@ -40,3 +40,12 @@ features = [
     "wayland_frontend",
     "xwayland",
 ]
+
+# Smithay places a new popup from the client's raw positioner before navi can bound it, so an
+# extreme one overflows there; debug navi wraps as release does, then navi bounds the result.
+[profile.dev.package.smithay]
+overflow-checks = false
+
+# Tests keep the checks, so the positioner tests still catch an overflow in Smithay's math.
+[profile.test.package.smithay]
+overflow-checks = true

@@ -63,6 +63,48 @@ impl Rect {
     }
 }
 
+/// How far a client's popup positioner may reach, in logical px: far past any output. With every
+/// coordinate within ±this and every size in 1..=this, Smithay's placement sums stay inside i32.
+pub const POPUP_LIMIT: i32 = 1 << 20;
+
+/// A client's positioner coordinate, bounded to `POPUP_LIMIT`.
+pub fn popup_coord(v: i32) -> i32 {
+    v.clamp(-POPUP_LIMIT, POPUP_LIMIT)
+}
+
+/// A client's positioner rect, bounded to `POPUP_LIMIT`; sizes stay at least 1.
+pub fn popup_rect(r: Rect) -> Rect {
+    let size = |v: i32| v.clamp(1, POPUP_LIMIT);
+    Rect::new(popup_coord(r.x), popup_coord(r.y), size(r.w), size(r.h))
+}
+
+/// How many popups deep a chain may go: it bounds the per-commit walks of the chain, and as navi
+/// places each popup within ±4 · `POPUP_LIMIT` of its parent, the chain's position stays exact in
+/// i32 (Smithay's `Point` sums saturate, so a longer chain would pin instead of overflow).
+pub const POPUP_DEPTH: usize = 16;
+const _: () = assert!(POPUP_DEPTH as i64 * 4 * POPUP_LIMIT as i64 <= i32::MAX as i64 / 2);
+
+/// How many popups one client may have open at once; more are dismissed.
+pub const CLIENT_POPUPS: usize = 64;
+
+/// Whether a client with these `open` popups is at `CLIENT_POPUPS`. Counts at most that many.
+pub fn popups_full<T>(open: impl Iterator<Item = T>) -> bool {
+    open.take(CLIENT_POPUPS).count() == CLIENT_POPUPS
+}
+
+/// Whether the popup chain from `popup` up through `parent` (the next popup, if any) is too deep.
+/// Walks at most `POPUP_DEPTH` steps.
+pub fn popup_too_deep<T>(popup: T, parent: impl Fn(&T) -> Option<T>) -> bool {
+    let mut at = popup;
+    for _ in 0..POPUP_DEPTH {
+        match parent(&at) {
+            Some(p) => at = p,
+            None => return false,
+        }
+    }
+    true
+}
+
 /// A rectangle of whole grid cells.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Cells {
@@ -1137,6 +1179,59 @@ mod tests {
     use super::*;
     use crate::layout::{Action, Button, Done, float_overlay};
     use drag::Hit;
+
+    #[test]
+    fn a_client_is_full_at_the_popup_limit() {
+        assert!(!popups_full(0..0));
+        assert!(!popups_full(0..CLIENT_POPUPS - 1));
+        assert!(popups_full(0..CLIENT_POPUPS));
+        assert!(popups_full(0..CLIENT_POPUPS + 1));
+        assert!(popups_full(0..)); // stops counting at the limit
+    }
+
+    #[test]
+    fn popup_chains_stop_at_the_depth_limit() {
+        // A chain of `n` popups: `i` is a popup while `i < n`; its parent is `i + 1`.
+        let chain = |n: usize| popup_too_deep(0, move |&i: &usize| (i + 1 < n).then_some(i + 1));
+        assert!(!chain(1));
+        assert!(!chain(POPUP_DEPTH - 1));
+        assert!(!chain(POPUP_DEPTH));
+        assert!(chain(POPUP_DEPTH + 1));
+        assert!(chain(usize::MAX));
+    }
+
+    #[test]
+    fn popup_values_are_bounded() {
+        const L: i32 = POPUP_LIMIT;
+        for (v, want) in [
+            (i32::MAX, L),
+            (i32::MIN, -L),
+            (0, 0),
+            (L, L),
+            (L - 1, L - 1),
+            (L + 1, L),
+            (-L, -L),
+            (-L + 1, -L + 1),
+            (-L - 1, -L),
+        ] {
+            assert_eq!(popup_coord(v), want, "{v}");
+        }
+        let r = |x, y, w, h| Rect::new(x, y, w, h);
+        assert_eq!(
+            popup_rect(r(i32::MAX, i32::MIN, i32::MAX, i32::MAX)),
+            r(L, -L, L, L)
+        );
+        assert_eq!(
+            popup_rect(r(i32::MIN, i32::MAX, i32::MIN, 0)),
+            r(-L, L, 1, 1)
+        );
+        for v in [1, L - 1, L] {
+            assert_eq!(popup_rect(r(v, -v, v, v)), r(v, -v, v, v));
+        }
+        assert_eq!(popup_rect(r(L + 1, -L - 1, L + 1, L + 1)), r(L, -L, L, L));
+        let menu = r(40, 30, 200, 24);
+        assert_eq!(popup_rect(menu), menu);
+    }
 
     fn out(name: &str, x: i32, y: i32, w: i32, h: i32, priority: u32) -> Output {
         Output {

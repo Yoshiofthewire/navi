@@ -1901,6 +1901,17 @@ impl Navi {
         })
     }
 
+    /// Whether `popup`'s client already has `layout::CLIENT_POPUPS` other live popups, wherever
+    /// they sit: under a live or destroyed root, parentless, or dismissed but kept alive. Closing
+    /// one frees its place. Each xdg_popup counts, even several sharing one surface.
+    fn client_popups_full(&self, popup: &PopupSurface) -> bool {
+        let client = popup.wl_surface().client();
+        let others = self.xdg_shell_state.popup_surfaces().iter().filter(|p| {
+            p.alive() && p.xdg_popup() != popup.xdg_popup() && p.wl_surface().client() == client
+        });
+        layout::popups_full(others)
+    }
+
     fn unconstrain_popup(&self, popup: &PopupSurface) {
         let Ok(root) = find_popup_root_surface(&PopupKind::Xdg(popup.clone())) else {
             return;
@@ -1926,8 +1937,9 @@ impl Navi {
             sub(b.x, up.x, window_geo.loc.x),
             sub(b.y, up.y, window_geo.loc.y),
         );
-        let target = Rectangle::new((x, y).into(), (b.w, b.h).into());
+        let target = bounded_rect(Rectangle::new((x, y).into(), (b.w, b.h).into()));
         popup.with_pending_state(|s| {
+            s.positioner = bounded(s.positioner);
             s.geometry = s.positioner.get_unconstrained_geometry(target);
         });
     }
@@ -2120,6 +2132,46 @@ fn intersect(r: Rect, bounds: Rect) -> Option<Rect> {
     // Inside `bounds`, so these fit.
     let (w, h) = (i32::try_from(w).ok()?, i32::try_from(h).ok()?);
     (w > 0 && h > 0).then_some(Rect { x, y, w, h })
+}
+
+/// `p` with every client value bounded to `layout::POPUP_LIMIT`, so Smithay's placement can't
+/// overflow.
+fn bounded(mut p: PositionerState) -> PositionerState {
+    p.anchor_rect = bounded_rect(p.anchor_rect);
+    p.rect_size = bounded_rect(Rectangle::new((0, 0).into(), p.rect_size)).size;
+    p.offset = (
+        layout::popup_coord(p.offset.x),
+        layout::popup_coord(p.offset.y),
+    )
+        .into();
+    p
+}
+
+/// Whether a new popup is placed. A parentless one only from navi-bar, as only a layer surface
+/// (navi-bar's alone) can adopt it later; elsewhere it would sit uncounted in Smithay's unmapped
+/// list, which every loop scans. Never past the depth or count caps.
+fn admits_popup(has_parent: bool, navi_bar: bool, too_deep: bool, full: bool) -> bool {
+    (has_parent || navi_bar) && !too_deep && !full
+}
+
+/// Past `layout::POPUP_DEPTH`; such popups are dismissed and never tracked or placed.
+fn too_deep(popup: &PopupSurface) -> bool {
+    layout::popup_too_deep(popup.wl_surface().clone(), |s| {
+        with_states(s, |st| {
+            st.data_map
+                .get::<XdgPopupSurfaceData>()?
+                .lock()
+                .ok()?
+                .parent
+                .clone()
+        })
+        .filter(|p| with_states(p, |st| st.data_map.get::<XdgPopupSurfaceData>().is_some()))
+    })
+}
+
+fn bounded_rect(r: Rectangle<i32, Logical>) -> Rectangle<i32, Logical> {
+    let b = layout::popup_rect(Rect::new(r.loc.x, r.loc.y, r.size.w, r.size.h));
+    Rectangle::new((b.x, b.y).into(), (b.w, b.h).into())
 }
 
 /// The logical pixel containing `p`.
@@ -2347,6 +2399,23 @@ impl XdgShellHandler for Navi {
     }
 
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
+        let navi_bar = privileged(
+            surface
+                .wl_surface()
+                .client()
+                .as_ref()
+                .and_then(|c| c.get_data()),
+        );
+        let has_parent = surface.get_parent_surface().is_some();
+        if !admits_popup(
+            has_parent,
+            navi_bar,
+            too_deep(&surface),
+            self.client_popups_full(&surface),
+        ) {
+            surface.send_popup_done();
+            return;
+        }
         self.unconstrain_popup(&surface);
         let _ = self.popups.track_popup(PopupKind::Xdg(surface));
     }
@@ -2357,6 +2426,10 @@ impl XdgShellHandler for Navi {
         positioner: PositionerState,
         token: u32,
     ) {
+        if too_deep(&surface) {
+            return;
+        }
+        let positioner = bounded(positioner);
         surface.with_pending_state(|s| {
             s.geometry = positioner.get_geometry();
             s.positioner = positioner;
@@ -2720,6 +2793,225 @@ delegate_xdg_activation!(Navi);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_positioner::{
+        Anchor, ConstraintAdjustment, Gravity,
+    };
+
+    fn rect(x: i32, y: i32, w: i32, h: i32) -> Rectangle<i32, Logical> {
+        Rectangle::new((x, y).into(), (w, h).into())
+    }
+
+    fn positioner(
+        offset: (i32, i32),
+        anchor: Rectangle<i32, Logical>,
+        size: i32,
+    ) -> PositionerState {
+        PositionerState {
+            rect_size: (size, size).into(),
+            anchor_rect: anchor,
+            offset: offset.into(),
+            ..Default::default()
+        }
+    }
+
+    /// A real client on an in-process navi: 66 `get_popup`s on one xdg_surface are 66 popups,
+    /// so the 65th and 66th are dismissed.
+    #[test]
+    fn popups_sharing_a_surface_each_count() {
+        use smithay_client_toolkit::reexports::client::{
+            Connection, Dispatch, QueueHandle, delegate_noop,
+            protocol::{wl_callback, wl_compositor, wl_registry, wl_surface},
+        };
+        use smithay_client_toolkit::reexports::protocols::xdg::shell::client::{
+            xdg_popup, xdg_positioner, xdg_surface, xdg_toplevel, xdg_wm_base,
+        };
+
+        #[derive(Default)]
+        struct Client {
+            compositor: Option<wl_compositor::WlCompositor>,
+            wm: Option<xdg_wm_base::XdgWmBase>,
+            done: usize,
+            synced: bool,
+        }
+        impl Dispatch<wl_registry::WlRegistry, ()> for Client {
+            fn event(
+                c: &mut Self,
+                r: &wl_registry::WlRegistry,
+                e: wl_registry::Event,
+                _: &(),
+                _: &Connection,
+                qh: &QueueHandle<Self>,
+            ) {
+                if let wl_registry::Event::Global {
+                    name, interface, ..
+                } = e
+                {
+                    match interface.as_str() {
+                        "wl_compositor" => c.compositor = Some(r.bind(name, 4, qh, ())),
+                        "xdg_wm_base" => c.wm = Some(r.bind(name, 3, qh, ())),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        impl Dispatch<xdg_popup::XdgPopup, ()> for Client {
+            fn event(
+                c: &mut Self,
+                _: &xdg_popup::XdgPopup,
+                e: xdg_popup::Event,
+                _: &(),
+                _: &Connection,
+                _: &QueueHandle<Self>,
+            ) {
+                if let xdg_popup::Event::PopupDone = e {
+                    c.done += 1;
+                }
+            }
+        }
+        impl Dispatch<wl_callback::WlCallback, ()> for Client {
+            fn event(
+                c: &mut Self,
+                _: &wl_callback::WlCallback,
+                _: wl_callback::Event,
+                _: &(),
+                _: &Connection,
+                _: &QueueHandle<Self>,
+            ) {
+                c.synced = true;
+            }
+        }
+        delegate_noop!(Client: ignore wl_compositor::WlCompositor);
+        delegate_noop!(Client: ignore wl_surface::WlSurface);
+        delegate_noop!(Client: ignore xdg_wm_base::XdgWmBase);
+        delegate_noop!(Client: ignore xdg_surface::XdgSurface);
+        delegate_noop!(Client: ignore xdg_toplevel::XdgToplevel);
+        delegate_noop!(Client: ignore xdg_positioner::XdgPositioner);
+
+        let (mut event_loop, mut data) = crate::xwayland::tests::harness();
+        let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
+        data.state
+            .display_handle
+            .insert_client(server, std::sync::Arc::new(ClientState::default()))
+            .unwrap();
+        let conn = Connection::from_socket(client).unwrap();
+        let mut queue = conn.new_event_queue::<Client>();
+        let qh = queue.handle();
+        let mut c = Client::default();
+        // Until the server has answered everything sent so far.
+        let mut sync = |c: &mut Client,
+                        queue: &mut smithay_client_toolkit::reexports::client::EventQueue<
+            Client,
+        >| {
+            c.synced = false;
+            conn.display().sync(&qh, ());
+            queue.flush().unwrap();
+            crate::xwayland::tests::pump(&mut event_loop, &mut data, |_| {
+                if let Some(read) = queue.prepare_read() {
+                    let _ = read.read();
+                }
+                queue.dispatch_pending(c).unwrap();
+                c.synced
+            });
+        };
+        conn.display().get_registry(&qh, ());
+        sync(&mut c, &mut queue);
+        let (comp, wm) = (c.compositor.clone().unwrap(), c.wm.clone().unwrap());
+        let top = wm.get_xdg_surface(&comp.create_surface(&qh, ()), &qh, ());
+        top.get_toplevel(&qh, ());
+        let pos = wm.create_positioner(&qh, ());
+        pos.set_size(8, 8);
+        pos.set_anchor_rect(0, 0, 1, 1);
+        let shared = wm.get_xdg_surface(&comp.create_surface(&qh, ()), &qh, ());
+        let popups: Vec<_> = (0..layout::CLIENT_POPUPS + 2)
+            .map(|_| shared.get_popup(Some(&top), &pos, &qh, ()))
+            .collect();
+        sync(&mut c, &mut queue);
+        assert_eq!(popups.len() - c.done, layout::CLIENT_POPUPS);
+    }
+
+    #[test]
+    fn only_navi_bar_may_open_a_parentless_popup() {
+        assert!(admits_popup(true, false, false, false));
+        assert!(admits_popup(true, true, false, false));
+        assert!(admits_popup(false, true, false, false));
+        assert!(!admits_popup(false, false, false, false));
+        for (deep, full) in [(true, false), (false, true)] {
+            assert!(!admits_popup(true, false, deep, full));
+            assert!(!admits_popup(false, true, deep, full));
+        }
+    }
+
+    #[test]
+    fn extreme_positioners_place_without_overflow() {
+        let (max, min) = (i32::MAX, i32::MIN);
+        let targets = [
+            rect(min, min, max, max),
+            rect(max, max, max, max),
+            rect(0, 0, 1, 1),
+        ]
+        .map(bounded_rect);
+        let mut raw = Vec::new();
+        for offset in [(max, max), (min, min), (max, min), (0, 0)] {
+            for (loc, len) in [(max, max), (min, max), (max, 1), (min, 1), (0, 1)] {
+                for size in [max, 1] {
+                    raw.push(positioner(offset, rect(loc, loc, len, len), size));
+                }
+            }
+        }
+        for p in raw {
+            let mut p = bounded(p);
+            for anchor in 0..=8 {
+                p.anchor_edges = Anchor::try_from(anchor).unwrap();
+                for gravity in 0..=8 {
+                    p.gravity = Gravity::try_from(gravity).unwrap();
+                    let _ = p.get_geometry();
+                    for adjust in 0..64 {
+                        p.constraint_adjustment = ConstraintAdjustment::from_bits_truncate(adjust);
+                        for t in targets {
+                            let _ = p.get_unconstrained_geometry(t);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn in_range_popups_place_as_before() {
+        let menu = PositionerState {
+            anchor_edges: Anchor::BottomLeft,
+            gravity: Gravity::BottomRight,
+            constraint_adjustment: ConstraintAdjustment::all(),
+            ..positioner((0, 4), rect(100, 20, 80, 24), 300)
+        };
+        for t in [
+            rect(-500, -300, 1280, 800),
+            rect(0, 0, 400, 300),
+            rect(-90, -10, 200, 200),
+        ] {
+            assert_eq!(bounded(menu), menu);
+            assert_eq!(
+                bounded(menu).get_unconstrained_geometry(bounded_rect(t)),
+                menu.get_unconstrained_geometry(t)
+            );
+        }
+    }
+
+    #[test]
+    fn reposition_to_extreme_offset_places_without_overflow() {
+        let p = PositionerState {
+            anchor_edges: Anchor::BottomRight,
+            gravity: Gravity::BottomRight,
+            ..positioner(
+                (i32::MAX, i32::MAX),
+                rect(i32::MAX, i32::MAX, 1, 1),
+                i32::MAX,
+            )
+        };
+        // As in `reposition_request`: anchor point L + 1, plus offset L.
+        let l = layout::POPUP_LIMIT;
+        assert_eq!(bounded(p).get_geometry(), rect(2 * l + 1, 2 * l + 1, l, l));
+    }
 
     #[test]
     fn ac1_only_navis_own_connection_is_privileged() {
