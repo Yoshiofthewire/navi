@@ -21,7 +21,7 @@ GTK4_API_CHECK = '''
 import gi
 gi.require_version('Gtk', '4.0')
 from gi.repository import Gtk
-for widget, method in [(Gtk.PasswordEntry, 'get_text'), (Gtk.AppChooserButton, 'new'), (Gtk.DropDown, 'new_from_strings')]:
+for widget, method in [(Gtk.PasswordEntry, 'get_text'), (Gtk.AppChooserButton, 'new'), (Gtk.DropDown, 'new_from_stringz')]:
     assert callable(getattr(widget, method)), (widget, method)
 '''
 
