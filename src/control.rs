@@ -25,8 +25,10 @@ pub const ATTENTION: u32 = 0x6e61_7601;
 /// Slot n (1..=9) is `SLOT_1 + n - 1`.
 pub const SLOT_1: u8 = 5;
 const SLOT_9: u8 = SLOT_1 + 8;
-/// navi → navi-bar, unsolicited: navi closed a client's toplevel past `layout::CLIENT_TOPLEVELS`.
+/// navi → navi-bar, unsolicited: navi closed a client's toplevel past `CLIENT_TOPLEVELS`.
 pub const WINDOW_LIMIT: u8 = SLOT_9 + 1;
+/// How many toplevels (dialogs included) one client may have open at once; more are closed.
+pub const CLIENT_TOPLEVELS: usize = 256;
 
 /// A dock key: Super+1..9 or Super+(Shift+)Tab.
 #[derive(Clone, Copy, Debug, PartialEq)]

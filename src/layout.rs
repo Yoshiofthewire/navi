@@ -92,8 +92,8 @@ pub fn popups_full<T>(open: impl Iterator<Item = T>) -> bool {
     open.take(CLIENT_POPUPS).count() == CLIENT_POPUPS
 }
 
-/// How many toplevels (dialogs included) one client may have open at once; more are closed.
-pub const CLIENT_TOPLEVELS: usize = 256;
+/// In `control` so navi-bar's card states the same number.
+pub use crate::control::CLIENT_TOPLEVELS;
 
 /// Whether a client with these `open` toplevels is at `CLIENT_TOPLEVELS`. Counts at most that many.
 pub fn toplevels_full<T>(open: impl Iterator<Item = T>) -> bool {

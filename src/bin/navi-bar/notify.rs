@@ -98,8 +98,10 @@ impl Notes {
             app_name: "Navi".into(),
             replaces_id: shown.map_or(0, |n| n.id),
             summary: "Window limit reached".into(),
-            body: "An app tried to open more than 256 windows. Close some of its windows to open more."
-                .into(),
+            body: format!(
+                "An app tried to open more than {} windows. Close some of its windows to open more.",
+                crate::control::CLIENT_TOPLEVELS
+            ),
             expire_timeout: -1,
             ..Request::default()
         };
