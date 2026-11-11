@@ -80,14 +80,24 @@ pub fn may_focus_on_map(dialog: Root, focus: Option<Root>) -> bool {
     matches!(dialog, Root::Tiled(_)) && focus == Some(dialog)
 }
 
-/// Where a dialog being shown goes in `order`, the shown windows back to front without it: on top
-/// while its family holds the keyboard, else right above its family's topmost window (the bottom
-/// if none is shown), so it never covers a window the user put in front of its family.
-pub fn stack_at<K>(order: &[K], in_family: impl Fn(&K) -> bool, family_focused: bool) -> usize {
-    match family_focused {
-        true => order.len(),
-        false => order.iter().rposition(in_family).map_or(0, |i| i + 1),
-    }
+/// A shown window's key in the one stacking order. `group` is the newest user raise of its
+/// family (root and dialogs); X11 menus use `u64::MAX`. Within a family the root is below its
+/// dialogs, and dialogs go by `own`: their last raise, else when they appeared.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Rank {
+    pub group: u64,
+    pub dialog: bool,
+    pub own: u64,
+    /// Open order, so equal keys keep a stable order.
+    pub seq: usize,
+}
+
+/// The shown windows' indices, back to front. Only a user raise moves a family up, so no map,
+/// re-show or commit puts one family above a window the user raised later.
+pub fn stack_order(ranks: &[Rank]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..ranks.len()).collect();
+    order.sort_by_key(|&i| ranks[i]);
+    order
 }
 
 #[cfg(test)]
@@ -236,25 +246,45 @@ mod tests {
         assert!(!may_focus_on_map(Root::Orphan, None));
     }
 
-    /// Round 2 security: a dialog shown again (a parent hop, a new dialog) goes right above its
-    /// family, not over the neighbour the user raised, unless its family has the keyboard.
+    fn rank(group: u64, dialog: bool, own: u64, seq: usize) -> Rank {
+        Rank {
+            group,
+            dialog,
+            own,
+            seq,
+        }
+    }
+
+    /// Round 3/4: one order from user raises. A neighbour raised after a family stays above every
+    /// window of that family, whatever order they are mapped or re-shown in.
     #[test]
-    fn a_shown_dialog_stacks_above_its_family_only() {
-        let order = ["wallpaper-tile", "parent", "sibling-dialog", "neighbour"];
-        let family = |k: &&str| ["parent", "sibling-dialog"].contains(k);
-        assert_eq!(stack_at(&order, family, false), 3, "below the neighbour");
-        assert_eq!(
-            stack_at(&order, family, true),
-            4,
-            "its family is focused: on top"
-        );
-        assert_eq!(
-            stack_at(&order, |_| false, false),
-            0,
-            "no family shown: bottom"
-        );
-        assert_eq!(stack_at(&order, |k| *k == "neighbour", false), 4);
-        assert_eq!(stack_at::<&str>(&[], |_| true, false), 0);
+    fn one_stacking_order_from_user_raises() {
+        // 0 parent (raised at 3), 1 its refused dialog (appeared at 9), 2 neighbour (raised at 5),
+        // 3 a menu, 4 a never-raised window opened before the others.
+        let ranks = [
+            rank(3, false, 3, 0),
+            rank(3, true, 9, 1),
+            rank(5, false, 5, 2),
+            rank(u64::MAX, false, 0, 3),
+            rank(0, false, 0, 4),
+        ];
+        assert_eq!(stack_order(&ranks), [4, 0, 1, 2, 3]);
+        // Re-shown in any order (the fullscreen-exit hop), the result is the same.
+        let reversed: Vec<Rank> = ranks.iter().rev().copied().collect();
+        let back: Vec<usize> = stack_order(&reversed).iter().map(|&i| 4 - i).collect();
+        assert_eq!(back, [4, 0, 1, 2, 3]);
+        // The user clicks the dialog: its family's group passes the neighbour's.
+        let mut clicked = ranks;
+        clicked[0].group = 10;
+        clicked[1] = rank(10, true, 10, 1);
+        assert_eq!(stack_order(&clicked), [4, 2, 0, 1, 3]);
+        // Within a family, dialogs by their own rank, above the root.
+        let family = [
+            rank(7, true, 7, 0),
+            rank(7, true, 2, 1),
+            rank(7, false, 1, 2),
+        ];
+        assert_eq!(stack_order(&family), [2, 1, 0]);
     }
 
     #[test]

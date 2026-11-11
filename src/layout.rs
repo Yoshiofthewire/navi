@@ -192,6 +192,8 @@ pub struct Tile {
     pub floating: bool,
     /// A float's window rect once the user moved or resized it; never remembered.
     pub user_rect: Option<Rect>,
+    /// A dialog of its family waits for the user (refused the keyboard): its tab is marked.
+    pub attention: bool,
 }
 
 impl Tile {
@@ -578,6 +580,17 @@ impl Layout {
 
     pub fn tiles(&self) -> &[Tile] {
         &self.tiles
+    }
+
+    /// Marks exactly the tiles in `ids` as wanting attention. Returns whether any mark changed.
+    pub fn set_attention(&mut self, ids: &[WinId]) -> bool {
+        let mut changed = false;
+        for t in &mut self.tiles {
+            let want = ids.contains(&t.id);
+            changed |= t.attention != want;
+            t.attention = want;
+        }
+        changed
     }
 
     pub fn tile(&self, id: WinId) -> Option<&Tile> {

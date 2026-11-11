@@ -1159,11 +1159,13 @@ pub fn buttons(l: &Layout, drag: Option<&Drag>, p: (i32, i32)) -> Vec<(WinId, Bu
         .collect()
 }
 
-/// A dialog's frame around its rect `r`, as a tile's: bright while it has the keyboard, else dim.
-pub fn dialog_frame(r: Rect, focused: bool) -> [(Rect, [f32; 4]); 4] {
-    let (px, alpha) = match focused {
-        true => (FOCUS_PX, 1.0),
-        false => (IDLE_PX, IDLE_ALPHA),
+/// A dialog's frame around its rect `r`, as a tile's: bright while it has the keyboard, else dim;
+/// full accent at 1 px while it `waiting` for the user (it was refused the keyboard).
+pub fn dialog_frame(r: Rect, focused: bool, waiting: bool) -> [(Rect, [f32; 4]); 4] {
+    let (px, alpha) = match (focused, waiting) {
+        (true, _) => (FOCUS_PX, 1.0),
+        (false, true) => (IDLE_PX, 1.0),
+        (false, false) => (IDLE_PX, IDLE_ALPHA),
     };
     frame(r, px).map(|f| (f, accent(alpha)))
 }

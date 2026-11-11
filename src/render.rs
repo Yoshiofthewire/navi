@@ -326,9 +326,9 @@ where
         .space
         .elements()
         .filter_map(|w| {
-            let r = state.dialog_rect(w)?;
+            let (r, waiting) = state.dialog_rect(w)?;
             let focused = focus.is_some() && crate::state::window_surface(w) == focus;
-            Some((w.clone(), layout::dialog_frame(r, focused)))
+            Some((w.clone(), layout::dialog_frame(r, focused, waiting)))
         })
         .filter(|(_, f)| f.iter().any(|(r, _)| overlaps(*r, full)))
         .unzip();

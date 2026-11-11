@@ -25,6 +25,8 @@ pub struct Info {
     pub app_id: String,
     pub output: Option<Output>,
     pub states: Vec<handle::State>,
+    /// A dialog of its family waits for the user; sent as `control::ATTENTION`.
+    pub attention: bool,
 }
 
 struct Sent {
@@ -112,13 +114,17 @@ fn update(dh: &DisplayHandle, s: &mut Sent, info: &Info) {
             o.client_outputs(&client).for_each(|w| h.output_enter(&w));
         }
     }
-    if s.info.states != info.states {
+    if (&s.info.states, s.info.attention) != (&info.states, info.attention) {
         let fullscreen = h.version() >= 2;
+        // Only navi-bar sees these handles, so it alone reads the private attention state.
+        let attention = info.attention.then_some(crate::control::ATTENTION);
         let states: Vec<u8> = info
             .states
             .iter()
             .filter(|&&st| fullscreen || st != handle::State::Fullscreen)
-            .flat_map(|&st| u32::from(st).to_ne_bytes())
+            .map(|&st| u32::from(st))
+            .chain(attention)
+            .flat_map(u32::to_ne_bytes)
             .collect();
         h.state(states);
     }

@@ -152,6 +152,9 @@ impl Navi {
             // `recenter_dialogs` resolves a transient's parent.
             up: None,
             fresh: false,
+            waiting: false,
+            rank: 0,
+            born: self.raises,
             asked: None,
             placed: None,
             last_output: None,
@@ -201,10 +204,13 @@ impl Navi {
                 })
             });
             match shown {
-                true => crate::state::put(&mut self.space, &window, (loc.x, loc.y)),
+                true => {
+                    crate::state::put(&mut self.space, &window, (loc.x, loc.y));
+                }
                 false => self.space.unmap_elem(&window),
             }
         }
+        self.restack();
     }
 
     fn x11_request(&mut self, x: &X11Surface, action: fn(&mut Layout, WinId) -> bool) {

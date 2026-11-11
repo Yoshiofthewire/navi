@@ -375,6 +375,8 @@ struct Win {
     app_id: String,
     minimized: bool,
     activated: bool,
+    /// A dialog of it waits for the user (navi's private state).
+    attention: bool,
     /// Shown after its first `done`.
     ready: bool,
 }
@@ -553,6 +555,7 @@ impl Bar {
             app_id: &w.app_id,
             focused: w.activated,
             minimized: w.minimized,
+            attention: w.attention,
         });
         windows.collect()
     }
@@ -775,6 +778,7 @@ impl Bar {
             .map(|app| Slot {
                 focused: app.focused,
                 minimized: app.minimized,
+                attention: app.attention,
                 running: app.windows.len(),
                 pinned: app.pinned,
             })
@@ -1586,6 +1590,7 @@ impl Dispatch<ZwlrForeignToplevelManagerV1, ()> for Bar {
                 app_id: String::new(),
                 minimized: false,
                 activated: false,
+                attention: false,
                 ready: false,
             }),
             manager::Event::Finished => warn!("window list finished"),
@@ -1622,6 +1627,7 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for Bar {
                     .collect();
                 w.minimized = states.contains(&(handle::State::Minimized as u32));
                 w.activated = states.contains(&(handle::State::Activated as u32));
+                w.attention = states.contains(&control::ATTENTION);
             }
             handle::Event::Done => {
                 w.ready = true;

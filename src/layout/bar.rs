@@ -112,6 +112,9 @@ fn outline(r: Rect) -> [Rect; 4] {
     ]
 }
 
+/// The attention line on a tab whose family has a waiting dialog, in px.
+const ATTENTION_PX: i32 = 3;
+
 /// Front to back: `bar` with `hover` (a tab id) lit. Its buttons are drawn by `crate::glyph`.
 pub fn draw(l: &Layout, id: WinId, bar: &Bar, hover: Option<Hit>) -> Vec<(Rect, [f32; 4])> {
     let mut out = Vec::new();
@@ -126,6 +129,15 @@ pub fn draw(l: &Layout, id: WinId, bar: &Bar, hover: Option<Hit>) -> Vec<(Rect, 
                 TAB_BG
             }
         };
+        // A dialog waits in this hidden or minimized tab: an accent line along its bottom.
+        if color != ACCENT && l.tile(t).is_some_and(|t| t.attention) {
+            let line = Rect {
+                y: r.y + r.h - ATTENTION_PX,
+                h: ATTENTION_PX,
+                ..r
+            };
+            out.push((line, rgba(ACCENT, 1.0)));
+        }
         out.push((r, rgba(color, 1.0)));
     }
     out.push((bar.rect, rgba(BAR_BG, 1.0)));
@@ -170,6 +182,28 @@ mod tests {
         l.clock = n as u64;
         l.next_id = n as WinId;
         l
+    }
+
+    /// Round 4: a hidden tab whose dialog waits for the user carries an accent line; the active
+    /// tab (its dialog is on screen with an accent frame) and unmarked tabs don't.
+    #[test]
+    fn a_hidden_tab_with_a_waiting_dialog_is_marked() {
+        let mut l = group_on(out("o", 1200, 800), FULL, 2);
+        let bar = l.bar(0).unwrap();
+        let line = |l: &Layout, t: usize| {
+            let r = bar.tabs[t].1;
+            let line = Rect {
+                y: r.y + r.h - ATTENTION_PX,
+                h: ATTENTION_PX,
+                ..r
+            };
+            draw(l, 0, &bar, None).contains(&(line, rgba(ACCENT, 1.0)))
+        };
+        assert!(!line(&l, 0) && !line(&l, 1));
+        assert!(l.set_attention(&[0, 1]));
+        assert!(!l.set_attention(&[0, 1]), "no change");
+        assert!(line(&l, 0), "hidden tab 0 is marked");
+        assert!(!line(&l, 1), "the active tab is accent already");
     }
 
     fn mid(r: Rect) -> (i32, i32) {
