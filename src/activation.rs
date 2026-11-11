@@ -25,7 +25,7 @@ pub fn may_issue(serial: Option<u32>, focus_since: Option<u32>, now: u32) -> boo
 /// Whether a token's activation raises as the user would: it came from navi-bar (the dock, the
 /// launcher), or from a window that holds the keyboard because the user gave it (a click, the
 /// dock, Super+N, a user activation). A window that took the keyboard on its own (new on map) or
-/// by navi's refocus mints tokens that may still activate (move the keyboard), but raise nothing.
+/// by navi's refocus mints tokens that only mark the window (`on_redeem`).
 pub fn minted_by_user(navi_bar: bool, focus_by_user: bool) -> bool {
     navi_bar || focus_by_user
 }
@@ -36,6 +36,24 @@ pub fn minted_by_user(navi_bar: bool, focus_by_user: bool) -> bool {
 /// but raises nothing.
 pub fn user_raise(bar: bool, user: bool, minted_at: u64, now: u64) -> bool {
     bar || user && minted_at == now
+}
+
+/// What redeeming a valid token does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Redeem {
+    /// The user's: restore, raise and focus the window.
+    Focus,
+    /// Anyone else's: leave the keyboard and the stacking order alone; mark the window's dock
+    /// entry and tab until the user switches to it.
+    Mark,
+}
+
+/// A user token focuses; any other only marks.
+pub fn on_redeem(user: bool) -> Redeem {
+    match user {
+        true => Redeem::Focus,
+        false => Redeem::Mark,
+    }
 }
 
 /// A token works once, up to `TTL` after it was made, and only while focus hasn't moved away:
@@ -116,6 +134,28 @@ mod tests {
         );
         assert!(!user_raise(false, false, 5, 5), "never the user's");
         assert!(user_raise(true, false, 5, 9), "navi-bar");
+    }
+
+    /// Round 11 (Yoshi's decision): an activation that isn't the user's neither raises nor takes
+    /// the keyboard; it only marks the window. A user token focuses.
+    #[test]
+    fn only_a_user_activation_takes_the_keyboard() {
+        assert_eq!(on_redeem(user_raise(false, true, 5, 5)), Redeem::Focus);
+        assert_eq!(
+            on_redeem(user_raise(true, false, 5, 9)),
+            Redeem::Focus,
+            "navi-bar"
+        );
+        assert_eq!(
+            on_redeem(user_raise(false, true, 5, 6)),
+            Redeem::Mark,
+            "stale"
+        );
+        assert_eq!(
+            on_redeem(user_raise(false, false, 5, 5)),
+            Redeem::Mark,
+            "self-focused"
+        );
     }
 
     #[test]

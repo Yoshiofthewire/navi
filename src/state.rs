@@ -178,6 +178,8 @@ pub struct Navi {
     /// Counts keyboard moves: a token is the user's only while the keyboard hasn't moved since
     /// it was made.
     pub(crate) focus_moves: u64,
+    /// The window that held the keyboard before the one holding it now.
+    pub(crate) before_focus: Option<Window>,
     /// The raise clock, in steps of 2 so an orphan's floor fits just below a raise.
     pub(crate) raises: u64,
     /// The window that held the keyboard when a click gave it to a layer.
@@ -292,6 +294,7 @@ impl Navi {
             raises: 0,
             focus_by_user: false,
             focus_moves: 0,
+            before_focus: None,
             before_layer: Default::default(),
             seat_state,
             popups: PopupManager::default(),
@@ -581,7 +584,7 @@ impl Navi {
             info!(?shown, "shown");
         }
         self.place_dialogs();
-        self.recenter_x11();
+        self.place_menus();
         self.keep_focus_mapped(&shown);
         self.restack();
         self.hide_layer_focus();
@@ -892,7 +895,7 @@ impl Navi {
             info!(id = ended, by = "bar", "fullscreen left");
             self.guard_fullscreen(ended);
         }
-        self.focus_or_restore(id, Raise::User);
+        self.focus_or_restore(id);
     }
 
     /// Refuses a fullscreen request from a window the user took out of fullscreen.
@@ -1039,7 +1042,7 @@ impl Navi {
 
     /// Focus or restore, from the bar or an activation token: `id` is shown in its group,
     /// restored, uncovered, and gets keyboard focus.
-    pub fn focus_or_restore(&mut self, id: WinId, by: Raise) {
+    pub fn focus_or_restore(&mut self, id: WinId) {
         if self.lock.active {
             return;
         }
@@ -1047,7 +1050,7 @@ impl Navi {
             self.apply_layout();
         }
         if self.layout.visible(id) {
-            self.focus_by(self.window_of(id), by);
+            self.focus_by(self.window_of(id), Raise::User);
         }
     }
 
@@ -1172,6 +1175,9 @@ impl Navi {
             }),
         }
         let moved = kb.current_focus() != target;
+        if moved && let Some(was) = self.focused_window() {
+            self.before_focus = Some(was);
+        }
         // `focus_changed` counts moves to a surface; this also counts the move to nobody.
         self.focus_moves += u64::from(moved);
         // navi's own refocus of the same window keeps what the user gave it.
@@ -1195,7 +1201,7 @@ impl Navi {
 
     /// Keyboard focus never rests on an unmapped window: it moves to the most recent of the
     /// windows just `shown`, or to nobody.
-    fn keep_focus_mapped(&mut self, shown: &[WinId]) {
+    pub(crate) fn keep_focus_mapped(&mut self, shown: &[WinId]) {
         let Some(focus) = self
             .seat
             .get_keyboard()
@@ -1485,6 +1491,8 @@ impl Navi {
     /// bounds and any cap, and hides it while its root is hidden. X11 menus aren't dialogs.
     pub(crate) fn recenter_dialogs(&mut self) {
         self.place_dialogs();
+        // A menu of a dialog hidden here hides with it.
+        self.place_menus();
         // A dialog hidden here (its parent hidden, a re-parent to a hidden window) can't keep
         // the keyboard: no key may reach a window that isn't shown.
         self.keep_focus_mapped(&[]);
@@ -1800,15 +1808,20 @@ impl Navi {
         }
         self.recenter_dialogs();
         self.sync_attention();
-        // A closed dialog gives the keyboard back to its parent.
-        if had_keys
-            && gone.tile.is_none()
-            && let Some(up) = gone
-                .up
-                .clone()
-                .filter(|w| self.space.element_location(w).is_some())
-        {
-            self.focus(Some(up));
+        // A closed window that had the keyboard gives it back: a dialog to its parent, else to
+        // the window that had it before, if either is shown.
+        let shown = |w: &Window| self.space.element_location(w).is_some();
+        let back = gone
+            .up
+            .clone()
+            .filter(|_| gone.tile.is_none())
+            .filter(shown);
+        let back = back.or_else(|| self.before_focus.clone().filter(shown));
+        if self.before_focus.as_ref() == Some(&gone.window) {
+            self.before_focus = None;
+        }
+        if had_keys && back.is_some() {
+            self.focus(back);
         }
         gone
     }
@@ -2562,14 +2575,29 @@ impl XdgActivationHandler for Navi {
         let age = data.timestamp.elapsed();
         match id.filter(|_| may_redeem(first_use, age, focus_kept)) {
             Some(id) => {
-                // Only a token from a focus the user gave, still held, raises; any other moves the
-                // keyboard but leaves the stacking order as it is.
+                // Only a token from a focus the user gave, still held, raises and takes the
+                // keyboard; any other only marks the window for the user.
                 let user = data.user_data.get::<UserToken>().is_some_and(|t| {
                     activation::user_raise(t.bar, t.user, t.moves, self.focus_moves)
                 });
-                info!(id, by = "activation", user, "activate");
-                let by = if user { Raise::User } else { Raise::Not };
-                self.focus_or_restore(id, by);
+                match activation::on_redeem(user) {
+                    activation::Redeem::Focus => {
+                        info!(id, by = "activation", user, "activate");
+                        self.focus_or_restore(id);
+                    }
+                    activation::Redeem::Mark => {
+                        info!(
+                            id,
+                            by = "activation",
+                            user,
+                            "activation: marked for the user"
+                        );
+                        if let Some(m) = self.managed_mut(&surface) {
+                            m.waiting = true;
+                        }
+                        self.sync_attention();
+                    }
+                }
             }
             None => info!(?id, first_use, ?age, focus_kept, "activation refused"),
         }

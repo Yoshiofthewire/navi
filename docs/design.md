@@ -256,19 +256,24 @@ aspect, gravity, position) are ignored.
   dialog is focused. An orphan never takes the keyboard on map. A dialog hides while its root is
   hidden or minimized, and loses the keyboard; it comes back with it. When a dialog's parent
   closes, it hangs from that parent's own parent if it had one, else it is an orphan centred in
-  its last bounds; a closed dialog that had the keyboard gives it back to its parent.
+  its last bounds; a closed window that had the keyboard gives it back: a dialog to its parent,
+  any other window to the window that had it before, if that one is shown. Every hide (a dialog
+  with its parent, a re-parent to a hidden window, an X11 menu with its parent) takes the keyboard
+  off the hidden window before the next key.
 - **Stacking order.** Windows stack by one rank: the last time they were raised, by the user (a
   click, the dock, Super+N, or an activation whose token came from the dock or from a window the
-  user focused) or by opening and taking the keyboard. A token minted by a window that took the
-  keyboard on its own still activates (moves the keyboard) but raises nothing. navi's own refocus
-  (giving the keyboard back after a close or a hide) raises nothing. A family stacks by its newest
-  raise, its dialogs above its root, and an X11 menu (override-redirect) above its X11 parent's
-  family, so a window the user raises later covers it. An orphan dialog's family is its own parent
-  chain: it keeps only what the user raised of its old family, else goes just below the window on
-  top when it becomes an orphan, so a window that opens and closes at once hands nothing on.
-  Nothing else moves a window up: a commit, a re-parent, a map or a re-show (after a minimize, a
-  fullscreen or maximize, a tab switch, an unplug) puts every window back at its rank, so no app
-  can put itself above a window the user raised later.
+  user focused) or by opening and taking the keyboard. Any other activation (a token minted by a
+  window that took the keyboard on its own, or one redeemed after the keyboard moved) neither
+  raises the window nor takes the keyboard: it only marks the window's dock entry and tab, as a
+  waiting dialog does, until the user switches to it. navi's own refocus (giving the keyboard back
+  after a close or a hide) raises nothing. A family stacks by its newest raise, its dialogs above
+  its root, and an X11 menu (override-redirect) above its X11 parent's family, so a window the
+  user raises later covers it. An orphan dialog's family is its own parent chain: it keeps only
+  what the user raised of its old family, else goes just below the window on top when it becomes
+  an orphan, so a window that opens and closes at once hands nothing on. Nothing else moves a
+  window up: a commit, a re-parent, a map or a re-show (after a minimize, a fullscreen or
+  maximize, a tab switch, an unplug) puts every window back at its rank, so no app can put itself
+  above a window the user raised later.
 - **Logs.** One `info` line per change: `client size hints` (app, id, min, max and the outcome),
   then `re-placed`, `floating: no tile fits` (and `floating: its minimum is bigger than the
   monitor` when it is) or `tiled again` with the cells or rect (`by="room freed"` when a float
@@ -384,9 +389,10 @@ bundling a degoogled, resource-tested Chromium variant is reserved for a future 
   slots and a blue active-window indicator. The launcher opens 12 px above it. The logo opens the launcher. Pinned apps come first, in pin order;
   other running apps follow in opening order. Each app has one icon, with up to three dots for
   its windows. Click an app to launch it if closed, focus or restore it if running, or cycle its
-  windows when already focused. Minimized apps are dimmed. An app with a dialog waiting for the
-  user (refused the keyboard, *Dialogs*) has an accent dot at its icon's corner until the dialog
-  is focused, so a dialog of a minimized or hidden window can still be found.
+  windows when already focused. Minimized apps are dimmed. An app with a window waiting for the
+  user (a dialog refused the keyboard, *Dialogs*, or an activation that wasn't the user's,
+  *Stacking order*) has an accent dot at its icon's corner until that window is focused, so it
+  can be found even while minimized or hidden.
   **Super+1…9** focuses or restores the Nth running app (pinned apps that aren't running take no
   number) at its first visible window, else its first; on the focused app it does nothing.
   **Super+Tab** and **Super+Shift+Tab** step focus to the next or previous running app in dock
@@ -570,7 +576,10 @@ session.
   the keyboard, with a serial from its current focus (no older than its keyboard enter, no newer
   than navi's latest). Each works once, within 10 s, and only while the keyboard is still on the
   surface that asked or on the one being activated, so an app can't stash tokens and take focus
-  back after you've moved on.
+  back after you've moved on. Only an activation by the user (a token from the dock, or from a
+  window the user focused, redeemed before the keyboard moved) restores, raises and focuses the
+  window; any other only marks its dock entry and tab (*Stacking order*). This replaces job 006's
+  rule that every accepted activation moves the keyboard.
 - **Locking** uses `ext-session-lock`, advertised only on the dedicated socket Navi gives its
   swaylock child. Applications, including the bar, cannot bind it. Normal windows, layers,
   wallpaper, decorations and cursors are excluded from locked output frames; normal keyboard,

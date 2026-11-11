@@ -185,9 +185,16 @@ impl Navi {
         self.refresh_toplevels();
     }
 
+    /// Places the X11 menus, then moves the keyboard off any window that isn't shown (a focused
+    /// menu hidden with its parent).
+    pub fn recenter_x11(&mut self) {
+        self.place_menus();
+        self.keep_focus_mapped(&[]);
+    }
+
     /// Override-redirect menus keep their X11 geometry and show only while their X11 parent is
     /// shown; `recenter_dialogs` places transients.
-    pub fn recenter_x11(&mut self) {
+    pub(crate) fn place_menus(&mut self) {
         let menus: Vec<_> = self
             .windows
             .iter()
@@ -198,6 +205,7 @@ impl Navi {
                     .then(|| (m.window.clone(), x.geometry().loc, m.x11_parent))
             })
             .collect();
+        let mut new = false;
         for (window, loc, parent) in menus {
             let shown = parent.is_some_and(|id| {
                 self.windows.iter().any(|m| {
@@ -206,13 +214,14 @@ impl Navi {
                 })
             });
             match shown {
-                true => {
-                    crate::state::put(&mut self.space, &window, (loc.x, loc.y));
-                }
+                true => new |= crate::state::put(&mut self.space, &window, (loc.x, loc.y)),
                 false => self.space.unmap_elem(&window),
             }
         }
-        self.restack();
+        // Only a newly shown menu changes the order; dialog commits come through here too.
+        if new {
+            self.restack();
+        }
     }
 
     fn x11_request(&mut self, x: &X11Surface, action: fn(&mut Layout, WinId) -> bool) {
@@ -1397,6 +1406,38 @@ mod tests {
         pump(&mut event_loop, &mut data, |_| {
             conn.get_input_focus().unwrap().reply().unwrap().focus == hop
         });
+        // Round 11: a menu of that dialog, which the user clicked (it takes the keyboard), hides
+        // with it and loses the keyboard too.
+        let menu = conn.generate_id().unwrap();
+        conn.create_window(
+            smithay::reexports::x11rb::COPY_DEPTH_FROM_PARENT,
+            menu,
+            root,
+            40,
+            40,
+            80,
+            60,
+            0,
+            WindowClass::INPUT_OUTPUT,
+            0,
+            &CreateWindowAux::new()
+                .override_redirect(1)
+                .background_pixel(0x226644)
+                .event_mask(EventMask::KEY_PRESS),
+        )
+        .unwrap();
+        conn.map_window(menu).unwrap();
+        conn.flush().unwrap();
+        pump(&mut event_loop, &mut data, |d| d.state.windows.len() == 4);
+        let menu_window = data.state.windows[3].window.clone();
+        assert_eq!(
+            data.state.windows[3].x11_parent,
+            Some(hop),
+            "the focused transient"
+        );
+        assert!(data.state.space.element_location(&menu_window).is_some());
+        data.state.focus_by(Some(menu_window.clone()), Raise::User);
+        assert_eq!(data.state.focused_window(), Some(menu_window.clone()));
         conn.change_property32(
             PropMode::REPLACE,
             hop,
@@ -1409,11 +1450,15 @@ mod tests {
         pump(&mut event_loop, &mut data, |d| {
             d.state.space.element_location(&hop_window).is_none()
         });
+        assert!(
+            data.state.space.element_location(&menu_window).is_none(),
+            "the menu hid with it"
+        );
         let kb = data.state.seat.get_keyboard().unwrap();
         assert_eq!(
             kb.current_focus(),
             None,
-            "the hidden dialog lost the keyboard"
+            "the hidden menu lost the keyboard"
         );
         data.state.keyboard_key(38u32.into(), KeyState::Pressed, 30);
         data.state
@@ -1422,14 +1467,14 @@ mod tests {
         pump(&mut event_loop, &mut data, |_| {
             while let Some(event) = conn.poll_for_event().unwrap() {
                 if let Event::KeyPress(event) = event {
-                    leaked |= event.event == hop;
+                    leaked |= event.event == hop || event.event == menu;
                 }
             }
             rounds += 1;
             rounds > 60
         });
         assert!(!leaked, "no key reached the hidden dialog");
-        for w in [hop, hidden] {
+        for w in [menu, hop, hidden] {
             conn.destroy_window(w).unwrap();
         }
         conn.flush().unwrap();
