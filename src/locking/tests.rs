@@ -244,6 +244,9 @@ fn lock_is_private_waits_for_all_presentations_and_survives_client_death() {
         .object_from_protocol_id(&h.data.state.display_handle, app_surface.id().protocol_id())
         .unwrap();
     h.data.state.focus_lock_surface(Some(normal.clone()));
+    // The app under the pointer hid the cursor before the lock.
+    h.data.state.cursor.focus(Some(normal.clone()));
+    h.data.state.cursor.request = crate::cursor::Request::Hidden;
     let mut locker = h.peer(true);
     let lock = locker
         .view
@@ -263,6 +266,11 @@ fn lock_is_private_waits_for_all_presentations_and_survives_client_death() {
             .is_none()
     );
     assert!(h.data.state.pointer_focus((10., 10.).into()).is_none());
+    assert_eq!(
+        h.data.state.cursor.request,
+        crate::cursor::Request::default(),
+        "the app's cursor request ends with its pointer focus at lock"
+    );
     assert_eq!(locker.view.locked, 0);
     let epoch = h.data.state.lock.epoch;
     h.data.state.lock_presented(&a, epoch.wrapping_sub(1));

@@ -325,8 +325,9 @@ impl Navi {
         if let Some(p) = self.seat.get_pointer() {
             let serial = SERIAL_COUNTER.next_serial();
             p.unset_grab(self, serial, 0);
-            p.motion(
-                self,
+            // Through `move_pointer`, so an app's cursor request (say, hidden) can't outlive the lock.
+            self.move_pointer(
+                &p,
                 None,
                 &MotionEvent {
                     location: p.current_location(),
