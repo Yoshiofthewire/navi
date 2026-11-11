@@ -362,6 +362,14 @@ impl Navi {
         Some(Rect::new(g.loc.x, g.loc.y, g.size.w, g.size.h))
     }
 
+    /// navi's zone at `pos`, unless a float's window or dialog drawn over it is there.
+    pub fn zone_at(&self, pos: Point<f64, Logical>) -> Option<layout::Hit> {
+        let over = self
+            .window_under(pos)
+            .and_then(|(w, _)| self.float_owner(w));
+        self.layout.hit_under(px(pos), over)
+    }
+
     /// The float `w` is, or whose dialog it is.
     pub fn float_owner(&self, w: &Window) -> Option<WinId> {
         let m = self.windows.iter().find(|m| &m.window == w)?;
@@ -427,7 +435,7 @@ impl Navi {
     /// zone or window in between.
     pub fn layer_at(&self, pos: Point<f64, Logical>) -> Option<LayerSurface> {
         let lower = || {
-            let clear = self.layout.hit(px(pos)).is_none() && self.window_under(pos).is_none();
+            let clear = self.zone_at(pos).is_none() && self.window_under(pos).is_none();
             clear.then(|| self.layer_under(pos, [Layer::Bottom, Layer::Background]))?
         };
         self.layer_under(pos, [Layer::Overlay, Layer::Top])
@@ -567,7 +575,7 @@ impl Navi {
         if let Some(upper) = surface(self.layer_under(pos, [Layer::Overlay, Layer::Top])) {
             return Some(upper);
         }
-        if self.layout.hit(px(pos)).is_some() {
+        if self.zone_at(pos).is_some() {
             return None;
         }
         self.window_surface_under(pos)

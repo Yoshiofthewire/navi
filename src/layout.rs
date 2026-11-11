@@ -2620,6 +2620,60 @@ mod tests {
         assert_eq!(drawn.first(), Some(&f));
     }
 
+    /// Round 3 (PR audit): a front float's dialog, larger than its window, drawn over the rear
+    /// float's ✕ and band, covers them: no navi zone there, so the pointer goes to the dialog
+    /// (`Navi::zone_at` passes the float of the window under the pointer as `over`).
+    #[test]
+    fn floats_dialog_in_front_covers_the_zones_behind_it() {
+        let (mut l, [a, _], f) = blocked(vec![], fixed());
+        let (g, _) = l.place_with("upd2", (1720, 600), fixed(), true).unwrap();
+        for _ in 0..3 {
+            l.keyboard_adjust(g, Side::Left, Nudge::Move).unwrap();
+        }
+        assert_eq!(l.floats(), [g, f]);
+        let (front, rear) = (l.clip(g).unwrap(), outer_of(&l, f));
+        let close = l.bar(f).unwrap().buttons[2].1;
+        let x = (close.x + close.w / 2, close.y + close.h / 2);
+        let band = (rear.x + rear.w + 3, rear.y + rear.h / 2);
+        // A dialog of g centred on it, wider than it, reaching over f's ✕ and right band.
+        let dialog = Rect::new(
+            front.x - 300,
+            front.y - 40,
+            front.w + 600 + 2 * 300,
+            front.h,
+        );
+        for p in [x, band] {
+            assert!(!front.contains(p) && dialog.contains(p), "{p:?}");
+            assert!(
+                l.hit(p).is_some_and(|h| h.id() == f),
+                "f's zone without the dialog"
+            );
+            assert_eq!(
+                l.hit_under(p, Some(g)),
+                None,
+                "the dialog is in front: {p:?}"
+            );
+            assert_eq!(l.hit_under(p, None), l.hit(p), "no window there: f's zone");
+            assert_eq!(
+                l.hit_under(p, Some(f)),
+                l.hit(p),
+                "f's own window doesn't cover it"
+            );
+        }
+        // A float's window or dialog also covers every tile zone.
+        let a_right = l.zone(Hit::Edge(a, Side::Right)).unwrap();
+        let p = (a_right.x + 1, front.y + front.h + 40);
+        assert_eq!(l.hit(p), Some(Hit::Edge(a, Side::Right)));
+        assert_eq!(l.hit_under(p, Some(f)), None);
+        // A rear float's dialog never covers the front float's zones.
+        let g_bar = (front.x + 40, front.y - 12);
+        assert_eq!(l.hit(g_bar), Some(Hit::Strip(g)));
+        assert_eq!(l.hit_under(g_bar, Some(f)), Some(Hit::Strip(g)));
+        // Focus brings f in front; then its zones take the point back from g's dialog.
+        assert!(l.raise(f));
+        assert_eq!(l.hit_under(x, Some(g)), Some(Hit::Button(f, Button::Close)));
+    }
+
     /// Round 1 (security probe): unplugging the monitor under a float drag leaves the float on a
     /// live monitor, whether the drag is cancelled or released.
     #[test]

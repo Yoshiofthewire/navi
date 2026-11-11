@@ -597,7 +597,7 @@ impl Navi {
         {
             self.click_layer(&layer);
         } else if !self.lock.active && pressed && !pointer.is_grabbed() {
-            let hit = self.layout.hit(px(pos));
+            let hit = self.zone_at(pos);
             // Keyboard focus follows click, in a tile's zones too, to the window shown there.
             let clicked = match hit {
                 Some(h) => self

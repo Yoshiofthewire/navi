@@ -180,6 +180,19 @@ impl Layout {
         floats.into_iter().map(|t| t.id).collect()
     }
 
+    /// `hit(p)`, unless the window under `p` belongs to float `over` (it or its dialog) drawn in
+    /// front of the zone: a float's window and dialogs cover the zones of every float behind it
+    /// and every tile's.
+    pub fn hit_under(&self, p: (i32, i32), over: Option<WinId>) -> Option<Hit> {
+        let hit = self.hit(p)?;
+        let Some(over) = over else {
+            return Some(hit);
+        };
+        let order = self.floats();
+        let rank = |id| order.iter().position(|&f| f == id).unwrap_or(usize::MAX);
+        (rank(over) >= rank(hit.id())).then_some(hit)
+    }
+
     /// Brings float `id` to the front, as focusing it does. Returns whether it moved; a tile or
     /// the front float doesn't.
     pub fn raise(&mut self, id: WinId) -> bool {
