@@ -46,7 +46,7 @@ use crate::{
     layout::Rect,
     monitors::{self, Arrangement, Mon},
     persist,
-    render::{self, Arrow, Frame, Pointer, Wallpaper},
+    render::{self, Arrow, Cursors, Frame, Wallpaper},
     state::{Navi, identity, set_identity},
     wallpaper,
 };
@@ -68,7 +68,7 @@ pub struct Udev {
     screens: Vec<Screen>,
     input_devices: Vec<smithay::reexports::input::Device>,
     wallpaper_epoch: u64,
-    pointer: Option<Pointer>,
+    pointer: Option<Cursors>,
     /// The session is active (not switched away).
     active: bool,
 }
@@ -254,10 +254,10 @@ pub fn init(
         .map(|o| o.current_scale().fractional_scale())
         .fold(1.0, f64::max)
         .ceil();
-    let theme = cursor::from_env(scale).map(|c| {
-        let theme = (c.theme.clone(), cursor::SIZE.round() as u32);
+    let theme = Cursors::from_env(scale as i32).map(|c| {
+        let theme = (c.theme().to_string(), cursor::SIZE.round() as u32);
         if let Some(u) = data.udev.as_mut() {
-            u.pointer = Some(Pointer::new(&c, scale as i32));
+            u.pointer = Some(c);
         }
         theme
     });
@@ -714,7 +714,11 @@ fn render(data: &mut CalloopData, crtc: crtc::Handle) {
             return;
         }
     };
-    let arrow = udev.pointer.as_ref().map_or(Arrow::Square, Arrow::Image);
+    let shape = data.state.cursor_shape();
+    let arrow = udev
+        .pointer
+        .as_mut()
+        .map_or(Arrow::Square, |c| c.arrow(shape));
     let mirror = crate::settings::output_preferences(&s.output).mirror;
     let source = if data.state.lock.active {
         s.output.clone()
@@ -822,7 +826,7 @@ pub fn apply_input_preferences(data: &mut CalloopData) {
         .map(|o| o.current_scale().fractional_scale())
         .fold(1.0, f64::max)
         .ceil();
-    let pointer = cursor::from_env(scale).map(|c| Pointer::new(&c, scale as i32));
+    let pointer = Cursors::from_env(scale as i32);
     if let Some(udev) = data.udev.as_mut() {
         udev.pointer = pointer;
         for device in &mut udev.input_devices {

@@ -24,11 +24,11 @@ use smithay::{
     utils::{Point, Rectangle, Scale, Transform},
     wayland::shell::wlr_layer::Layer,
 };
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::{
     activation,
-    cursor::Cursor,
+    cursor::{self, Cursor},
     image::Image,
     layout, monitors,
     state::{Navi, identity},
@@ -132,7 +132,43 @@ impl Solids {
     }
 }
 
-/// navi's own arrow, at a whole-number buffer scale.
+/// navi's cursor shapes, each uploaded on first use at a whole-number buffer scale.
+pub struct Cursors {
+    shapes: cursor::Shapes<Pointer>,
+    scale: i32,
+    /// The shape drawn last, to log changes.
+    last: Option<&'static str>,
+}
+
+impl Cursors {
+    /// The user's theme loaded at `scale`, so it stays sharp on outputs up to that scale.
+    pub fn from_env(scale: i32) -> Option<Cursors> {
+        let shapes = cursor::from_env(f64::from(scale), |c| Pointer::new(c, scale))?;
+        Some(Cursors {
+            shapes,
+            scale,
+            last: Some("default"),
+        })
+    }
+
+    pub fn theme(&self) -> &str {
+        &self.shapes.theme
+    }
+
+    /// How to draw `shape`; `None` draws nothing.
+    pub fn arrow(&mut self, shape: Option<&'static str>) -> Arrow<'_> {
+        if shape != self.last {
+            debug!(shape = shape.unwrap_or("hidden"), "cursor");
+            self.last = shape;
+        }
+        let scale = self.scale;
+        shape.map_or(Arrow::None, |s| {
+            Arrow::Image(self.shapes.get(s, |c| Pointer::new(c, scale)))
+        })
+    }
+}
+
+/// One cursor shape.
 pub struct Pointer {
     buffer: MemoryRenderBuffer,
     /// In logical px.
@@ -140,8 +176,7 @@ pub struct Pointer {
 }
 
 impl Pointer {
-    /// An arrow loaded at `scale`, so it stays sharp on outputs up to that scale.
-    pub fn new(c: &Cursor, scale: i32) -> Pointer {
+    fn new(c: &Cursor, scale: i32) -> Pointer {
         let buffer = MemoryRenderBuffer::from_slice(
             &c.pixels,
             Fourcc::Argb8888,

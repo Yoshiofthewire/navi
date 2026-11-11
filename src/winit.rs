@@ -28,8 +28,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     CalloopData,
-    cursor::Cursor,
-    render::{self, Arrow, Pointer, Wallpaper},
+    render::{self, Arrow, Cursors, Wallpaper},
     screenshot::Screenshot,
     state::Navi,
     wallpaper,
@@ -57,15 +56,14 @@ impl FrameClock {
 pub fn init(
     event_loop: &mut EventLoop<CalloopData>,
     data: &mut CalloopData,
-    cursor: Option<Cursor>,
+    cursor: Option<Cursors>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (backend, winit) = winit::init::<GlesRenderer>()?;
     // Winit drops `CursorLeft`, so this arrow stays where the pointer left the window.
-    let mut cursor = cursor.map(|c| {
+    let mut cursor = cursor.inspect(|_| {
         // Winit sends the host `wl_pointer.set_cursor` with no surface on every pointer enter.
         backend.window().set_cursor_visible(false);
         info!("host cursor hidden over navi's window");
-        Pointer::new(&c, 1)
     });
     let mut cursor_settings = data.state.desktop.clone();
     let mode = Mode {
@@ -158,7 +156,7 @@ pub fn init(
                     if state.desktop["cursor_theme"] != cursor_settings["cursor_theme"]
                         || state.desktop["cursor_size"] != cursor_settings["cursor_size"]
                     {
-                        cursor = crate::cursor::from_env(1.0).map(|c| Pointer::new(&c, 1));
+                        cursor = Cursors::from_env(1);
                         backend
                             .borrow()
                             .window()
@@ -180,7 +178,9 @@ pub fn init(
                     let mut failed = false;
                     match backend.bind() {
                         Ok((renderer, mut framebuffer)) => {
-                            let arrow = cursor.as_ref().map_or(Arrow::None, Arrow::Image);
+                            let arrow = cursor
+                                .as_mut()
+                                .map_or(Arrow::None, |c| c.arrow(state.cursor_shape()));
                             let elements = render::elements(
                                 renderer,
                                 state,

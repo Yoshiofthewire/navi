@@ -154,10 +154,10 @@ fn run(backend: Backend) -> Result<(), Box<dyn Error>> {
     };
     let theme = match backend {
         Backend::Nested => {
-            let cursor = cursor::from_env(1.0);
+            let cursor = render::Cursors::from_env(1);
             let theme = cursor
                 .as_ref()
-                .map(|c| (c.theme.clone(), cursor::SIZE.round() as u32));
+                .map(|c| (c.theme().to_string(), cursor::SIZE.round() as u32));
             winit::init(&mut event_loop, &mut data, cursor)?;
             theme
         }

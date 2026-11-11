@@ -1,17 +1,17 @@
-//! The pointer navi draws: the `default` arrow of the first installed XCursor theme. Theme
-//! files are untrusted, so every read and size is capped and a bad file is an error, never a
+//! The pointer navi draws: named shapes of the first installed XCursor theme, the `default`
+//! arrow standing in for any it lacks. Theme files are untrusted, so every read and size is capped and a bad file is an error, never a
 //! panic.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
+use smithay::input::pointer::CursorIcon;
 use tracing::{info, warn};
 
 use crate::files::{read_bytes, xdg_dir};
 
 pub const THEMES: [&str; 2] = ["Sweet-cursors", "Adwaita"];
-const SHAPES: [&str; 2] = ["default", "left_ptr"];
 /// Logical px; times the output scale.
 pub const SIZE: f64 = 24.0;
 const MAX_FILE: u64 = 2 << 20;
@@ -63,14 +63,25 @@ pub fn theme(dirs: &[PathBuf]) -> Option<&'static str> {
         .find(|t| dirs.iter().any(|d| d.join(t).join("cursors").is_dir()))
 }
 
-/// The arrow's file: `default`, else `left_ptr`, each looked for in `theme` and then the themes
-/// it inherits, at most `MAX_INHERITS` deep.
-pub fn file(dirs: &[PathBuf], theme: &str) -> Option<PathBuf> {
-    let chain = chain(dirs, theme);
-    SHAPES.iter().find_map(|shape| {
+/// File names for shape `name`: its CSS name, then its legacy aliases. Names come only from
+/// navi's fixed tables and `CursorIcon`, never from a client.
+fn names(name: &'static str) -> Vec<&'static str> {
+    let icon = name.parse::<CursorIcon>().ok();
+    let alt = icon.iter().flat_map(|i| i.alt_names().iter().copied());
+    let extra: &[&'static str] = if name == "grabbing" { &["fleur"] } else { &[] };
+    std::iter::once(name)
+        .chain(alt)
+        .chain(extra.iter().copied())
+        .collect()
+}
+
+/// The file of shape `name`: each of its names is looked for through the whole `chain` before the
+/// next.
+fn file(dirs: &[PathBuf], chain: &[String], name: &'static str) -> Option<PathBuf> {
+    names(name).into_iter().find_map(|n| {
         chain.iter().find_map(|t| {
             dirs.iter()
-                .map(|d| d.join(t).join("cursors").join(shape))
+                .map(|d| d.join(t).join("cursors").join(n))
                 .find(|p| p.is_file())
         })
     })
@@ -111,9 +122,146 @@ fn inherits(dirs: &[PathBuf], theme: &str) -> Vec<String> {
         .collect()
 }
 
-/// The arrow for output `scale` from the user's themes; `None`, after one warning, keeps the
+/// What a client asked the pointer to look like over its surface.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Request {
+    Named(&'static str),
+    Hidden,
+    /// A client cursor surface, which navi doesn't draw yet.
+    Surface,
+}
+
+impl Default for Request {
+    fn default() -> Self {
+        Request::Named("default")
+    }
+}
+
+/// The request of the client under the pointer, `F` its surface.
+pub struct Requested<F> {
+    focus: Option<F>,
+    pub request: Request,
+}
+
+impl<F> Default for Requested<F> {
+    fn default() -> Self {
+        Requested {
+            focus: None,
+            request: Request::default(),
+        }
+    }
+}
+
+impl<F: PartialEq> Requested<F> {
+    /// The pointer focus is now `focus`: a change forgets the old client's request.
+    pub fn focus(&mut self, focus: Option<F>) {
+        if self.focus != focus {
+            self.focus = focus;
+            self.request = Request::default();
+        }
+    }
+}
+
+/// The shape to draw, `None` for none, top rule first: while locked the lock client's request;
+/// a drag's cursor; over a Top or Overlay layer its client's; over a zone the zone's; else the
+/// client's under the pointer (`default` once the focus moved off it).
+pub fn pick(
+    lock: bool,
+    drag: Option<&'static str>,
+    layer: bool,
+    zone: Option<&'static str>,
+    request: Request,
+) -> Option<&'static str> {
+    let client = match request {
+        Request::Named(n) => Some(n),
+        Request::Hidden => None,
+        Request::Surface => Some("default"),
+    };
+    if lock {
+        return client;
+    }
+    match (drag, layer, zone) {
+        (Some(d), ..) => Some(d),
+        (None, false, Some(z)) => Some(z),
+        _ => client,
+    }
+}
+
+/// One theme's shapes at one size. Each shape's file is read at most once, hit or miss; a missing
+/// or bad shape draws as the arrow.
+pub struct Shapes<T> {
+    pub theme: String,
+    dirs: Vec<PathBuf>,
+    chain: Vec<String>,
+    want: u32,
+    arrow: T,
+    found: HashMap<&'static str, Option<T>>,
+}
+
+impl<T> Shapes<T> {
+    /// The shapes of `theme` nearest `want` px; an error without an arrow.
+    pub fn new(
+        dirs: Vec<PathBuf>,
+        theme: &str,
+        want: u32,
+        make: impl FnOnce(&Cursor) -> T,
+    ) -> Result<Self, String> {
+        let chain = chain(&dirs, theme);
+        let arrow =
+            read(&dirs, &chain, theme, want, "default")?.ok_or("no default or left_ptr cursor")?;
+        let (x, y) = arrow.hotspot;
+        info!("cursor theme={theme} size={} hotspot=({x},{y})", arrow.size);
+        Ok(Shapes {
+            theme: theme.into(),
+            arrow: make(&arrow),
+            dirs,
+            chain,
+            want,
+            found: HashMap::new(),
+        })
+    }
+
+    /// Shape `name`, built by `make` on its first use.
+    pub fn get(&mut self, name: &'static str, make: impl FnOnce(&Cursor) -> T) -> &T {
+        if name == "default" {
+            return &self.arrow;
+        }
+        let (dirs, chain, theme, want) = (&self.dirs, &self.chain, &self.theme, self.want);
+        let found =
+            self.found
+                .entry(name)
+                .or_insert_with(|| match read(dirs, chain, theme, want, name) {
+                    Ok(c) => {
+                        info!(name, found = c.is_some(), "cursor shape loaded");
+                        c.map(|c| make(&c))
+                    }
+                    Err(e) => {
+                        warn!("cursor {name} of {theme} not loaded, the arrow instead: {e}");
+                        None
+                    }
+                });
+        found.as_ref().unwrap_or(&self.arrow)
+    }
+}
+
+/// Shape `name` decoded at the size nearest `want`, `None` if the theme has none.
+fn read(
+    dirs: &[PathBuf],
+    chain: &[String],
+    theme: &str,
+    want: u32,
+    name: &'static str,
+) -> Result<Option<Cursor>, String> {
+    let Some(p) = file(dirs, chain, name) else {
+        return Ok(None);
+    };
+    let bytes = read_bytes(&p, MAX_FILE)?.ok_or("no file")?;
+    decode(&bytes, theme, want).map(Some)
+}
+
+/// The shapes for output `scale` from the user's themes; `None`, after one warning, keeps the
 /// host's or no cursor.
-pub fn from_env(scale: f64) -> Option<Cursor> {
+pub fn from_env<T>(scale: f64, make: impl FnOnce(&Cursor) -> T) -> Option<Shapes<T>> {
     let var = std::env::var_os;
     let dirs = dirs(
         var("XDG_DATA_HOME").as_deref(),
@@ -134,27 +282,10 @@ pub fn from_env(scale: f64) -> Option<Cursor> {
         );
         return None;
     };
-    let loaded = file(&dirs, &theme)
-        .ok_or_else(|| "no default or left_ptr cursor".to_string())
-        .and_then(|p| {
-            let bytes = read_bytes(&p, MAX_FILE)?.ok_or("No cursor file")?;
-            decode(
-                &bytes,
-                &theme,
-                (settings["cursor_size"].as_u64().unwrap_or(24) as f64 * scale).round() as u32,
-            )
-        });
-    match loaded {
-        Ok(c) => {
-            let (x, y) = c.hotspot;
-            info!("cursor theme={theme} size={} hotspot=({x},{y})", c.size);
-            Some(c)
-        }
-        Err(e) => {
-            warn!("cursor theme {theme} not loaded, navi draws no cursor: {e}");
-            None
-        }
-    }
+    let want = (settings["cursor_size"].as_u64().unwrap_or(24) as f64 * scale).round() as u32;
+    Shapes::new(dirs, &theme, want, make)
+        .inspect_err(|e| warn!("cursor theme {theme} not loaded, navi draws no cursor: {e}"))
+        .ok()
 }
 
 /// The first frame of the size nearest `SIZE × scale` in the file at `path`.
@@ -282,6 +413,15 @@ mod tests {
         }
     }
 
+    fn arrow(dirs: &[PathBuf], theme: &str) -> Option<PathBuf> {
+        file(dirs, &chain(dirs, theme), "default")
+    }
+
+    /// Shapes of `theme` whose values are the decoded cursors.
+    fn shapes(dirs: &[PathBuf], theme: &str, want: u32) -> Shapes<Cursor> {
+        Shapes::new(dirs.to_vec(), theme, want, Cursor::clone).unwrap()
+    }
+
     #[test]
     fn ac4_dirs_from_the_environment() {
         let os = |s: &str| Some(OsStr::new(s).to_owned());
@@ -313,10 +453,10 @@ mod tests {
         theme_dir(&dot, "Sweet-cursors", None, &["default"]);
         assert_eq!(theme(&all), Some("Sweet-cursors"));
         let sweet = |d: &Path| d.join("Sweet-cursors/cursors/default");
-        assert_eq!(file(&all, "Sweet-cursors"), Some(sweet(&dot)));
+        assert_eq!(arrow(&all, "Sweet-cursors"), Some(sweet(&dot)));
         // The XDG_DATA_HOME copy wins over ~/.icons.
         theme_dir(&home, "Sweet-cursors", None, &["default"]);
-        assert_eq!(file(&all, "Sweet-cursors"), Some(sweet(&home)));
+        assert_eq!(arrow(&all, "Sweet-cursors"), Some(sweet(&home)));
     }
 
     #[test]
@@ -327,15 +467,15 @@ mod tests {
         theme_dir(&tmp.0, "child", Some("mid, nothing"), &[]);
         theme_dir(&tmp.0, "mid", Some("base"), &[]);
         theme_dir(&tmp.0, "base", None, &["default"]);
-        assert_eq!(file(&d, "child"), Some(tmp.0.join("base/cursors/default")));
+        assert_eq!(arrow(&d, "child"), Some(tmp.0.join("base/cursors/default")));
         // A cycle ends.
         theme_dir(&tmp.0, "a", Some("b"), &[]);
         theme_dir(&tmp.0, "b", Some("a,../../etc"), &[]);
-        assert_eq!(file(&d, "a"), None);
+        assert_eq!(arrow(&d, "a"), None);
         assert_eq!(chain(&d, "a"), ["a", "b"]);
         // No `default` anywhere: `left_ptr`.
         theme_dir(&tmp.0, "old", None, &["left_ptr"]);
-        assert_eq!(file(&d, "old"), Some(tmp.0.join("old/cursors/left_ptr")));
+        assert_eq!(arrow(&d, "old"), Some(tmp.0.join("old/cursors/left_ptr")));
         // At most 4 levels below the theme.
         for (t, i) in [
             ("l0", "l1"),
@@ -347,8 +487,8 @@ mod tests {
             theme_dir(&tmp.0, t, Some(i), &[]);
         }
         theme_dir(&tmp.0, "l5", None, &["default"]);
-        assert_eq!(file(&d, "l1"), Some(tmp.0.join("l5/cursors/default")));
-        assert_eq!(file(&d, "l0"), None);
+        assert_eq!(arrow(&d, "l1"), Some(tmp.0.join("l5/cursors/default")));
+        assert_eq!(arrow(&d, "l0"), None);
     }
 
     #[test]
@@ -419,5 +559,141 @@ mod tests {
         for n in 0..wide.len() {
             let _ = decode(&wide[..n], "t", 24);
         }
+    }
+
+    #[test]
+    fn shapes_ac4_pick_precedence() {
+        use Request::*;
+        let text = Named("text");
+        // Lock beats everything, even a drag left over.
+        assert_eq!(
+            pick(true, Some("grabbing"), true, Some("n-resize"), text),
+            Some("text")
+        );
+        assert_eq!(pick(true, Some("grabbing"), false, None, Hidden), None);
+        // A drag beats a layer, a zone and the client.
+        assert_eq!(
+            pick(false, Some("se-resize"), true, Some("grab"), text),
+            Some("se-resize")
+        );
+        assert_eq!(
+            pick(false, Some("grabbing"), false, None, Hidden),
+            Some("grabbing")
+        );
+        // A Top/Overlay layer beats a zone: its client's request counts.
+        assert_eq!(
+            pick(false, None, true, Some("w-resize"), text),
+            Some("text")
+        );
+        assert_eq!(pick(false, None, true, Some("w-resize"), Hidden), None);
+        // A zone beats the client's request, Hidden included.
+        assert_eq!(
+            pick(false, None, false, Some("w-resize"), text),
+            Some("w-resize")
+        );
+        assert_eq!(pick(false, None, false, Some("grab"), Hidden), Some("grab"));
+        // With none of those, the client's request.
+        assert_eq!(pick(false, None, false, None, text), Some("text"));
+        assert_eq!(pick(false, None, false, None, Hidden), None);
+        assert_eq!(pick(false, None, false, None, Surface), Some("default"));
+        // A focus change resets the request; the old client's no longer applies.
+        let mut r = Requested::default();
+        r.focus(Some(1));
+        r.request = Hidden;
+        r.focus(Some(1));
+        assert_eq!(pick(false, None, false, None, r.request), None);
+        r.focus(Some(2));
+        assert_eq!(pick(false, None, false, None, r.request), Some("default"));
+        r.request = text;
+        r.focus(None);
+        assert_eq!(pick(false, None, false, None, r.request), Some("default"));
+    }
+
+    #[test]
+    fn shapes_ac5_name_alias_inherits_and_fallback() {
+        let tmp = Tmp::new("shapes");
+        let d = vec![tmp.0.clone()];
+        let shape = |hot: (u32, u32), sizes: &[u32]| {
+            xcursor(&sizes.iter().map(|&s| (s, s, hot)).collect::<Vec<_>>())
+        };
+        theme_dir(&tmp.0, "base", None, &["default"]);
+        theme_dir(&tmp.0, "kid", Some("base"), &[]);
+        let (kid, base) = (tmp.0.join("kid/cursors"), tmp.0.join("base/cursors"));
+        // Under its CSS name, with its own hotspot.
+        fs::write(kid.join("nw-resize"), shape((3, 4), &[24, 48])).unwrap();
+        // Only a legacy alias.
+        fs::write(kid.join("closedhand"), shape((5, 6), &[24])).unwrap();
+        // Only in the inherited theme.
+        fs::write(base.join("e-resize"), shape((7, 8), &[24, 48])).unwrap();
+        // The CSS name in a parent beats an alias in the child.
+        fs::write(kid.join("bottom_side"), shape((9, 9), &[24])).unwrap();
+        fs::write(base.join("s-resize"), shape((10, 10), &[24])).unwrap();
+
+        let mut s = shapes(&d, "kid", 48);
+        let arrow = s.get("default", Cursor::clone).clone();
+        assert_eq!((arrow.hotspot, arrow.size), ((1, 1), 24));
+        let got = |s: &mut Shapes<Cursor>, n| {
+            let c = s.get(n, Cursor::clone);
+            (c.hotspot, c.size)
+        };
+        assert_eq!(got(&mut s, "nw-resize"), ((3, 4), 48));
+        assert_eq!(got(&mut s, "grabbing"), ((5, 6), 24));
+        assert_eq!(got(&mut s, "e-resize"), ((7, 8), 48));
+        assert_eq!(got(&mut s, "s-resize"), ((10, 10), 24));
+        // Missing everywhere: the arrow.
+        assert_eq!(*s.get("ne-resize", Cursor::clone), arrow);
+        // The size nearest size × scale.
+        assert_eq!(got(&mut shapes(&d, "kid", 24), "nw-resize"), ((3, 4), 24));
+        assert_eq!(got(&mut shapes(&d, "kid", 40), "e-resize"), ((7, 8), 48));
+        // `grabbing` also tries `fleur`; `grab` its `openhand` alias.
+        assert_eq!(names("grabbing"), ["grabbing", "closedhand", "fleur"]);
+        assert_eq!(names("grab"), ["grab", "openhand", "fleur"]);
+        assert_eq!(names("se-resize"), ["se-resize", "bottom_right_corner"]);
+        // A theme with no arrow loads nothing.
+        theme_dir(&tmp.0, "bare", None, &["text"]);
+        assert!(Shapes::new(d.clone(), "bare", 24, Cursor::clone).is_err());
+    }
+
+    #[test]
+    fn shapes_ac6_caps_and_one_read() {
+        let tmp = Tmp::new("caps");
+        let d = vec![tmp.0.clone()];
+        theme_dir(&tmp.0, "t", None, &["default"]);
+        let dir = tmp.0.join("t/cursors");
+        let mut big = xcursor(&[(24, 24, (0, 0))]);
+        big.resize(MAX_FILE as usize + 1, 0);
+        let mut lying = xcursor(&[(24, 24, (0, 0))]);
+        lying[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
+        let bad = [
+            ("n-resize", big),
+            ("s-resize", xcursor(&[(24, 257, (0, 0))])),
+            ("e-resize", xcursor(&[(24, 24, (24, 0))])),
+            ("w-resize", lying),
+        ];
+        for (n, bytes) in &bad {
+            fs::write(dir.join(n), bytes).unwrap();
+        }
+        let mut s = shapes(&d, "t", 24);
+        let arrow = s.get("default", Cursor::clone).clone();
+        for (n, _) in &bad {
+            assert_eq!(*s.get(n, Cursor::clone), arrow, "{n}");
+        }
+        // A hit is read once: gone from disk, it still draws.
+        fs::write(dir.join("grab"), xcursor(&[(24, 24, (2, 3))])).unwrap();
+        assert_eq!(s.get("grab", Cursor::clone).hotspot, (2, 3));
+        fs::remove_file(dir.join("grab")).unwrap();
+        assert_eq!(s.get("grab", Cursor::clone).hotspot, (2, 3));
+        // A miss is remembered too: a file appearing later isn't looked for.
+        assert_eq!(*s.get("text", Cursor::clone), arrow);
+        fs::write(dir.join("text"), xcursor(&[(24, 24, (4, 4))])).unwrap();
+        assert_eq!(*s.get("text", Cursor::clone), arrow);
+        // So is a bad file, fixed later.
+        fs::write(dir.join("n-resize"), xcursor(&[(24, 24, (4, 4))])).unwrap();
+        assert_eq!(*s.get("n-resize", Cursor::clone), arrow);
+        // A new load reads the files again.
+        assert_eq!(
+            shapes(&d, "t", 24).get("text", Cursor::clone).hotspot,
+            (4, 4)
+        );
     }
 }

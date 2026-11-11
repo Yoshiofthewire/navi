@@ -1,8 +1,8 @@
 use smithay::{
     backend::renderer::utils::on_commit_buffer_handler,
     backend::session::libseat::LibSeatSession,
-    delegate_compositor, delegate_data_device, delegate_layer_shell, delegate_output,
-    delegate_seat, delegate_shm, delegate_xdg_activation, delegate_xdg_decoration,
+    delegate_compositor, delegate_cursor_shape, delegate_data_device, delegate_layer_shell,
+    delegate_output, delegate_seat, delegate_shm, delegate_xdg_activation, delegate_xdg_decoration,
     delegate_xdg_shell,
     desktop::{
         LayerSurface, PopupKind, PopupManager, Space, Window, WindowSurfaceType,
@@ -12,7 +12,7 @@ use smithay::{
     input::{
         Seat, SeatHandler, SeatState,
         keyboard::Keycode,
-        pointer::{CursorImageStatus, MotionEvent},
+        pointer::{CursorImageStatus, MotionEvent, PointerHandle},
     },
     output::Output,
     reexports::{
@@ -162,6 +162,9 @@ pub struct Navi {
     pub windows: Vec<Managed>,
     /// A drag in navi's strip or edges, from press to release.
     pub drag: Option<Drag>,
+    _cursor_shape_state: smithay::wayland::cursor_shape::CursorShapeManagerState,
+    /// The cursor the client under the pointer asked for.
+    pub cursor: crate::cursor::Requested<WlSurface>,
     pub edge_clicks: layout::EdgeClicks,
     /// The layout's outputs, with the area layer surfaces leave for the grid.
     pub(crate) grid: Vec<layout::Output>,
@@ -298,6 +301,10 @@ impl Navi {
             xwayland_shell: XWaylandShellState::new::<Self>(&dh),
             windows: Vec::new(),
             drag: None,
+            _cursor_shape_state: smithay::wayland::cursor_shape::CursorShapeManagerState::new::<Self>(
+                &dh,
+            ),
+            cursor: Default::default(),
             edge_clicks: layout::EdgeClicks::default(),
             grid: Vec::new(),
             toplevels: Toplevels::default(),
@@ -634,9 +641,36 @@ impl Navi {
                 serial: SERIAL_COUNTER.next_serial(),
                 time: self.now_ms() as u32,
             };
-            pointer.motion(self, under, &motion);
+            self.move_pointer(&pointer, under, &motion);
             pointer.frame(self);
         }
+    }
+
+    /// Sends `motion`; a new pointer focus starts from the `default` cursor.
+    pub fn move_pointer(
+        &mut self,
+        pointer: &PointerHandle<Navi>,
+        under: Option<(WlSurface, Point<f64, Logical>)>,
+        motion: &MotionEvent,
+    ) {
+        pointer.motion(self, under, motion);
+        self.cursor.focus(pointer.current_focus());
+    }
+
+    /// The cursor shape to draw at the pointer, `None` for hidden.
+    pub fn cursor_shape(&self) -> Option<&'static str> {
+        let pos = self.pointer_location();
+        let lock = self.lock.active;
+        crate::cursor::pick(
+            lock,
+            self.drag.as_ref().map(Drag::cursor),
+            !lock
+                && self
+                    .layer_under(pos, [Layer::Overlay, Layer::Top])
+                    .is_some(),
+            self.zone_at(pos).map(layout::Hit::cursor),
+            self.cursor.request,
+        )
     }
 
     /// What gets pointer focus at `pos`, top down: Overlay and Top layers, navi's zones (which
@@ -2546,6 +2580,8 @@ impl XdgDecorationHandler for Navi {
     }
 }
 
+impl smithay::wayland::tablet_manager::TabletSeatHandler for Navi {}
+
 impl SeatHandler for Navi {
     type KeyboardFocus = Focus;
     type PointerFocus = WlSurface;
@@ -2555,7 +2591,16 @@ impl SeatHandler for Navi {
         &mut self.seat_state
     }
 
-    fn cursor_image(&mut self, _seat: &Seat<Self>, _image: CursorImageStatus) {}
+    /// Smithay already dropped a request from a client without pointer focus or with a stale
+    /// enter serial.
+    fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
+        self.cursor.request = match image {
+            CursorImageStatus::Named(icon) => crate::cursor::Request::Named(icon.name()),
+            CursorImageStatus::Hidden => crate::cursor::Request::Hidden,
+            CursorImageStatus::Surface(_) => crate::cursor::Request::Surface,
+        };
+        self.request_redraw();
+    }
 
     fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&Focus>) {
         self.focus_moves += 1;
@@ -2807,6 +2852,7 @@ delegate_xdg_shell!(Navi);
 delegate_xdg_decoration!(Navi);
 delegate_layer_shell!(Navi);
 delegate_seat!(Navi);
+delegate_cursor_shape!(Navi);
 delegate_data_device!(Navi);
 delegate_output!(Navi);
 delegate_xdg_activation!(Navi);

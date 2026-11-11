@@ -129,6 +129,12 @@ space when you want it.
   when the pointer leaves every monitor or the nested window loses focus.
 - A float moves by its bar and resizes by the 6 px band around it, px for px with no grid or
   preview (see *Client sizes → Floats*).
+- **Cursors:** every target shows what it does. Edges show `w-resize`, `e-resize`, `n-resize` or
+  `s-resize`, corners `nw-resize`, `ne-resize`, `sw-resize` or `se-resize` (a tile's top corners
+  at its strip's ends, a float's at its band's), and the strip and a float's bar the open `grab`
+  hand. A pressed strip and every move (tile, tab, float) show the closed `grabbing` hand. A
+  resize keeps its zone's cursor wherever the pointer goes until release. Tabs, window buttons, a
+  cancelled drag and the wallpaper show the arrow.
 
 ### Keyboard window controls
 
@@ -557,11 +563,24 @@ don't affect navi's MIT licence.
   (`Inherits=` in `index.theme`, at most 4 levels, no cycles). Its size is the one in the file
   nearest 24 × the monitor's scale, the larger on a tie (Sweet ships 24, 36 and 48), and only its
   first frame is used. Files over 2 MiB, images over 256 px a side and hotspots outside the image
-  are refused; then navi logs one warning and keeps the host's pointer. Built now: this arrow
-  for every surface, with `XCURSOR_THEME` and `XCURSOR_SIZE` (24 × scale) set for navi-bar and
-  the apps it launches. Still to come: apps' own cursors (`cursor-shape-v1`, cursor surfaces),
-  importing the cursor chosen in KDE, and animated cursors. Nested, the arrow stays at the edge
-  where the pointer left the window, since the winit backend doesn't report leaving.
+  are refused; then navi logs one warning and keeps the host's pointer. Other shapes (navi's
+  resize and grab cursors, apps' named cursors) are found the same way under their CSS name, then
+  their legacy X11 names (`top_left_corner`, `openhand`, `closedhand`, `xterm`…), with the same
+  caps; a missing or refused shape draws the arrow. Each file is read at most once per theme
+  load, hit or miss, and only names from navi's fixed table and `cursor-shape-v1`'s list are ever
+  looked up, never a client's string.
+  Built now: navi's zone and drag cursors (see *Dragging*), apps' named cursors through
+  `cursor-shape-v1` (an I-beam over text and so on), and `XCURSOR_THEME` and `XCURSOR_SIZE`
+  (24 × scale) set for navi-bar and the apps it launches. What shows, top rule first: while
+  locked, the lock screen's request; during a drag, the drag's cursor; over a Top or Overlay
+  panel, that panel's request; over a navi target, its cursor; else the request of the app under
+  the pointer. An app's request counts only while the pointer is over it: each new pointer focus
+  starts from the arrow, and a request from an app without pointer focus or with a stale enter
+  serial is dropped. An app may hide the pointer only over its own surface, never over navi's
+  targets or during a drag. Still to come: cursor surfaces (`wl_pointer.set_cursor` with a buffer,
+  which every X11 app uses; navi draws its arrow instead), importing the cursor chosen in KDE,
+  animated cursors, and cursors for navi-bar's own UI. Nested, the pointer stays at the edge
+  where it left the window, since the winit backend doesn't report leaving.
 - **Planned theme imports:** sounds
   from `kdeglobals` `[Sounds]`, cursor from `kcminputrc` `[Mouse]`. This is a one-time copy into
   navi's config, so Plasma users keep the look they chose. Icons already read KDE's explicit

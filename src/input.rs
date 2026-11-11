@@ -519,7 +519,7 @@ impl Navi {
             serial: SERIAL_COUNTER.next_serial(),
             time,
         };
-        pointer.motion(self, under, &motion);
+        self.move_pointer(&pointer, under, &motion);
         pointer.frame(self);
         if self.lock.active {
             let s = self.pointer_focus(pos).map(|(s, _)| s);
