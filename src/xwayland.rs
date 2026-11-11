@@ -1543,12 +1543,102 @@ mod tests {
         data.state.focus_by(parent.clone(), Raise::User);
         let (b, b_win) = open(&mut data, &mut event_loop);
         data.state.focus_by(Some(b_win), Raise::User);
-        data.state.before_focus = None;
+        data.state.protect_session();
         close(&mut data, &mut event_loop, b);
         assert_eq!(
             data.state.focused_window(),
             None,
             "nothing left to go back to"
+        );
+        data.state.lock.active = false;
+
+        // Job 021: a dialog that took the keyboard from its parent gives it back when it closes,
+        // if the keyboard hasn't moved since, even when the parent took it on its own.
+        let x11 = |d: &CalloopData, w: u32| {
+            d.state
+                .windows
+                .iter()
+                .find(|m| m.window.x11_surface().is_some_and(|x| x.window_id() == w))
+                .map(|m| m.window.clone())
+        };
+        let dialog = |data: &mut CalloopData, event_loop: &mut EventLoop<CalloopData>, up: u32| {
+            let w = make(Some(up));
+            pump(event_loop, data, |d| {
+                x11(d, w).is_some_and(|win| d.state.focused_window() == Some(win))
+            });
+            (w, x11(data, w).unwrap())
+        };
+        let shut = |data: &mut CalloopData, event_loop: &mut EventLoop<CalloopData>, w: u32| {
+            conn.destroy_window(w).unwrap();
+            conn.flush().unwrap();
+            pump(event_loop, data, |d| x11(d, w).is_none());
+        };
+        // Allowed: the parent took it on its own, its dialog took it from the parent.
+        data.state.focus_by(parent.clone(), Raise::New);
+        let (d, _) = dialog(&mut data, &mut event_loop, window);
+        let raises = data.state.raises;
+        shut(&mut data, &mut event_loop, d);
+        assert_eq!(data.state.focused_window(), parent, "back to the parent");
+        assert_eq!(data.state.raises, raises, "the hand-back raises nothing");
+        // (a) Refused: the keyboard moved to nobody and back to the dialog.
+        data.state.focus_by(parent.clone(), Raise::New);
+        let (d, d_win) = dialog(&mut data, &mut event_loop, window);
+        data.state.focus(None);
+        data.state.focus(Some(d_win));
+        shut(&mut data, &mut event_loop, d);
+        assert_eq!(data.state.focused_window(), None, "moved since");
+        // Refused: a move outside `focus_by` (a layer's), which leaves `before_focus` as it was.
+        data.state.focus_by(parent.clone(), Raise::New);
+        let (d, _) = dialog(&mut data, &mut event_loop, window);
+        data.state.focus_moves += 2;
+        shut(&mut data, &mut event_loop, d);
+        assert_eq!(data.state.focused_window(), None, "a layer came between");
+        // (b) Refused: the parent is minimized.
+        data.state.focus_by(parent.clone(), Raise::New);
+        let (d, _) = dialog(&mut data, &mut event_loop, window);
+        data.state.layout.minimize(id);
+        data.state.apply_layout();
+        shut(&mut data, &mut event_loop, d);
+        assert_eq!(data.state.focused_window(), None, "the parent is hidden");
+        data.state.layout.activate(id);
+        data.state.apply_layout();
+        // (c) Refused: the lock came between.
+        data.state.focus_by(parent.clone(), Raise::New);
+        let (d, _) = dialog(&mut data, &mut event_loop, window);
+        data.state.protect_session();
+        shut(&mut data, &mut event_loop, d);
+        assert_eq!(data.state.focused_window(), None, "across the lock");
+        data.state.lock.active = false;
+        // (d) Refused: a sibling dialog took it from the first one, then closed.
+        data.state.focus_by(parent.clone(), Raise::New);
+        let (d1, _) = dialog(&mut data, &mut event_loop, window);
+        let (d2, _) = dialog(&mut data, &mut event_loop, window);
+        shut(&mut data, &mut event_loop, d2);
+        assert_eq!(
+            data.state.focused_window(),
+            None,
+            "not the sibling's parent"
+        );
+        shut(&mut data, &mut event_loop, d1);
+        // (e) A dialog's dialog gives it back to the dialog; that one then hands it to nobody,
+        // since the keyboard moved after it took it from the parent.
+        data.state.focus_by(parent.clone(), Raise::New);
+        let (d1, d1_win) = dialog(&mut data, &mut event_loop, window);
+        let (d2, _) = dialog(&mut data, &mut event_loop, d1);
+        shut(&mut data, &mut event_loop, d2);
+        assert_eq!(data.state.focused_window(), Some(d1_win), "back to D1");
+        shut(&mut data, &mut event_loop, d1);
+        assert_eq!(data.state.focused_window(), None, "moved since D1 took it");
+        // Round-13 nit: an unrelated window that closes keeps what the dialog took it from.
+        let (u, _) = open(&mut data, &mut event_loop);
+        data.state.focus_by(parent.clone(), Raise::New);
+        let (d, _) = dialog(&mut data, &mut event_loop, window);
+        shut(&mut data, &mut event_loop, u);
+        shut(&mut data, &mut event_loop, d);
+        assert_eq!(
+            data.state.focused_window(),
+            parent,
+            "unrelated close kept it"
         );
         data.state.focus(parent);
         let menu = conn.generate_id().unwrap();

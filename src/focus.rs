@@ -182,6 +182,11 @@ pub struct HandBack {
     /// The keyboard moved again since it left that window (only the closing window may have
     /// held it in between).
     pub moved_since: bool,
+    /// The exact case: it is the closing dialog's parent, the window the dialog took the
+    /// keyboard from.
+    pub held_before: bool,
+    /// The keyboard moved after the dialog took it (any move, a layer's too).
+    pub moved_after: bool,
     /// Some of the window is where a click would reach it: shown, not minimized, not covered.
     pub exposed: bool,
     /// It is on the closing window's output.
@@ -189,10 +194,14 @@ pub struct HandBack {
     pub locked: bool,
 }
 
-/// Whether the keyboard may go back: only to a focus the user gave, held right before the
-/// closing window, to a window the user can see where the closed one was. Else to nobody.
+/// Whether the keyboard may go back: to a focus the user gave, held right before the closing
+/// window, or to the parent a dialog took it from with no move since (it only gets back what it
+/// held), and only to a window the user can see where the closed one was. Else to nobody.
 pub fn may_hand_back(h: HandBack) -> bool {
-    h.user_gave && !h.moved_since && h.exposed && h.same_output && !h.locked
+    (h.user_gave && !h.moved_since || h.held_before && !h.moved_after)
+        && h.exposed
+        && h.same_output
+        && !h.locked
 }
 
 #[cfg(test)]
@@ -317,6 +326,7 @@ mod tests {
             exposed: true,
             same_output: true,
             locked: false,
+            ..HandBack::default()
         };
         assert!(may_hand_back(ok));
         for (no, why) in [
@@ -349,6 +359,61 @@ mod tests {
                 "on another output",
             ),
             (HandBack { locked: true, ..ok }, "across the lock"),
+        ] {
+            assert!(!may_hand_back(no), "{why}");
+        }
+    }
+
+    /// Job 021: a dialog's parent gets the keyboard back without a user's focus only when the
+    /// dialog took it straight from the parent and it hasn't moved since.
+    #[test]
+    fn a_closed_dialog_hands_the_keyboard_back_to_the_parent_it_took_it_from() {
+        let exact = HandBack {
+            user_gave: false,
+            moved_since: false,
+            held_before: true,
+            moved_after: false,
+            exposed: true,
+            same_output: true,
+            locked: false,
+        };
+        assert!(may_hand_back(exact));
+        for (no, why) in [
+            (
+                HandBack {
+                    moved_after: true,
+                    ..exact
+                },
+                "the keyboard moved since",
+            ),
+            (
+                HandBack {
+                    held_before: false,
+                    ..exact
+                },
+                "a sibling dialog or another window held it",
+            ),
+            (
+                HandBack {
+                    exposed: false,
+                    ..exact
+                },
+                "hidden, minimized or covered",
+            ),
+            (
+                HandBack {
+                    same_output: false,
+                    ..exact
+                },
+                "on another output",
+            ),
+            (
+                HandBack {
+                    locked: true,
+                    ..exact
+                },
+                "across the lock",
+            ),
         ] {
             assert!(!may_hand_back(no), "{why}");
         }
