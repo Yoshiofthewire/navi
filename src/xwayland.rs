@@ -340,8 +340,10 @@ impl XwmHandler for Navi {
     fn property_notify(&mut self, _: XwmId, x: X11Surface, prop: WmWindowProperty) {
         match (prop, x.wl_surface()) {
             // `refit` paces it and ignores windows without a tile.
-            (WmWindowProperty::NormalHints, Some(root)) => self.refit(&root),
-            (WmWindowProperty::NormalHints, None) => {}
+            (WmWindowProperty::NormalHints | WmWindowProperty::MotifHints, Some(root)) => {
+                self.refit(&root)
+            }
+            (WmWindowProperty::NormalHints | WmWindowProperty::MotifHints, None) => {}
             (WmWindowProperty::TransientFor, _) => self.recenter_dialogs(),
             _ => self.refresh_toplevels(),
         }
@@ -2496,5 +2498,296 @@ pub(crate) mod tests {
         pump(&mut event_loop, &mut data, |d| menus(d) == 0);
         destroy(&mut event_loop, &mut data, a);
         destroy(&mut event_loop, &mut data, b);
+    }
+
+    /// `_MOTIF_WM_HINTS` changed after map adds or removes navi's bar through `refit`, paced and
+    /// coalesced like size hints. Named so CI's `x11_lifecycle_and_input` filter runs it.
+    #[test]
+    #[ignore = "requires the Xwayland executable"]
+    fn x11_lifecycle_and_input_motif_hints() {
+        use crate::layout::{BAR, GAP, Rect, STRIP};
+        let (mut event_loop, mut data) = harness();
+        let xdisplay = start(&event_loop.handle(), &data.state).expect("spawn Xwayland");
+        pump(&mut event_loop, &mut data, |d| d.state.xwm.is_some());
+        let (conn, screen) = smithay::reexports::x11rb::connect(Some(&xdisplay)).unwrap();
+        let root = conn.setup().roots[screen].root;
+        let motif_atom = conn
+            .intern_atom(false, b"_MOTIF_WM_HINTS")
+            .unwrap()
+            .reply()
+            .unwrap()
+            .atom;
+        // Flags DECORATIONS; decorations 0 is the app's own title bar, 1 is navi's bar.
+        const OWN: [u32; 5] = [2, 0, 0, 0, 0];
+        const NAVI: [u32; 5] = [2, 0, 1, 0, 0];
+        let motif = |win: u32, words: &[u32]| {
+            conn.change_property32(PropMode::REPLACE, win, motif_atom, motif_atom, words)
+                .unwrap();
+            conn.flush().unwrap();
+        };
+        let create = |class: &str, min: Option<(i32, i32)>, words: Option<&[u32]>| {
+            let win = conn.generate_id().unwrap();
+            conn.create_window(
+                smithay::reexports::x11rb::COPY_DEPTH_FROM_PARENT,
+                win,
+                root,
+                0,
+                0,
+                200,
+                120,
+                0,
+                WindowClass::INPUT_OUTPUT,
+                0,
+                &CreateWindowAux::new().background_pixel(0x224466),
+            )
+            .unwrap();
+            let wm_class = format!("{class}\0{class}\0");
+            conn.change_property8(
+                PropMode::REPLACE,
+                win,
+                AtomEnum::WM_CLASS,
+                AtomEnum::STRING,
+                wm_class.as_bytes(),
+            )
+            .unwrap();
+            if let Some(min) = min {
+                let h = WmSizeHints {
+                    min_size: Some(min),
+                    ..WmSizeHints::new()
+                };
+                h.set_normal_hints(&conn, win).unwrap();
+            }
+            if let Some(words) = words {
+                motif(win, words);
+            }
+            win
+        };
+        let map = |win: u32| {
+            conn.map_window(win).unwrap();
+            conn.flush().unwrap();
+        };
+        let managed = |d: &CalloopData, win: u32| {
+            d.state
+                .windows
+                .iter()
+                .position(|m| m.window.x11_surface().is_some_and(|x| x.window_id() == win))
+        };
+        let destroy = |event_loop: &mut EventLoop<CalloopData>, data: &mut CalloopData, win| {
+            conn.destroy_window(win).unwrap();
+            conn.flush().unwrap();
+            pump(event_loop, data, |d| managed(d, win).is_none());
+        };
+        // The XWM handles one connection's requests in order: once a later title shows, every
+        // earlier request from it has been handled.
+        let mut syncs = 0;
+        let mut sync = |event_loop: &mut EventLoop<CalloopData>, data: &mut CalloopData, win| {
+            syncs += 1;
+            let title = format!("sync {syncs}");
+            conn.change_property8(
+                PropMode::REPLACE,
+                win,
+                AtomEnum::WM_NAME,
+                AtomEnum::STRING,
+                title.as_bytes(),
+            )
+            .unwrap();
+            conn.flush().unwrap();
+            pump(event_loop, data, |d| {
+                managed(d, win).is_some_and(|i| {
+                    crate::state::window_title(&d.state.windows[i].window) == title
+                })
+            });
+        };
+        let tile_of = |d: &CalloopData, win| managed(d, win).and_then(|i| d.state.windows[i].tile);
+        let decorated = |d: &CalloopData, id| d.state.layout.tile(id).unwrap().decorated;
+        let geometry = |d: &CalloopData, win| {
+            let i = managed(d, win).unwrap();
+            let g = d.state.windows[i].window.x11_surface().unwrap().geometry();
+            Rect::new(g.loc.x, g.loc.y, g.size.w, g.size.h)
+        };
+        // Its configured geometry is the layout's window rect.
+        let settled = |event_loop: &mut EventLoop<CalloopData>, data: &mut CalloopData, win, id| {
+            pump(event_loop, data, |d| {
+                d.state
+                    .layout
+                    .rect(id)
+                    .is_some_and(|r| geometry(d, win) == r)
+            });
+            data.state.layout.rect(id).unwrap()
+        };
+        // The window rect its cells give it, with and without a bar; the output has no panels.
+        let cells_window = |d: &CalloopData, id, bar: bool| {
+            let t = d.state.layout.tile(id).unwrap();
+            let full = Rect::new(0, 0, 1280, 720);
+            let o = crate::layout::Output {
+                name: t.output.clone(),
+                area: full,
+                full,
+                priority: 0,
+            };
+            let r = o.cells_rect(t.cells);
+            let top = STRIP + if bar { BAR } else { 0 };
+            (r.w - GAP, r.h - top - (GAP - STRIP))
+        };
+        let overlapped = |d: &CalloopData, id| {
+            let a = d.state.layout.tile(id).unwrap();
+            d.state.layout.tiles().iter().any(|b| {
+                let (a, b) = (a.cells, b.cells);
+                b != a
+                    && a.col < b.col + b.cols
+                    && b.col < a.col + a.cols
+                    && a.row < b.row + b.rows
+                    && b.row < a.row + a.rows
+            })
+        };
+
+        // AC2: no hint is navi's bar; OWN drops it, NAVI brings it back, each refit configured.
+        let plain = create("plain", None, None);
+        map(plain);
+        pump(&mut event_loop, &mut data, |d| tile_of(d, plain).is_some());
+        let neighbour = tile_of(&data, plain).unwrap();
+        assert!(decorated(&data, neighbour));
+        let barred = settled(&mut event_loop, &mut data, plain, neighbour);
+        motif(plain, &OWN);
+        pump(&mut event_loop, &mut data, |d| !decorated(d, neighbour));
+        let bare = settled(&mut event_loop, &mut data, plain, neighbour);
+        assert_eq!(bare.y, barred.y - BAR, "{bare:?} {barred:?}");
+        motif(plain, &NAVI);
+        pump(&mut event_loop, &mut data, |d| decorated(d, neighbour));
+        let below = settled(&mut event_loop, &mut data, plain, neighbour);
+        assert_eq!(below.y, bare.y + BAR, "configured below the bar");
+        assert_eq!(below, barred);
+
+        // AC3: a minimum that fits its cells only without the bar is refitted when the bar comes.
+        let probe = create("tight", None, Some(&OWN));
+        map(probe);
+        pump(&mut event_loop, &mut data, |d| tile_of(d, probe).is_some());
+        let (w, h) = cells_window(&data, tile_of(&data, probe).unwrap(), false);
+        let min = (w - 20, h - BAR / 2);
+        destroy(&mut event_loop, &mut data, probe);
+        let win = create("tight", Some(min), Some(&OWN));
+        map(win);
+        pump(&mut event_loop, &mut data, |d| tile_of(d, win).is_some());
+        let id = tile_of(&data, win).unwrap();
+        assert!(!decorated(&data, id));
+        let t = data.state.layout.tile(id).unwrap().clone();
+        assert!(!t.floating);
+        assert!(
+            cells_window(&data, id, true).1 < min.1,
+            "the bar must not fit"
+        );
+        motif(win, &NAVI);
+        pump(&mut event_loop, &mut data, |d| decorated(d, id));
+        let after = data.state.layout.tile(id).unwrap();
+        assert!(after.floating || after.cells != t.cells, "refitted");
+        if !after.floating {
+            let (w, h) = cells_window(&data, id, true);
+            assert!(w >= min.0 && h >= min.1, "{w} × {h}");
+        }
+        assert!(!overlapped(&data, id));
+        assert!(!overlapped(&data, neighbour));
+        settled(&mut event_loop, &mut data, win, id);
+        destroy(&mut event_loop, &mut data, win);
+
+        // AC4: five toggles within REFIT_PACE of a refit apply once, as the last one left it.
+        let win = create("paced", None, None);
+        map(win);
+        pump(&mut event_loop, &mut data, |d| tile_of(d, win).is_some());
+        let id = tile_of(&data, win).unwrap();
+        let i = managed(&data, win).unwrap();
+        motif(win, &OWN);
+        pump(&mut event_loop, &mut data, |d| !decorated(d, id));
+        let first = data.state.windows[i].refitted.unwrap();
+        for words in [NAVI, OWN, NAVI, OWN, NAVI] {
+            motif(win, &words);
+        }
+        sync(&mut event_loop, &mut data, win);
+        assert!(
+            first.elapsed() < Duration::from_secs(1),
+            "too slow to test pacing"
+        );
+        assert!(!decorated(&data, id), "nothing applied inside the pace");
+        assert!(data.state.windows[i].refit_queued);
+        pump(&mut event_loop, &mut data, |d| {
+            !d.state.windows[i].refit_queued
+        });
+        assert!(decorated(&data, id), "the last write wins");
+        let second = data.state.windows[i].refitted.unwrap();
+        assert!(
+            second - first >= Duration::from_secs(1),
+            "{:?}",
+            second - first
+        );
+        sync(&mut event_loop, &mut data, win);
+        assert_eq!(data.state.windows[i].refitted, Some(second), "one change");
+        assert!(!data.state.windows[i].refit_queued);
+        destroy(&mut event_loop, &mut data, win);
+
+        // AC5: short, format-8 and oversized values neither hang nor reset the bar.
+        let win = create("hostile", None, Some(&OWN));
+        map(win);
+        pump(&mut event_loop, &mut data, |d| tile_of(d, win).is_some());
+        let id = tile_of(&data, win).unwrap();
+        assert!(!decorated(&data, id));
+        motif(win, &[2, 0, 1]);
+        conn.change_property8(
+            PropMode::REPLACE,
+            win,
+            motif_atom,
+            motif_atom,
+            &[2, 0, 1, 0, 0],
+        )
+        .unwrap();
+        conn.flush().unwrap();
+        sync(&mut event_loop, &mut data, win);
+        let i = managed(&data, win).unwrap();
+        assert!(!decorated(&data, id), "the last valid value stands");
+        assert!(!data.state.windows[i].refit_queued);
+        let mut big = vec![7u32; 65_536];
+        for words in [NAVI, OWN] {
+            big[..5].copy_from_slice(&words);
+            motif(win, &big);
+            let bar = words == NAVI;
+            pump(&mut event_loop, &mut data, |d| decorated(d, id) == bar);
+        }
+        assert!(!decorated(&data, id), "the first five words of 64 Ki count");
+        let next = create("next", None, None);
+        map(next);
+        pump(&mut event_loop, &mut data, |d| tile_of(d, next).is_some());
+        destroy(&mut event_loop, &mut data, next);
+        destroy(&mut event_loop, &mut data, win);
+
+        // AC6: a transient dialog's motif change does nothing: no tile, no bar, same geometry.
+        let tiles = data.state.layout.tiles().len();
+        let dialog = create("dialog", None, None);
+        conn.change_property32(
+            PropMode::REPLACE,
+            dialog,
+            AtomEnum::WM_TRANSIENT_FOR,
+            AtomEnum::WINDOW,
+            &[plain],
+        )
+        .unwrap();
+        map(dialog);
+        pump(&mut event_loop, &mut data, |d| managed(d, dialog).is_some());
+        let parent = data
+            .state
+            .space
+            .element_geometry(&data.state.window_of(neighbour).unwrap())
+            .unwrap();
+        let at = parent.loc + (parent.size - (200, 120).into()).downscale(2).to_point();
+        let centred = Rect::new(at.x, at.y, 200, 120);
+        pump(&mut event_loop, &mut data, |d| {
+            geometry(d, dialog) == centred
+        });
+        for words in [OWN, NAVI] {
+            motif(dialog, &words);
+            sync(&mut event_loop, &mut data, dialog);
+            assert_eq!(tile_of(&data, dialog), None);
+            assert_eq!(data.state.layout.tiles().len(), tiles);
+            assert_eq!(geometry(&data, dialog), centred);
+        }
+        destroy(&mut event_loop, &mut data, dialog);
+        destroy(&mut event_loop, &mut data, plain);
     }
 }

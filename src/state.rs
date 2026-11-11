@@ -1411,7 +1411,7 @@ impl Navi {
     }
 
     /// After a commit of `root`, or an X11 hints change: refits a tiled window whose min/max size
-    /// changed, and logs a geometry larger than its clip rect once per change of either.
+    /// or X11 bar changed, and logs a geometry larger than its clip rect once per change of either.
     pub(crate) fn refit(&mut self, root: &WlSurface) {
         let Some(i) = self
             .windows
@@ -1424,14 +1424,15 @@ impl Navi {
         let (Some(id), app) = (m.tile, window_app(&m.window)) else {
             return;
         };
-        let (min, max) = match m.window.x11_surface() {
-            Some(x) => crate::xwayland::x11_hints(x),
-            None => size_hints(root),
+        // An X11 window's bar follows its `_MOTIF_WM_HINTS`; a Wayland window's has its own path.
+        let ((min, max), bar) = match m.window.x11_surface() {
+            Some(x) => (crate::xwayland::x11_hints(x), Some(!x.is_decorated())),
+            None => (size_hints(root), None),
         };
         let changed = self
             .layout
             .tile(id)
-            .is_some_and(|t| t.hints != layout::Hints::new(min, max));
+            .is_some_and(|t| refit_due(t, layout::Hints::new(min, max), bar));
         if changed {
             let now = std::time::Instant::now();
             match refit_wait(m.refitted, now) {
@@ -1458,6 +1459,13 @@ impl Navi {
                 }
                 None => {
                     self.windows[i].refitted = Some(now);
+                    if let Some(bar) = bar {
+                        let fit = self.layout.set_decorated(id, bar);
+                        if fit != Fit::Unchanged {
+                            info!(app, id, decorated = bar, "X11 decoration");
+                        }
+                        self.report_fit(id, &app, fit);
+                    }
                     let fit = self.layout.set_hints(id, min, max);
                     self.report_fit(id, &app, fit);
                 }
@@ -2152,6 +2160,11 @@ fn refit_wait(
 ) -> Option<std::time::Duration> {
     let due = last? + REFIT_PACE;
     (due > now).then(|| due - now)
+}
+
+/// Whether tile `t` must refit to client `hints` and, for an X11 window, navi's `bar`.
+fn refit_due(t: &layout::Tile, hints: layout::Hints, bar: Option<bool>) -> bool {
+    t.hints != hints || bar.is_some_and(|b| b != t.decorated)
 }
 
 /// `p` with every client value bounded to `layout::POPUP_LIMIT`, so Smithay's placement can't
@@ -3136,6 +3149,22 @@ mod tests {
         assert_eq!(refit_wait(Some(t), t + ms(400)), Some(ms(600)));
         assert_eq!(refit_wait(Some(t), t + REFIT_PACE), None);
         assert_eq!(refit_wait(Some(t), t + ms(5000)), None);
+    }
+
+    #[test]
+    fn refit_is_due_when_hints_or_bar_differ() {
+        let hints = layout::Hints::new((300, 200), (0, 0));
+        let t = layout::Tile {
+            hints,
+            decorated: true,
+            ..Default::default()
+        };
+        assert!(!refit_due(&t, hints, Some(true)), "both match");
+        assert!(!refit_due(&t, hints, None), "Wayland: hints match");
+        assert!(refit_due(&t, hints, Some(false)), "only the bar differs");
+        let other = layout::Hints::new((400, 200), (0, 0));
+        assert!(refit_due(&t, other, Some(true)), "only the hints differ");
+        assert!(refit_due(&t, other, None), "Wayland: only the hints differ");
     }
 
     #[test]
