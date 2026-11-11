@@ -4,6 +4,8 @@ import json
 import os
 from pathlib import Path
 import socket
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -14,6 +16,14 @@ model = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(model)
 exec(Path(__file__).with_name('system.py').read_text(), model.__dict__)
 exec(Path(__file__).with_name('services.py').read_text(), model.__dict__)
+
+GTK4_API_CHECK = '''
+import gi
+gi.require_version('Gtk', '4.0')
+from gi.repository import Gtk
+for widget, method in [(Gtk.PasswordEntry, 'get_text'), (Gtk.AppChooserButton, 'new'), (Gtk.DropDown, 'new_from_strings')]:
+    assert callable(getattr(widget, method)), (widget, method)
+'''
 
 class SettingsTests(unittest.TestCase):
     def test_search_finds_tasks_and_empty_result(self):
@@ -80,11 +90,11 @@ class SettingsTests(unittest.TestCase):
             from gi.repository import GLib, Gio
         except ImportError:
             self.skipTest('PyGObject is required for native variant checks')
-        import gi
-        gi.require_version('Gtk', '4.0')
-        from gi.repository import Gtk
-        for widget, method in [(Gtk.PasswordEntry, 'get_text'), (Gtk.AppChooserButton, 'new'), (Gtk.DropDown, 'new_from_strings')]:
-            self.assertTrue(callable(getattr(widget, method)))
+        # Importing Gtk starts Pango's fontconfig thread, whose getenv() races later tests'
+        # os.environ writes and segfaulted CI. Keep Gtk out of this process.
+        child = subprocess.run([sys.executable, '-X', 'faulthandler', '-c', GTK4_API_CHECK],
+                               capture_output=True, text=True, timeout=30)
+        self.assertEqual(child.returncode, 0, child.stderr)
         raw = model.wifi_profile(b'Test', 'wpa-psk', 'dummy-password', True, 'tester')
         settings = {group: {key: GLib.Variant(sig, val) for key, (sig, val) in values.items()} for group, values in raw.items()}
         params = GLib.Variant('(a{sa{sv}}ooa{sv})', (settings, '/device', '/ap', {'persist': GLib.Variant('s', 'disk')}))
