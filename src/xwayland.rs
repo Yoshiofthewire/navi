@@ -1346,6 +1346,95 @@ mod tests {
         );
         data.state.focus_by(parent, Raise::User);
         assert!(data.state.focus_by_user);
+
+        // PR #39 audit P1: a focused dialog hidden by a re-parent (to a minimized window) loses
+        // the keyboard at once, and later keys reach nobody.
+        let make = |transient_for: Option<u32>| {
+            let w = conn.generate_id().unwrap();
+            conn.create_window(
+                smithay::reexports::x11rb::COPY_DEPTH_FROM_PARENT,
+                w,
+                root,
+                0,
+                0,
+                200,
+                150,
+                0,
+                WindowClass::INPUT_OUTPUT,
+                0,
+                &CreateWindowAux::new()
+                    .background_pixel(0x664422)
+                    .event_mask(EventMask::KEY_PRESS),
+            )
+            .unwrap();
+            if let Some(p) = transient_for {
+                conn.change_property32(
+                    PropMode::REPLACE,
+                    w,
+                    AtomEnum::WM_TRANSIENT_FOR,
+                    AtomEnum::WINDOW,
+                    &[p],
+                )
+                .unwrap();
+            }
+            conn.map_window(w).unwrap();
+            conn.flush().unwrap();
+            w
+        };
+        let hidden = make(None);
+        pump(&mut event_loop, &mut data, |d| d.state.windows.len() == 2);
+        let hidden_id = data.state.windows[1].tile.expect("tiled");
+        data.state.layout.minimize(hidden_id);
+        data.state.apply_layout();
+        let hop = make(Some(window));
+        pump(&mut event_loop, &mut data, |d| d.state.windows.len() == 3);
+        let hop_window = data.state.windows[2].window.clone();
+        pump(&mut event_loop, &mut data, |d| {
+            d.state.space.element_location(&hop_window).is_some()
+        });
+        data.state.focus_by(Some(hop_window.clone()), Raise::User);
+        assert_eq!(data.state.focused_window(), Some(hop_window.clone()));
+        pump(&mut event_loop, &mut data, |_| {
+            conn.get_input_focus().unwrap().reply().unwrap().focus == hop
+        });
+        conn.change_property32(
+            PropMode::REPLACE,
+            hop,
+            AtomEnum::WM_TRANSIENT_FOR,
+            AtomEnum::WINDOW,
+            &[hidden],
+        )
+        .unwrap();
+        conn.flush().unwrap();
+        pump(&mut event_loop, &mut data, |d| {
+            d.state.space.element_location(&hop_window).is_none()
+        });
+        let kb = data.state.seat.get_keyboard().unwrap();
+        assert_eq!(
+            kb.current_focus(),
+            None,
+            "the hidden dialog lost the keyboard"
+        );
+        data.state.keyboard_key(38u32.into(), KeyState::Pressed, 30);
+        data.state
+            .keyboard_key(38u32.into(), KeyState::Released, 31);
+        let (mut rounds, mut leaked) = (0, false);
+        pump(&mut event_loop, &mut data, |_| {
+            while let Some(event) = conn.poll_for_event().unwrap() {
+                if let Event::KeyPress(event) = event {
+                    leaked |= event.event == hop;
+                }
+            }
+            rounds += 1;
+            rounds > 60
+        });
+        assert!(!leaked, "no key reached the hidden dialog");
+        for w in [hop, hidden] {
+            conn.destroy_window(w).unwrap();
+        }
+        conn.flush().unwrap();
+        pump(&mut event_loop, &mut data, |d| d.state.windows.len() == 1);
+        data.state.focus(data.state.window_of(id));
         let menu = conn.generate_id().unwrap();
         conn.create_window(
             smithay::reexports::x11rb::COPY_DEPTH_FROM_PARENT,

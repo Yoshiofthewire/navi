@@ -168,9 +168,10 @@ fn corner(band: Rect, id: WinId, side: Side, p: (i32, i32)) -> Hit {
 
 impl Layout {
     /// Every float, the front one first: the one order floats are drawn, hit and given input in.
+    /// By stacking rank (only a raise moves it), then by when it was last touched.
     pub fn floats(&self) -> Vec<WinId> {
         let mut floats: Vec<&Tile> = self.tiles.iter().filter(|t| t.floating).collect();
-        floats.sort_by_key(|t| std::cmp::Reverse(t.stamp));
+        floats.sort_by_key(|t| std::cmp::Reverse((t.rank, t.stamp)));
         floats.into_iter().map(|t| t.id).collect()
     }
 

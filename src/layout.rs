@@ -194,6 +194,8 @@ pub struct Tile {
     pub user_rect: Option<Rect>,
     /// A dialog of its family waits for the user (refused the keyboard): its tab is marked.
     pub attention: bool,
+    /// Its family's newest raise, from navi's one stacking order: floats are ordered by it first.
+    pub rank: u64,
 }
 
 impl Tile {
@@ -580,6 +582,13 @@ impl Layout {
 
     pub fn tiles(&self) -> &[Tile] {
         &self.tiles
+    }
+
+    /// Sets `id`'s stacking rank (`Tile::rank`).
+    pub fn set_rank(&mut self, id: WinId, rank: u64) {
+        if let Some(t) = self.tile_mut(id) {
+            t.rank = rank;
+        }
     }
 
     /// Marks exactly the tiles in `ids` as wanting attention. Returns whether any mark changed.
@@ -2688,6 +2697,38 @@ mod tests {
         // Focus brings f in front; then its zones take the point back from g's dialog.
         assert!(l.raise(f));
         assert_eq!(l.hit_under(x, Some(g)), Some(Hit::Button(f, Button::Close)));
+    }
+
+    /// PR #39 audit P2: floats follow the stacking ranks first. Restoring or activating the rear
+    /// float without a raise (navi's `Raise::Not`: a token that isn't the user's) touches its
+    /// stamp but leaves the drawn and hit order alone; a raise of its family puts it in front.
+    #[test]
+    fn floats_follow_the_raise_ranks() {
+        let (mut l, _, f) = blocked(vec![], fixed());
+        let (g, _) = l.place_with("upd2", (1720, 600), fixed(), true).unwrap();
+        // g half a window to the right of f, over f's right band.
+        l.keyboard_adjust(g, Side::Right, Nudge::Move).unwrap();
+        l.set_rank(f, 2);
+        l.set_rank(g, 4);
+        assert_eq!(l.floats(), [g, f]);
+        // They overlap: a point in both windows belongs to the front one.
+        let (front, rear) = (l.clip(g).unwrap(), l.clip(f).unwrap());
+        let p = (front.x + front.w / 2, front.y + front.h / 2);
+        assert!(rear.contains(p) && front.contains(p));
+        // f's right band runs under g's window: g, in front, takes the point.
+        let band = l.float_zone(f, Side::Right).unwrap();
+        let q = (band.x + 1, band.y + band.h / 2);
+        assert!(front.contains(q));
+        assert_eq!(l.hit(q), None, "inside g's window");
+        // A minimize and an activation without a raise: the stamp moves, the order doesn't.
+        l.minimize(f);
+        assert!(l.activate(f));
+        assert_eq!(l.floats(), [g, f], "no raise, no move");
+        assert_eq!(l.hit(q), None, "g still covers f's band");
+        // A raise of f's family (its rank passes g's) puts it in front.
+        l.set_rank(f, 6);
+        assert_eq!(l.floats(), [f, g]);
+        assert_eq!(l.hit(q).map(|h| h.id()), Some(f), "f's band is f's again");
     }
 
     /// Job 020 AC5: a front float's dialog of a dialog has the float as its root, so it covers

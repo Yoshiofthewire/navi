@@ -580,7 +580,7 @@ impl Navi {
         if !shown.is_empty() {
             info!(?shown, "shown");
         }
-        self.recenter_dialogs();
+        self.place_dialogs();
         self.recenter_x11();
         self.keep_focus_mapped(&shown);
         self.restack();
@@ -1159,8 +1159,11 @@ impl Navi {
                 }
                 self.restack();
                 self.sync_attention();
-                // A float (or a float's dialog) comes to the front of the floats' one order.
-                if let Some(id) = self.float_owner(w) {
+                // A raised float (or a float's dialog) comes to the front of the floats' order;
+                // `restack` gives every float its family's rank, which leads that order.
+                if by != Raise::Not
+                    && let Some(id) = self.float_owner(w)
+                {
                     self.layout.raise(id);
                 }
             }
@@ -1481,6 +1484,14 @@ impl Navi {
     /// Places every dialog (and X11 transient) inside its bounds over its parent, sends it its
     /// bounds and any cap, and hides it while its root is hidden. X11 menus aren't dialogs.
     pub(crate) fn recenter_dialogs(&mut self) {
+        self.place_dialogs();
+        // A dialog hidden here (its parent hidden, a re-parent to a hidden window) can't keep
+        // the keyboard: no key may reach a window that isn't shown.
+        self.keep_focus_mapped(&[]);
+    }
+
+    /// `recenter_dialogs` without the focus check, for `apply_layout`, which does its own.
+    fn place_dialogs(&mut self) {
         self.resolve_x11_parents();
         let (mut fresh, mut shown) = (Vec::new(), false);
         for i in 0..self.windows.len() {
@@ -1584,6 +1595,12 @@ impl Navi {
             }
         }
         let ranks = dialog::ranks(&wins);
+        // Floats are drawn and hit in `Layout::floats`' order: lead it with the same ranks.
+        for (m, r) in self.windows.iter().zip(&ranks) {
+            if let Some(id) = m.tile {
+                self.layout.set_rank(id, r.group);
+            }
+        }
         let shown: Vec<Window> = self.space.elements().cloned().collect();
         let shown_ranks: Vec<dialog::Rank> = shown
             .iter()
