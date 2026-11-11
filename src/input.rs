@@ -434,13 +434,16 @@ impl Navi {
                 {
                     match self.layout.keyboard_adjust(id, side, op) {
                         Ok(Done::Layout(what, tiles)) => {
-                            let cells: Vec<_> = tiles.iter().map(|t| (t.id, t.cells)).collect();
-                            match self.layout.tile(id).filter(|t| t.floating) {
-                                Some(_) => {
+                            match tiles.as_slice() {
+                                [t] if t.floating => {
                                     let rect = self.layout.rect(id);
                                     info!(id, by = "keyboard", ?rect, "{what}");
                                 }
-                                None => info!(id, by = "keyboard", ?cells, "{what}"),
+                                _ => {
+                                    let cells: Vec<_> =
+                                        tiles.iter().map(|t| (t.id, t.cells)).collect();
+                                    info!(id, by = "keyboard", ?cells, "{what}");
+                                }
                             }
                             self.edge_clicks = Default::default();
                             self.memory.sync(&self.layout);
