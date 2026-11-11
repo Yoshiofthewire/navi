@@ -78,6 +78,25 @@ pub fn popup_rect(r: Rect) -> Rect {
     Rect::new(popup_coord(r.x), popup_coord(r.y), size(r.w), size(r.h))
 }
 
+/// How many popups deep a chain may go: it bounds the per-commit walks of the chain, and as navi
+/// places each popup within ±4 · `POPUP_LIMIT` of its parent, the chain's position stays exact in
+/// i32 (Smithay's `Point` sums saturate, so a longer chain would pin instead of overflow).
+pub const POPUP_DEPTH: usize = 16;
+const _: () = assert!(POPUP_DEPTH as i64 * 4 * POPUP_LIMIT as i64 <= i32::MAX as i64 / 2);
+
+/// Whether the popup chain from `popup` up through `parent` (the next popup, if any) is too deep.
+/// Walks at most `POPUP_DEPTH` steps.
+pub fn popup_too_deep<T>(popup: T, parent: impl Fn(&T) -> Option<T>) -> bool {
+    let mut at = popup;
+    for _ in 0..POPUP_DEPTH {
+        match parent(&at) {
+            Some(p) => at = p,
+            None => return false,
+        }
+    }
+    true
+}
+
 /// A rectangle of whole grid cells.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Cells {
@@ -1152,6 +1171,17 @@ mod tests {
     use super::*;
     use crate::layout::{Action, Button, Done, float_overlay};
     use drag::Hit;
+
+    #[test]
+    fn popup_chains_stop_at_the_depth_limit() {
+        // A chain of `n` popups: `i` is a popup while `i < n`; its parent is `i + 1`.
+        let chain = |n: usize| popup_too_deep(0, move |&i: &usize| (i + 1 < n).then_some(i + 1));
+        assert!(!chain(1));
+        assert!(!chain(POPUP_DEPTH - 1));
+        assert!(!chain(POPUP_DEPTH));
+        assert!(chain(POPUP_DEPTH + 1));
+        assert!(chain(usize::MAX));
+    }
 
     #[test]
     fn popup_values_are_bounded() {

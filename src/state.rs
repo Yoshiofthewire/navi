@@ -2124,6 +2124,21 @@ fn bounded(mut p: PositionerState) -> PositionerState {
     p
 }
 
+/// Past `layout::POPUP_DEPTH`; such popups are dismissed and never tracked or placed.
+fn too_deep(popup: &PopupSurface) -> bool {
+    layout::popup_too_deep(popup.wl_surface().clone(), |s| {
+        with_states(s, |st| {
+            st.data_map
+                .get::<XdgPopupSurfaceData>()?
+                .lock()
+                .ok()?
+                .parent
+                .clone()
+        })
+        .filter(|p| with_states(p, |st| st.data_map.get::<XdgPopupSurfaceData>().is_some()))
+    })
+}
+
 fn bounded_rect(r: Rectangle<i32, Logical>) -> Rectangle<i32, Logical> {
     let b = layout::popup_rect(Rect::new(r.loc.x, r.loc.y, r.size.w, r.size.h));
     Rectangle::new((b.x, b.y).into(), (b.w, b.h).into())
@@ -2354,6 +2369,10 @@ impl XdgShellHandler for Navi {
     }
 
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
+        if too_deep(&surface) {
+            surface.send_popup_done();
+            return;
+        }
         self.unconstrain_popup(&surface);
         let _ = self.popups.track_popup(PopupKind::Xdg(surface));
     }
@@ -2364,6 +2383,9 @@ impl XdgShellHandler for Navi {
         positioner: PositionerState,
         token: u32,
     ) {
+        if too_deep(&surface) {
+            return;
+        }
         let positioner = bounded(positioner);
         surface.with_pending_state(|s| {
             s.geometry = positioner.get_geometry();
@@ -2794,9 +2816,9 @@ mod tests {
                 i32::MAX,
             )
         };
-        // As in `reposition_request`.
-        let g = bounded(p).get_geometry();
-        assert!(g.loc.x <= 3 * layout::POPUP_LIMIT + 1);
+        // As in `reposition_request`: anchor point L + 1, plus offset L.
+        let l = layout::POPUP_LIMIT;
+        assert_eq!(bounded(p).get_geometry(), rect(2 * l + 1, 2 * l + 1, l, l));
     }
 
     #[test]
