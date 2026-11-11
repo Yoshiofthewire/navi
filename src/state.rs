@@ -1194,9 +1194,9 @@ impl Navi {
         }
     }
 
-    /// After a commit of `root`: refits a placed xdg toplevel whose min/max size changed, and logs
-    /// a geometry larger than its clip rect once per change of either.
-    fn refit(&mut self, root: &WlSurface) {
+    /// After a commit of `root`, or an X11 hints change: refits a tiled window whose min/max size
+    /// changed, and logs a geometry larger than its clip rect once per change of either.
+    pub(crate) fn refit(&mut self, root: &WlSurface) {
         let Some(i) = self
             .windows
             .iter()
@@ -1208,12 +1208,15 @@ impl Navi {
         let (Some(id), app) = (m.tile, window_app(&m.window)) else {
             return;
         };
-        let (min, max) = size_hints(root);
+        let (min, max) = match m.window.x11_surface() {
+            Some(x) => crate::xwayland::x11_hints(x),
+            None => size_hints(root),
+        };
         let changed = self
             .layout
             .tile(id)
             .is_some_and(|t| t.hints != layout::Hints::new(min, max));
-        if m.window.toplevel().is_some() && changed {
+        if changed {
             let now = std::time::Instant::now();
             match refit_wait(m.refitted, now) {
                 // Coalesced: the timer applies whatever hints are current then.
@@ -1289,7 +1292,7 @@ impl Navi {
         self.apply_layout();
     }
 
-    fn log_float(&self, id: WinId, app: &str) {
+    pub(crate) fn log_float(&self, id: WinId, app: &str) {
         let h = self.layout.tile(id).map(|t| t.hints).unwrap_or_default();
         let (min, max, rect) = (h.min, h.max, self.layout.rect(id));
         info!(app, id, ?min, ?max, ?rect, "floating: no tile fits");

@@ -156,7 +156,10 @@ Every press changes exactly one grid cell.
 An app may state a minimum and a maximum window size (xdg-toplevel `set_min_size` and
 `set_max_size`; 0 means no limit). navi treats both as untrusted: values are capped at 65535 px,
 a maximum below the minimum is ignored, and hints equal to the stored ones change nothing, so an
-app that resends them on every commit costs nothing. X11 size hints aren't read.
+app that resends them on every commit costs nothing. An X11 app's `WM_NORMAL_HINTS` `PMinSize`
+and `PMaxSize` feed the same rules: they are read at map and whenever the property changes, and
+are paced by the same one-refit-a-second rule. Other X11 size fields (base size, increments,
+aspect, gravity, position) are ignored.
 
 - **Placement** uses the minimum and the wanted size, as *Placing a new window* says. A tab group's
   minimum is its largest member's.
@@ -581,7 +584,9 @@ session.
   native apps. Embedded NULs in `WM_CLASS` and window titles become U+FFFD; the resulting text
   is capped at 2048 bytes at a UTF-8 boundary before layout or Wayland window-list events use it.
   This keeps complete events within the backend's 4096-byte buffer. The metadata reaches the
-  dock. X11 keyboard focus is set as well as Wayland focus. Transient dialogs follow their
+  dock. X11 keyboard focus is set as well as Wayland focus. Tiled X11 windows get their minimum
+  and maximum size from `WM_NORMAL_HINTS`, as *Client sizes* says; transient dialogs and menus
+  ignore those hints. Transient dialogs follow their
   parents and hide with them; override-redirect
   menus keep their X11 geometry and require an X11 parent. Clipboard transfers are bridged,
   with X11 access gated on keyboard focus. Clipboard MIME names containing NULs or exceeding
