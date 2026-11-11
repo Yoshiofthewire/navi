@@ -232,7 +232,8 @@ aspect, gravity, position) are ignored.
   fullscreen. A popup (menu, tooltip) is kept inside its window's rect: navi slides, flips or
   shrinks it there when it's placed, and draws and hits it only there, whatever size the app asks
   for or attaches. So a popup, with or without a grab, can't cover or take input meant for a
-  neighbouring tile. A window that draws larger, such as a CSD shadow or a buffer bigger than its
+  neighbouring tile. An app keeps at most 64 popups open and nests them at most 16 deep; navi
+  dismisses any more. A window that draws larger, such as a CSD shadow or a buffer bigger than its
   configure, is cropped there, and a click just outside it reaches what's below. So no app draws
   over, or takes clicks meant for, another tile or navi's zones, except through a dialog, below.
 - **Dialogs.** A dialog (an xdg toplevel with a parent, or an X11 `WM_TRANSIENT_FOR` window) has a
