@@ -139,8 +139,17 @@ impl Navi {
                 self.memory.sync(&self.layout);
             }
         }
+        // A transient's parent, once navi knows it; X11 has no isolation to check it against.
+        let up = x11_parent
+            .filter(|_| !x.is_override_redirect())
+            .and_then(|id| {
+                self.windows
+                    .iter()
+                    .find(|m| m.window.x11_surface().is_some_and(|p| p.window_id() == id))
+            })
+            .map(|m| m.window.clone());
         self.windows.push(Managed {
-            window: window.clone(),
+            window,
             tile,
             last_size: x.geometry().size,
             clipped: None,
@@ -149,10 +158,15 @@ impl Navi {
             want_fullscreen: false,
             escaped: false,
             x11_parent,
+            up,
+            asked: None,
+            placed: None,
+            last_output: None,
+            capped_for: None,
         });
         self.apply_layout();
-        if !x.is_override_redirect() && self.space.element_location(&window).is_some() {
-            self.focus(Some(window));
+        if !x.is_override_redirect() {
+            self.focus_new(self.windows.len() - 1);
         }
     }
 
@@ -164,8 +178,7 @@ impl Navi {
         else {
             return;
         };
-        let m = self.windows.remove(at);
-        self.space.unmap_elem(&m.window);
+        let m = self.forget(at);
         if let Some(id) = m.tile {
             self.layout.remove(id);
             info!(id, "X11 closed; its cells stay empty");
@@ -174,46 +187,30 @@ impl Navi {
         self.refresh_toplevels();
     }
 
-    /// Transient dialogs follow their parent; override-redirect menus keep their X11 geometry.
+    /// Override-redirect menus keep their X11 geometry and show only while their X11 parent is
+    /// shown; `recenter_dialogs` places transients.
     pub fn recenter_x11(&mut self) {
-        let floating: Vec<_> = self
+        let menus: Vec<_> = self
             .windows
             .iter()
             .filter(|m| m.tile.is_none())
             .filter_map(|m| {
-                Some((
-                    m.window.clone(),
-                    m.window.x11_surface()?.clone(),
-                    m.x11_parent,
-                ))
+                let x = m.window.x11_surface()?;
+                x.is_override_redirect()
+                    .then(|| (m.window.clone(), x.geometry().loc, m.x11_parent))
             })
             .collect();
-        for (window, x, parent_id) in floating {
-            let parent = parent_id.and_then(|id| {
-                self.windows
-                    .iter()
-                    .find(|m| m.window.x11_surface().is_some_and(|p| p.window_id() == id))
+        for (window, loc, parent) in menus {
+            let shown = parent.is_some_and(|id| {
+                self.windows.iter().any(|m| {
+                    m.window.x11_surface().is_some_and(|p| p.window_id() == id)
+                        && self.space.element_location(&m.window).is_some()
+                })
             });
-            if x.is_override_redirect() && parent.is_none() {
-                self.space.unmap_elem(&window);
-                continue;
+            match shown {
+                true => self.space.map_element(window, loc, false),
+                false => self.space.unmap_elem(&window),
             }
-            let over = match parent {
-                Some(m) => self.space.element_geometry(&m.window),
-                None => self
-                    .main_output()
-                    .and_then(|o| self.space.output_geometry(&o)),
-            };
-            let Some(over) = over else {
-                self.space.unmap_elem(&window);
-                continue;
-            };
-            let mut geo = x.geometry();
-            if !x.is_override_redirect() {
-                geo.loc = over.loc + (over.size - geo.size).downscale(2).to_point();
-                let _ = x.configure(geo);
-            }
-            self.space.map_element(window, geo.loc, false);
         }
     }
 
@@ -278,21 +275,27 @@ impl XwmHandler for Navi {
     ) {
         if let Some(m) = self
             .windows
-            .iter()
+            .iter_mut()
             .find(|m| m.window.x11_surface() == Some(&x))
         {
             if m.tile.is_some() {
                 self.apply_layout();
+            } else if x.is_override_redirect() {
+                self.recenter_x11();
             } else {
-                let mut geo = x.geometry();
+                // The client sees only the capped size `recenter_dialogs` configures.
+                let (mut w0, mut h0) = m.asked.unwrap_or_else(|| {
+                    let g = x.geometry().size;
+                    (g.w, g.h)
+                });
                 if let Some(w) = w {
-                    geo.size.w = (w as i32).clamp(1, 8192);
+                    w0 = w.clamp(1, 8192) as i32;
                 }
                 if let Some(h) = h {
-                    geo.size.h = (h as i32).clamp(1, 8192);
+                    h0 = h.clamp(1, 8192) as i32;
                 }
-                let _ = x.configure(geo);
-                self.recenter_x11();
+                m.asked = Some((w0, h0));
+                self.recenter_dialogs();
             }
         } else {
             let _ = x.configure(None);

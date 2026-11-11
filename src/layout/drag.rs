@@ -1159,6 +1159,15 @@ pub fn buttons(l: &Layout, drag: Option<&Drag>, p: (i32, i32)) -> Vec<(WinId, Bu
         .collect()
 }
 
+/// A dialog's frame around its rect `r`, as a tile's: bright while it has the keyboard, else dim.
+pub fn dialog_frame(r: Rect, focused: bool) -> [(Rect, [f32; 4]); 4] {
+    let (px, alpha) = match focused {
+        true => (FOCUS_PX, 1.0),
+        false => (IDLE_PX, IDLE_ALPHA),
+    };
+    frame(r, px).map(|f| (f, accent(alpha)))
+}
+
 /// `px` wide rects around `r`, just outside it: top, bottom, left, right.
 fn frame(r: Rect, px: i32) -> [Rect; 4] {
     let (x, w) = (r.x - px, r.w + 2 * px);

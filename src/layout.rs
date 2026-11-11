@@ -3,11 +3,14 @@
 use std::collections::HashMap;
 
 mod bar;
+pub mod dialog;
 mod drag;
 mod float;
 mod memory;
 pub use bar::{Button, Decor, decoration};
-pub use drag::{Action, Done, Drag, EdgeClicks, Hit, Nudge, Side, buttons, float_overlay, overlay};
+pub use drag::{
+    Action, Done, Drag, EdgeClicks, Hit, Nudge, Side, buttons, dialog_frame, float_overlay, overlay,
+};
 use memory::MAX_PX;
 pub use memory::safe;
 
@@ -943,7 +946,7 @@ impl Layout {
             .map(|t| (here.name.clone(), t.cells, Step::Tabbed(t.id)))
     }
 
-    fn output(&self, name: &str) -> Option<&Output> {
+    pub fn output(&self, name: &str) -> Option<&Output> {
         self.outputs.iter().find(|o| o.name == name)
     }
 
@@ -2672,6 +2675,39 @@ mod tests {
         // Focus brings f in front; then its zones take the point back from g's dialog.
         assert!(l.raise(f));
         assert_eq!(l.hit_under(x, Some(g)), Some(Hit::Button(f, Button::Close)));
+    }
+
+    /// Job 020 AC5: a front float's dialog of a dialog has the float as its root, so it covers
+    /// the rear float's zones as the float's own dialog does.
+    #[test]
+    fn floats_dialog_of_dialog_covers_the_zones_behind_it() {
+        use dialog::{Root, place, root};
+        let (mut l, _, f) = blocked(vec![], fixed());
+        let (g, _) = l.place_with("upd2", (1720, 600), fixed(), true).unwrap();
+        for _ in 0..3 {
+            l.keyboard_adjust(g, Side::Left, Nudge::Move).unwrap();
+        }
+        assert_eq!(l.floats(), [g, f]);
+        // Windows 0: float g, 1: its dialog, 2: that dialog's dialog.
+        let parents = [None, Some(0), Some(1)];
+        let owner = root(2, |i| parents[i], |i| (i == 0).then_some(g));
+        assert_eq!(owner, Root::Tiled(g));
+        let Root::Tiled(owner) = owner else {
+            unreachable!()
+        };
+        let (front, rear) = (l.clip(g).unwrap(), outer_of(&l, f));
+        let b = bounds_of(&l, g);
+        let d1 = place(front, (200, 200), b);
+        let d2 = place(d1, (b.w, front.h), b);
+        let band = (rear.x + rear.w + 3, rear.y + rear.h / 2);
+        assert!(!front.contains(band) && d2.contains(band), "{d2:?}");
+        assert!(l.hit(band).is_some_and(|h| h.id() == f));
+        assert_eq!(
+            l.hit_under(band, Some(owner)),
+            None,
+            "the chain is in front"
+        );
+        assert_eq!(l.hit_under(band, Some(f)), l.hit(band));
     }
 
     /// Round 1 (security probe): unplugging the monitor under a float drag leaves the float on a

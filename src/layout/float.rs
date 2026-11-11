@@ -2,7 +2,7 @@
 //! they tile again once free cells on their own output hold them.
 
 use super::{
-    BAR, Cells, FLOAT_MARGIN, GAP, Layout, MIN_H, MIN_W, Need, Output, Rect, Tile, WinId, dist2,
+    BAR, Cells, GAP, Layout, MIN_H, MIN_W, Need, Output, Rect, Tile, WinId, dist2,
     drag::{ARM_PX, CORNER_PX, Done, Hit, Nudge, Side},
 };
 
@@ -11,15 +11,9 @@ pub(super) const FLOAT_EDGE: i32 = GAP / 2;
 /// Further than any output: a double-click fill goes to the bounds or the max.
 const FAR: i64 = 1 << 40;
 
-/// Where a float on `o` stays while it fits: its area, `FLOAT_MARGIN` in.
+/// Where a float on `o` stays while it fits: a dialog's bounds there.
 pub(super) fn bounds(o: &Output) -> Rect {
-    let m = FLOAT_MARGIN;
-    Rect {
-        x: o.area.x + m,
-        y: o.area.y + m,
-        w: (o.area.w - 2 * m).max(1),
-        h: (o.area.h - 2 * m).max(1),
-    }
+    super::dialog::bounds(o.area)
 }
 
 /// The bar and window as one rect; saturating, since a drag may push either to `i32::MAX`.

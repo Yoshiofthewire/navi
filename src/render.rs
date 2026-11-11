@@ -53,21 +53,30 @@ type Physical = Rectangle<i32, smithay::utils::Physical>;
 #[derive(Default)]
 pub struct Solids {
     rects: Vec<SolidColorBuffer>,
+    /// Dialog frames, which draw with their dialogs.
+    frames: Vec<SolidColorBuffer>,
     glyphs: std::collections::HashMap<GlyphKey, MemoryRenderBuffer>,
+}
+
+/// `rects` drawn from `buffers`, reused in order.
+fn solid(
+    buffers: &mut Vec<SolidColorBuffer>,
+    rects: Vec<(Physical, [f32; 4])>,
+) -> Vec<SolidColorRenderElement> {
+    buffers.resize_with(rects.len(), SolidColorBuffer::default);
+    buffers
+        .iter_mut()
+        .zip(rects)
+        .map(|(buffer, (rect, color))| {
+            buffer.update((rect.size.w, rect.size.h), color);
+            SolidColorRenderElement::from_buffer(buffer, rect.loc, 1.0, 1.0, Kind::Unspecified)
+        })
+        .collect()
 }
 
 impl Solids {
     fn elements(&mut self, rects: Vec<(Physical, [f32; 4])>) -> Vec<SolidColorRenderElement> {
-        self.rects
-            .resize_with(rects.len(), SolidColorBuffer::default);
-        self.rects
-            .iter_mut()
-            .zip(rects)
-            .map(|(buffer, (rect, color))| {
-                buffer.update((rect.size.w, rect.size.h), color);
-                SolidColorRenderElement::from_buffer(buffer, rect.loc, 1.0, 1.0, Kind::Unspecified)
-            })
-            .collect()
+        solid(&mut self.rects, rects)
     }
 
     /// The window buttons' glyphs, by window; textures of buttons no longer shown are dropped.
@@ -307,7 +316,33 @@ where
     let float_decorations = owners.into_iter().zip(tiles.split_off(tile_decorations));
     let mut pointer: Vec<_> = tiles.drain(..above_panels).collect();
     let (mut panels, mut lower) = surfaces(renderer, state, output, scale);
-    let (float_windows, mut windows) = windows(renderer, state, geo, scale, rect);
+    // Every shown dialog's frame, so even a transparent one is seen: bright with the keyboard.
+    let focus = state
+        .seat
+        .get_keyboard()
+        .and_then(|kb| kb.current_focus())
+        .and_then(|f| f.surface());
+    let (framed, frame_rects): (Vec<_>, Vec<_>) = state
+        .space
+        .elements()
+        .filter_map(|w| {
+            let r = state.dialog_rect(w)?;
+            let focused = focus.is_some() && crate::state::window_surface(w) == focus;
+            Some((w.clone(), layout::dialog_frame(r, focused)))
+        })
+        .filter(|(_, f)| f.iter().any(|(r, _)| overlaps(*r, full)))
+        .unzip();
+    let frame_rects = frame_rects.into_iter().flatten();
+    let mut frame_elements = solid(
+        &mut solids.frames,
+        frame_rects.map(|(r, k)| (rect(r), k)).collect(),
+    )
+    .into_iter();
+    let frames: Vec<(Window, Vec<SolidColorRenderElement>)> = framed
+        .into_iter()
+        .map(|w| (w, frame_elements.by_ref().take(4).collect()))
+        .collect();
+    let (float_windows, mut windows) = windows(renderer, state, geo, scale, rect, frames);
     // Each float's buttons, bar and frame right above its own window and dialogs, front float
     // first, so a float in front covers all of a float behind it.
     let mut float_frames: Vec<Owned<R>> = float_glyphs
@@ -418,13 +453,15 @@ pub fn send_frames(state: &mut Navi, output: &Output) {
 
 /// The floating windows, by the float they belong to, and the tiled ones over `geo`, each top
 /// first. A window's own surfaces are cropped to its clip rect, its popups to their configured
-/// geometry on their output. `rect` maps a global logical rect to `geo`'s physical px.
+/// geometry on their output; a dialog's `frames` go right above it. `rect` maps a global logical
+/// rect to `geo`'s physical px.
 fn windows<R>(
     renderer: &mut R,
     state: &Navi,
     geo: Rectangle<i32, smithay::utils::Logical>,
     scale: f64,
     rect: impl Fn(layout::Rect) -> Physical,
+    mut frames: Vec<(Window, Vec<SolidColorRenderElement>)>,
 ) -> (Vec<Owned<R>>, Vec<Frame<R>>)
 where
     R: Renderer + ImportAll + ImportMem,
@@ -443,6 +480,9 @@ where
         let loc = (loc - w.geometry().loc - geo.loc).to_physical_precise_round(scale);
         let (float, clip) = state.stacking(w);
         let mut out = Vec::new();
+        if let Some(i) = frames.iter().position(|(f, _)| f == w) {
+            out.extend(frames.swap_remove(i).1.into_iter().map(Frame::from));
+        }
         for (surface, at, popup) in state.popups(w) {
             let at = (at - geo.loc).to_physical_precise_round(scale);
             let k = Kind::Unspecified;

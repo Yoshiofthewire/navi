@@ -72,6 +72,7 @@ use tracing::{info, warn};
 use crate::CalloopData;
 use crate::activation::{self, may_issue, may_redeem};
 use crate::focus::{Focus, Handoff};
+use crate::layout::dialog::{self, Root};
 use crate::layout::{self, Decor, Drag, Fit, Layout, Rect, WinId, decoration};
 use crate::monitors::{BarHover, Hover};
 use crate::persist::{self, Store};
@@ -101,6 +102,16 @@ pub struct Managed {
     /// presses a key or button on it.
     pub(crate) escaped: bool,
     pub(crate) x11_parent: Option<u32>,
+    /// A dialog's parent window, as navi knows it: a gone parent's dialogs take its own.
+    pub(crate) up: Option<Window>,
+    /// An X11 transient's last requested size, before any cap.
+    pub(crate) asked: Option<(i32, i32)>,
+    /// A shown dialog's rect: where it's drawn and hit.
+    pub(crate) placed: Option<Rect>,
+    /// The output a dialog was last shown on, for when it becomes an orphan.
+    pub(crate) last_output: Option<String>,
+    /// The bounds a dialog's cap was last logged for.
+    pub(crate) capped_for: Option<Rect>,
 }
 
 pub struct Navi {
@@ -350,8 +361,8 @@ impl Navi {
             .collect()
     }
 
-    /// Where `w`'s popups are kept: its tile's or float's clip rect, else (a dialog, a window not
-    /// placed) the output it's on.
+    /// Where `w`'s popups are kept: its clip rect (a tile's, a float's, a dialog's), else (an X11
+    /// menu, a window not placed) the output it's on.
     fn popup_bounds(&self, w: &Window) -> Option<Rect> {
         if let Some(clip) = self.stacking(w).1 {
             return Some(clip);
@@ -372,8 +383,8 @@ impl Navi {
 
     /// The float `w` is, or whose dialog it is.
     pub fn float_owner(&self, w: &Window) -> Option<WinId> {
-        let m = self.windows.iter().find(|m| &m.window == w)?;
-        self.owner(m)
+        let i = self.windows.iter().position(|m| &m.window == w)?;
+        self.owner(i)
             .filter(|&id| self.layout.tile(id).is_some_and(|t| t.floating))
     }
 
@@ -399,14 +410,24 @@ impl Navi {
     }
 
     /// Whether `w` stacks with the floats (a float or a float's dialog), and the rect its own
-    /// surfaces are drawn and hit inside; dialogs have none.
+    /// surfaces are drawn and hit inside: its tile's clip or a dialog's rect. X11 menus have none.
     pub fn stacking(&self, w: &Window) -> (bool, Option<Rect>) {
-        let Some(m) = self.windows.iter().find(|m| &m.window == w) else {
+        let Some(i) = self.windows.iter().position(|m| &m.window == w) else {
             return (false, None);
         };
-        let owner = self.owner(m).and_then(|id| self.layout.tile(id));
-        let clip = m.tile.and_then(|id| self.layout.clip(id));
+        let m = &self.windows[i];
+        let owner = self.owner(i).and_then(|id| self.layout.tile(id));
+        let clip = match m.tile {
+            Some(id) => self.layout.clip(id),
+            None => m.placed,
+        };
         (owner.is_some_and(|t| t.floating), clip)
+    }
+
+    /// A shown dialog's rect, which navi frames; `None` for every other window.
+    pub fn dialog_rect(&self, w: &Window) -> Option<Rect> {
+        let m = self.windows.iter().find(|m| &m.window == w)?;
+        m.tile.is_none().then_some(m.placed)?
     }
 
     /// The topmost layer surface at `pos` on one of `layers`, and the surface under `pos` in it.
@@ -774,30 +795,34 @@ impl Navi {
     /// The tile of the window holding the keyboard, a dialog counting as its parent's.
     fn focused_window_tile(&self) -> Option<WinId> {
         let focus = self.seat.get_keyboard()?.current_focus()?.surface()?;
-        let m = self
+        let i = self
             .windows
             .iter()
-            .find(|m| window_surface(&m.window).as_ref() == Some(&focus))?;
-        self.owner(m)
+            .position(|m| window_surface(&m.window).as_ref() == Some(&focus))?;
+        self.owner(i)
     }
 
-    /// `m`'s tile, or a dialog's parent's.
-    fn owner(&self, m: &Managed) -> Option<WinId> {
-        if m.tile.is_some() {
-            return m.tile;
+    /// Window `i`'s tile, or a dialog's root's.
+    fn owner(&self, i: usize) -> Option<WinId> {
+        match self.root(i) {
+            Root::Tiled(id) => Some(id),
+            Root::Orphan => None,
         }
-        if let Some(parent) = m.window.toplevel().and_then(|t| t.parent()) {
-            return self.tile_of(&parent);
-        }
-        let parent = m.x11_parent?;
-        self.windows
-            .iter()
-            .find(|p| {
-                p.window
-                    .x11_surface()
-                    .is_some_and(|x| x.window_id() == parent)
-            })?
-            .tile
+    }
+
+    /// Window `i`'s root: itself if tiled, else up its dialog parents.
+    fn root(&self, i: usize) -> Root {
+        let up = |j: usize| {
+            let up = self.windows.get(j)?.up.as_ref()?;
+            self.windows.iter().position(|m| &m.window == up)
+        };
+        dialog::root(i, up, |j| self.windows.get(j)?.tile)
+    }
+
+    /// The root of the window holding the keyboard; `None` while a layer surface or nothing does.
+    fn focus_root(&self) -> Option<Root> {
+        let w = self.focused_window()?;
+        Some(self.root(self.windows.iter().position(|m| m.window == w)?))
     }
 
     /// The output Super+Esc acts on now, if a window is fullscreen there.
@@ -1084,6 +1109,26 @@ impl Navi {
         match &window {
             Some(w) => {
                 self.space.raise_element(w, true);
+                // Its dialogs stay in front of it, children above their parents.
+                let mut family = vec![w.clone()];
+                for _ in 0..dialog::DIALOG_DEPTH {
+                    let next: Vec<Window> = self
+                        .windows
+                        .iter()
+                        .filter(|m| m.tile.is_none() && !family.contains(&m.window))
+                        .filter(|m| m.up.as_ref().is_some_and(|up| family.contains(up)))
+                        .map(|m| m.window.clone())
+                        .collect();
+                    if next.is_empty() {
+                        break;
+                    }
+                    family.extend(next);
+                }
+                for d in &family[1..] {
+                    if self.space.element_location(d).is_some() {
+                        self.space.raise_element(d, false);
+                    }
+                }
                 // A float (or a float's dialog) comes to the front of the floats' one order.
                 if let Some(id) = self.float_owner(w) {
                     self.layout.raise(id);
@@ -1236,11 +1281,25 @@ impl Navi {
         self.apply_layout();
         surface.send_configure();
         self.recenter_dialogs();
+        self.focus_new(idx);
+    }
 
-        let window = self.windows[idx].window.clone();
-        if self.space.element_location(&window).is_some() {
-            self.focus(Some(window));
+    /// A new window `i` takes the keyboard once shown; a dialog only from its own family.
+    pub(crate) fn focus_new(&mut self, i: usize) {
+        let m = &self.windows[i];
+        let window = m.window.clone();
+        if self.space.element_location(&window).is_none() {
+            return;
         }
+        if m.tile.is_none() {
+            let root = self.root(i);
+            if !dialog::may_focus_on_map(root, self.focus_root()) {
+                let app = window_app(&window);
+                info!(app, ?root, "dialog: focus refused");
+                return;
+            }
+        }
+        self.focus(Some(window));
     }
 
     /// After a commit of `root`, or an X11 hints change: refits a tiled window whose min/max size
@@ -1367,51 +1426,172 @@ impl Navi {
         }
     }
 
-    /// Dialogs float centred over their parent while it is mapped, and are unmapped while it
-    /// isn't. A dialog whose parent is gone floats over the output.
-    fn recenter_dialogs(&mut self) {
-        for m in self.windows.iter().filter(|m| m.tile.is_none()) {
-            let Some(toplevel) = m.window.toplevel() else {
-                continue;
-            };
-            if !toplevel.is_initial_configure_sent() {
+    /// Places every dialog (and X11 transient) inside its bounds over its parent, sends it its
+    /// bounds and any cap, and hides it while its root is hidden. X11 menus aren't dialogs.
+    pub(crate) fn recenter_dialogs(&mut self) {
+        for i in 0..self.windows.len() {
+            let m = &self.windows[i];
+            let menu = m
+                .window
+                .x11_surface()
+                .is_some_and(|x| x.is_override_redirect());
+            if m.tile.is_some() || menu {
                 continue;
             }
-            // A tiled parent's layout rect: its committed size lags a maximize.
-            let over = match toplevel.parent() {
-                Some(p) if self.is_mapped(&p) => {
-                    match self.tile_of(&p).and_then(|id| self.layout.rect(id)) {
-                        Some(r) => Some(Rectangle::new((r.x, r.y).into(), (r.w, r.h).into())),
-                        None => self
-                            .space
-                            .elements()
-                            .find(|w| w.toplevel().is_some_and(|t| t.wl_surface() == &p))
-                            .and_then(|w| self.space.element_geometry(w)),
+            let spot = self.dialog_spot(i);
+            let window = m.window.clone();
+            let toplevel = window.toplevel().cloned();
+            if let Some(t) = &toplevel {
+                if let Some((_, b, _)) = &spot {
+                    t.with_pending_state(|s| s.bounds = Some((b.w, b.h).into()));
+                }
+                if !t.is_initial_configure_sent() {
+                    continue;
+                }
+            }
+            let Some((r, b, output)) = spot else {
+                self.windows[i].placed = None;
+                if self.space.element_location(&window).is_some() {
+                    self.space.unmap_elem(&window);
+                    window.set_activated(false);
+                    if let Some(t) = &toplevel {
+                        t.send_pending_configure();
+                    }
+                    info!(app = window_app(&window), "dialog hidden with its parent");
+                }
+                continue;
+            };
+            let want = want(&self.windows[i]);
+            let cap = dialog::needs_cap(want, b);
+            let m = &mut self.windows[i];
+            (m.placed, m.last_output) = (Some(r), Some(output));
+            if let Some((cap_w, cap_h)) = cap
+                && m.capped_for != Some(b)
+            {
+                m.capped_for = Some(b);
+                let (app, (w, h)) = (window_app(&window), want);
+                info!(app, w, h, cap_w, cap_h, rect = ?r, "dialog: capped to its monitor");
+            }
+            match (&toplevel, window.x11_surface()) {
+                (Some(t), _) => {
+                    if let Some(cap) = cap {
+                        t.with_pending_state(|s| s.size = Some(cap.into()));
+                    }
+                    self.configure_dialog(i);
+                }
+                (None, Some(x)) => {
+                    // Every time, as before: it answers the transient's configure requests.
+                    let geo = Rectangle::new((r.x, r.y).into(), (r.w, r.h).into());
+                    if let Err(e) = x.configure(geo) {
+                        warn!("X11 configure: {e}");
                     }
                 }
-                Some(_) => None,
-                None => self
-                    .main_output()
-                    .and_then(|o| self.space.output_geometry(&o)),
-            };
-            match over {
-                Some(over) => {
-                    let size = m.window.geometry().size;
-                    let loc = over.loc + (over.size - size).downscale(2).to_point();
-                    self.space.map_element(m.window.clone(), loc, false);
+                (None, None) => {}
+            }
+            self.space.map_element(window, (r.x, r.y), false);
+        }
+    }
+
+    /// Where dialog `i` goes now: its rect, its bounds and their output; `None` while its root is
+    /// hidden. Each dialog of a chain is placed over its parent's rect, an orphan in its bounds.
+    fn dialog_spot(&self, i: usize) -> Option<(Rect, Rect, String)> {
+        let up = |j: usize| {
+            let up = self.windows[j].up.as_ref()?;
+            self.windows.iter().position(|m| &m.window == up)
+        };
+        match self.root(i) {
+            Root::Tiled(id) => {
+                self.space.element_location(&self.window_of(id)?)?;
+                let t = self.layout.tile(id)?;
+                let b = dialog::bounds(self.layout.output(&t.output)?.area);
+                // The dialogs from `i` up to the root, which `root` found within the cap.
+                let mut chain = vec![i];
+                for _ in 0..dialog::DIALOG_DEPTH {
+                    match up(*chain.last()?) {
+                        Some(j) if self.windows[j].tile.is_none() => chain.push(j),
+                        _ => break,
+                    }
                 }
-                None if self.space.element_location(&m.window).is_some() => {
-                    self.space.unmap_elem(&m.window);
-                    m.window.set_activated(false);
-                    toplevel.send_pending_configure();
-                    info!(
-                        app = app_id(toplevel.wl_surface()),
-                        "dialog hidden with its parent"
-                    );
+                let mut r = self.layout.rect(id)?;
+                for &j in chain.iter().rev() {
+                    r = dialog::place(r, want(&self.windows[j]), b);
                 }
-                None => {}
+                Some((r, b, t.output.clone()))
+            }
+            Root::Orphan => {
+                let main = self.main_output().map(|o| identity(&o));
+                let mut last = self.windows[i].last_output.iter().chain(main.iter());
+                let o = last.find_map(|n| self.layout.output(n))?;
+                let b = dialog::bounds(o.area);
+                let r = dialog::place(b, want(&self.windows[i]), b);
+                Some((r, b, o.name.clone()))
             }
         }
+    }
+
+    /// Sends dialog `i` its pending bounds and cap, at most once a second; a later change waits
+    /// for a timer.
+    fn configure_dialog(&mut self, i: usize) {
+        let m = &self.windows[i];
+        let (Some(t), app) = (m.window.toplevel().cloned(), window_app(&m.window)) else {
+            return;
+        };
+        if !t.has_pending_changes() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        match refit_wait(m.refitted, now) {
+            Some(_) if m.refit_queued => {}
+            Some(wait) => {
+                let surface = t.wl_surface().clone();
+                let timer = Timer::from_duration(wait);
+                let timed = self.loop_handle.insert_source(timer, move |_, _, data| {
+                    let s = &mut data.state;
+                    if let Some(m) = s.managed_mut(&surface) {
+                        m.refit_queued = false;
+                    }
+                    s.recenter_dialogs();
+                    TimeoutAction::Drop
+                });
+                match timed {
+                    Ok(_) => self.windows[i].refit_queued = true,
+                    Err(e) => warn!(app, "dialog configure not timed: {e}"),
+                }
+            }
+            None => {
+                self.windows[i].refitted = Some(now);
+                t.send_pending_configure();
+            }
+        }
+    }
+
+    /// Removes window `i`. Its dialogs now hang from its own parent, as xdg-shell says (with
+    /// none they're orphans); each dialog whose root changed logs its new one.
+    pub(crate) fn forget(&mut self, i: usize) -> Managed {
+        let mut roots: Vec<Root> = (0..self.windows.len()).map(|j| self.root(j)).collect();
+        roots.remove(i);
+        let gone = self.windows.remove(i);
+        self.space.unmap_elem(&gone.window);
+        let moved: Vec<bool> = self
+            .windows
+            .iter_mut()
+            .map(|m| {
+                let moved = m.up.as_ref() == Some(&gone.window);
+                if moved {
+                    m.up = gone.up.clone();
+                }
+                moved
+            })
+            .collect();
+        for (j, (was, moved)) in roots.into_iter().zip(moved).enumerate() {
+            let root = self.root(j);
+            if self.windows[j].tile.is_none() && (moved || root != was) {
+                let app = window_app(&self.windows[j].window);
+                info!(app, ?was, ?root, "dialog: re-resolved");
+            }
+        }
+        self.recenter_dialogs();
+        gone
     }
 
     fn unconstrain_popup(&self, popup: &PopupSurface) {
@@ -1526,6 +1706,18 @@ pub fn set_identity(output: &Output, id: String) {
 
 /// navi-bar's taskbar namespace; only navi-bar has layer shell, so it can be trusted.
 const BAR: &str = "navi-bar";
+
+/// The size `m` asks for: a Wayland window's geometry, an X11 window's request. Untrusted.
+fn want(m: &Managed) -> (i32, i32) {
+    if let Some(asked) = m.asked {
+        return asked;
+    }
+    let g = match m.window.x11_surface() {
+        Some(x) => x.geometry().size,
+        None => m.window.geometry().size,
+    };
+    (g.w, g.h)
+}
 
 /// A toplevel's committed min and max size, untrusted.
 fn size_hints(s: &WlSurface) -> ((i32, i32), (i32, i32)) {
@@ -1739,6 +1931,11 @@ impl XdgShellHandler for Navi {
             want_fullscreen: false,
             escaped: false,
             x11_parent: None,
+            up: None,
+            asked: None,
+            placed: None,
+            last_output: None,
+            capped_for: None,
         });
     }
 
@@ -1751,14 +1948,26 @@ impl XdgShellHandler for Navi {
         }) else {
             return;
         };
-        let m = self.windows.remove(idx);
-        self.space.unmap_elem(&m.window);
+        let m = self.forget(idx);
         if let Some(id) = m.tile {
             self.layout.remove(id);
             info!(id, "closed; its cells stay empty");
             // A tab, or the tiles a maximized one covered, may show now.
             self.apply_layout();
         }
+    }
+
+    fn parent_changed(&mut self, surface: ToplevelSurface) {
+        let parent = surface.parent();
+        let up = self
+            .windows
+            .iter()
+            .find(|m| window_surface(&m.window) == parent);
+        let up = up.filter(|_| parent.is_some()).map(|m| m.window.clone());
+        if let Some(m) = self.managed_mut(surface.wl_surface()) {
+            m.up = up;
+        }
+        self.recenter_dialogs();
     }
 
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
