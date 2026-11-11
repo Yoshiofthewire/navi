@@ -7,6 +7,7 @@ pub mod dialog;
 mod drag;
 mod float;
 mod memory;
+mod shape;
 pub use bar::{Button, Decor, decoration};
 pub use drag::{
     Action, Done, Drag, EdgeClicks, Hit, Nudge, Side, buttons, dialog_frame, float_overlay,
@@ -14,6 +15,7 @@ pub use drag::{
 };
 use memory::MAX_PX;
 pub use memory::safe;
+pub use shape::{Cut, Shape};
 
 pub const COLS: i32 = 24;
 pub const ROWS: i32 = 12;
@@ -42,7 +44,7 @@ pub fn grid_in(zone: Rect) -> Rect {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Rect {
     pub x: i32,
     pub y: i32,
@@ -140,6 +142,12 @@ pub fn intersect(r: Rect, bounds: Rect) -> Option<Rect> {
     // Inside `bounds`, so these fit.
     let (w, h) = (i32::try_from(w).ok()?, i32::try_from(h).ok()?);
     (w > 0 && h > 0).then_some(Rect { x, y, w, h })
+}
+
+/// Whether a window's surface at px `p` takes input: inside its `clip` rect (if any) and not
+/// cut off by its outline. So a popup's bound only ever shrinks.
+pub fn takes(clip: Option<Rect>, cut: Option<Shape>, p: (i32, i32)) -> bool {
+    clip.is_none_or(|c| c.contains(p)) && cut.is_none_or(|s| !s.cuts(p))
 }
 
 /// A rectangle of whole grid cells.
@@ -698,6 +706,21 @@ impl Layout {
     /// The rect `id`'s window is drawn and hit inside. Dialogs, which aren't tiles, have none.
     pub fn clip(&self, id: WinId) -> Option<Rect> {
         self.rect(id)
+    }
+
+    /// The outline `id` is drawn and hit inside: its bar and window, rounded by `RADIUS`. None
+    /// while fullscreen. Its window is that cut to `clip`, square under a bar.
+    pub fn shape(&self, id: WinId) -> Option<Shape> {
+        let r = self.rect(id).filter(|_| !self.is_fullscreen(id))?;
+        let outer = match self.bar(id) {
+            Some(b) => Rect {
+                y: b.rect.y,
+                h: r.y + r.h - b.rect.y,
+                ..r
+            },
+            None => r,
+        };
+        Some(Shape::new(outer, crate::theme::RADIUS))
     }
 
     /// The px of `id`'s cells (the whole grid while maximized) and of its window, which sits below
@@ -3165,7 +3188,7 @@ mod tests {
         // A hovered band lights in the float layer, above the tiles, and not below them.
         let lit = crate::theme::rgba(crate::theme::ACCENT, 1.0);
         let zone = l.zone(Hit::Edge(f, Side::Top)).unwrap();
-        assert!(float_overlay(&l, None, l.hit(p), None).contains(&(f, zone, lit)));
+        assert!(float_overlay(&l, None, l.hit(p), None).contains(&(f, zone, lit, None)));
         assert!(
             !drag::tests::overlay_at(&l, None, p, 0, None)
                 .iter()
@@ -3175,7 +3198,7 @@ mod tests {
         let glow = float_overlay(&l, None, l.hit(corner), None);
         for s in [Side::Left, Side::Top] {
             assert!(
-                glow.contains(&(f, l.zone(Hit::Edge(f, s)).unwrap(), lit)),
+                glow.contains(&(f, l.zone(Hit::Edge(f, s)).unwrap(), lit, None)),
                 "{s:?}"
             );
         }
@@ -3983,5 +4006,163 @@ mod tests {
         let mut d = Drag::press(&l, p).unwrap();
         d.motion(&mut l, (p.0 + 300, p.1 + 200), 0);
         assert_eq!(d.cursor(), "default", "cancelled");
+    }
+
+    fn corners_of(r: Rect) -> [(i32, i32); 4] {
+        let (x1, y1) = (r.x + r.w - 1, r.y + r.h - 1);
+        [(r.x, r.y), (x1, r.y), (x1, y1), (r.x, y1)]
+    }
+
+    /// Job 031 AC2: a tile's and a float's outline: the window alone rounded, or bar and window
+    /// with the window's top corners square; maximized rounded, fullscreen none; frames ring it.
+    #[test]
+    fn rounded_outlines() {
+        use crate::theme::RADIUS;
+        let mut l = layout(vec![ultrawide()]);
+        let (a, b) = two_halves(&mut l);
+        let r = l.rect(a).unwrap();
+        let s = l.shape(a).unwrap();
+        assert_eq!(s, Shape::new(r, RADIUS));
+        assert!(corners_of(r).iter().all(|&p| !s.contains(p)));
+
+        l.set_decorated(b, true);
+        let (bar, r) = (l.bar(b).unwrap().rect, l.rect(b).unwrap());
+        let s = l.shape(b).unwrap();
+        let outer = Rect {
+            y: bar.y,
+            h: r.y + r.h - bar.y,
+            ..r
+        };
+        assert_eq!(s, Shape::new(outer, RADIUS));
+        let [tl, tr, br, bl] = corners_of(r);
+        assert!(!s.contains((bar.x, bar.y)) && !s.contains((bar.x + bar.w - 1, bar.y)));
+        assert!(
+            s.contains(tl) && s.contains(tr),
+            "the window's top corners are square"
+        );
+        assert!(!s.contains(br) && !s.contains(bl));
+
+        // Frames: a ring just outside, outer radius RADIUS + px around RADIUS, bright or dim.
+        for (focus, px) in [(Some(a), 2), (None, 1)] {
+            let o = overlay(&l, None, None, 0, focus);
+            let ring = Cut::ring(l.rect(a).unwrap(), RADIUS, px);
+            assert_eq!(ring.shape.radii, [RADIUS + px; 4]);
+            assert_eq!(ring.hole.unwrap().radii, [RADIUS; 4]);
+            let mine = o.iter().filter(|(g, ..)| *g == Some(a));
+            assert_eq!(mine.clone().count(), 4);
+            assert!(mine.clone().all(|&(.., c)| c == Some(ring)), "{px}");
+            // With a bar (unfocused here), the ring takes the bar in; the bar is cut to the
+            // outline.
+            let theirs: Vec<_> = o.iter().filter(|(g, ..)| *g == Some(b)).collect();
+            let inner = Rect {
+                y: bar.y + 1,
+                h: r.y + r.h - bar.y - 1,
+                ..r
+            };
+            let ring = Some(Cut::ring(inner, RADIUS, 1));
+            assert_eq!(theirs.iter().filter(|(.., c)| *c == ring).count(), 4);
+            let bg = crate::theme::rgba(crate::theme::BAR_BG, 1.0);
+            let barred = (Some(b), bar, bg, Some(Cut::solid(s)));
+            assert!(o.contains(&barred));
+        }
+
+        l.maximize(a);
+        assert_eq!(
+            l.shape(a),
+            Some(Shape::new(l.rect(a).unwrap(), RADIUS)),
+            "maximized"
+        );
+        l.unmaximize(a);
+        l.fullscreen(a);
+        assert_eq!(l.shape(a), None, "fullscreen");
+        assert!(overlay(&l, None, None, 0, Some(a)).is_empty());
+
+        let (l, _, f) = blocked(vec![], fixed());
+        let (o, r) = l.frame(f).unwrap();
+        let s = l.shape(f).unwrap();
+        assert_eq!(s, Shape::new(o, RADIUS), "a float's bar and window");
+        assert!(corners_of(o).iter().all(|&p| !s.contains(p)));
+        let [tl, tr, br, bl] = corners_of(r);
+        assert!(s.contains(tl) && s.contains(tr) && !s.contains(br) && !s.contains(bl));
+    }
+
+    /// Job 031 AC3: a bar's cut-off corners are no zone of its tile, one px inside the arc is;
+    /// a float's cut-off corners are not the float's. Corner and edge zones are unchanged
+    /// (their tests run unmodified).
+    #[test]
+    fn rounded_bar_corners_are_no_zone() {
+        // Two tabs, the active one decorated: a tab in one corner, ✕ in the other.
+        let half = drag::tests::c(0, 0, 12, 12);
+        let mut l = drag::tests::with(&[half, half]);
+        l.set_decorated(1, true);
+        {
+            let (id, bar) = (1, l.bar(1).unwrap());
+            let r = bar.rect;
+            let (x1, y) = (r.x + r.w - 1, r.y);
+            assert_eq!(l.hit((r.x, y)), None);
+            assert_eq!(l.hit((x1, y)), None);
+            assert_eq!(l.hit((r.x + 1, y + 1)), None);
+            // The arc's 45° point is 2.9 px in; one px further is inside.
+            let tab = bar.tabs[0].0;
+            assert_eq!(l.hit((r.x + 3, y + 3)), Some(Hit::Tab(tab)));
+            assert_eq!(l.hit((x1 - 3, y + 3)), Some(Hit::Button(id, Button::Close)));
+            assert_eq!(
+                l.hit((r.x + 10, y)),
+                Some(Hit::Tab(tab)),
+                "the straight edge"
+            );
+            // The strip row above is not cut.
+            assert!(matches!(l.hit((r.x, y - 1)), Some(Hit::Corner(..))));
+        }
+
+        let (l, _, f) = blocked(vec![], fixed());
+        let o = l.frame(f).unwrap().0;
+        for p in corners_of(o) {
+            assert!(l.hit(p).is_none_or(|h| h.id() != f), "{p:?}");
+        }
+        assert_eq!(l.hit((o.x + 3, o.y + 3)), Some(Hit::Strip(f)));
+        let x1 = o.x + o.w - 1;
+        assert_eq!(
+            l.hit((x1 - 3, o.y + 3)),
+            Some(Hit::Button(f, Button::Close))
+        );
+    }
+
+    /// Job 031 AC4: a window's surfaces and popups take input only inside its outline; a popup's
+    /// bound only loses its cut-off corner px.
+    #[test]
+    fn popups_are_cut_to_their_owners_outline() {
+        let owner = Rect::new(100, 100, 400, 300);
+        let s = Shape::new(owner, crate::theme::RADIUS);
+        let flush = intersect(Rect::new(60, 300, 200, 150), owner).unwrap();
+        let inside = Rect::new(200, 200, 50, 50);
+        for bound in [flush, inside, owner] {
+            for x in bound.x - 3..bound.x + bound.w + 3 {
+                for y in bound.y - 3..bound.y + bound.h + 3 {
+                    let p = (x, y);
+                    if takes(Some(bound), Some(s), p) {
+                        assert!(bound.contains(p), "never larger: {p:?}");
+                    } else if bound.contains(p) {
+                        assert!(s.cuts(p), "only corners are lost: {p:?}");
+                    }
+                }
+            }
+        }
+        assert!(
+            !takes(Some(flush), Some(s), (100, 399)),
+            "on the owner's arc"
+        );
+        assert!(takes(Some(flush), Some(s), (103, 396)));
+        assert!(
+            takes(Some(flush), None, (100, 399)),
+            "a dialog's popup is square"
+        );
+        for p in corners_of(owner) {
+            assert!(!takes(Some(owner), Some(s), p));
+        }
+        assert!(takes(Some(owner), Some(s), (110, 110)));
+        let whole = (inside.x..inside.x + inside.w)
+            .flat_map(|x| (inside.y..inside.y + inside.h).map(move |y| (x, y)));
+        assert!(whole.into_iter().all(|p| takes(Some(inside), Some(s), p)));
     }
 }

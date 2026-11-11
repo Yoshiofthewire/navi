@@ -1,12 +1,13 @@
 //! Moving and resizing tiles with the mouse and keyboard, as docs/design.md describes.
 
 use super::{
-    COLS, Cells, GAP, Layout, MIN_H, MIN_W, Memory, Output, ROWS, Rect, STRIP, Tile, WinId,
+    COLS, Cells, Cut, GAP, Layout, MIN_H, MIN_W, Memory, Output, ROWS, Rect, STRIP, Shape, Tile,
+    WinId,
     bar::{self, Button},
     dist2,
     float::FloatDrag,
 };
-use crate::theme::{ACCENT, MINIMIZED, rgba};
+use crate::theme::{ACCENT, MINIMIZED, RADIUS, rgba};
 
 /// A press on a strip becomes a move once the pointer travels this far, in px.
 pub(super) const ARM_PX: u64 = 8;
@@ -153,7 +154,7 @@ impl Layout {
                 ]
             })
             .chain(ids().map(|id| Hit::Edge(id, Side::Top)))
-            .find(|&h| self.zone(h).is_some_and(|z| z.contains(p)))?;
+            .find(|&h| self.zone(h).is_some_and(|z| z.contains(p)) && !self.cut_off(h.id(), p))?;
         let Hit::Strip(id) = hit else {
             return Some(self.corner_hit(hit, p));
         };
@@ -175,6 +176,13 @@ impl Layout {
                 .find(|(_, r)| r.contains(p))
                 .map(|&(t, _)| Hit::Tab(t)),
         }
+    }
+
+    /// Whether `p` is in `id`'s outline rect but cut off by its rounding: the strip's px on a
+    /// bar's corner belong to what shows through.
+    pub(super) fn cut_off(&self, id: WinId, p: (i32, i32)) -> bool {
+        self.shape(id)
+            .is_some_and(|s| s.rect.contains(p) && !s.contains(p))
     }
 
     /// Corners use only the existing gaps, leaving client pixels, tabs and buttons alone.
@@ -1029,8 +1037,10 @@ impl Layout {
 }
 
 /// A solid rect of a tile's or float's chrome: whose group (its active tile), global logical px,
-/// premultiplied RGBA.
-type Chrome = (WinId, Rect, [f32; 4]);
+/// premultiplied RGBA, and what it is cut to.
+type Chrome = (WinId, Rect, [f32; 4], Option<Cut>);
+/// `Chrome` tagged `None` where it goes above every tile-layer window.
+pub type Drawn = (Option<WinId>, Rect, [f32; 4], Option<Cut>);
 
 /// The tiles' solid rects, front to back, each tagged with its group; `None` for what goes above
 /// every tile-layer window. During a move, the grid and a preview of the landing tile (`None`),
@@ -1044,7 +1054,7 @@ pub fn overlay(
     under: Option<Hit>,
     now_ms: u64,
     focused: Option<WinId>,
-) -> Vec<(Option<WinId>, Rect, [f32; 4])> {
+) -> Vec<Drawn> {
     let mut out = Vec::new();
     let hover = match drag.map(|d| &d.0) {
         None => under,
@@ -1077,7 +1087,7 @@ pub fn overlay(
                 out.extend(
                     move_overlay(o, target, top, alpha)
                         .into_iter()
-                        .map(|(r, k)| (None, r, k)),
+                        .map(|(r, k, cut)| (None, r, k, cut)),
                 );
             }
             None
@@ -1089,7 +1099,11 @@ pub fn overlay(
     let mut tiles = Vec::new();
     light(l, hover, &mut tiles);
     decorations(l, |t| !t.floating, hover, focused, &mut tiles);
-    out.extend(tiles.into_iter().map(|(id, r, k)| (Some(id), r, k)));
+    out.extend(
+        tiles
+            .into_iter()
+            .map(|(id, r, k, cut)| (Some(id), r, k, cut)),
+    );
     out
 }
 
@@ -1110,12 +1124,20 @@ fn light(l: &Layout, hover: Option<Hit>, out: &mut Vec<Chrome>) {
     let Some(id) = hover.map(Hit::id) else {
         return;
     };
-    out.extend(lit.map(|z| (id, z, accent(1.0))));
+    // A lit strip runs over the bar, so it is cut as the bar is.
+    let cut = match hover {
+        Some(Hit::Strip(_)) => l.shape(id).map(Cut::solid),
+        _ => None,
+    };
+    out.extend(lit.map(|z| (id, z, accent(1.0), cut)));
     if let Some(Hit::Corner(_, x, y)) = hover {
         for side in [x, y] {
-            out.extend(l.zone(Hit::Edge(id, side)).map(|z| (id, z, accent(1.0))));
+            out.extend(
+                l.zone(Hit::Edge(id, side))
+                    .map(|z| (id, z, accent(1.0), None)),
+            );
         }
-        out.extend(l.corner_strip(id, x, y).map(|z| (id, z, accent(1.0))));
+        out.extend(l.corner_strip(id, x, y).map(|z| (id, z, accent(1.0), None)));
     }
 }
 
@@ -1166,12 +1188,14 @@ fn decorations(
                 .bar(t.id)
                 .map(|b| b.rect)
                 .or_else(|| l.zone(Hit::Strip(t.id)));
-            out.extend(z.map(|z| (t.id, z, rgba(MINIMIZED, 1.0))));
+            let cut = z.map(|z| Cut::solid(Shape::new(z, RADIUS)));
+            out.extend(z.map(|z| (t.id, z, rgba(MINIMIZED, 1.0), cut)));
         } else if let Some(b) = l.bar(t.id) {
+            let cut = l.shape(t.id).map(Cut::solid);
             out.extend(
                 bar::draw(l, t.id, &b, hover)
                     .into_iter()
-                    .map(|(r, k)| (t.id, r, k)),
+                    .map(|(r, k)| (t.id, r, k, cut)),
             );
         }
     }
@@ -1193,11 +1217,15 @@ fn decorations(
                     h: r.y + r.h - b.rect.y - px,
                     ..r
                 };
+                let cut = Some(Cut::ring(r, RADIUS, px));
                 let [top, rest @ ..] = frame(r, px);
-                out.insert(front, (t.id, top, k));
-                out.extend(rest.map(|f| (t.id, f, k)));
+                out.insert(front, (t.id, top, k, cut));
+                out.extend(rest.map(|f| (t.id, f, k, cut)));
             }
-            None => out.extend(frame(r, px).map(|f| (t.id, f, k))),
+            None => {
+                let cut = Some(Cut::ring(r, RADIUS, px));
+                out.extend(frame(r, px).map(|f| (t.id, f, k, cut)));
+            }
         }
     }
 }
@@ -1293,8 +1321,14 @@ fn grid_alpha(cell: i32) -> f32 {
     (GRID_ALPHA * scale).max(GRID_MIN_ALPHA)
 }
 
-/// The output's interior cell boundaries, 1 px wide, and the preview where the window would go.
-fn move_overlay(o: &Output, target: Target, top: i32, alpha: f32) -> Vec<(Rect, [f32; 4])> {
+/// The output's interior cell boundaries, 1 px wide, and the preview where the window would go,
+/// rounded by its own rect.
+fn move_overlay(
+    o: &Output,
+    target: Target,
+    top: i32,
+    alpha: f32,
+) -> Vec<(Rect, [f32; 4], Option<Cut>)> {
     let a = o.area;
     let grid = accent(grid_alpha(o.cell_w().min(o.cell_h())));
     let cols = (1..COLS).map(|k| Rect {
@@ -1307,13 +1341,10 @@ fn move_overlay(o: &Output, target: Target, top: i32, alpha: f32) -> Vec<(Rect, 
         h: 1,
         ..a
     });
+    let preview = |r: Rect| (r, accent(alpha), Some(Cut::solid(Shape::new(r, RADIUS))));
     cols.chain(rows)
-        .map(|r| (r, grid))
-        .chain(
-            target
-                .cells()
-                .map(|c| (o.window_rect(c, top), accent(alpha))),
-        )
+        .map(|r| (r, grid, None))
+        .chain(target.cells().map(|c| preview(o.window_rect(c, top))))
         .collect()
 }
 
@@ -1330,7 +1361,7 @@ pub(super) mod tests {
         focused: Option<WinId>,
     ) -> Vec<(Rect, [f32; 4])> {
         let out = overlay(l, drag, l.hit(p), now_ms, focused);
-        out.into_iter().map(|(_, r, k)| (r, k)).collect()
+        out.into_iter().map(|(_, r, k, _)| (r, k)).collect()
     }
 
     /// The overlay with no focus and without the dim frames every shown tile has.
@@ -1522,15 +1553,12 @@ pub(super) mod tests {
         assert!(matches!(d.0, State::Move { .. }));
         let o = overlay(&l, Some(&d), None, 0, Some(a));
         let preview = (None, accent(PREVIEW_ALPHA));
-        assert!(o.iter().any(|&(g, _, k)| (g, k) == preview));
-        assert!(
-            o.contains(&(
-                Some(m),
-                l.bar(m)
-                    .map_or_else(|| l.zone(Hit::Strip(m)).unwrap(), |b| b.rect),
-                rgba(MINIMIZED, 1.0)
-            ))
-        );
+        assert!(o.iter().any(|&(g, _, k, _)| (g, k) == preview));
+        let strip = l
+            .bar(m)
+            .map_or_else(|| l.zone(Hit::Strip(m)).unwrap(), |b| b.rect);
+        let cut = Some(Cut::solid(Shape::new(strip, RADIUS)));
+        assert!(o.contains(&(Some(m), strip, rgba(MINIMIZED, 1.0), cut)));
         let tagged = |id| o.iter().filter(|(g, ..)| *g == Some(id)).count();
         assert!(tagged(a) >= 4 && tagged(b) >= 5, "{o:?}");
         let tops = o.iter().position(|(g, ..)| g.is_some()).unwrap();
@@ -1643,6 +1671,10 @@ pub(super) mod tests {
                             // Sampled: a hit test per window px is slow.
                             true if (x + y) % 61 == 0 => assert_eq!(l.hit(p), None, "{name} {p:?}"),
                             true => {}
+                            // Job 031: but a bar's rounded corners, which are no zone.
+                            false if (0..4).any(|id| l.cut_off(id, p)) => {
+                                assert_eq!(l.hit(p), None, "{name} {p:?}")
+                            }
                             false => assert!(l.hit(p).is_some(), "{name} {p:?}"),
                         }
                     }
@@ -2565,9 +2597,16 @@ pub(super) mod tests {
         let rects = move_overlay(&laptop, Target::Free(c(0, 0, 6, 6)), 0, PREVIEW_ALPHA);
         let (lines, preview) = rects.split_at(rects.len() - 1);
         assert_eq!(lines.len(), (COLS - 1 + ROWS - 1) as usize);
-        assert!(lines.iter().all(|&(_, k)| k == accent(grid_alpha(46))));
+        assert!(
+            lines
+                .iter()
+                .all(|&(_, k, cut)| k == accent(grid_alpha(46)) && cut.is_none())
+        );
         assert!(grid_alpha(46) < GRID_ALPHA);
         assert_eq!(preview[0].1, accent(PREVIEW_ALPHA));
+        // Job 031: the preview is rounded by its own rect.
+        let cut = Some(Cut::solid(Shape::new(preview[0].0, RADIUS)));
+        assert_eq!(preview[0].2, cut);
     }
 
     #[test]
@@ -2911,12 +2950,15 @@ pub(super) mod tests {
             assert!(bar.rect.y >= c.y + STRIP, "{name}");
             for x in bar.rect.x..bar.rect.x + bar.rect.w {
                 for y in bar.rect.y..bar.rect.y + bar.rect.h {
+                    // Job 031: the bar's rounded corners are no zone.
                     let want = bar
                         .buttons
                         .iter()
+                        .filter(|_| !l.cut_off(id, (x, y)))
                         .find(|(_, b)| b.contains((x, y)))
                         .map(|&(b, _)| Hit::Button(id, b))
                         .or_else(|| match bar.tabs.is_empty() {
+                            _ if l.cut_off(id, (x, y)) => None,
                             true => Some(Hit::Strip(id)),
                             false => bar
                                 .tabs

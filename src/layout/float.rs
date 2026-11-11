@@ -236,6 +236,10 @@ impl Layout {
         let mut shown = floats.filter(|t| self.visible(t.id) && !t.fullscreen);
         shown.find_map(|f| {
             let (o, r) = self.frame(f.id)?;
+            // A cut-off corner shows, and gives the pointer to, what is behind.
+            if self.cut_off(f.id, p) {
+                return None;
+            }
             if r.contains(p) {
                 return Some(None);
             }

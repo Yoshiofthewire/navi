@@ -19,8 +19,8 @@ use smithay::{
         input::InputEvent,
         libinput::{LibinputInputBackend, LibinputSessionInterface},
         renderer::{
-            gles::GlesRenderer,
-            multigpu::{GpuManager, MultiRenderer, gbm::GbmGlesBackend},
+            gles::{GlesError, GlesFrame, GlesRenderer},
+            multigpu::{self, GpuManager, MultiRenderer, gbm::GbmGlesBackend},
         },
         session::{Event as SessionEvent, Session, libseat::LibSeatSession},
         udev::{UdevBackend, UdevEvent, all_gpus, primary_gpu},
@@ -54,6 +54,23 @@ use crate::{
 type Gpu = GbmGlesBackend<GlesRenderer, DrmDeviceFd>;
 type UdevRenderer<'a> = MultiRenderer<'a, 'a, Gpu, Gpu>;
 type Allocator = GbmAllocator<DrmDeviceFd>;
+
+/// The render GPU's GLES renderer and frame draw navi's rounded outlines.
+impl render::Gl for UdevRenderer<'_> {
+    fn gles(&mut self) -> Option<&mut GlesRenderer> {
+        Some(self.as_mut())
+    }
+    fn on_gles<'f, 'b>(
+        frame: &mut Self::Frame<'f, 'b>,
+        f: impl FnOnce(&mut GlesFrame<'f, 'b>) -> Result<(), GlesError>,
+    ) -> Result<(), Self::Error>
+    where
+        'b: 'f,
+        Self: 'f,
+    {
+        f(frame.as_mut()).map_err(multigpu::Error::Render)
+    }
+}
 type Exporter = GbmFramebufferExporter<DrmDeviceFd>;
 
 /// The EDID blob read from a connector, at most.

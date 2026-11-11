@@ -365,13 +365,14 @@ impl Navi {
     }
 
     /// The window at `pos` and its surface there, top down: floats and their dialogs above the
-    /// rest. A window's own surfaces take input only inside its clip rect; its popups anywhere.
+    /// rest. A window's own surfaces take input only inside its clip rect, its popups inside
+    /// theirs, both cut to its outline (`cut`).
     pub fn window_under(&self, pos: Point<f64, Logical>) -> Option<(&Window, Under)> {
         let under = |w: &Window, clip: Option<Rect>| -> Option<Under> {
+            let cut = self.cut(w);
             let popup = self.popups(w).into_iter().find_map(|(s, loc, clip)| {
                 let all = WindowSurfaceType::ALL;
-                let (s, p) = clip
-                    .contains(px(pos))
+                let (s, p) = layout::takes(Some(clip), cut, px(pos))
                     .then(|| under_from_surface_tree(&s, pos, loc, all))??;
                 Some((s, p.to_f64()))
             });
@@ -380,7 +381,7 @@ impl Navi {
             }
             let loc = self.space.element_location(w)? - w.geometry().loc;
             let own = WindowSurfaceType::TOPLEVEL | WindowSurfaceType::SUBSURFACE;
-            let inside = clip.is_none_or(|c| c.contains(px(pos)));
+            let inside = layout::takes(clip, cut, px(pos));
             let (s, p) = inside.then(|| w.surface_under(pos - loc.to_f64(), own))??;
             Some((s, (p + loc).to_f64()))
         };
@@ -505,6 +506,17 @@ impl Navi {
             None => m.placed,
         };
         (owner.is_some_and(|t| t.floating), clip)
+    }
+
+    /// The outline `w`'s own surfaces and popups are cut to: its tile's, or an X11 menu's
+    /// owner's. `None` for dialogs and fullscreen windows.
+    pub fn cut(&self, w: &Window) -> Option<layout::Shape> {
+        let m = self.windows.iter().find(|m| &m.window == w)?;
+        let m = match &m.menu_owner {
+            Some(o) => self.windows.iter().find(|n| &n.window == o)?,
+            None => m,
+        };
+        self.layout.shape(m.tile?)
     }
 
     /// A shown dialog's rect, which navi frames, and whether it waits for the user; `None` for
