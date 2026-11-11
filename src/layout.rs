@@ -9,7 +9,8 @@ mod float;
 mod memory;
 pub use bar::{Button, Decor, decoration};
 pub use drag::{
-    Action, Done, Drag, EdgeClicks, Hit, Nudge, Side, buttons, dialog_frame, float_overlay, overlay,
+    Action, Done, Drag, EdgeClicks, Hit, Nudge, Side, buttons, dialog_frame, float_overlay,
+    overlay, tile_stack,
 };
 use memory::MAX_PX;
 pub use memory::safe;
@@ -2230,7 +2231,7 @@ mod tests {
         assert_eq!(l.clip(id), Some(r));
         assert_eq!(l.bar(id).unwrap().rect.w, 1220);
         let focus = crate::theme::rgba(crate::theme::ACCENT, 1.0);
-        let frames = overlay(&l, None, (0, 0), 0, Some(id));
+        let frames = drag::tests::overlay_at(&l, None, (0, 0), 0, Some(id));
         assert!(
             frames
                 .iter()
@@ -2848,7 +2849,7 @@ mod tests {
         assert!(front.contains(x), "the rear ✕ lies under the front window");
         assert_eq!(l.hit(x), None, "the front window's client, not the rear ✕");
         // Render draws each float's decorations right above its window, front float first.
-        let drawn: Vec<WinId> = float_overlay(&l, None, (0, 0), None)
+        let drawn: Vec<WinId> = float_overlay(&l, None, None, None)
             .into_iter()
             .map(|(id, ..)| id)
             .collect();
@@ -2873,7 +2874,7 @@ mod tests {
         if l.clip(f).unwrap().contains(under) {
             assert_eq!(l.hit(under), None);
         }
-        let drawn: Vec<WinId> = float_overlay(&l, None, (0, 0), None)
+        let drawn: Vec<WinId> = float_overlay(&l, None, None, None)
             .into_iter()
             .map(|(id, ..)| id)
             .collect();
@@ -2909,13 +2910,17 @@ mod tests {
                 "f's zone without the dialog"
             );
             assert_eq!(
-                l.hit_under(p, Some(g)),
+                l.hit_under(p, Some(g), |_| false),
                 None,
                 "the dialog is in front: {p:?}"
             );
-            assert_eq!(l.hit_under(p, None), l.hit(p), "no window there: f's zone");
             assert_eq!(
-                l.hit_under(p, Some(f)),
+                l.hit_under(p, None, |_| false),
+                l.hit(p),
+                "no window there: f's zone"
+            );
+            assert_eq!(
+                l.hit_under(p, Some(f), |_| false),
                 l.hit(p),
                 "f's own window doesn't cover it"
             );
@@ -2924,14 +2929,17 @@ mod tests {
         let a_right = l.zone(Hit::Edge(a, Side::Right)).unwrap();
         let p = (a_right.x + 1, front.y + front.h + 40);
         assert_eq!(l.hit(p), Some(Hit::Edge(a, Side::Right)));
-        assert_eq!(l.hit_under(p, Some(f)), None);
+        assert_eq!(l.hit_under(p, Some(f), |_| false), None);
         // A rear float's dialog never covers the front float's zones.
         let g_bar = (front.x + 40, front.y - 12);
         assert_eq!(l.hit(g_bar), Some(Hit::Strip(g)));
-        assert_eq!(l.hit_under(g_bar, Some(f)), Some(Hit::Strip(g)));
+        assert_eq!(l.hit_under(g_bar, Some(f), |_| false), Some(Hit::Strip(g)));
         // Focus brings f in front; then its zones take the point back from g's dialog.
         assert!(l.raise(f));
-        assert_eq!(l.hit_under(x, Some(g)), Some(Hit::Button(f, Button::Close)));
+        assert_eq!(
+            l.hit_under(x, Some(g), |_| false),
+            Some(Hit::Button(f, Button::Close))
+        );
     }
 
     /// PR #39 audit P2: floats follow the stacking ranks first. Restoring or activating the rear
@@ -2966,6 +2974,41 @@ mod tests {
         assert_eq!(l.hit(q).map(|h| h.id()), Some(f), "f's band is f's again");
     }
 
+    /// Job 028 AC1: a float's bar and band over a tile's zones win, whether or not a tile-layer
+    /// window there covers that tile.
+    #[test]
+    fn floats_zones_beat_tile_layer_windows() {
+        let (mut l, [_, b], f) = blocked(vec![], fixed());
+        l.set_decorated(b, true);
+        for _ in 0..2 {
+            l.keyboard_adjust(f, Side::Right, Nudge::Move).unwrap();
+        }
+        let right = l.zone(Hit::Edge(b, Side::Right)).unwrap();
+        let o = outer_of(&l, f);
+        let x = right.x + 1;
+        // f's bar (a button there), then its top band, over b's right edge.
+        for p in [(x, o.y + 12), (x, o.y - 3)] {
+            assert!(right.contains(p), "{p:?}");
+            let want = l.hit(p).unwrap();
+            assert_eq!(want.id(), f, "{p:?}");
+            assert_eq!(
+                l.hit_under(p, None, |g| g == b),
+                Some(want),
+                "covered: {p:?}"
+            );
+            assert_eq!(
+                l.hit_under(p, None, |_| true),
+                Some(want),
+                "all covered: {p:?}"
+            );
+            assert_eq!(
+                l.hit_under(p, None, |_| false),
+                Some(want),
+                "not covered: {p:?}"
+            );
+        }
+    }
+
     /// Job 020 AC5: a front float's dialog of a dialog has the float as its root, so it covers
     /// the rear float's zones as the float's own dialog does.
     #[test]
@@ -2992,11 +3035,11 @@ mod tests {
         assert!(!front.contains(band) && d2.contains(band), "{d2:?}");
         assert!(l.hit(band).is_some_and(|h| h.id() == f));
         assert_eq!(
-            l.hit_under(band, Some(owner)),
+            l.hit_under(band, Some(owner), |_| false),
             None,
             "the chain is in front"
         );
-        assert_eq!(l.hit_under(band, Some(f)), l.hit(band));
+        assert_eq!(l.hit_under(band, Some(f), |_| false), l.hit(band));
     }
 
     /// Round 1 (security probe): unplugging the monitor under a float drag leaves the float on a
@@ -3102,14 +3145,14 @@ mod tests {
         // A hovered band lights in the float layer, above the tiles, and not below them.
         let lit = crate::theme::rgba(crate::theme::ACCENT, 1.0);
         let zone = l.zone(Hit::Edge(f, Side::Top)).unwrap();
-        assert!(float_overlay(&l, None, p, None).contains(&(f, zone, lit)));
+        assert!(float_overlay(&l, None, l.hit(p), None).contains(&(f, zone, lit)));
         assert!(
-            !overlay(&l, None, p, 0, None)
+            !drag::tests::overlay_at(&l, None, p, 0, None)
                 .iter()
                 .any(|&(r, k)| k == lit && overlaps(r, zone))
         );
         let corner = (left, top);
-        let glow = float_overlay(&l, None, corner, None);
+        let glow = float_overlay(&l, None, l.hit(corner), None);
         for s in [Side::Left, Side::Top] {
             assert!(
                 glow.contains(&(f, l.zone(Hit::Edge(f, s)).unwrap(), lit)),
