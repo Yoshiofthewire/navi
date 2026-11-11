@@ -139,15 +139,6 @@ impl Navi {
                 self.memory.sync(&self.layout);
             }
         }
-        // A transient's parent, once navi knows it; X11 has no isolation to check it against.
-        let up = x11_parent
-            .filter(|_| !x.is_override_redirect())
-            .and_then(|id| {
-                self.windows
-                    .iter()
-                    .find(|m| m.window.x11_surface().is_some_and(|p| p.window_id() == id))
-            })
-            .map(|m| m.window.clone());
         self.windows.push(Managed {
             window,
             tile,
@@ -158,7 +149,9 @@ impl Navi {
             want_fullscreen: false,
             escaped: false,
             x11_parent,
-            up,
+            // `recenter_dialogs` resolves a transient's parent.
+            up: None,
+            fresh: false,
             asked: None,
             placed: None,
             last_output: None,
@@ -208,7 +201,7 @@ impl Navi {
                 })
             });
             match shown {
-                true => self.space.map_element(window, loc, false),
+                true => crate::state::put(&mut self.space, &window, (loc.x, loc.y)),
                 false => self.space.unmap_elem(&window),
             }
         }
@@ -317,6 +310,7 @@ impl XwmHandler for Navi {
             // `refit` paces it and ignores windows without a tile.
             (WmWindowProperty::NormalHints, Some(root)) => self.refit(&root),
             (WmWindowProperty::NormalHints, None) => {}
+            (WmWindowProperty::TransientFor, _) => self.recenter_dialogs(),
             _ => self.refresh_toplevels(),
         }
     }

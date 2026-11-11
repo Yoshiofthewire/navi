@@ -235,24 +235,25 @@ aspect, gravity, position) are ignored.
   neighbouring tile. A window that draws larger, such as a CSD shadow or a buffer bigger than its
   configure, is cropped there, and a click just outside it reaches what's below. So no app draws
   over, or takes clicks meant for, another tile or navi's zones, except through a dialog, below.
-- **Dialogs.** A dialog (an xdg toplevel with a parent, or an X11 `WM_TRANSIENT_FOR` window) has
-  a *root*: the first tiled or floating window up its parents. The walk stops after 8 steps or on
-  a loop; a chain that ends without a tiled window, is too deep or loops makes an *orphan*. Its
-  *family* is every window with the same root. A dialog stays inside its root's monitor's
-  bounds, the same as a float's (the area, 8 px in); an orphan uses the monitor it was last
-  shown on, else the main one. navi sends every dialog those bounds (`configure_bounds`) and
-  never sizes it otherwise, but a dialog larger than its bounds on an axis is configured once
-  with that axis lowered to the bound, at most once a second. It is centred on its parent (a
-  tile's or float's rect, or a parent dialog's), then slid into the bounds, again whenever the
-  parent moves or resizes, the panels change, or it commits a new size. Its rect is its clip, and
-  every shown dialog has navi's frame around it, so even a transparent one can be seen. Inside its
-  monitor a dialog may cover neighbouring tiles, so a file picker larger than its window still
-  works, but it is always visible where it takes clicks. A new dialog takes the keyboard only
-  if a window of its own family holds it; otherwise it maps without it (logged) and gets it when
-  the user clicks it. An orphan never takes the keyboard on map. A dialog hides while its root
-  is hidden or minimized, and loses the keyboard; it comes back with it. When a dialog's parent
-  closes, it hangs from that parent's own parent if it had one, else it is an orphan centred in
-  its last bounds.
+- **Dialogs.** A dialog (an xdg toplevel with a parent, or an X11 `WM_TRANSIENT_FOR` window) has a
+  *root*: the first tiled or floating window up its parents. The walk stops after 8 steps or on a
+  loop; a chain that ends without a tiled window, is too deep or loops makes an *orphan*. Its
+  *family* is every window with the same root. A dialog stays inside its root's monitor's bounds,
+  the same as a float's (the area, 8 px in); an orphan uses the monitor it was last shown on, else
+  the main one. navi sends every dialog those bounds (`configure_bounds`) and never sizes it
+  otherwise, but a dialog larger than its bounds on an axis is configured once with that axis
+  lowered to the bound, at most once a second. That size stays its configured size until it asks
+  for another, even if the bounds later grow. It is centred on its parent (a tile's or float's
+  rect, or a parent dialog's), then slid into the bounds, again whenever the parent moves or
+  resizes, the panels change, or it commits a new size. Its rect is its clip, and every shown
+  dialog has navi's frame around it, so even a transparent one can be seen. Moving it never raises
+  it: only focus does, so a neighbour the user clicks stays in front of it. Inside its monitor a
+  dialog may cover neighbouring tiles, so a file picker larger than its window still works, but it
+  is always visible where it takes clicks. A new dialog takes the keyboard only if a window of its
+  own family holds it; otherwise it maps without it (logged) and gets it when the user clicks it.
+  An orphan never takes the keyboard on map. A dialog hides while its root is hidden or minimized,
+  and loses the keyboard; it comes back with it. When a dialog's parent closes, it hangs from that
+  parent's own parent if it had one, else it is an orphan centred in its last bounds.
 - **Logs.** One `info` line per change: `client size hints` (app, id, min, max and the outcome),
   then `re-placed`, `floating: no tile fits` (and `floating: its minimum is bigger than the
   monitor` when it is) or `tiled again` with the cells or rect (`by="room freed"` when a float
@@ -455,9 +456,9 @@ bundling a degoogled, resource-tested Chromium variant is reserved for a future 
   purple, amber or pink accents; Accessibility offers high contrast. These are opt-in variants
   of the same system, preserving geometry, hierarchy and instant state changes. The
   window with the keyboard has a 2 px accent frame just outside it, in the gap; every other shown
-  window, dialogs included, has a dim 1 px one, so the gaps read as thin neon lines and the grab strips stay easy to
-  find. A lit strip or edge, the bars and the minimized strips draw in front of the frames, and
-  the shell's panels in front of all of them.
+  window, dialogs included, has a dim 1 px one, so the gaps read as thin neon lines and the grab
+  strips stay easy to find. A lit strip or edge, the bars and the minimized strips draw in front
+  of the frames, and the shell's panels in front of all of them.
   The shell's panels (dock, launcher, status band, session menu and notification cards) float:
   12 px (`INSET`) from the screen edges and from what they sit next to, with 10 px corners
   (`RADIUS`), the shell fill and a 1 px rim. The dock and band, which sit over the wallpaper,

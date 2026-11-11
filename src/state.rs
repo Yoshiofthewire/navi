@@ -110,6 +110,8 @@ pub struct Managed {
     pub(crate) placed: Option<Rect>,
     /// The output a dialog was last shown on, for when it becomes an orphan.
     pub(crate) last_output: Option<String>,
+    /// A new dialog not shown yet: the focus rule runs when it first is.
+    pub(crate) fresh: bool,
     /// The bounds a dialog's cap was last logged for.
     pub(crate) capped_for: Option<Rect>,
 }
@@ -491,7 +493,7 @@ impl Navi {
                     if self.space.element_location(&m.window).is_none() {
                         shown.push(id);
                     }
-                    self.space.map_element(m.window.clone(), (r.x, r.y), false);
+                    put(&mut self.space, &m.window, (r.x, r.y));
                 } else if self.space.element_location(&m.window).is_some() {
                     self.space.unmap_elem(&m.window);
                     m.window.set_activated(false);
@@ -546,7 +548,7 @@ impl Navi {
             if !mapped {
                 shown.push(id);
             }
-            self.space.map_element(m.window.clone(), (r.x, r.y), false);
+            put(&mut self.space, &m.window, (r.x, r.y));
         }
         if !hidden.is_empty() {
             info!(?hidden, "hidden");
@@ -1280,8 +1282,12 @@ impl Navi {
         // Sets the size before the first configure goes out.
         self.apply_layout();
         surface.send_configure();
+        match self.windows[idx].tile {
+            Some(_) => self.focus_new(idx),
+            // Shown, and given the focus rule, at its first buffer.
+            None => self.windows[idx].fresh = true,
+        }
         self.recenter_dialogs();
-        self.focus_new(idx);
     }
 
     /// A new window `i` takes the keyboard once shown; a dialog only from its own family.
@@ -1429,6 +1435,8 @@ impl Navi {
     /// Places every dialog (and X11 transient) inside its bounds over its parent, sends it its
     /// bounds and any cap, and hides it while its root is hidden. X11 menus aren't dialogs.
     pub(crate) fn recenter_dialogs(&mut self) {
+        self.resolve_x11_parents();
+        let mut fresh = Vec::new();
         for i in 0..self.windows.len() {
             let m = &self.windows[i];
             let menu = m
@@ -1462,6 +1470,10 @@ impl Navi {
                 continue;
             };
             let want = want(&self.windows[i]);
+            // Nothing to show before its first buffer.
+            if want.0 <= 0 || want.1 <= 0 {
+                continue;
+            }
             let cap = dialog::needs_cap(want, b);
             let m = &mut self.windows[i];
             (m.placed, m.last_output) = (Some(r), Some(output));
@@ -1488,7 +1500,39 @@ impl Navi {
                 }
                 (None, None) => {}
             }
-            self.space.map_element(window, (r.x, r.y), false);
+            // Moved in place: only the user's focus restacks a dialog.
+            put(&mut self.space, &window, (r.x, r.y));
+            if std::mem::take(&mut self.windows[i].fresh) {
+                fresh.push(window);
+            }
+        }
+        for w in fresh {
+            if let Some(i) = self.windows.iter().position(|m| m.window == w) {
+                self.focus_new(i);
+            }
+        }
+    }
+
+    /// Points each X11 transient's `up` at its current `WM_TRANSIENT_FOR` window, once navi
+    /// knows it; the property may change, or name a window mapped later.
+    fn resolve_x11_parents(&mut self) {
+        let ups: Vec<Option<Window>> = self
+            .windows
+            .iter()
+            .map(|m| {
+                let x = m.window.x11_surface()?;
+                let id = x.is_transient_for().filter(|_| !x.is_override_redirect())?;
+                let p = self
+                    .windows
+                    .iter()
+                    .find(|p| p.window.x11_surface().is_some_and(|p| p.window_id() == id))?;
+                Some(p.window.clone())
+            })
+            .collect();
+        for (m, up) in self.windows.iter_mut().zip(ups) {
+            if m.window.x11_surface().is_some() && m.tile.is_none() {
+                m.up = up;
+            }
         }
     }
 
@@ -1706,6 +1750,32 @@ pub fn set_identity(output: &Output, id: String) {
 
 /// navi-bar's taskbar namespace; only navi-bar has layer shell, so it can be trusted.
 const BAR: &str = "navi-bar";
+
+/// Maps `w` at `loc`: on top if it's new, else moved where it is in the stacking order. Only a
+/// user's focus raises a window that is already shown.
+pub(crate) fn put<E: smithay::desktop::space::SpaceElement + Clone + PartialEq>(
+    space: &mut Space<E>,
+    w: &E,
+    loc: (i32, i32),
+) {
+    let loc = Point::from(loc);
+    match space.element_location(w) {
+        Some(at) if at == loc => {}
+        Some(_) => {
+            let above: Vec<E> = space
+                .elements()
+                .skip_while(|e| *e != w)
+                .skip(1)
+                .cloned()
+                .collect();
+            space.map_element(w.clone(), loc, false);
+            for e in &above {
+                space.raise_element(e, false);
+            }
+        }
+        None => space.map_element(w.clone(), loc, false),
+    }
+}
 
 /// The size `m` asks for: a Wayland window's geometry, an X11 window's request. Untrusted.
 fn want(m: &Managed) -> (i32, i32) {
@@ -1932,6 +2002,7 @@ impl XdgShellHandler for Navi {
             escaped: false,
             x11_parent: None,
             up: None,
+            fresh: false,
             asked: None,
             placed: None,
             last_output: None,
@@ -2298,6 +2369,51 @@ mod tests {
             ..Default::default()
         };
         assert!(privileged(Some(&bar)));
+    }
+
+    /// A stand-in window for `Space`, by name.
+    #[derive(Clone, Debug, PartialEq)]
+    struct Elem(&'static str);
+
+    impl smithay::utils::IsAlive for Elem {
+        fn alive(&self) -> bool {
+            true
+        }
+    }
+
+    impl smithay::desktop::space::SpaceElement for Elem {
+        fn bbox(&self) -> Rectangle<i32, Logical> {
+            Rectangle::new((0, 0).into(), (10, 10).into())
+        }
+        fn is_in_input_region(&self, _: &Point<f64, Logical>) -> bool {
+            true
+        }
+        fn set_activate(&self, _: bool) {}
+        fn output_enter(&self, _: &Output, _: Rectangle<i32, Logical>) {}
+        fn output_leave(&self, _: &Output) {}
+    }
+
+    /// Round 1 security: re-placing a shown window (a dialog on every commit) never raises it,
+    /// so a neighbour the user raised stays in front of it.
+    #[test]
+    fn re_placing_keeps_the_stacking_order() {
+        let mut space = Space::<Elem>::default();
+        let order = |s: &Space<Elem>| s.elements().map(|e| e.0).collect::<Vec<_>>();
+        for (e, x) in [("dialog", 0), ("neighbour", 50)] {
+            put(&mut space, &Elem(e), (x, 0));
+        }
+        assert_eq!(
+            order(&space),
+            ["dialog", "neighbour"],
+            "new windows go on top"
+        );
+        put(&mut space, &Elem("dialog"), (0, 0));
+        put(&mut space, &Elem("dialog"), (7, 3));
+        assert_eq!(order(&space), ["dialog", "neighbour"]);
+        assert_eq!(space.element_location(&Elem("dialog")), Some((7, 3).into()));
+        put(&mut space, &Elem("new"), (1, 1));
+        put(&mut space, &Elem("neighbour"), (9, 9));
+        assert_eq!(order(&space), ["dialog", "neighbour", "new"]);
     }
 
     #[test]
