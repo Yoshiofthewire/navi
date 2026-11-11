@@ -126,13 +126,19 @@ pub enum Done {
 
 impl Layout {
     pub fn hit(&self, p: (i32, i32)) -> Option<Hit> {
-        self.hit_where(p, |_| false)
+        self.hit_where(p, |_| false, None)
     }
 
-    /// `hit(p)` without the zones of the groups `covered` names (by their active tile).
-    pub(super) fn hit_where(&self, p: (i32, i32), covered: impl Fn(WinId) -> bool) -> Option<Hit> {
+    /// `hit(p)` without the zones of the groups `covered` names (by their active tile), with
+    /// `focused`'s frame drawn bright.
+    pub(super) fn hit_where(
+        &self,
+        p: (i32, i32),
+        covered: impl Fn(WinId) -> bool,
+        focused: Option<WinId>,
+    ) -> Option<Hit> {
         // Floats, and their bands, are above every tile's zones.
-        if let Some(hit) = self.float_hit(p) {
+        if let Some(hit) = self.float_hit(p, focused) {
             return hit;
         }
         // One set of zones per group, from its active tile; none for a fullscreen tile or one it covers.
@@ -183,6 +189,21 @@ impl Layout {
     pub(super) fn cut_off(&self, id: WinId, p: (i32, i32)) -> bool {
         self.shape(id)
             .is_some_and(|s| s.rect.contains(p) && !s.contains(p))
+    }
+
+    /// The rect `id`'s frame surrounds and the ring it is drawn in, `px` wide: just outside the
+    /// window, or with a bar along the bar's top rows.
+    pub(super) fn frame_ring(&self, id: WinId, px: i32) -> Option<(Rect, Cut)> {
+        let r = self.rect(id)?;
+        let r = match self.bar(id) {
+            Some(b) => Rect {
+                y: b.rect.y + px,
+                h: r.y + r.h - b.rect.y - px,
+                ..r
+            },
+            None => r,
+        };
+        Some((r, Cut::ring(r, RADIUS, px)))
     }
 
     /// Corners use only the existing gaps, leaving client pixels, tabs and buttons alone.
@@ -1200,33 +1221,24 @@ fn decorations(
         }
     }
     for t in tiles() {
-        let Some(r) = l.rect(t.id).filter(|_| l.visible(t.id) && !t.fullscreen) else {
+        let alpha = match focused == Some(t.id) {
+            true => 1.0,
+            false => IDLE_ALPHA,
+        };
+        let px = frame_px(focused == Some(t.id));
+        let shown = l.visible(t.id) && !t.fullscreen;
+        let Some((r, cut)) = l.frame_ring(t.id, px).filter(|_| shown) else {
             continue;
         };
-        let (px, alpha) = match focused == Some(t.id) {
-            true => (FOCUS_PX, 1.0),
-            false => (IDLE_PX, IDLE_ALPHA),
-        };
-        let k = accent(alpha);
+        let (k, cut) = (accent(alpha), Some(cut));
         // A bar is the window's top edge, so the frame takes it in: its top line runs along
         // the bar's top rows, in front of the bar.
+        let [top, rest @ ..] = frame(r, px);
         match l.bar(t.id) {
-            Some(b) => {
-                let r = Rect {
-                    y: b.rect.y + px,
-                    h: r.y + r.h - b.rect.y - px,
-                    ..r
-                };
-                let cut = Some(Cut::ring(r, RADIUS, px));
-                let [top, rest @ ..] = frame(r, px);
-                out.insert(front, (t.id, top, k, cut));
-                out.extend(rest.map(|f| (t.id, f, k, cut)));
-            }
-            None => {
-                let cut = Some(Cut::ring(r, RADIUS, px));
-                out.extend(frame(r, px).map(|f| (t.id, f, k, cut)));
-            }
+            Some(_) => out.insert(front, (t.id, top, k, cut)),
+            None => out.push((t.id, top, k, cut)),
         }
+        out.extend(rest.map(|f| (t.id, f, k, cut)));
     }
 }
 
@@ -1277,6 +1289,14 @@ pub fn tile_stack<T>(
     }
     out.extend(rest.into_iter().map(|(_, c)| c));
     out
+}
+
+/// A frame's width: bright and wider with the keyboard.
+pub(super) fn frame_px(focused: bool) -> i32 {
+    match focused {
+        true => FOCUS_PX,
+        false => IDLE_PX,
+    }
 }
 
 /// A dialog's frame around its rect `r`, as a tile's: bright while it has the keyboard, else dim;
@@ -1671,7 +1691,7 @@ pub(super) mod tests {
                             // Sampled: a hit test per window px is slow.
                             true if (x + y) % 61 == 0 => assert_eq!(l.hit(p), None, "{name} {p:?}"),
                             true => {}
-                            // Job 031: but a bar's rounded corners, which are no zone.
+                            // But a bar's rounded corners, which are no zone.
                             false if (0..4).any(|id| l.cut_off(id, p)) => {
                                 assert_eq!(l.hit(p), None, "{name} {p:?}")
                             }
@@ -2604,7 +2624,7 @@ pub(super) mod tests {
         );
         assert!(grid_alpha(46) < GRID_ALPHA);
         assert_eq!(preview[0].1, accent(PREVIEW_ALPHA));
-        // Job 031: the preview is rounded by its own rect.
+        // The preview is rounded by its own rect.
         let cut = Some(Cut::solid(Shape::new(preview[0].0, RADIUS)));
         assert_eq!(preview[0].2, cut);
     }
@@ -2950,7 +2970,7 @@ pub(super) mod tests {
             assert!(bar.rect.y >= c.y + STRIP, "{name}");
             for x in bar.rect.x..bar.rect.x + bar.rect.w {
                 for y in bar.rect.y..bar.rect.y + bar.rect.h {
-                    // Job 031: the bar's rounded corners are no zone.
+                    // The bar's rounded corners are no zone.
                     let want = bar
                         .buttons
                         .iter()

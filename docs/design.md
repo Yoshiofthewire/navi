@@ -257,6 +257,8 @@ aspect, gravity, position) are ignored.
   sees all of Xwayland as one client): a flood from one X11 app can keep another's menus from
   showing until it closes some. A window that draws larger, such as a CSD shadow or a buffer
   bigger than its configure, is cropped there, and a click just outside it reaches what's below.
+  So no app draws over, or takes clicks meant for, another tile or navi's zones, except through
+  a dialog in front of that tile (below, and *Stacking order*).
 - **Rounded tiles.** Each shown tile and float has one outline: its bar and window (the window
   alone without a bar), corner radius `RADIUS` (10 px, times the output scale), clamped to half
   its shorter side. navi's chrome and the app's own pixels are cut to it, antialiased over one
@@ -269,18 +271,20 @@ aspect, gravity, position) are ignored.
   rect, so one flush with a corner loses the px past the arc and one inside is whole. A window
   takes the pointer exactly where it's drawn: a cut-off corner (about 21 px² at scale 1) belongs
   to what shows through it, the tile behind a float or nothing, and so does its cursor; the
-  bar's tabs, buttons and strip there are no zone. The resize corners, edges and strip keep
-  their geometry in the gaps: the cut is too small for a second corner rule, and letting the
-  window keep its square hit rect would let a click on a px showing the tile behind go to the
-  float. Two GLES programs, compiled once per GL context, draw it in both backends: one fills
+  bar's tabs, buttons and strip there are no zone. Where a float's frame is drawn over its
+  cut-off corner (out to the ring's outer arc, wider while focused), the px are that float's
+  resize corner, so a click on frame it can see never focuses the window behind. Otherwise
+  the resize corners, edges and strip keep their geometry in the gaps: the cut is too small for
+  a second corner rule, and letting the window keep its square hit rect would let a click on a
+  px showing the tile behind go to the float. Two GLES programs, compiled once per GL context, draw it in both backends: one fills
   chrome in the corner squares (everything else stays a plain rect, so an idle desktop still
   has no damage), one cuts app surfaces and window buttons that reach a corner. If they don't
   compile, navi logs one warning and draws square. A cut surface can't be scanned out directly
   on DRM; fullscreen windows aren't cut, so fullscreen video and games keep direct scanout.
-  X11 apps get navi's focus and clicks by the outline, but Xwayland picks which overlapping X11
-  window gets motion by its own square stacking.
-  So no app draws over, or takes clicks meant for, another tile or navi's zones, except through
-  a dialog in front of that tile (below, and *Stacking order*).
+  X11 apps get navi's focus and clicks by the outline, but Xwayland gives X11 motion to the X11
+  window on top of its own stack, which follows the last focused X11 window rather than navi's
+  drawing, so where two X11 windows overlap (a cut corner included) the one behind can see
+  motion.
 - **Dialogs.** A dialog (an xdg toplevel with a parent, or an X11 `WM_TRANSIENT_FOR` window) has a
   *root*: the first tiled or floating window up its parents. The walk stops after 8 steps or on a
   loop; a chain that ends without a tiled window, is too deep or loops makes an *orphan*. Its

@@ -447,7 +447,8 @@ impl Navi {
         let rank = |w: &Window| self.space.elements().position(|e| e == w);
         let at = under.filter(|_| over.is_none()).and_then(rank);
         let covers = |g| Layout::covers(at, self.window_of(g).as_ref().and_then(rank));
-        self.layout.hit_under(px(pos), over, covers)
+        self.layout
+            .hit_seen(px(pos), over, covers, self.focused_tile())
     }
 
     /// The tile `w` is the window of; `None` for dialogs and menus.

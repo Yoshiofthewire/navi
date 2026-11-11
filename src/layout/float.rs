@@ -175,17 +175,30 @@ impl Layout {
         floats.into_iter().map(|t| t.id).collect()
     }
 
-    /// `hit(p)` without the zones the window at `p` is drawn in front of. When it belongs to float
-    /// `over` (it or its dialog), it covers the zones of every float behind it and every tile's.
-    /// Else (a tile-layer window) it covers the groups `covers` names, by their active tile: those
-    /// whose window ranks below it. No tile-layer window covers a float's zones.
+    /// `hit_seen` with every frame dim.
+    #[cfg(test)]
     pub fn hit_under(
         &self,
         p: (i32, i32),
         over: Option<WinId>,
         covers: impl Fn(WinId) -> bool,
     ) -> Option<Hit> {
-        let hit = self.hit_where(p, covers)?;
+        self.hit_seen(p, over, covers, None)
+    }
+
+    /// `hit(p)` without the zones the window at `p` is drawn in front of. When it belongs to float
+    /// `over` (it or its dialog), it covers the zones of every float behind it and every tile's.
+    /// Else (a tile-layer window) it covers the groups `covers` names, by their active tile: those
+    /// whose window ranks below it. No tile-layer window covers a float's zones. `focused`'s frame
+    /// is the bright, wider one, as drawn.
+    pub fn hit_seen(
+        &self,
+        p: (i32, i32),
+        over: Option<WinId>,
+        covers: impl Fn(WinId) -> bool,
+        focused: Option<WinId>,
+    ) -> Option<Hit> {
+        let hit = self.hit_where(p, covers, focused)?;
         let Some(over) = over else {
             return Some(hit);
         };
@@ -231,14 +244,30 @@ impl Layout {
     /// What the front-most shown float under `p` (its bar, window or band) takes it as: a button,
     /// the rest of its bar, an edge or corner, or `None` inside its window. `None` if no float is
     /// there.
-    pub(super) fn float_hit(&self, p: (i32, i32)) -> Option<Option<Hit>> {
+    pub(super) fn float_hit(&self, p: (i32, i32), focused: Option<WinId>) -> Option<Option<Hit>> {
         let floats = self.floats().into_iter().filter_map(|id| self.tile(id));
         let mut shown = floats.filter(|t| self.visible(t.id) && !t.fullscreen);
         shown.find_map(|f| {
             let (o, r) = self.frame(f.id)?;
-            // A cut-off corner shows, and gives the pointer to, what is behind.
+            // A cut-off corner shows, and gives the pointer to, what is behind, but for the px
+            // its frame is drawn over: those are a corner of the float's.
             if self.cut_off(f.id, p) {
-                return None;
+                let px = super::drag::frame_px(focused == Some(f.id));
+                let (_, ring) = self.frame_ring(f.id, px)?;
+                if !ring.shape.contains(p) {
+                    return None;
+                }
+                let x = if p.0 < o.x + o.w / 2 {
+                    Side::Left
+                } else {
+                    Side::Right
+                };
+                let y = if p.1 < o.y + o.h / 2 {
+                    Side::Top
+                } else {
+                    Side::Bottom
+                };
+                return Some(Some(Hit::Corner(f.id, x, y)));
             }
             if r.contains(p) {
                 return Some(None);

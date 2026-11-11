@@ -2360,8 +2360,14 @@ mod tests {
         for x in (outer.x..outer.x + outer.w).step_by(7) {
             for y in (outer.y..outer.y + outer.h).step_by(5) {
                 let hit = l.hit((x, y));
+                // A rounded corner's frame px are a corner of the float's.
+                let framed =
+                    l.cut_off(f, (x, y)) && matches!(hit, Some(Hit::Corner(id, ..)) if id == f);
                 assert!(
-                    hit.is_none_or(|h| matches!(h, Hit::Button(id, _) | Hit::Strip(id) if id == f)),
+                    framed
+                        || hit.is_none_or(
+                            |h| matches!(h, Hit::Button(id, _) | Hit::Strip(id) if id == f)
+                        ),
                     "{hit:?}"
                 );
             }
@@ -3173,7 +3179,14 @@ mod tests {
         assert_eq!(c((right - 32, bottom)), Some(Hit::Edge(f, Side::Bottom)));
         for x in (r.x..r.x + r.w).step_by(7) {
             for y in (r.y..r.y + r.h).step_by(5) {
-                assert_eq!(l.hit((x, y)), None, "({x}, {y}) is the client's");
+                // But a rounded corner's frame px, a corner of the float's.
+                let want = match l.cut_off(f, (x, y)) {
+                    true => l
+                        .hit((x, y))
+                        .filter(|h| matches!(h, Hit::Corner(id, ..) if *id == f)),
+                    false => None,
+                };
+                assert_eq!(l.hit((x, y)), want, "({x}, {y}) is the client's");
             }
         }
         // A band px over a tile's client, and over a tile's edge zone.
@@ -4013,7 +4026,7 @@ mod tests {
         [(r.x, r.y), (x1, r.y), (x1, y1), (r.x, y1)]
     }
 
-    /// Job 031 AC2: a tile's and a float's outline: the window alone rounded, or bar and window
+    /// AC2: a tile's and a float's outline: the window alone rounded, or bar and window
     /// with the window's top corners square; maximized rounded, fullscreen none; frames ring it.
     #[test]
     fn rounded_outlines() {
@@ -4086,8 +4099,9 @@ mod tests {
         assert!(s.contains(tl) && s.contains(tr) && !s.contains(br) && !s.contains(bl));
     }
 
-    /// Job 031 AC3: a bar's cut-off corners are no zone of its tile, one px inside the arc is;
-    /// a float's cut-off corners are not the float's. Corner and edge zones are unchanged
+    /// AC3: a bar's cut-off corners are no zone of its tile, one px inside the arc is;
+    /// a float's cut-off corners are not the float's, but where its frame is drawn. Corner and
+    /// edge zones are unchanged
     /// (their tests run unmodified).
     #[test]
     fn rounded_bar_corners_are_no_zone() {
@@ -4121,6 +4135,20 @@ mod tests {
             assert!(l.hit(p).is_none_or(|h| h.id() != f), "{p:?}");
         }
         assert_eq!(l.hit((o.x + 3, o.y + 3)), Some(Hit::Strip(f)));
+        // Its frame is drawn over part of a cut-off corner, out to the ring's outer arc (10 + 2
+        // px focused, 10 + 1 dim): those px are a corner of the float's, not what is behind.
+        let (x1, y1) = (o.x + o.w - 1, o.y + o.h - 1);
+        let seen = |p, focused| l.hit_seen(p, None, |_| false, focused);
+        let corner = Some(Hit::Corner(f, Side::Right, Side::Bottom));
+        for focused in [Some(f), None] {
+            assert_eq!(seen((x1 - 2, y1 - 2), focused), corner, "{focused:?}");
+            assert!(seen((x1, y1), focused).is_none_or(|h| h.id() != f));
+        }
+        assert_eq!(seen((x1, y1 - 3), Some(f)), corner, "on the bright frame");
+        assert!(
+            seen((x1, y1 - 3), None).is_none_or(|h| h.id() != f),
+            "past the dim frame"
+        );
         let x1 = o.x + o.w - 1;
         assert_eq!(
             l.hit((x1 - 3, o.y + 3)),
@@ -4128,7 +4156,7 @@ mod tests {
         );
     }
 
-    /// Job 031 AC4: a window's surfaces and popups take input only inside its outline; a popup's
+    /// AC4: a window's surfaces and popups take input only inside its outline; a popup's
     /// bound only loses its cut-off corner px.
     #[test]
     fn popups_are_cut_to_their_owners_outline() {
