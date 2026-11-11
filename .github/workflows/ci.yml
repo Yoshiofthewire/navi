@@ -43,7 +43,7 @@ jobs:
           navi_test_daemon=$(bash scripts/build-oo7-test.sh)
           python3 scripts/check-secrets.py --daemon "$navi_test_daemon" --nm-applet /usr/bin/nm-applet --xvfb /usr/bin/Xvfb --output "$RUNNER_TEMP/navi-secrets-check"
       - name: Settings model checks
-        run: python3 -m unittest discover -s src/settings -p 'test_*.py'
+        run: python3 -X faulthandler -m unittest discover -s src/settings -p 'test_*.py'
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked

@@ -25,5 +25,7 @@
 ## Verification
 
 `python3 -m unittest discover -s src/settings -p 'test_*.py'` exercises search, credential profiles, audio commands, pairing registration,
-actual private-socket exchange and system summary. Verify rendered pages inside an isolated Navi
+actual private-socket exchange and system summary. Run it with `python3 -X faulthandler`, as CI does. Never import
+Gtk in the test process: it starts Pango's fontconfig thread, which crashes against tests that
+change `os.environ`. The GTK 4 widget-API check runs in a child process. Verify rendered pages inside an isolated Navi
 instance without changing host devices, application defaults, credentials or power state.
