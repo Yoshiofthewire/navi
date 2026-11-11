@@ -4,9 +4,10 @@ use std::collections::HashMap;
 
 mod bar;
 mod drag;
+mod float;
 mod memory;
 pub use bar::{Button, Decor, decoration};
-pub use drag::{Action, Done, Drag, EdgeClicks, Nudge, Side, buttons, float_overlay, overlay};
+pub use drag::{Action, Done, Drag, EdgeClicks, Hit, Nudge, Side, buttons, float_overlay, overlay};
 use memory::MAX_PX;
 pub use memory::safe;
 
@@ -186,6 +187,8 @@ pub struct Tile {
     pub hints: Hints,
     /// Too big for any tile: centred above the tiles, holding no cells.
     pub floating: bool,
+    /// A float's window rect once the user moved or resized it; never remembered.
+    pub user_rect: Option<Rect>,
 }
 
 impl Tile {
@@ -313,6 +316,7 @@ impl Layout {
         for name in new {
             self.return_home(&name);
         }
+        self.pin_floats();
     }
 
     /// Tiles whose home is `output` go back to their cells there, by id, where nothing else is.
@@ -343,6 +347,7 @@ impl Layout {
                 t.output = output.to_string();
                 t.cells = cells;
                 t.floating = false;
+                t.user_rect = None;
                 t.maximized = false;
                 t.fullscreen = false;
                 back.push(id);
@@ -382,6 +387,7 @@ impl Layout {
                     Some((output, cells, _)) => (output.clone(), *cells, false),
                     None => (main.name.clone(), Cells::default(), true),
                 };
+                t.user_rect = None;
                 t.maximized = false;
                 t.fullscreen = false;
             }
@@ -450,7 +456,9 @@ impl Layout {
             return Fit::Unchanged;
         };
         t.hints = hints;
-        self.refit(id)
+        let fit = self.refit(id);
+        self.pin_floats();
+        fit
     }
 
     /// Whether the app asked navi to draw its controls. A tile whose window no longer fits below
@@ -515,24 +523,20 @@ impl Layout {
             Some((output, cells, _)) => (output.clone(), *cells, false),
             None => (here.name.clone(), Cells::default(), true),
         };
+        // A float that stays one keeps the user's rect, clamped to its new hints.
+        t.user_rect = t.user_rect.filter(|_| spot.is_none());
         t.maximized = false;
         t.fullscreen = false;
         self.tiles.insert(i, t);
         spot
     }
 
-    /// A float's window, below its bar: its wanted size, centred in its output's area,
-    /// `FLOAT_MARGIN` from its edges. Where that's below the app's minimum it takes what the
-    /// minimum needs of the whole output, past the panels (which stay on top), but its bar never
-    /// goes above the area, so its buttons stay in reach.
+    /// A float's window, below its bar: the user's rect if it has one (see `placed_float`), else
+    /// its wanted size, centred in its bounds. Where that's below the app's minimum it takes what
+    /// the minimum needs of the whole output, past the panels (which stay on top), but its bar
+    /// never goes above the area, so its buttons stay in reach.
     fn float_rect(&self, t: &Tile, o: &Output) -> Rect {
-        let (f, m) = (o.full, FLOAT_MARGIN);
-        let a = Rect {
-            x: o.area.x + m,
-            y: o.area.y + m,
-            w: (o.area.w - 2 * m).max(1),
-            h: (o.area.h - 2 * m).max(1),
-        };
+        let (f, a) = (o.full, float::bounds(o));
         let need = self.need_for(&t.app, t.hints, true, (a.w / 2, a.h));
         let (min_w, min_h) = t.hints.min;
         let bottom = f.y + f.h;
@@ -548,12 +552,13 @@ impl Layout {
             true => a.y + (a.h - outer) / 2,
             false => a.y.min(bottom - outer).max(o.area.y),
         };
-        Rect {
+        let centred = Rect {
             x,
             y: top + BAR,
             w,
             h,
-        }
+        };
+        float::placed(t, o, centred)
     }
 
     /// `id` floats with a minimum bigger than its output can show, so part of it is cut.
@@ -1105,7 +1110,7 @@ fn dist2((ax, ay): (i32, i32), (bx, by): (i32, i32)) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layout::{Action, Button, Done};
+    use crate::layout::{Action, Button, Done, float_overlay};
     use drag::Hit;
 
     fn out(name: &str, x: i32, y: i32, w: i32, h: i32, priority: u32) -> Output {
@@ -2072,7 +2077,7 @@ mod tests {
             for y in (outer.y..outer.y + outer.h).step_by(5) {
                 let hit = l.hit((x, y));
                 assert!(
-                    hit.is_none_or(|h| matches!(h, Hit::Button(id, _) if id == f)),
+                    hit.is_none_or(|h| matches!(h, Hit::Button(id, _) | Hit::Strip(id) if id == f)),
                     "{hit:?}"
                 );
             }
@@ -2444,5 +2449,1006 @@ mod tests {
                 }
             }
         }
+    }
+
+    // Floating windows (job 019).
+
+    use crate::layout::EdgeClicks;
+    use float::{FLOAT_EDGE, bounds};
+
+    /// Tiles whose client minimum blocks 017's shrink on the ultrawide under its panels: 11
+    /// columns each, and too tall for a tab's bar.
+    const BLOCK: (i32, i32) = (1500, 1300);
+
+    /// The ultrawide under its panels (plus `more`), two blocking halves, and a float of `hints`
+    /// placed from the middle: 017 AC4's fixed window when `hints` is `fixed()`.
+    fn blocked(more: Vec<Output>, hints: Hints) -> (Layout, [WinId; 2], WinId) {
+        let mut outputs = vec![uw_panels()];
+        outputs.extend(more);
+        let mut l = layout(outputs);
+        let (a, _) = l.place("a", (100, 100)).unwrap();
+        let (b, _) = l.place("b", (3400, 100)).unwrap();
+        for id in [a, b] {
+            assert_eq!(l.set_hints(id, BLOCK, (0, 0)), Fit::Fits);
+        }
+        let (f, step) = l.place_with("upd", (1720, 600), hints, true).unwrap();
+        assert_eq!(step, Step::Floating);
+        (l, [a, b], f)
+    }
+
+    /// A float that can grow and shrink: at least 1220 x 600, no max.
+    fn sizable() -> Hints {
+        Hints::new(FIXED, (0, 0))
+    }
+
+    /// `blocked` with a `sizable` float shrunk to its minimum by the keyboard, then moved
+    /// three cells down: room on every side.
+    fn blocked_small() -> (Layout, [WinId; 2], WinId) {
+        let (mut l, tiles, f) = blocked(vec![], sizable());
+        for side in [Side::Right, Side::Bottom] {
+            while l.keyboard_adjust(f, side, Nudge::Shrink).is_ok() {}
+        }
+        for _ in 0..3 {
+            l.keyboard_adjust(f, Side::Bottom, Nudge::Move).unwrap();
+        }
+        assert_eq!(l.clip(f).map(|r| (r.w, r.h)), Some(FIXED));
+        (l, tiles, f)
+    }
+
+    fn outer_of(l: &Layout, id: WinId) -> Rect {
+        l.frame(id).unwrap().0
+    }
+
+    fn bounds_of(l: &Layout, id: WinId) -> Rect {
+        bounds(l.output(&l.tile(id).unwrap().output).unwrap())
+    }
+
+    fn tiles_cells(l: &Layout) -> Vec<(WinId, String, Cells, bool)> {
+        let t = l.tiles.iter().filter(|t| !t.floating);
+        t.map(|t| (t.id, t.output.clone(), t.cells, t.floating))
+            .collect()
+    }
+
+    fn shift(r: Rect, dx: i32, dy: i32) -> Rect {
+        Rect {
+            x: r.x + dx,
+            y: r.y + dy,
+            ..r
+        }
+    }
+
+    /// Presses at `from`, moves through `path`, releases at its last point.
+    fn float_drag(l: &mut Layout, from: (i32, i32), path: &[(i32, i32)]) -> Option<Done> {
+        let mut d = Drag::press(l, from).expect("a float zone");
+        for &p in path {
+            d.motion(l, p, 0);
+            assert_floats_contained(l);
+        }
+        let last = *path.last().unwrap_or(&from);
+        let done = d.release(l, last, 0);
+        assert_floats_contained(l);
+        done
+    }
+
+    /// AC8: every float that fits has its outer rect inside its bounds and its clip inside the
+    /// area; no tile's clip or zones overlap another tile's.
+    fn assert_floats_contained(l: &Layout) {
+        for t in l.tiles.iter().filter(|t| t.floating && !t.fullscreen) {
+            let o = l.output(&t.output).unwrap();
+            let b = bounds(o);
+            let (outer, clip) = (outer_of(l, t.id), l.clip(t.id).unwrap());
+            let min = (t.hints.min.0.max(MIN_W), t.hints.min.1.max(MIN_H));
+            if min.0 <= b.w && min.1 + BAR <= b.h {
+                assert!(inside(outer, b), "{t:?}: {outer:?} outside {b:?}");
+                assert!(inside(clip, o.area), "{t:?}");
+                assert!(clip.w >= min.0 && clip.h >= min.1, "{t:?}: {clip:?}");
+                for (v, max) in [(clip.w, t.hints.max.0), (clip.h, t.hints.max.1)] {
+                    assert!(max == 0 || v <= max, "{t:?}: {clip:?}");
+                }
+            }
+            assert!(outer.y >= o.area.y, "{t:?}: its bar above the area");
+        }
+        let shown: Vec<&Tile> = l
+            .tiles
+            .iter()
+            .filter(|t| l.visible(t.id) && !t.floating)
+            .collect();
+        for t in &shown {
+            let clip = l.clip(t.id).unwrap();
+            for u in shown.iter().filter(|u| u.id != t.id) {
+                assert!(!overlaps(clip, l.clip(u.id).unwrap()), "{t:?} {u:?}");
+                let zones = [Side::Left, Side::Right, Side::Top, Side::Bottom]
+                    .map(|s| Hit::Edge(u.id, s))
+                    .into_iter()
+                    .chain([Hit::Strip(u.id)]);
+                for z in zones.filter_map(|h| l.zone(h)) {
+                    assert!(!overlaps(clip, z), "{t:?} {u:?} {z:?}");
+                }
+            }
+        }
+    }
+
+    /// Round 1 (security probe): one float order. A rear float's bar and buttons under the
+    /// front window are drawn below it and take no clicks; focusing the rear float swaps both.
+    #[test]
+    fn floats_draw_hit_and_raise_in_one_order() {
+        let (mut l, [a, _], f) = blocked(vec![], fixed());
+        let (g, _) = l.place_with("upd2", (1720, 600), fixed(), true).unwrap();
+        for _ in 0..3 {
+            l.keyboard_adjust(f, Side::Left, Nudge::Move).unwrap();
+        }
+        for _ in 0..2 {
+            l.keyboard_adjust(f, Side::Bottom, Nudge::Move).unwrap();
+        }
+        assert_eq!(l.floats(), [g, f], "front first");
+        let front = l.clip(g).unwrap();
+        let rear_bar = l.bar(f).unwrap();
+        let close = rear_bar.buttons[2].1;
+        let x = (close.x + close.w / 2, close.y + close.h / 2);
+        assert!(front.contains(x), "the rear ✕ lies under the front window");
+        assert_eq!(l.hit(x), None, "the front window's client, not the rear ✕");
+        // Render draws each float's decorations right above its window, front float first.
+        let drawn: Vec<WinId> = float_overlay(&l, None, (0, 0), None)
+            .into_iter()
+            .map(|(id, ..)| id)
+            .collect();
+        let last_g = drawn.iter().rposition(|&id| id == g).unwrap();
+        assert!(drawn[..=last_g].iter().all(|&id| id == g), "{drawn:?}");
+        assert!(drawn[last_g + 1..].iter().all(|&id| id == f), "{drawn:?}");
+
+        // Focusing the rear float brings it in front for drawing and hits alike.
+        assert!(l.raise(f));
+        assert!(!l.raise(f), "already in front");
+        assert!(!l.raise(a), "tiles don't take part");
+        assert_eq!(l.floats(), [f, g]);
+        let strip = (
+            rear_bar.rect.x + rear_bar.rect.w - 300,
+            rear_bar.rect.y + 12,
+        );
+        assert!(front.contains(strip));
+        assert_eq!(l.hit(strip), Some(Hit::Strip(f)));
+        assert_eq!(l.hit(x), Some(Hit::Button(f, Button::Close)));
+        let g_bar = l.bar(g).unwrap().rect;
+        let under = (g_bar.x + 10, g_bar.y + 12);
+        if l.clip(f).unwrap().contains(under) {
+            assert_eq!(l.hit(under), None);
+        }
+        let drawn: Vec<WinId> = float_overlay(&l, None, (0, 0), None)
+            .into_iter()
+            .map(|(id, ..)| id)
+            .collect();
+        assert_eq!(drawn.first(), Some(&f));
+    }
+
+    /// Round 3 (PR audit): a front float's dialog, larger than its window, drawn over the rear
+    /// float's ✕ and band, covers them: no navi zone there, so the pointer goes to the dialog
+    /// (`Navi::zone_at` passes the float of the window under the pointer as `over`).
+    #[test]
+    fn floats_dialog_in_front_covers_the_zones_behind_it() {
+        let (mut l, [a, _], f) = blocked(vec![], fixed());
+        let (g, _) = l.place_with("upd2", (1720, 600), fixed(), true).unwrap();
+        for _ in 0..3 {
+            l.keyboard_adjust(g, Side::Left, Nudge::Move).unwrap();
+        }
+        assert_eq!(l.floats(), [g, f]);
+        let (front, rear) = (l.clip(g).unwrap(), outer_of(&l, f));
+        let close = l.bar(f).unwrap().buttons[2].1;
+        let x = (close.x + close.w / 2, close.y + close.h / 2);
+        let band = (rear.x + rear.w + 3, rear.y + rear.h / 2);
+        // A dialog of g centred on it, wider than it, reaching over f's ✕ and right band.
+        let dialog = Rect::new(
+            front.x - 300,
+            front.y - 40,
+            front.w + 600 + 2 * 300,
+            front.h,
+        );
+        for p in [x, band] {
+            assert!(!front.contains(p) && dialog.contains(p), "{p:?}");
+            assert!(
+                l.hit(p).is_some_and(|h| h.id() == f),
+                "f's zone without the dialog"
+            );
+            assert_eq!(
+                l.hit_under(p, Some(g)),
+                None,
+                "the dialog is in front: {p:?}"
+            );
+            assert_eq!(l.hit_under(p, None), l.hit(p), "no window there: f's zone");
+            assert_eq!(
+                l.hit_under(p, Some(f)),
+                l.hit(p),
+                "f's own window doesn't cover it"
+            );
+        }
+        // A float's window or dialog also covers every tile zone.
+        let a_right = l.zone(Hit::Edge(a, Side::Right)).unwrap();
+        let p = (a_right.x + 1, front.y + front.h + 40);
+        assert_eq!(l.hit(p), Some(Hit::Edge(a, Side::Right)));
+        assert_eq!(l.hit_under(p, Some(f)), None);
+        // A rear float's dialog never covers the front float's zones.
+        let g_bar = (front.x + 40, front.y - 12);
+        assert_eq!(l.hit(g_bar), Some(Hit::Strip(g)));
+        assert_eq!(l.hit_under(g_bar, Some(f)), Some(Hit::Strip(g)));
+        // Focus brings f in front; then its zones take the point back from g's dialog.
+        assert!(l.raise(f));
+        assert_eq!(l.hit_under(x, Some(g)), Some(Hit::Button(f, Button::Close)));
+    }
+
+    /// Round 1 (security probe): unplugging the monitor under a float drag leaves the float on a
+    /// live monitor, whether the drag is cancelled or released.
+    #[test]
+    fn unplug_mid_drag_keeps_the_float_on_a_live_monitor() {
+        for cancel in [true, false] {
+            // The laptop is left, too narrow for it: it stays a float there.
+            let lp = out("laptop", -1125, 600, 1125, 703, 1);
+            let (mut l, _, f) = blocked(vec![lp], fixed());
+            let start = outer_of(&l, f);
+            let from = (start.x + 300, start.y + 12);
+            let mut d = Drag::press(&l, from).unwrap();
+            d.motion(&mut l, (from.0 + 40, from.1 + 40), 0);
+            l.remove_output("uwp");
+            assert!(l.tile(f).unwrap().floating);
+            if cancel {
+                d.cancel(&mut l);
+            } else {
+                // Over the laptop, where 1220 px doesn't fit.
+                d.motion(&mut l, (-600, 900), 0);
+                d.release(&mut l, (-600, 900), 0);
+            }
+            let t = l.tile(f).unwrap();
+            assert!(l.output(&t.output).is_some(), "cancel={cancel}: {t:?}");
+            assert!(l.rect(f).is_some(), "cancel={cancel}");
+            assert_floats_contained(&l);
+        }
+    }
+
+    #[test]
+    fn ac1_float_zones() {
+        let (mut l, [a, _], f) = blocked(vec![], fixed());
+        let o = outer_of(&l, f);
+        let r = l.clip(f).unwrap();
+        let e = FLOAT_EDGE;
+        assert_eq!(e, 6);
+        assert_eq!(l.hit((o.x + 40, o.y + 10)), Some(Hit::Strip(f)), "the bar");
+        for (b, br) in l.bar(f).unwrap().buttons {
+            assert_eq!(l.hit((br.x + 12, br.y + 12)), Some(Hit::Button(f, b)));
+        }
+        let (mx, my) = (o.x + o.w / 2, o.y + o.h / 2);
+        for (p, side) in [
+            ((o.x - 1, my), Side::Left),
+            ((o.x - e, my), Side::Left),
+            ((o.x + o.w, my), Side::Right),
+            ((o.x + o.w + e - 1, my), Side::Right),
+            ((mx, o.y - 1), Side::Top),
+            ((mx, o.y - e), Side::Top),
+            ((mx, o.y + o.h), Side::Bottom),
+            ((mx, o.y + o.h + e - 1), Side::Bottom),
+        ] {
+            assert_eq!(l.hit(p), Some(Hit::Edge(f, side)), "{p:?}");
+        }
+        for p in [(o.x - e - 1, my), (mx, o.y - e - 1), (mx, o.y + o.h + e)] {
+            assert!(
+                l.hit(p).is_none_or(|h| h.id() != f),
+                "{p:?} outside the band"
+            );
+        }
+        // The 32 px of each band nearest a corner.
+        let (left, right, top, bottom) = (o.x - e, o.x + o.w + e - 1, o.y - e, o.y + o.h + e - 1);
+        for (x, sx) in [(left, Side::Left), (right, Side::Right)] {
+            for (y, sy) in [(top, Side::Top), (bottom, Side::Bottom)] {
+                assert_eq!(l.hit((x, y)), Some(Hit::Corner(f, sx, sy)));
+            }
+        }
+        let c = |p| l.hit(p);
+        assert_eq!(
+            c((left, top + 31)),
+            Some(Hit::Corner(f, Side::Left, Side::Top))
+        );
+        assert_eq!(c((left, top + 32)), Some(Hit::Edge(f, Side::Left)));
+        assert_eq!(
+            c((left, bottom - 31)),
+            Some(Hit::Corner(f, Side::Left, Side::Bottom))
+        );
+        assert_eq!(c((left, bottom - 32)), Some(Hit::Edge(f, Side::Left)));
+        assert_eq!(
+            c((left + 31, top)),
+            Some(Hit::Corner(f, Side::Left, Side::Top))
+        );
+        assert_eq!(c((left + 32, top)), Some(Hit::Edge(f, Side::Top)));
+        assert_eq!(
+            c((right - 31, bottom)),
+            Some(Hit::Corner(f, Side::Right, Side::Bottom))
+        );
+        assert_eq!(c((right - 32, bottom)), Some(Hit::Edge(f, Side::Bottom)));
+        for x in (r.x..r.x + r.w).step_by(7) {
+            for y in (r.y..r.y + r.h).step_by(5) {
+                assert_eq!(l.hit((x, y)), None, "({x}, {y}) is the client's");
+            }
+        }
+        // A band px over a tile's client, and over a tile's edge zone.
+        let client = (o.x - 3, my);
+        assert!(l.clip(a).unwrap().contains(client));
+        assert_eq!(l.hit(client), Some(Hit::Edge(f, Side::Left)));
+        let a_right = l.zone(Hit::Edge(a, Side::Right)).unwrap();
+        let p = (a_right.x + 1, o.y - 3);
+        assert!(a_right.contains(p));
+        assert_eq!(l.hit(p), Some(Hit::Edge(f, Side::Top)));
+
+        // A hovered band lights in the float layer, above the tiles, and not below them.
+        let lit = crate::theme::rgba(crate::theme::ACCENT, 1.0);
+        let zone = l.zone(Hit::Edge(f, Side::Top)).unwrap();
+        assert!(float_overlay(&l, None, p, None).contains(&(f, zone, lit)));
+        assert!(
+            !overlay(&l, None, p, 0, None)
+                .iter()
+                .any(|&(r, k)| k == lit && overlaps(r, zone))
+        );
+        let corner = (left, top);
+        let glow = float_overlay(&l, None, corner, None);
+        for s in [Side::Left, Side::Top] {
+            assert!(
+                glow.contains(&(f, l.zone(Hit::Edge(f, s)).unwrap(), lit)),
+                "{s:?}"
+            );
+        }
+
+        // Two floats: the front one's window hides the rear one's zones under it.
+        let (g, step) = l.place_with("upd2", (1720, 600), fixed(), true).unwrap();
+        assert_eq!(step, Step::Floating);
+        for _ in 0..2 {
+            l.keyboard_adjust(f, Side::Right, Nudge::Move).unwrap();
+        }
+        let (rear, front) = (outer_of(&l, f), l.clip(g).unwrap());
+        let under = (rear.x - 3, rear.y + rear.h / 2);
+        assert!(front.contains(under));
+        assert_eq!(l.hit(under), None, "the front float's client");
+        let beyond = (rear.x + rear.w + 3, rear.y + rear.h / 2);
+        assert!(!outer_of(&l, g).contains(beyond));
+        assert_eq!(l.hit(beyond), Some(Hit::Edge(f, Side::Right)));
+        let bar = (rear.x + 100, rear.y + 5);
+        assert!(front.contains(bar) || outer_of(&l, g).contains(bar));
+        assert_ne!(l.hit(bar), Some(Hit::Strip(f)));
+
+        // Minimized or fullscreen: no zones, and the tile's show through again.
+        assert!(l.minimize(g) && l.minimize(f));
+        assert_eq!(l.hit(p), Some(Hit::Edge(a, Side::Right)));
+        assert!(l.activate(f));
+        assert_eq!(
+            l.hit((rear.x - 1, rear.y + 100)),
+            Some(Hit::Edge(f, Side::Left))
+        );
+        assert!(l.fullscreen(f));
+        for q in [(rear.x - 1, rear.y + 100), (rear.x + 40, rear.y + 10)] {
+            assert!(l.hit(q).is_none_or(|h| h.id() != f), "{q:?}");
+        }
+    }
+
+    #[test]
+    fn ac2_a_float_follows_its_bar() {
+        let (mut l, _, f) = blocked(vec![], fixed());
+        let (tiles, memory) = (tiles_cells(&l), l.memory_text());
+        let start = outer_of(&l, f);
+        let from = (start.x + 300, start.y + 12);
+        let grab = (from.0 - start.x, from.1 - start.y);
+        let mut d = Drag::press(&l, from).unwrap();
+        d.motion(&mut l, (from.0 + 5, from.1 + 5), 0);
+        assert_eq!(outer_of(&l, f), start, "under ARM_PX");
+        for (dx, dy) in [(120, 60), (121, 60), (-300, -200), (40, 300), (0, 1)] {
+            let p = (from.0 + dx, from.1 + dy);
+            d.motion(&mut l, p, 0);
+            let now = outer_of(&l, f);
+            assert_eq!(now, shift(start, dx, dy), "({dx}, {dy})");
+            assert_eq!((p.0 - now.x, p.1 - now.y), grab);
+        }
+        let b = bounds_of(&l, f);
+        let wild = [i32::MIN, -100_000, 0, 100_000, i32::MAX];
+        for x in wild {
+            for y in wild {
+                d.motion(&mut l, (x, y), 0);
+                let now = outer_of(&l, f);
+                assert!(inside(now, b), "({x}, {y}): {now:?}");
+                assert!(now.y >= l.output("uwp").unwrap().area.y + FLOAT_MARGIN);
+            }
+        }
+        let to = (from.0 + 120, from.1 + 60);
+        let Some(Done::Layout("float moved", moved)) = d.release(&mut l, to, 0) else {
+            panic!("not moved");
+        };
+        assert_eq!(moved.len(), 1);
+        assert_eq!(outer_of(&l, f), shift(start, 120, 60));
+        assert_eq!((tiles_cells(&l), l.memory_text()), (tiles, memory));
+        assert!(l.tile(f).unwrap().floating);
+
+        let was = outer_of(&l, f);
+        let from = (was.x + 300, was.y + 12);
+        let mut d = Drag::press(&l, from).unwrap();
+        d.motion(&mut l, (from.0 - 400, from.1 + 90), 0);
+        assert_ne!(outer_of(&l, f), was);
+        assert!(d.cancel(&mut l));
+        assert_eq!(outer_of(&l, f), was, "cancel puts it back");
+        // A click on the bar moves nothing.
+        assert_eq!(float_drag(&mut l, from, &[(from.0 + 3, from.1)]), None);
+        assert_eq!(outer_of(&l, f), was);
+    }
+
+    /// The rig at logical size: the laptop is 1125 x 703, narrower than a 1220 px float.
+    fn logical_rig() -> Vec<Output> {
+        vec![
+            out("4k", 0, -2160, 3840, 2160, 1),
+            out("laptop", -1125, 600, 1125, 703, 2),
+        ]
+    }
+
+    /// `blocked` with the 4K filled, so the float stays on the ultrawide.
+    fn blocked_rig() -> (Layout, [WinId; 2], WinId, WinId) {
+        let mut l = layout(vec![uw_panels()]);
+        l.set_outputs([vec![uw_panels()], logical_rig()].concat());
+        let k = Tile {
+            id: 50,
+            app: "full".into(),
+            output: "4k".into(),
+            cells: FULL,
+            ..Tile::default()
+        };
+        l.tiles.push(k);
+        l.next_id = 51;
+        let (a, _) = l.place("a", (100, 100)).unwrap();
+        let (b, _) = l.place("b", (3400, 100)).unwrap();
+        for id in [a, b] {
+            assert_eq!(l.set_hints(id, BLOCK, (0, 0)), Fit::Fits);
+        }
+        let (f, step) = l.place_with("upd", (1720, 600), fixed(), true).unwrap();
+        assert_eq!(step, Step::Floating);
+        assert_eq!(l.tile(f).unwrap().output, "uwp");
+        (l, [a, b], f, 50)
+    }
+
+    #[test]
+    fn ac3_a_float_moves_between_monitors_its_minimum_fits() {
+        let (mut l, _, f, full) = blocked_rig();
+        let start = outer_of(&l, f);
+        let from = (start.x + 300, start.y + 12);
+        // Over the laptop, narrower than 1220: it stops at the ultrawide's left bound.
+        let done = float_drag(&mut l, from, &[(-500, 900)]);
+        assert!(matches!(done, Some(Done::Layout("float moved", _))));
+        let (t, now) = (l.tile(f).unwrap(), outer_of(&l, f));
+        assert_eq!(t.output, "uwp");
+        assert_eq!(now.x, bounds_of(&l, f).x);
+
+        // Free cells on the 4K only: it stays floating.
+        l.remove(full);
+        assert!(l.tile_floats().is_empty());
+        assert!(l.tile(f).unwrap().floating);
+
+        let from = (now.x + 300, now.y + 12);
+        let done = float_drag(&mut l, from, &[(2000, -1000)]);
+        assert!(matches!(done, Some(Done::Layout("float moved", _))));
+        let t = l.tile(f).unwrap();
+        assert_eq!(t.output, "4k");
+        assert!(inside(outer_of(&l, f), bounds_of(&l, f)));
+        let (outer, grabbed) = (outer_of(&l, f), (2000 - 300, -1000 - 12));
+        assert_eq!(
+            (outer.x, outer.y),
+            grabbed,
+            "the grabbed point under the pointer"
+        );
+
+        let tiled = l.tile_floats();
+        assert_eq!(tiled.len(), 1);
+        let (id, output, k) = tiled[0].clone();
+        assert_eq!((id, output.as_str()), (f, "4k"));
+        assert!(k.cols >= 8 && k.rows >= 4, "{k:?}");
+        let t = l.tile(f).unwrap();
+        assert!(!t.floating && t.cells == k && t.user_rect.is_none());
+        assert_no_overlap(&l);
+    }
+
+    /// The `side` band's middle, or a corner's tip.
+    fn band(l: &Layout, f: WinId, hit: Hit) -> (i32, i32) {
+        let (o, e) = (outer_of(l, f), FLOAT_EDGE / 2);
+        let (mx, my) = (o.x + o.w / 2, o.y + o.h / 2);
+        let x = |s| {
+            if s == Side::Left {
+                o.x - e
+            } else {
+                o.x + o.w + e
+            }
+        };
+        let y = |s| {
+            if s == Side::Top {
+                o.y - e
+            } else {
+                o.y + o.h + e
+            }
+        };
+        let p = match hit {
+            Hit::Edge(_, s @ (Side::Left | Side::Right)) => (x(s), my),
+            Hit::Edge(_, s) => (mx, y(s)),
+            Hit::Corner(_, sx, sy) => (x(sx), y(sy)),
+            _ => unreachable!(),
+        };
+        assert_eq!(l.hit(p), Some(hit));
+        p
+    }
+
+    /// Left, top, right and bottom of a rect.
+    fn sides(r: Rect) -> [i32; 4] {
+        [r.x, r.y, r.x + r.w, r.y + r.h]
+    }
+
+    #[test]
+    fn ac4_a_float_resizes_by_its_band() {
+        let (mut l, _, f) = blocked_small();
+        let memory = l.memory_text();
+        let d = 37;
+        for (side, k, sign) in [
+            (Side::Left, 0, -1),
+            (Side::Top, 1, -1),
+            (Side::Right, 2, 1),
+            (Side::Bottom, 3, 1),
+        ] {
+            let start = l.clip(f).unwrap();
+            let x = matches!(side, Side::Left | Side::Right);
+            let p = band(&l, f, Hit::Edge(f, side));
+            let (dx, dy) = if x { (sign * d, 9) } else { (9, sign * d) };
+            let done = float_drag(&mut l, p, &[(p.0 + dx, p.1 + dy)]);
+            assert!(matches!(done, Some(Done::Layout("float resized", _))));
+            let (was, now) = (sides(start), sides(l.clip(f).unwrap()));
+            for i in 0..4 {
+                let want = if i == k { was[i] + sign * d } else { was[i] };
+                assert_eq!(now[i], want, "{side:?} side {i}");
+            }
+        }
+        for (sx, sy) in [
+            (Side::Left, Side::Top),
+            (Side::Right, Side::Top),
+            (Side::Left, Side::Bottom),
+            (Side::Right, Side::Bottom),
+        ] {
+            let was = sides(l.clip(f).unwrap());
+            let p = band(&l, f, Hit::Corner(f, sx, sy));
+            let (dx, dy) = (
+                if sx == Side::Left { -20 } else { 20 },
+                if sy == Side::Top { -15 } else { 15 },
+            );
+            float_drag(&mut l, p, &[(p.0 + dx, p.1 + dy)]);
+            let now = sides(l.clip(f).unwrap());
+            let (kx, ky) = (
+                if sx == Side::Left { 0 } else { 2 },
+                if sy == Side::Top { 1 } else { 3 },
+            );
+            for i in 0..4 {
+                let want = match i {
+                    _ if i == kx => was[i] + dx,
+                    _ if i == ky => was[i] + dy,
+                    _ => was[i],
+                };
+                assert_eq!(now[i], want, "{sx:?}{sy:?} side {i}");
+            }
+        }
+        assert_eq!(l.memory_text(), memory);
+
+        // Every path stops at the floor, the bounds and the max.
+        let b = bounds_of(&l, f);
+        for side in [Side::Left, Side::Right, Side::Top, Side::Bottom] {
+            let mut ends = [i32::MIN / 2, i32::MAX / 2];
+            if matches!(side, Side::Right | Side::Bottom) {
+                ends.reverse();
+            }
+            // Out to the bounds, then in to the floor.
+            for far in ends {
+                let p = band(&l, f, Hit::Edge(f, side));
+                let x = matches!(side, Side::Left | Side::Right);
+                let to = if x { (far, p.1) } else { (p.0, far) };
+                float_drag(&mut l, p, &[to]);
+                let r = l.clip(f).unwrap();
+                assert!(r.w >= FIXED.0 && r.h >= FIXED.1, "{side:?}: {r:?}");
+                assert!(inside(outer_of(&l, f), b));
+            }
+        }
+        let r = l.clip(f).unwrap();
+        assert_eq!((r.w, r.h), FIXED, "shrunk to the client minimum");
+
+        // No client minimum: navi's.
+        let mut l = layout(vec![uw_panels()]);
+        l.tiles.push(Tile {
+            id: 7,
+            app: "free".into(),
+            output: "uwp".into(),
+            floating: true,
+            ..Tile::default()
+        });
+        for side in [Side::Right, Side::Bottom] {
+            let p = band(&l, 7, Hit::Edge(7, side));
+            float_drag(&mut l, p, &[(p.0 - 5000, p.1 - 5000)]);
+        }
+        let r = l.clip(7).unwrap();
+        assert_eq!((r.w, r.h), (MIN_W, MIN_H));
+
+        // A max stops it; a fixed float doesn't change.
+        let max = Hints::new(FIXED, (1300, 650));
+        let (mut l, _, f) = blocked(vec![], max);
+        let p = band(&l, f, Hit::Corner(f, Side::Right, Side::Bottom));
+        float_drag(&mut l, p, &[(p.0 + 500, p.1 + 500)]);
+        let r = l.clip(f).unwrap();
+        assert_eq!((r.w, r.h), (1300, 650));
+        let (mut l, _, f) = blocked(vec![], fixed());
+        let was = l.clip(f).unwrap();
+        for hit in [
+            Hit::Edge(f, Side::Left),
+            Hit::Corner(f, Side::Right, Side::Bottom),
+        ] {
+            let p = band(&l, f, hit);
+            assert_eq!(float_drag(&mut l, p, &[(p.0 + 80, p.1 + 80)]), None);
+            assert_eq!(l.clip(f), Some(was));
+        }
+
+        // Double-clicking an edge fills that side to the bounds, or to the max.
+        for (hints, side) in [
+            (sizable(), Side::Right),
+            (max, Side::Left),
+            (sizable(), Side::Top),
+        ] {
+            let (mut l, _, f) = blocked(vec![], hints);
+            if hints == max {
+                l.keyboard_adjust(f, side, Nudge::Shrink).unwrap();
+            }
+            let (b, was) = (bounds_of(&l, f), outer_of(&l, f));
+            let mut clicks = EdgeClicks::default();
+            let p = band(&l, f, Hit::Edge(f, side));
+            let mut done = None;
+            for t in [0, 100] {
+                let d = Drag::press(&l, p).unwrap();
+                let edge = d.edge_click(&l, p);
+                assert_eq!(d.release(&mut l, p, t), None);
+                done = clicks.release(&mut l, edge, p, t);
+            }
+            assert!(
+                matches!(done, Some(Done::Layout("float resized", _))),
+                "{done:?}"
+            );
+            let now = outer_of(&l, f);
+            match (side, hints == max) {
+                (Side::Right, _) => assert_eq!((now.x, now.x + now.w), (was.x, b.x + b.w)),
+                (Side::Left, true) => {
+                    assert_eq!((now.x + now.w, now.w), (was.x + was.w, 1300));
+                }
+                _ => assert_eq!((now.y, now.y + now.h), (b.y, was.y + was.h)),
+            }
+        }
+
+        // Cancel restores.
+        let (mut l, _, f) = blocked(vec![], sizable());
+        let was = outer_of(&l, f);
+        let p = band(&l, f, Hit::Edge(f, Side::Right));
+        let mut d = Drag::press(&l, p).unwrap();
+        d.motion(&mut l, (p.0 + 100, p.1), 0);
+        assert_eq!(outer_of(&l, f).w, was.w + 100);
+        assert!(d.cancel(&mut l));
+        assert_eq!(outer_of(&l, f), was);
+    }
+
+    #[test]
+    fn ac5_keyboard_moves_and_resizes_a_float_by_cells() {
+        let (mut l, _, f) = blocked_small();
+        let (tiles, memory) = (tiles_cells(&l), l.memory_text());
+        let o = uw_panels();
+        let (cw, ch) = (o.cell_w(), o.cell_h());
+        let b = bounds_of(&l, f);
+        let mut steps = Vec::new();
+        loop {
+            let was = outer_of(&l, f);
+            match l.keyboard_adjust(f, Side::Right, Nudge::Move) {
+                Ok(Done::Layout("float moved", _)) => steps.push(outer_of(&l, f).x - was.x),
+                Ok(other) => panic!("{other:?}"),
+                Err(why) => {
+                    assert_eq!(why, "monitor edge");
+                    break;
+                }
+            }
+            assert_eq!(outer_of(&l, f).w, was.w);
+        }
+        let (last, full) = steps.split_last().unwrap();
+        assert!(
+            full.iter().all(|&s| s == cw) && *last <= cw && *last > 0,
+            "{steps:?}"
+        );
+        assert_eq!(outer_of(&l, f).x + outer_of(&l, f).w, b.x + b.w);
+        // Moving up.
+        let was = outer_of(&l, f);
+        l.keyboard_adjust(f, Side::Top, Nudge::Move).unwrap();
+        assert_eq!(outer_of(&l, f), shift(was, 0, -ch));
+
+        // Grow left to the bounds, shrink it back to the floor.
+        loop {
+            let was = outer_of(&l, f);
+            match l.keyboard_adjust(f, Side::Left, Nudge::Grow) {
+                Ok(_) => {
+                    let now = outer_of(&l, f);
+                    assert_eq!(now.x + now.w, was.x + was.w, "the right side stays");
+                    assert!(now.w - was.w == cw || now.x == b.x);
+                }
+                Err(why) => {
+                    assert_eq!(why, "monitor edge");
+                    break;
+                }
+            }
+        }
+        assert_eq!(outer_of(&l, f).x, b.x);
+        loop {
+            let was = outer_of(&l, f);
+            match l.keyboard_adjust(f, Side::Left, Nudge::Shrink) {
+                Ok(Done::Layout("float resized", _)) => {
+                    let now = outer_of(&l, f);
+                    assert!(now.w == was.w - cw || now.w == FIXED.0, "{now:?}");
+                }
+                Ok(other) => panic!("{other:?}"),
+                Err(why) => {
+                    assert_eq!(why, "float at minimum");
+                    break;
+                }
+            }
+        }
+        assert_eq!(l.clip(f).unwrap().w, FIXED.0);
+        assert_eq!((tiles_cells(&l), l.memory_text()), (tiles, memory));
+
+        // A max stops growth there.
+        let (mut l, _, f) = blocked(vec![], Hints::new(FIXED, (1300, 650)));
+        assert_eq!(l.clip(f).unwrap().h, 650, "its wanted size is its max");
+        assert!(l.keyboard_adjust(f, Side::Bottom, Nudge::Shrink).is_ok());
+        assert_eq!(
+            l.clip(f).unwrap().h,
+            FIXED.1,
+            "less than a cell to the floor"
+        );
+        assert!(l.keyboard_adjust(f, Side::Bottom, Nudge::Grow).is_ok());
+        assert_eq!(l.clip(f).unwrap().h, 650);
+        assert_eq!(
+            l.keyboard_adjust(f, Side::Bottom, Nudge::Grow),
+            Err("float at maximum")
+        );
+        let (mut l, _, f) = blocked(vec![], fixed());
+        assert_eq!(
+            l.keyboard_adjust(f, Side::Right, Nudge::Grow),
+            Err("float at maximum")
+        );
+        assert_eq!(
+            l.keyboard_adjust(f, Side::Right, Nudge::Shrink),
+            Err("float at minimum")
+        );
+        assert!(l.minimize(f));
+        for op in [Nudge::Move, Nudge::Grow, Nudge::Shrink] {
+            assert_eq!(
+                l.keyboard_adjust(f, Side::Left, op),
+                Err("not a shown tile")
+            );
+        }
+        assert!(l.activate(f) && l.fullscreen(f));
+        assert_eq!(
+            l.keyboard_adjust(f, Side::Left, Nudge::Move),
+            Err("not a shown tile")
+        );
+    }
+
+    #[test]
+    fn ac6_the_user_rect_survives_until_the_float_tiles_or_its_output_goes() {
+        let (mut l, [a, b], f) = blocked_small();
+        let p = (outer_of(&l, f).x + 300, outer_of(&l, f).y + 12);
+        float_drag(&mut l, p, &[(p.0 - 200, p.1 + 100)]);
+        let e = band(&l, f, Hit::Edge(f, Side::Right));
+        float_drag(&mut l, e, &[(e.0 + 60, e.1)]);
+        let kept = l.clip(f).unwrap();
+        assert!(l.tile(f).unwrap().user_rect.is_some());
+
+        // Tiles shrink and grow, a window opens and closes: none of it tiles the float.
+        l.keyboard_adjust(a, Side::Right, Nudge::Shrink).unwrap();
+        assert!(l.tile_floats().is_empty());
+        let (c, _) = l.place("c", (100, 100)).unwrap();
+        assert!(l.tile_floats().is_empty());
+        l.remove(c);
+        l.keyboard_adjust(a, Side::Right, Nudge::Grow).unwrap();
+        assert!(l.tile_floats().is_empty());
+        assert_eq!(l.clip(f), Some(kept));
+
+        // New hints: up to the min, down to the max, the top-left kept.
+        assert_eq!(l.set_hints(f, (1400, 700), (0, 0)), Fit::Floated);
+        let r = l.clip(f).unwrap();
+        assert_eq!(
+            r,
+            Rect {
+                w: 1400,
+                h: 700,
+                ..kept
+            }
+        );
+        assert_eq!(l.set_hints(f, FIXED, (1250, 620)), Fit::Floated);
+        let r = l.clip(f).unwrap();
+        assert_eq!(
+            r,
+            Rect {
+                w: 1250,
+                h: 620,
+                ..kept
+            }
+        );
+        // Near the bounds' right, a bigger min keeps it inside.
+        let p = (outer_of(&l, f).x + 300, outer_of(&l, f).y + 12);
+        float_drag(&mut l, p, &[(i32::MAX, p.1)]);
+        assert_eq!(l.set_hints(f, (1600, 700), (0, 0)), Fit::Floated);
+        let bd = bounds_of(&l, f);
+        let o = outer_of(&l, f);
+        assert_eq!((o.x + o.w, o.w), (bd.x + bd.w, 1600));
+
+        // A taller band re-clamps it.
+        let mut short = uw_panels();
+        short.area = Rect {
+            y: 400,
+            h: 932,
+            ..short.area
+        };
+        float_drag(&mut l, (o.x + 300, o.y + 12), &[(o.x + 300, i32::MIN)]);
+        l.set_outputs(vec![short.clone()]);
+        assert!(inside(outer_of(&l, f), bounds(&short)));
+        assert_eq!(outer_of(&l, f).y, short.area.y + FLOAT_MARGIN);
+
+        // Tiled, then floating again: centred.
+        l.set_outputs(vec![uw_panels()]);
+        l.remove(b);
+        assert_eq!(l.tile_floats().len(), 1);
+        assert!(l.tile(f).unwrap().user_rect.is_none());
+        assert_eq!(l.set_hints(f, BLOCK, (0, 0)), Fit::Floated);
+        let (o, bd) = (outer_of(&l, f), bounds_of(&l, f));
+        assert!((o.x - bd.x - (bd.x + bd.w - o.x - o.w)).abs() <= 1, "{o:?}");
+        assert!(l.tile(f).unwrap().user_rect.is_none());
+
+        // Unplugged: 017's centring on the remaining output, here too narrow for it.
+        let lp = out("laptop", -1125, 600, 1125, 703, 1);
+        let (mut l, _, f) = blocked(vec![lp.clone()], fixed());
+        let p = (outer_of(&l, f).x + 300, outer_of(&l, f).y + 12);
+        float_drag(&mut l, p, &[(p.0 + 500, p.1 + 200)]);
+        l.remove_output("uwp");
+        let t = l.tile(f).unwrap().clone();
+        assert!(
+            t.floating && t.output == "laptop" && t.user_rect.is_none(),
+            "{t:?}"
+        );
+        let mut fresh = layout(vec![lp.clone()]);
+        let (g, _) = fresh.place_with("upd", (-500, 900), fixed(), true).unwrap();
+        assert_eq!(l.clip(f), fresh.clip(g));
+        let o = outer_of(&l, f);
+        assert_eq!(
+            (o.x, o.w),
+            (lp.full.x, lp.full.w),
+            "017's cut: the monitor's width"
+        );
+    }
+
+    #[test]
+    fn ac7_floats_tile_when_room_frees() {
+        let (mut l, [a, b], f) = blocked(vec![], fixed());
+        let before = (l.tiles.clone(), l.memory.clone(), l.clock, l.memory_text());
+        for _ in 0..1000 {
+            assert!(l.tile_floats().is_empty());
+        }
+        assert_eq!(
+            (l.tiles.clone(), l.memory.clone(), l.clock, l.memory_text()),
+            before
+        );
+
+        let centre = outer_of(&l, f).center();
+        let a_was = cells_of(&l, a);
+        l.remove(b);
+        let tiled = l.tile_floats();
+        assert_eq!(tiled.len(), 1);
+        let (id, output, k) = tiled[0].clone();
+        assert_eq!((id, output.as_str()), (f, "uwp"));
+        assert!(k.cols >= 9 && k.rows >= 6, "{k:?}");
+        let o = uw_panels();
+        let d = dist2(o.cells_rect(k).center(), centre);
+        let mut rest = l.tiles.clone();
+        rest.retain(|t| t.id != f);
+        let others = Layout {
+            tiles: rest,
+            ..Layout::default()
+        };
+        for c in spots(k.cols, k.rows).filter(|&c| others.is_free("uwp", c)) {
+            assert!(
+                dist2(o.cells_rect(c).center(), centre) >= d,
+                "{c:?} is nearer"
+            );
+        }
+        assert!(!k.overlaps(&cells_of(&l, a)));
+        assert_eq!(cells_of(&l, a), a_was);
+        let t = l.tile(f).unwrap();
+        assert!(!t.floating && t.cells == k);
+        assert_eq!(l.memory["upd"].cells, k);
+        assert_eq!(l.rect(f).map(|r| (r.w, r.h)), Some(FIXED));
+        assert_no_overlap(&l);
+        assert!(l.tile_floats().is_empty(), "tiled once");
+
+        // Minimized or fullscreen floats wait; restoring is a layout event.
+        let (mut l, [_, b], f) = blocked(vec![], fixed());
+        assert!(l.minimize(f));
+        l.remove(b);
+        assert!(l.tile_floats().is_empty());
+        assert!(l.activate(f));
+        assert_eq!(l.tile_floats().len(), 1);
+        let (mut l, [_, b], f) = blocked(vec![], fixed());
+        assert!(l.fullscreen(f));
+        l.remove(b);
+        assert!(l.tile_floats().is_empty());
+        assert!(l.unfullscreen(f));
+        assert_eq!(l.tile_floats().len(), 1);
+
+        // A maximized group would cover it: it waits for the maximize to end.
+        let (mut l, [a, b], _) = blocked(vec![], fixed());
+        l.remove(b);
+        assert!(l.maximize(a));
+        assert!(l.tile_floats().is_empty());
+        assert!(l.unmaximize(a));
+        assert_eq!(l.tile_floats().len(), 1);
+
+        // Two floats: the most recent first, never overlapping.
+        let (mut l, [a, b], f) = blocked(vec![], fixed());
+        let (g, step) = l.place_with("upd2", (1720, 600), fixed(), true).unwrap();
+        assert_eq!(step, Step::Floating);
+        // Apart, so the first one's cells don't split the room the second needs.
+        while l.keyboard_adjust(f, Side::Left, Nudge::Move).is_ok() {}
+        while l.keyboard_adjust(g, Side::Right, Nudge::Move).is_ok() {}
+        l.remove(a);
+        l.remove(b);
+        let tiled = l.tile_floats();
+        let ids: Vec<WinId> = tiled.iter().map(|t| t.0).collect();
+        assert_eq!(ids, [g, f]);
+        assert!(!cells_of(&l, f).overlaps(&cells_of(&l, g)));
+        assert_no_overlap(&l);
+    }
+
+    #[test]
+    fn ac8_floats_stay_in_bounds_whatever_the_user_does() {
+        let mut layouts = sized_layouts();
+        layouts.push(blocked(vec![], fixed()).0);
+        layouts.push(blocked(vec![], sizable()).0);
+        layouts.push(blocked(vec![], Hints::new(FIXED, (1300, 650))).0);
+        layouts.push(blocked_rig().0);
+        let wild = [i32::MIN, -5000, 0, 5000, i32::MAX];
+        let mut checked = 0;
+        for mut l in layouts {
+            assert_floats_contained(&l);
+            let floats: Vec<WinId> = l
+                .tiles
+                .iter()
+                .filter(|t| t.floating && l.visible(t.id))
+                .map(|t| t.id)
+                .collect();
+            for f in floats {
+                for &x in &wild {
+                    for &y in &wild {
+                        let o = outer_of(&l, f);
+                        let hits = [
+                            (o.x + 30, o.y + 3),
+                            (o.x - 2, o.y + o.h / 2),
+                            (o.x + o.w + 2, o.y + o.h + 2),
+                            (o.x + o.w / 2, o.y - 2),
+                        ];
+                        for p in hits {
+                            if l.hit(p).is_some_and(|h| h.id() == f) {
+                                float_drag(&mut l, p, &[(x / 2, y / 2), (x, y)]);
+                                checked += 1;
+                            }
+                        }
+                    }
+                }
+                for side in [Side::Left, Side::Right, Side::Top, Side::Bottom] {
+                    for op in [Nudge::Move, Nudge::Grow, Nudge::Shrink] {
+                        for _ in 0..30 {
+                            let _ = l.keyboard_adjust(f, side, op);
+                            assert_floats_contained(&l);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 100, "{checked}");
     }
 }

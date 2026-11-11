@@ -4,12 +4,13 @@ use super::{
     COLS, Cells, GAP, Layout, MIN_H, MIN_W, Memory, Output, ROWS, Rect, STRIP, Tile, WinId,
     bar::{self, Button},
     dist2,
+    float::FloatDrag,
 };
 use crate::theme::{ACCENT, MINIMIZED, rgba};
 
 /// A press on a strip becomes a move once the pointer travels this far, in px.
-const ARM_PX: u64 = 8;
-const CORNER_PX: i32 = 32;
+pub(super) const ARM_PX: u64 = 8;
+pub(super) const CORNER_PX: i32 = 32;
 const DOUBLE_CLICK_MS: u64 = 400;
 /// Holding a move over a tile's middle this long, in ms, tabs instead of swapping.
 const HOLD_MS: u64 = 500;
@@ -100,17 +101,9 @@ pub enum Done {
 
 impl Layout {
     pub fn hit(&self, p: (i32, i32)) -> Option<Hit> {
-        // A float is above every tile's zones and has none of its own: only its buttons.
-        let float = self
-            .tiles
-            .iter()
-            .filter(|t| t.floating && self.visible(t.id) && !t.fullscreen)
-            .filter(|t| self.frame(t.id).is_some_and(|(r, _)| r.contains(p)))
-            .max_by_key(|t| t.stamp);
-        if let Some(f) = float {
-            let bar = self.bar(f.id)?;
-            let button = bar.buttons.iter().find(|(_, r)| r.contains(p));
-            return button.map(|&(b, _)| Hit::Button(f.id, b));
+        // Floats, and their bands, are above every tile's zones.
+        if let Some(hit) = self.float_hit(p) {
+            return hit;
         }
         // One set of zones per group, from its active tile; none for a fullscreen tile or one it covers.
         let ids = || {
@@ -188,9 +181,10 @@ impl Layout {
 
     /// The strip-row px a top corner owns; `None` for a bottom corner.
     fn corner_strip(&self, id: WinId, x: Side, y: Side) -> Option<Rect> {
+        let floating = self.tile(id)?.floating;
         let (c, r) = self
             .frame(id)
-            .filter(|_| y == Side::Top && !self.is_maximized(id))?;
+            .filter(|_| y == Side::Top && !self.is_maximized(id) && !floating)?;
         let strip = Rect { h: STRIP, ..c };
         Some(match x {
             Side::Left => Rect {
@@ -220,6 +214,7 @@ impl Layout {
             },
             Hit::Tab(id) => self.bar(id)?.tabs.into_iter().find(|&(u, _)| u == id)?.1,
             Hit::Button(id, b) => self.bar(id)?.buttons.into_iter().find(|&(u, _)| u == b)?.1,
+            Hit::Edge(id, side) if t.floating => return self.float_zone(id, side),
             Hit::Edge(..) if self.maximized(t) => return None,
             Hit::Edge(_, Side::Left) => Rect { w: r.x - c.x, ..c },
             Hit::Edge(_, Side::Right) => Rect {
@@ -441,7 +436,12 @@ impl Layout {
 
     /// Expand only the clicked side, using the same collision and minimum-size rules as a drag.
     fn expand_edge(&mut self, hit: Hit) -> Option<Done> {
-        let Hit::Edge(_, side) = hit else { return None };
+        let Hit::Edge(id, side) = hit else {
+            return None;
+        };
+        if self.tile(id)?.floating {
+            return self.float_fill(id, side);
+        }
         let r = Resize::new(self, hit, (0, 0))?;
         let o = self.output(&r.output)?;
         let p = match side {
@@ -464,6 +464,9 @@ impl Layout {
         op: Nudge,
     ) -> Result<Done, &'static str> {
         let t = self.tile(id).ok_or("no tile")?;
+        if t.floating && self.visible(id) && !t.fullscreen {
+            return self.float_nudge(id, side, op);
+        }
         if !self.visible(id) || self.maximized(t) || t.fullscreen || t.floating {
             return Err("not a shown tile");
         }
@@ -764,6 +767,7 @@ enum State {
         middle: Option<(WinId, u64)>,
     },
     Resize(Resize),
+    Float(FloatDrag),
     Cancelled,
 }
 
@@ -776,6 +780,7 @@ impl Drag {
     pub fn press(l: &Layout, p: (i32, i32)) -> Option<Drag> {
         let state = match l.hit(p)? {
             hit @ (Hit::Strip(_) | Hit::Tab(_) | Hit::Button(..)) => State::Armed { hit, from: p },
+            hit if l.tile(hit.id())?.floating => State::Float(FloatDrag::new(l, hit, p, false)?),
             hit @ (Hit::Edge(..) | Hit::Corner(..)) => State::Resize(Resize::new(l, hit, p)?),
         };
         Some(Drag(state))
@@ -791,6 +796,14 @@ impl Drag {
                     && l.hit(p) == Some(r.hit) =>
             {
                 Some(r.hit)
+            }
+            State::Float(f)
+                if matches!(f.hit, Hit::Edge(..))
+                    && !f.dragged
+                    && dist2(f.press, p) < ARM_PX * ARM_PX
+                    && l.hit(p) == Some(f.hit) =>
+            {
+                Some(f.hit)
             }
             _ => None,
         }
@@ -812,6 +825,9 @@ impl Drag {
             self.0 = match hit {
                 // A maximized group doesn't move; a button press stays a click.
                 Hit::Strip(_) | Hit::Tab(_) if l.is_maximized(id) => State::Cancelled,
+                Hit::Strip(_) if l.tile(id).is_some_and(|t| t.floating) => {
+                    FloatDrag::new(l, hit, from, true).map_or(State::Cancelled, State::Float)
+                }
                 Hit::Strip(_) | Hit::Tab(_) => State::Move {
                     id,
                     tab,
@@ -857,6 +873,11 @@ impl Drag {
                 return changed;
             }
             State::Resize(r) => return r.motion(l, p),
+            // Gone, or tiled by its hints mid-drag.
+            State::Float(f) if !l.tile(f.id()).is_some_and(|t| t.floating) => {
+                self.0 = State::Cancelled;
+            }
+            State::Float(f) => return f.motion(l, p),
             _ => {}
         }
         false
@@ -866,6 +887,7 @@ impl Drag {
     pub fn cancel(self, l: &mut Layout) -> bool {
         match self.0 {
             State::Resize(r) => l.restore(&r.before),
+            State::Float(f) => f.cancel(l),
             _ => false,
         }
     }
@@ -924,6 +946,7 @@ impl Drag {
                 Some(Done::Layout(what, tiles))
             }
             State::Resize(r) => l.finish_resize(&r.before, "resized"),
+            State::Float(f) => f.finish(l),
             State::Armed { hit, .. } => l.click(hit, p).map(|(a, id)| Done::Click(a, id)),
             State::Cancelled => None,
         }
@@ -976,6 +999,7 @@ pub fn overlay(
         None => l.hit(p),
         Some(State::Armed { hit, .. }) => Some(*hit),
         Some(State::Resize(r)) => Some(r.hit),
+        Some(State::Float(_)) => None,
         Some(State::Move {
             id,
             tab,
@@ -1005,7 +1029,16 @@ pub fn overlay(
         }
         Some(State::Cancelled) => None,
     };
-    // A lit strip stops at the buttons.
+    // A float's zones light in its own layer.
+    let hover = hover.filter(|h| !l.tile(h.id()).is_some_and(|t| t.floating));
+    light(l, hover, &mut out);
+    decorations(l, |t| !t.floating, hover, focused, &mut out);
+    out
+}
+
+/// The hovered or pressed zone: a strip up to its buttons, an edge, or a corner's two edges and
+/// strip end.
+fn light(l: &Layout, hover: Option<Hit>, out: &mut Vec<(Rect, [f32; 4])>) {
     let lit = match hover {
         Some(Hit::Strip(id)) => l.zone(Hit::Strip(id)).map(|z| {
             let buttons = l.bar(id).map_or(0, |b| b.buttons.len() as i32);
@@ -1024,26 +1057,43 @@ pub fn overlay(
         }
         out.extend(l.corner_strip(id, x, y).map(|z| (z, accent(1.0))));
     }
-    decorations(l, false, hover, focused, &mut out);
-    out
 }
 
-/// What `overlay` draws for floats, which go above every tile and its decorations.
-pub fn float_overlay(l: &Layout, focused: Option<WinId>) -> Vec<(Rect, [f32; 4])> {
+/// What `overlay` draws for floats, which go above every tile and its decorations, by float,
+/// front float first (`Layout::floats`): its hovered or pressed zone, then its bar and frame.
+/// Each float's go right above its own window, so a float in front covers them.
+pub fn float_overlay(
+    l: &Layout,
+    drag: Option<&Drag>,
+    p: (i32, i32),
+    focused: Option<WinId>,
+) -> Vec<(WinId, Rect, [f32; 4])> {
     let mut out = Vec::new();
-    decorations(l, true, None, focused, &mut out);
+    let hover = match drag.map(|d| &d.0) {
+        None => l.hit(p),
+        Some(State::Armed { hit, .. }) => Some(*hit),
+        Some(State::Float(f)) => Some(f.hit),
+        Some(_) => None,
+    };
+    let hover = hover.filter(|h| l.tile(h.id()).is_some_and(|t| t.floating));
+    for id in l.floats() {
+        let mut one = Vec::new();
+        light(l, hover.filter(|h| h.id() == id), &mut one);
+        decorations(l, |t| t.id == id, hover, focused, &mut one);
+        out.extend(one.into_iter().map(|(r, k)| (id, r, k)));
+    }
     out
 }
 
 /// Appends the bars, minimized strips and frames of the tiles, or of the floats.
 fn decorations(
     l: &Layout,
-    floats: bool,
+    which: impl Fn(&Tile) -> bool,
     hover: Option<Hit>,
     focused: Option<WinId>,
     out: &mut Vec<(Rect, [f32; 4])>,
 ) {
-    let tiles = || l.tiles.iter().filter(|t| t.floating == floats);
+    let tiles = || l.tiles.iter().filter(|t| which(t));
     // Where a frame's top goes when it runs along the top of a bar, in front of it.
     let front = out.len();
     for t in tiles() {
