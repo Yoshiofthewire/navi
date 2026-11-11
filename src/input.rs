@@ -1,5 +1,5 @@
-//! Input from either backend. navi keeps quit/VT bindings, the fullscreen escape and
-//! focused-window move/expand/shrink shortcuts before clients see them.
+//! Input from either backend. navi keeps quit/VT bindings, the fullscreen escape,
+//! focused-window move/expand/shrink shortcuts and the dock keys before clients see them.
 
 use smithay::{
     backend::{
@@ -21,6 +21,7 @@ use smithay::{
 use tracing::{debug, info, warn};
 
 use crate::{
+    control::{Command, DockKey},
     layout::{Action, Done, Drag, Layout, Nudge, Rect, Side, WinId},
     monitors,
     state::{Navi, identity, px},
@@ -36,6 +37,32 @@ pub enum Binding {
     Expand(Side),
     Shrink(Side),
     LeaveFullscreen,
+    /// Super+1..9: the Nth running app in the dock.
+    DockSlot(u8),
+    /// Super+Tab, or with Shift backward: the next running app in the dock.
+    DockCycle {
+        forward: bool,
+    },
+}
+
+/// evdev KEY_1 as an xkb keycode; KEY_2..KEY_9 follow it.
+const KEY_1: u32 = 2 + 8;
+
+/// The dock keys: exactly Super with the top-row digit keys, matched by keycode so every layout
+/// works, or Super+(Shift+)Tab. The move modifier setting never remaps them.
+pub fn dock_binding(mods: &ModifiersState, code: u32, sym: Keysym) -> Option<Binding> {
+    if !mods.logo || mods.ctrl || mods.alt {
+        return None;
+    }
+    match sym {
+        Keysym::Tab | Keysym::ISO_Left_Tab => Some(Binding::DockCycle {
+            forward: !mods.shift,
+        }),
+        _ if !mods.shift && (KEY_1..KEY_1 + 9).contains(&code) => {
+            Some(Binding::DockSlot((code - KEY_1 + 1) as u8))
+        }
+        _ => None,
+    }
 }
 
 /// Quit/VT bindings, Super+L, Super+Esc, and the window shortcuts: the move modifier (Alt, or
@@ -340,7 +367,8 @@ impl Navi {
                     };
                 }
                 sym = key.modified_sym();
-                let binding = binding(mods, sym, navi.desktop["move_modifier"] == "super");
+                let binding = dock_binding(mods, code.raw(), sym)
+                    .or_else(|| binding(mods, sym, navi.desktop["move_modifier"] == "super"));
                 chord = binding;
                 let usable = match binding {
                     Some(Binding::Vt(_)) => vt,
@@ -379,10 +407,7 @@ impl Navi {
                     .unwrap_or_default();
                 for &id in &ended {
                     info!(id, by = "keyboard", "fullscreen escape");
-                    if let Some(m) = self.windows.iter_mut().find(|m| m.tile == Some(id)) {
-                        m.want_fullscreen = false;
-                        m.escaped = true;
-                    }
+                    self.guard_fullscreen(id);
                 }
                 if !ended.is_empty() {
                     self.apply_layout();
@@ -420,7 +445,24 @@ impl Navi {
                     }
                 }
             }
+            Some(Binding::DockSlot(n)) => self.dock_key(DockKey::Slot(n)),
+            Some(Binding::DockCycle { forward }) => self.dock_key(DockKey::Cycle { forward }),
             None => {}
+        }
+    }
+
+    /// navi-bar resolves dock keys against the dock it draws and activates as a click does.
+    fn dock_key(&mut self, key: DockKey) {
+        let Some(control) = &self.bar_control else {
+            info!(reason = "no navi-bar", "dock key ignored");
+            return;
+        };
+        if !crate::shell::send_command(control, Command::Dock(key)) {
+            return;
+        }
+        match key {
+            DockKey::Slot(slot) => info!(slot, by = "keyboard", "dock slot"),
+            DockKey::Cycle { forward } => info!(forward, by = "keyboard", "dock cycle"),
         }
     }
 
@@ -432,7 +474,7 @@ impl Navi {
                 if self
                     .bar_control
                     .as_ref()
-                    .is_some_and(crate::shell::send_toggle)
+                    .is_some_and(|c| crate::shell::send_command(c, Command::ToggleMenu))
                 {
                     info!(by = "keyboard", "app menu toggle");
                 }
@@ -987,5 +1029,86 @@ mod tests {
         // An ordinary key the app received, a bare Esc included.
         assert!(lifts_guard(Keysym::a, None, true));
         assert!(lifts_guard(Keysym::Escape, None, true));
+    }
+
+    /// xkb keycodes: evdev KEY_0, KEY_1, KEY_9, Tab, and the keypad's 1 and 0.
+    const KEY_0: u32 = 11 + 8;
+    const TAB: u32 = 15 + 8;
+    const KP_1: u32 = 79 + 8;
+    const KP_0: u32 = 82 + 8;
+
+    #[test]
+    fn dock_keys_are_only_super_digit_and_super_shift_tab() {
+        for (mask, mods) in masks() {
+            for n in 1..=9u8 {
+                let code = KEY_1 + u32::from(n) - 1;
+                // Matched by keycode: an AZERTY top row (no digit unshifted) works too.
+                for sym in [Keysym::from(u32::from(b'0' + n)), Keysym::ampersand] {
+                    let expected = (mask == 4).then_some(Binding::DockSlot(n));
+                    assert_eq!(dock_binding(&mods, code, sym), expected, "{n} mask {mask}");
+                }
+            }
+            for sym in [Keysym::Tab, Keysym::ISO_Left_Tab] {
+                let got = dock_binding(&mods, TAB, sym);
+                match mask {
+                    12 => assert_eq!(got, Some(Binding::DockCycle { forward: false })),
+                    4 if sym == Keysym::Tab => {
+                        assert_eq!(got, Some(Binding::DockCycle { forward: true }))
+                    }
+                    4 => {}
+                    _ => assert_eq!(got, None, "{sym:?} mask {mask}"),
+                }
+            }
+            for (code, sym) in [
+                (KEY_0, Keysym::_0),
+                (KP_1, Keysym::KP_1),
+                (KP_1, Keysym::KP_End),
+                (KP_0, Keysym::KP_0),
+            ] {
+                assert_eq!(dock_binding(&mods, code, sym), None, "{sym:?} mask {mask}");
+            }
+            // The dock keys are no other binding, and never remapped by the move modifier.
+            for swap in [false, true] {
+                for sym in [Keysym::_1, Keysym::Tab, Keysym::ISO_Left_Tab] {
+                    assert_eq!(binding(&mods, sym, swap), None);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dock_keys_are_kept_from_apps_and_only_act_unlocked() {
+        for b in [
+            Binding::DockSlot(1),
+            Binding::DockSlot(9),
+            Binding::DockCycle { forward: true },
+            Binding::DockCycle { forward: false },
+        ] {
+            // usable is always true for them: acted on, even with no slot or no navi-bar.
+            assert_eq!(keep(Some(b), false, false, true), Some(Some(b)));
+            assert_eq!(keep(Some(b), false, true, true), Some(Some(b)), "repeat");
+            // Locked: swallowed, never acted on.
+            assert_eq!(keep(Some(b), true, false, true), Some(None));
+            assert_eq!(keep(Some(b), true, true, true), Some(None));
+            for sym in [Keysym::_1, Keysym::Tab, Keysym::ISO_Left_Tab] {
+                assert!(!lifts_guard(sym, Some(b), false), "{b:?}");
+                assert!(!lifts_guard(sym, Some(b), true), "{b:?}");
+            }
+        }
+        for (code, sym) in [(KEY_1, Keysym::_1), (TAB, Keysym::Tab)] {
+            assert!(
+                !tap(|t| {
+                    t.key(code, sym, true, false);
+                    t.key(code, Keysym::NoSymbol, false, false);
+                }),
+                "{sym:?}"
+            );
+            // Super released first, then the key.
+            let mut t = SuperTap::default();
+            t.key(SUPER_L, Keysym::Super_L, true, true);
+            t.key(code, sym, true, false);
+            assert!(!t.key(SUPER_L, Keysym::NoSymbol, false, false));
+            assert!(!t.key(code, Keysym::NoSymbol, false, true));
+        }
     }
 }

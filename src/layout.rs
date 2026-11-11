@@ -507,6 +507,17 @@ impl Layout {
         changed
     }
 
+    /// The fullscreen windows `activate(id)` ends: every other one on its output.
+    pub fn fullscreen_ended_by(&self, id: WinId) -> Vec<WinId> {
+        let Some(t) = self.tile(id) else {
+            return Vec::new();
+        };
+        let on = self.tiles.iter().filter(|u| u.output == t.output);
+        on.filter(|u| u.fullscreen && u.id != id)
+            .map(|u| u.id)
+            .collect()
+    }
+
     /// Places a new window of `app`, following the order in docs/design.md.
     /// `None` only when there are no outputs.
     pub fn place(&mut self, app: &str, pointer: (i32, i32)) -> Option<(WinId, Step)> {
@@ -1299,6 +1310,28 @@ mod tests {
         assert!(l.maximize(t));
         assert!(l.activate(b));
         assert!(l.is_maximized(b) && l.visible(b));
+    }
+
+    #[test]
+    fn activate_reports_the_fullscreen_it_ends() {
+        let (mut l, [a, b, c]) = rig_with_tiles();
+        // Another window on the fullscreen output ends it, and is reported.
+        assert!(l.fullscreen(a));
+        assert_eq!(l.fullscreen_ended_by(b), vec![a]);
+        assert!(l.activate(b));
+        assert!(!l.is_fullscreen(a) && l.visible(b));
+        // The fullscreen window itself, or a window on another output: none, still fullscreen.
+        assert!(l.fullscreen(a));
+        assert_eq!(l.fullscreen_ended_by(a), Vec::<WinId>::new());
+        l.activate(a);
+        assert_eq!(l.fullscreen_ended_by(c), Vec::<WinId>::new());
+        l.activate(c);
+        assert!(l.is_fullscreen(a));
+        assert_eq!(
+            l.fullscreen_ended_by(99),
+            Vec::<WinId>::new(),
+            "no such tile"
+        );
     }
 
     /// Yoshi's rig: ultrawide (main), 4K above it, laptop left.

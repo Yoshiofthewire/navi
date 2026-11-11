@@ -693,6 +693,25 @@ impl Navi {
         }
     }
 
+    /// The user took `id` out of fullscreen: it can't go back until a user press reaches it.
+    pub fn guard_fullscreen(&mut self, id: WinId) {
+        if let Some(m) = self.windows.iter_mut().find(|m| m.tile == Some(id)) {
+            m.want_fullscreen = false;
+            m.escaped = true;
+        }
+    }
+
+    /// navi-bar activates `id`, by a dock click or key. A fullscreen window that ends gets the
+    /// re-entry guard, so its app can't cover the window the user just chose.
+    pub fn bar_activate(&mut self, id: WinId) {
+        info!(id, by = "bar", "activate");
+        for ended in self.layout.fullscreen_ended_by(id) {
+            info!(id = ended, by = "bar", "fullscreen left");
+            self.guard_fullscreen(ended);
+        }
+        self.focus_or_restore(id);
+    }
+
     /// Refuses a fullscreen request from a window the user took out of fullscreen.
     pub fn refuse_escaped(&self, id: Option<WinId>) -> bool {
         let escaped = self
@@ -704,7 +723,7 @@ impl Navi {
                 ?id,
                 by = "app",
                 refused = "fullscreen",
-                "request refused: left by Super+Esc"
+                "request refused: user left fullscreen"
             );
         }
         escaped

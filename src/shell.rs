@@ -26,7 +26,7 @@ use tracing::{info, warn};
 
 use crate::{
     CalloopData,
-    control::{LOCK, NO, TOGGLE_MENU, YES},
+    control::{self, LOCK, NO, YES},
     state::ClientState,
 };
 
@@ -72,19 +72,19 @@ pub struct Bar {
     clock: Instant,
 }
 
-/// Tells navi-bar to open or close the app menu. Never blocks: a full or broken socket drops
-/// the toggle. Returns whether it was sent.
-pub fn send_toggle(control: &UnixStream) -> bool {
+/// Sends navi-bar one command. Never blocks: a full or broken socket drops it. Returns whether
+/// it was sent.
+pub fn send_command(control: &UnixStream, command: control::Command) -> bool {
     use rustix::net::{SendFlags, send};
     match send(
         control,
-        &[TOGGLE_MENU],
+        &[command.byte()],
         SendFlags::DONTWAIT | SendFlags::NOSIGNAL,
     ) {
         Ok(1) => true,
         Ok(_) => false,
         Err(e) => {
-            warn!("app menu toggle dropped: {e}");
+            warn!(?command, "control command dropped: {e}");
             false
         }
     }
@@ -92,7 +92,7 @@ pub fn send_toggle(control: &UnixStream) -> bool {
 
 /// Spawns `navi-bar` next to navi's own executable, with no shell and no `PATH` search, and
 /// restarts it when it exits. Without it, navi runs without a bar. Returns the first bar's
-/// control stream for `send_toggle`; `Navi::bar_control` follows each restart.
+/// control stream for `send_command`; `Navi::bar_control` follows each restart.
 pub fn start_bar(
     handle: &LoopHandle<'static, CalloopData>,
     dh: &mut DisplayHandle,
@@ -293,15 +293,19 @@ mod tests {
         let (navi, bar) = UnixStream::pair().unwrap();
         // The bar never reads: every send returns at once until the buffer fills.
         let start = Instant::now();
-        let sent = (0..10_000_000).take_while(|_| send_toggle(&navi)).count();
+        let toggle = || send_command(&navi, control::Command::ToggleMenu);
+        let sent = (0..10_000_000).take_while(|_| toggle()).count();
         assert!(sent > 0);
-        assert!(!send_toggle(&navi), "still full, still dropped");
+        assert!(!toggle(), "still full, still dropped");
         assert!(start.elapsed() < Duration::from_secs(10));
         let mut first = [0];
         (&bar).read_exact(&mut first).unwrap();
-        assert_eq!(first, [TOGGLE_MENU]);
+        assert_eq!(first, [control::TOGGLE_MENU]);
         drop(bar);
-        assert!(!send_toggle(&navi), "broken socket");
+        assert!(
+            !send_command(&navi, control::Command::ToggleMenu),
+            "broken socket"
+        );
     }
 
     #[test]
