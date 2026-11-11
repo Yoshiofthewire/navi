@@ -84,6 +84,14 @@ pub fn popup_rect(r: Rect) -> Rect {
 pub const POPUP_DEPTH: usize = 16;
 const _: () = assert!(POPUP_DEPTH as i64 * 4 * POPUP_LIMIT as i64 <= i32::MAX as i64 / 2);
 
+/// How many popups one client may have open at once; more are dismissed.
+pub const CLIENT_POPUPS: usize = 64;
+
+/// Whether a client with these `open` popups is at `CLIENT_POPUPS`. Counts at most that many.
+pub fn popups_full<T>(open: impl Iterator<Item = T>) -> bool {
+    open.take(CLIENT_POPUPS).count() == CLIENT_POPUPS
+}
+
 /// Whether the popup chain from `popup` up through `parent` (the next popup, if any) is too deep.
 /// Walks at most `POPUP_DEPTH` steps.
 pub fn popup_too_deep<T>(popup: T, parent: impl Fn(&T) -> Option<T>) -> bool {
@@ -1171,6 +1179,15 @@ mod tests {
     use super::*;
     use crate::layout::{Action, Button, Done, float_overlay};
     use drag::Hit;
+
+    #[test]
+    fn a_client_is_full_at_the_popup_limit() {
+        assert!(!popups_full(0..0));
+        assert!(!popups_full(0..CLIENT_POPUPS - 1));
+        assert!(popups_full(0..CLIENT_POPUPS));
+        assert!(popups_full(0..CLIENT_POPUPS + 1));
+        assert!(popups_full(0..)); // stops counting at the limit
+    }
 
     #[test]
     fn popup_chains_stop_at_the_depth_limit() {

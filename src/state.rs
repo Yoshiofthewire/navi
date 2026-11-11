@@ -1891,6 +1891,19 @@ impl Navi {
         })
     }
 
+    /// Whether `popup`'s client already has `layout::CLIENT_POPUPS` popups tracked. Only
+    /// tracked, live popups count, so closing one frees its place.
+    fn client_popups_full(&self, popup: &PopupSurface) -> bool {
+        let client = popup.wl_surface().client();
+        layout::popups_full(
+            self.xdg_shell_state
+                .toplevel_surfaces()
+                .iter()
+                .filter(|t| t.wl_surface().client() == client)
+                .flat_map(|t| PopupManager::popups_for_surface(t.wl_surface())),
+        )
+    }
+
     fn unconstrain_popup(&self, popup: &PopupSurface) {
         let Ok(root) = find_popup_root_surface(&PopupKind::Xdg(popup.clone())) else {
             return;
@@ -2369,7 +2382,7 @@ impl XdgShellHandler for Navi {
     }
 
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
-        if too_deep(&surface) {
+        if too_deep(&surface) || self.client_popups_full(&surface) {
             surface.send_popup_done();
             return;
         }
