@@ -194,6 +194,13 @@ impl Layout {
         (rank(over) >= rank(hit.id())).then_some(hit)
     }
 
+    /// Whether a tile-layer window at space rank `at` (bottom first; `None`: no such window at
+    /// the point) covers a group whose window has rank `group` (`None`: not in the space, so its
+    /// chrome draws below every window).
+    pub fn covers(at: Option<usize>, group: Option<usize>) -> bool {
+        at.is_some_and(|r| group.is_none_or(|g| r > g))
+    }
+
     /// Brings float `id` to the front, as focusing it does. Returns whether it moved; a tile or
     /// the front float doesn't.
     pub fn raise(&mut self, id: WinId) -> bool {

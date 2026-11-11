@@ -442,13 +442,7 @@ impl Navi {
         let over = under.and_then(|w| self.float_owner(w));
         let rank = |w: &Window| self.space.elements().position(|e| e == w);
         let at = under.filter(|_| over.is_none()).and_then(rank);
-        // A group whose window isn't in the space draws its chrome below every window.
-        let covers = |g| {
-            at.is_some_and(|r| {
-                let group = self.window_of(g);
-                group.as_ref().and_then(rank).is_none_or(|rg| r > rg)
-            })
-        };
+        let covers = |g| Layout::covers(at, self.window_of(g).as_ref().and_then(rank));
         self.layout.hit_under(px(pos), over, covers)
     }
 

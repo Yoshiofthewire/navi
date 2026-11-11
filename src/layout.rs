@@ -2974,6 +2974,26 @@ mod tests {
         assert_eq!(l.hit(q).map(|h| h.id()), Some(f), "f's band is f's again");
     }
 
+    /// Job 028 (round 1): `zone_at`'s rank check. Ranks are space positions, bottom first.
+    #[test]
+    fn a_window_covers_only_groups_ranked_below_it() {
+        assert!(
+            Layout::covers(Some(2), Some(1)),
+            "a dialog above the group's window"
+        );
+        assert!(!Layout::covers(Some(1), Some(2)), "the group raised later");
+        assert!(!Layout::covers(Some(1), Some(1)), "the group's own window");
+        assert!(
+            Layout::covers(Some(0), None),
+            "a group with no window: below every window"
+        );
+        assert!(
+            !Layout::covers(None, Some(0)),
+            "no tile-layer window at the point"
+        );
+        assert!(!Layout::covers(None, None));
+    }
+
     /// Job 028 AC1: a float's bar and band over a tile's zones win, whether or not a tile-layer
     /// window there covers that tile.
     #[test]

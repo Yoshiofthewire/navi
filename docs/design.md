@@ -274,10 +274,10 @@ aspect, gravity, position) are ignored.
   one can be seen. Inside its monitor a dialog may cover neighbouring tiles, so a file picker
   larger than its window still works, but it is always visible where it takes clicks. While it is
   in front of a neighbour it covers that neighbour's bar, buttons and frame too, and takes the
-  clicks there; clicking the neighbour's window outside it brings the neighbour back on top. A new dialog
-  takes the keyboard only if a window of its own family holds it; otherwise it maps without it
-  (logged), *waits*, and gets it when the user clicks it, or focuses its parent from the dock or
-  Super+N and then clicks it. A waiting dialog's frame is full accent (1 px), its root's dock icon
+  clicks there; clicking the neighbour's window outside it brings the neighbour back on top.
+  A new dialog takes the keyboard only if a window of its own family holds it; otherwise it maps
+  without it (logged), *waits*, and gets it when the user clicks it, or focuses its parent from
+  the dock or Super+N and then clicks it. A waiting dialog's frame is full accent (1 px), its root's dock icon
   has an accent dot and, in a tab group, its root's tab an accent line along its bottom, until the
   dialog is focused. An orphan never takes the keyboard on map. A dialog hides while its root is
   hidden or minimized, and loses the keyboard; it comes back with it. When a dialog's parent
