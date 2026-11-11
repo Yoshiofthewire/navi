@@ -193,7 +193,7 @@ impl Harness {
                 .display
                 .dispatch_clients(&mut self.data.state)
                 .unwrap();
-            self.data.display.flush_clients().unwrap();
+            crate::after_dispatch(&mut self.data);
             if let Some(read) = p.queue.prepare_read() {
                 match read.read() {
                     Ok(_) => {}

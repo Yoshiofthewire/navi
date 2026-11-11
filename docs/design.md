@@ -599,7 +599,10 @@ don't affect navi's MIT licence.
   panel, that panel's request; over a navi target, its cursor; else the request of the app under
   the pointer. An app's request counts only while the pointer is over it: each new pointer focus
   starts from the arrow, and a request from an app without pointer focus or with a stale enter
-  serial is dropped. An app may hide the pointer only over its own surface, never over navi's
+  serial is dropped. Pointer focus follows the topmost surface under the pointer whenever the
+  scene changes (a window, dialog, popup, panel or lock surface maps, unmaps, moves or is
+  raised), not only on motion, except while a button or grab holds it; it never moves the
+  keyboard. An app may hide the pointer only over its own surface, never over navi's
   targets or during a drag. Still to come: cursor surfaces (`wl_pointer.set_cursor` with a buffer,
   which every X11 app uses; navi draws its arrow instead), importing the cursor chosen in KDE,
   animated cursors, and cursors for navi-bar's own UI. Nested, the pointer stays at the edge

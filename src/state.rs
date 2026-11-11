@@ -163,6 +163,8 @@ pub struct Navi {
     /// A drag in navi's strip or edges, from press to release.
     pub drag: Option<Drag>,
     _cursor_shape_state: smithay::wayland::cursor_shape::CursorShapeManagerState,
+    /// The pointer's focus and its origin, as `move_pointer` last gave it.
+    pointer_under: Option<Under>,
     /// The cursor the client under the pointer asked for.
     pub cursor: crate::cursor::Requested<WlSurface>,
     pub edge_clicks: layout::EdgeClicks,
@@ -306,6 +308,7 @@ impl Navi {
             _cursor_shape_state: smithay::wayland::cursor_shape::CursorShapeManagerState::new::<Self>(
                 &dh,
             ),
+            pointer_under: None,
             cursor: Default::default(),
             edge_clicks: layout::EdgeClicks::default(),
             grid: Vec::new(),
@@ -643,18 +646,29 @@ impl Navi {
         self.keep_focus_mapped(&shown);
         self.restack();
         self.hide_layer_focus();
-        // Tiles moved: refocus a still pointer, so a click can't land in the window that left.
-        if let Some(pointer) = self.seat.get_pointer() {
-            let pos = pointer.current_location();
-            let under = self.pointer_focus(pos);
-            let motion = MotionEvent {
-                location: pos,
-                serial: SERIAL_COUNTER.next_serial(),
-                time: self.now_ms() as u32,
-            };
-            self.move_pointer(&pointer, under, &motion);
-            pointer.frame(self);
+        self.repick_pointer();
+    }
+
+    /// Gives a still pointer to what is now under it (`pointer_focus`), when that or its
+    /// position changed: the scene moved, not the pointer. Never moves the keyboard; a grab
+    /// keeps its focus.
+    pub fn repick_pointer(&mut self) {
+        let Some(pointer) = self.seat.get_pointer().filter(|p| !p.is_grabbed()) else {
+            return;
+        };
+        let pos = pointer.current_location();
+        let under = self.pointer_focus(pos);
+        let focus = under.as_ref().map(|(s, _)| s.clone());
+        if under == self.pointer_under && pointer.current_focus() == focus {
+            return;
         }
+        let motion = MotionEvent {
+            location: pos,
+            serial: SERIAL_COUNTER.next_serial(),
+            time: self.now_ms() as u32,
+        };
+        self.move_pointer(&pointer, under, &motion);
+        pointer.frame(self);
     }
 
     /// Sends `motion`; a new pointer focus starts from the `default` cursor.
@@ -664,8 +678,10 @@ impl Navi {
         under: Option<(WlSurface, Point<f64, Logical>)>,
         motion: &MotionEvent,
     ) {
-        pointer.motion(self, under, motion);
-        self.cursor.focus(pointer.current_focus());
+        pointer.motion(self, under.clone(), motion);
+        let focus = pointer.current_focus();
+        self.pointer_under = under.filter(|(s, _)| focus.as_ref() == Some(s));
+        self.cursor.focus(focus);
     }
 
     /// The cursor shape to draw at the pointer, `None` for hidden.
@@ -3547,3 +3563,6 @@ mod tests {
         assert_eq!(fired, [true, false, false, true, false, true]);
     }
 }
+
+#[cfg(test)]
+mod pointer_tests;
