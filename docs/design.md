@@ -249,8 +249,8 @@ aspect, gravity, position) are ignored.
   dialog has navi's frame around it, so even a transparent one can be seen. Moving it never raises
   it: only focus does, so a neighbour the user clicks stays in front of it. A dialog that shows
   (new, or again) goes on top only while its family has the keyboard, else right above its family.
-  Inside its monitor a dialog may cover neighbouring tiles, so a file picker larger than its window still works, but it
-  is always visible where it takes clicks. A new dialog takes the keyboard only if a window of its
+  Inside its monitor a dialog may cover neighbouring tiles, so a file picker larger than its window
+  still works, but it is always visible where it takes clicks. A new dialog takes the keyboard only if a window of its
   own family holds it; otherwise it maps without it (logged) and gets it when the user clicks it.
   An orphan never takes the keyboard on map. A dialog hides while its root is hidden or minimized,
   and loses the keyboard; it comes back with it. When a dialog's parent closes, it hangs from that
