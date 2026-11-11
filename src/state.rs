@@ -1891,17 +1891,21 @@ impl Navi {
         })
     }
 
-    /// Whether `popup`'s client already has `layout::CLIENT_POPUPS` popups tracked. Only
-    /// tracked, live popups count, so closing one frees its place.
+    /// Whether `popup`'s client already has `layout::CLIENT_POPUPS` popups tracked, under any of
+    /// its toplevels or layer surfaces (every root a popup can have). Only tracked, live popups
+    /// count, so closing one frees its place.
     fn client_popups_full(&self, popup: &PopupSurface) -> bool {
         let client = popup.wl_surface().client();
-        layout::popups_full(
-            self.xdg_shell_state
-                .toplevel_surfaces()
-                .iter()
-                .filter(|t| t.wl_surface().client() == client)
-                .flat_map(|t| PopupManager::popups_for_surface(t.wl_surface())),
-        )
+        let toplevels = self.xdg_shell_state.toplevel_surfaces().iter();
+        let roots = toplevels
+            .map(|t| t.wl_surface().clone())
+            .chain(
+                self.layer_shell_state
+                    .layer_surfaces()
+                    .map(|l| l.wl_surface().clone()),
+            )
+            .filter(|s| s.client() == client);
+        layout::popups_full(roots.flat_map(|s| PopupManager::popups_for_surface(&s)))
     }
 
     fn unconstrain_popup(&self, popup: &PopupSurface) {
@@ -2382,7 +2386,11 @@ impl XdgShellHandler for Navi {
     }
 
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
-        if too_deep(&surface) || self.client_popups_full(&surface) {
+        // A parentless popup would sit in the manager's unmapped list, uncounted, until it dies.
+        if surface.get_parent_surface().is_none()
+            || too_deep(&surface)
+            || self.client_popups_full(&surface)
+        {
             surface.send_popup_done();
             return;
         }
