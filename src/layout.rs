@@ -6,7 +6,8 @@ mod bar;
 mod drag;
 mod memory;
 pub use bar::{Button, Decor, decoration};
-pub use drag::{Action, Done, Drag, EdgeClicks, Nudge, Side, buttons, overlay};
+pub use drag::{Action, Done, Drag, EdgeClicks, Nudge, Side, buttons, float_overlay, overlay};
+use memory::MAX_PX;
 pub use memory::safe;
 
 pub const COLS: i32 = 24;
@@ -20,6 +21,8 @@ pub const STRIP: i32 = 8;
 pub const BAR: i32 = 24;
 pub const MIN_W: i32 = 320;
 pub const MIN_H: i32 = 240;
+/// A float's distance from the panels and screen edges, while it fits.
+const FLOAT_MARGIN: i32 = STRIP;
 
 pub type WinId = u64;
 
@@ -43,11 +46,15 @@ pub struct Rect {
 }
 
 impl Rect {
+    pub fn new(x: i32, y: i32, w: i32, h: i32) -> Rect {
+        Rect { x, y, w, h }
+    }
+
     fn center(&self) -> (i32, i32) {
         (self.x + self.w / 2, self.y + self.h / 2)
     }
 
-    fn contains(&self, (x, y): (i32, i32)) -> bool {
+    pub fn contains(&self, (x, y): (i32, i32)) -> bool {
         x >= self.x && x < self.x + self.w && y >= self.y && y < self.y + self.h
     }
 }
@@ -127,6 +134,24 @@ impl Output {
         }
     }
 
+    /// The fewest cells whose narrowest run, along x or y, is at least `px`; `None` if the whole
+    /// grid isn't. With even boundaries the first `k` cells are a narrowest run of `k`.
+    fn fewest(&self, x: bool, px: i32) -> Option<i32> {
+        match x {
+            true => (1..=COLS).find(|&k| self.x_edge(k) - self.area.x >= px),
+            false => (1..=ROWS).find(|&k| self.y_edge(k) - self.area.y >= px),
+        }
+    }
+
+    /// The smallest span whose window, below a bar if `bar`, is at least `min` at every grid
+    /// position, and at least navi's minimum. `None` if even the whole grid is too small.
+    fn min_span(&self, min: (i32, i32), bar: bool) -> Option<(i32, i32)> {
+        let navi = self.span_for((MIN_W, MIN_H));
+        let cols = self.fewest(true, min.0 + GAP)?;
+        let rows = self.fewest(false, min.1 + GAP + if bar { BAR } else { 0 })?;
+        Some((cols.max(navi.0), rows.max(navi.1)))
+    }
+
     /// The span in cells nearest to a px size, never below the minimum tile size.
     pub fn span_for(&self, (w, h): (i32, i32)) -> (i32, i32) {
         let fit = |px: i32, cell: i32, min: i32, max: i32| {
@@ -158,13 +183,89 @@ pub struct Tile {
     /// Where it was before its output was unplugged; it goes back when that output returns,
     /// unless the user moved it since.
     pub home: Option<(String, Cells)>,
+    pub hints: Hints,
+    /// Too big for any tile: centred above the tiles, holding no cells.
+    pub floating: bool,
 }
 
 impl Tile {
-    /// Same output and cells: tabbed together.
+    /// Itself, or a tile on the same output and cells: tabbed together. Floats never tab.
     fn tabbed(&self, o: &Tile) -> bool {
-        self.output == o.output && self.cells == o.cells
+        self.id == o.id
+            || (!self.floating && !o.floating && self.output == o.output && self.cells == o.cells)
     }
+}
+
+/// A client's minimum and maximum window size in logical px; 0 on an axis is no limit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Hints {
+    pub min: (i32, i32),
+    pub max: (i32, i32),
+}
+
+impl Hints {
+    /// Untrusted values capped to `0..=MAX_PX`; a max axis below its min axis is dropped.
+    pub fn new(min: (i32, i32), max: (i32, i32)) -> Hints {
+        let cap = |v: i32| v.clamp(0, MAX_PX);
+        let axis = |lo: i32, hi: i32| {
+            let (lo, hi) = (cap(lo), cap(hi));
+            (lo, if hi < lo { 0 } else { hi })
+        };
+        let ((min_w, max_w), (min_h, max_h)) = (axis(min.0, max.0), axis(min.1, max.1));
+        Hints {
+            min: (min_w, min_h),
+            max: (max_w, max_h),
+        }
+    }
+
+    /// `r` no bigger than the max, anchored at its top-left.
+    fn clamp(&self, r: Rect) -> Rect {
+        let cap = |v: i32, max: i32| if max > 0 { v.min(max) } else { v };
+        Rect {
+            w: cap(r.w, self.max.0),
+            h: cap(r.h, self.max.1),
+            ..r
+        }
+    }
+}
+
+/// What a spot must give a window: the px it wants, gap and bar included, and its client
+/// minimum.
+#[derive(Clone, Copy, Debug)]
+struct Need {
+    size: (i32, i32),
+    min: (i32, i32),
+    bar: bool,
+}
+
+impl Need {
+    /// The span `o` gives it and its minimum span there; `None` if the minimum doesn't fit `o`.
+    fn spans(&self, o: &Output) -> Option<((i32, i32), (i32, i32))> {
+        let min = o.min_span(self.min, self.bar)?;
+        let (c, r) = o.span_for(self.size);
+        Some(((c.max(min.0), r.max(min.1)), min))
+    }
+
+    /// Its window, at `c` on `o`, is at least its minimum.
+    fn holds(&self, o: &Output, c: Cells) -> bool {
+        let r = o.window_rect(c, if self.bar { STRIP + BAR } else { STRIP });
+        r.w >= self.min.0 && r.h >= self.min.1
+    }
+}
+
+/// What `set_hints` did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Fit {
+    /// The same hints as before.
+    Unchanged,
+    /// The tile's cells still hold the window.
+    Fits,
+    /// The tile moved through the placement order.
+    Replaced(String, Cells),
+    /// No tile fits: it floats.
+    Floated,
+    /// A float found a tile.
+    Tiled(String, Cells),
 }
 
 /// What navi remembers per app ID: where it was, and the size it wants, in px.
@@ -186,6 +287,8 @@ pub enum Step {
     Shrunk,
     OtherOutput,
     Tabbed(WinId),
+    /// No step fits: it floats.
+    Floating,
 }
 
 #[derive(Default)]
@@ -239,6 +342,7 @@ impl Layout {
             if free && let Some(t) = self.tile_mut(id) {
                 t.output = output.to_string();
                 t.cells = cells;
+                t.floating = false;
                 t.maximized = false;
                 t.fullscreen = false;
                 back.push(id);
@@ -247,7 +351,8 @@ impl Layout {
     }
 
     /// Moves `name`'s tiles, a tab group at a time, to the other outputs with the placement steps
-    /// from the main output's centre, and forgets `name`. Memory doesn't change.
+    /// from the main output's centre, floating them on it if nothing fits, and forgets `name`.
+    /// Floats go through the same steps. Memory doesn't change.
     pub fn remove_output(&mut self, name: &str) {
         self.outputs.retain(|o| o.name != name);
         let Some(main) = self.outputs.first().cloned() else {
@@ -264,28 +369,203 @@ impl Layout {
             let id = ids.remove(0);
             let group = self.group(id);
             ids.retain(|i| !group.contains(i));
-            let Some(t) = self.tile(id).cloned() else {
+            let half = (main.area.w / 2, main.area.h);
+            let Some(need) = self.need(id, &group, self.has_bar(id), half) else {
                 continue;
             };
-            let size = self.output_size(&t);
-            let (output, cells, _) = self.find_spot(&main, size, main.area.center(), None);
+            let spot = self.find_spot(&main, need, main.area.center(), None);
             for t in self.tiles.iter_mut().filter(|t| group.contains(&t.id)) {
-                t.home = t.home.take().or(Some((t.output.clone(), t.cells)));
-                t.output = output.clone();
-                t.cells = cells;
+                if !t.floating {
+                    t.home = t.home.take().or(Some((t.output.clone(), t.cells)));
+                }
+                (t.output, t.cells, t.floating) = match &spot {
+                    Some((output, cells, _)) => (output.clone(), *cells, false),
+                    None => (main.name.clone(), Cells::default(), true),
+                };
                 t.maximized = false;
                 t.fullscreen = false;
             }
         }
     }
 
-    /// The px size `t` wants: its memory, else half an output's width.
-    fn output_size(&self, t: &Tile) -> (i32, i32) {
-        let half = self
-            .outputs
-            .first()
-            .map_or((MIN_W, MIN_H), |o| (o.area.w / 2, o.area.h));
-        self.memory.get(&t.app).map_or(half, |m| m.size)
+    /// What `app` needs with `hints`: its remembered px size, else `fallback`, lowered to its max
+    /// and raised to its min, with the gap and a bar if `bar`.
+    fn need_for(&self, app: &str, hints: Hints, bar: bool, fallback: (i32, i32)) -> Need {
+        let (w, h) = self.memory.get(app).map_or(fallback, |m| m.size);
+        let fit = |v: i32, lo: i32, hi: i32, extra: i32| {
+            let v = if hi > 0 { v.min(hi + extra) } else { v };
+            v.max(lo + extra)
+        };
+        let top = GAP + if bar { BAR } else { 0 };
+        Need {
+            size: (
+                fit(w, hints.min.0, hints.max.0, GAP),
+                fit(h, hints.min.1, hints.max.1, top),
+            ),
+            min: hints.min,
+            bar,
+        }
+    }
+
+    /// What moving `ids` needs: `id`'s size, and the largest of their minimums.
+    fn need(&self, id: WinId, ids: &[WinId], bar: bool, fallback: (i32, i32)) -> Option<Need> {
+        let t = self.tile(id)?;
+        let need = self.need_for(&t.app, t.hints, bar, fallback);
+        let (w, h) = self.largest_min(ids);
+        Some(Need {
+            min: (need.min.0.max(w), need.min.1.max(h)),
+            ..need
+        })
+    }
+
+    /// The fewest cells `id`'s group can have: navi's minimum, or a member's client minimum below
+    /// the group's bar where that is larger.
+    fn floor(&self, id: WinId) -> (i32, i32) {
+        let Some((t, o)) = self
+            .tile(id)
+            .and_then(|t| Some((t, self.output(&t.output)?)))
+        else {
+            return (COLS, ROWS);
+        };
+        let min = largest_min(self.tiles.iter().filter(|u| u.tabbed(t)));
+        o.min_span(min, self.has_bar(id)).unwrap_or((COLS, ROWS))
+    }
+
+    /// The largest client minimum of `ids`, per axis.
+    fn largest_min(&self, ids: &[WinId]) -> (i32, i32) {
+        largest_min(self.tiles.iter().filter(|t| ids.contains(&t.id)))
+    }
+
+    /// Every one of `ids` fits `c` on `o`, below a bar if `bar`, at its minimum span.
+    fn fit_in(&self, ids: &[WinId], o: &Output, c: Cells, bar: bool) -> bool {
+        span_holds(o, c, self.largest_min(ids), bar)
+    }
+
+    /// Stores `id`'s client hints, sanitised. A tile whose cells no longer hold its window, and a
+    /// float, go through the placement order again from where they are; memory learns a new
+    /// tile's spot and px size.
+    pub fn set_hints(&mut self, id: WinId, min: (i32, i32), max: (i32, i32)) -> Fit {
+        let hints = Hints::new(min, max);
+        let Some(t) = self.tile_mut(id).filter(|t| t.hints != hints) else {
+            return Fit::Unchanged;
+        };
+        t.hints = hints;
+        self.refit(id)
+    }
+
+    /// Whether the app asked navi to draw its controls. A tile whose window no longer fits below
+    /// its new bar is refitted as `set_hints` does; a float always has the bar.
+    pub fn set_decorated(&mut self, id: WinId, on: bool) -> Fit {
+        let Some(t) = self.tile_mut(id).filter(|t| t.decorated != on) else {
+            return Fit::Unchanged;
+        };
+        t.decorated = on;
+        match t.floating {
+            true => Fit::Fits,
+            false => self.refit(id),
+        }
+    }
+
+    /// Places `id` again if its cells no longer hold its window, or if it floats.
+    fn refit(&mut self, id: WinId) -> Fit {
+        let Some(t) = self.tile(id).cloned() else {
+            return Fit::Unchanged;
+        };
+        let Some(o) = self.output(&t.output).cloned() else {
+            return Fit::Fits;
+        };
+        let hints = t.hints;
+        let need = Need {
+            size: (0, 0),
+            min: hints.min,
+            bar: self.has_bar(id),
+        };
+        if !t.floating && need.holds(&o, t.cells) {
+            return Fit::Fits;
+        }
+        let pointer = self.frame(id).map_or(o.area.center(), |(c, _)| c.center());
+        let Some((output, cells, step)) = self.settle(id, &o, pointer) else {
+            return Fit::Floated;
+        };
+        if !matches!(step, Step::Tabbed(_)) {
+            let tiles = self.tiles_in(&[id]);
+            self.learn(&tiles, true);
+        }
+        match t.floating {
+            true => Fit::Tiled(output, cells),
+            false => Fit::Replaced(output, cells),
+        }
+    }
+
+    /// Takes `id` out of its cells and places it again from `pointer` on `here`, alone. It floats
+    /// on `here` if nothing fits.
+    fn settle(
+        &mut self,
+        id: WinId,
+        here: &Output,
+        pointer: (i32, i32),
+    ) -> Option<(String, Cells, Step)> {
+        let i = self.tiles.iter().position(|t| t.id == id)?;
+        let mut t = self.tiles.remove(i);
+        let half = (here.area.w / 2, here.area.h);
+        let need = self.need_for(&t.app, t.hints, t.decorated, half);
+        let mem = self.memory.get(&t.app).cloned();
+        let spot = self.find_spot(here, need, pointer, mem.as_ref());
+        (t.output, t.cells, t.floating) = match &spot {
+            Some((output, cells, _)) => (output.clone(), *cells, false),
+            None => (here.name.clone(), Cells::default(), true),
+        };
+        t.maximized = false;
+        t.fullscreen = false;
+        self.tiles.insert(i, t);
+        spot
+    }
+
+    /// A float's window, below its bar: its wanted size, centred in its output's area,
+    /// `FLOAT_MARGIN` from its edges. Where that's below the app's minimum it takes what the
+    /// minimum needs of the whole output, past the panels (which stay on top), but its bar never
+    /// goes above the area, so its buttons stay in reach.
+    fn float_rect(&self, t: &Tile, o: &Output) -> Rect {
+        let (f, m) = (o.full, FLOAT_MARGIN);
+        let a = Rect {
+            x: o.area.x + m,
+            y: o.area.y + m,
+            w: (o.area.w - 2 * m).max(1),
+            h: (o.area.h - 2 * m).max(1),
+        };
+        let need = self.need_for(&t.app, t.hints, true, (a.w / 2, a.h));
+        let (min_w, min_h) = t.hints.min;
+        let bottom = f.y + f.h;
+        let w = (need.size.0 - GAP).min(a.w).max(min_w).min(f.w).max(1);
+        let h = (need.size.1 - GAP - BAR).min(a.h - BAR).max(min_h);
+        let h = h.min(bottom - o.area.y - BAR).max(1);
+        let x = match w <= a.w {
+            true => a.x + (a.w - w) / 2,
+            false => f.x + (f.w - w) / 2,
+        };
+        let outer = h + BAR;
+        let top = match outer <= a.h {
+            true => a.y + (a.h - outer) / 2,
+            false => a.y.min(bottom - outer).max(o.area.y),
+        };
+        Rect {
+            x,
+            y: top + BAR,
+            w,
+            h,
+        }
+    }
+
+    /// `id` floats with a minimum bigger than its output can show, so part of it is cut.
+    pub fn too_small(&self, id: WinId) -> bool {
+        let Some((t, o)) = self
+            .tile(id)
+            .and_then(|t| Some((t, self.output(&t.output)?)))
+        else {
+            return false;
+        };
+        let r = self.float_rect(t, o);
+        t.floating && (r.w < t.hints.min.0 || r.h < t.hints.min.1)
     }
 
     pub fn tiles(&self) -> &[Tile] {
@@ -296,7 +576,8 @@ impl Layout {
         self.tiles.iter().find(|t| t.id == id)
     }
 
-    /// The window's rect in global logical px.
+    /// The window's rect in global logical px: clamped to its max, a float's, or the whole output
+    /// while fullscreen.
     pub fn rect(&self, id: WinId) -> Option<Rect> {
         let t = self.tile(id)?;
         match t.fullscreen {
@@ -305,17 +586,34 @@ impl Layout {
         }
     }
 
+    /// The rect `id`'s window is drawn and hit inside. Dialogs, which aren't tiles, have none.
+    pub fn clip(&self, id: WinId) -> Option<Rect> {
+        self.rect(id)
+    }
+
     /// The px of `id`'s cells (the whole grid while maximized) and of its window, which sits below
-    /// a bar if it has one.
+    /// a bar if it has one, anchored top-left and clamped to its max. A float's bar and window.
     fn frame(&self, id: WinId) -> Option<(Rect, Rect)> {
         let t = self.tile(id)?;
         let o = self.output(&t.output)?;
+        if t.floating {
+            let r = self.float_rect(t, o);
+            let bar = Rect {
+                y: r.y - BAR,
+                h: r.h + BAR,
+                ..r
+            };
+            return Some((bar, r));
+        }
         let cells = match self.maximized(t) {
             true => FULL,
             false => t.cells,
         };
         let top = if self.has_bar(id) { STRIP + BAR } else { STRIP };
-        Some((o.cells_rect(cells), o.window_rect(cells, top)))
+        Some((
+            o.cells_rect(cells),
+            t.hints.clamp(o.window_rect(cells, top)),
+        ))
     }
 
     /// Closing leaves the cells empty; nothing else moves.
@@ -353,11 +651,11 @@ impl Layout {
         self.tiles.iter().any(|u| u.maximized && u.tabbed(t))
     }
 
-    /// Another group on its output is maximized over it, or another window is fullscreen there.
+    /// Another window is fullscreen on its output, or another group is maximized over its tile.
     fn covered(&self, t: &Tile) -> bool {
         self.tiles.iter().any(|u| {
             u.output == t.output
-                && ((u.maximized && u.cells != t.cells) || (u.fullscreen && u.id != t.id))
+                && ((u.maximized && !t.floating && !u.tabbed(t)) || (u.fullscreen && u.id != t.id))
         })
     }
 
@@ -382,19 +680,14 @@ impl Layout {
             .is_some_and(|t| !t.minimized && self.active(id) == Some(id) && !self.covered(t))
     }
 
-    /// Tabbed, or showing a window that wants navi's controls.
+    /// Tabbed, floating, or showing a window that wants navi's controls. A float always has
+    /// them, so it can be minimized or closed whatever the app draws.
     pub fn has_bar(&self, id: WinId) -> bool {
-        let decorated = self
+        let controls = self
             .active(id)
             .and_then(|a| self.tile(a))
-            .is_some_and(|a| a.decorated);
-        decorated || self.group(id).len() > 1
-    }
-
-    pub fn set_decorated(&mut self, id: WinId, on: bool) {
-        if let Some(t) = self.tile_mut(id) {
-            t.decorated = on;
-        }
+            .is_some_and(|a| a.decorated || a.floating);
+        controls || self.group(id).len() > 1
     }
 
     fn tile_mut(&mut self, id: WinId) -> Option<&mut Tile> {
@@ -431,7 +724,7 @@ impl Layout {
         let Some(t) = self.tile(id).filter(|_| self.visible(id)) else {
             return false;
         };
-        if self.maximized(t) {
+        if self.maximized(t) || t.floating {
             return false;
         }
         let output = t.output.clone();
@@ -509,9 +802,10 @@ impl Layout {
         }
         let t = self.tile(id).cloned().unwrap_or_default();
         for u in self.tiles.iter_mut().filter(|u| u.output == t.output) {
-            let other_group = u.cells != t.cells;
-            if (u.maximized && other_group) || (u.fullscreen && u.id != id) {
-                u.maximized = u.maximized && !other_group;
+            // A float is above every maximize.
+            let unmaximize = u.maximized && !t.floating && !u.tabbed(&t);
+            if unmaximize || (u.fullscreen && u.id != id) {
+                u.maximized &= !unmaximize;
                 u.fullscreen = false;
                 changed = true;
             }
@@ -530,9 +824,20 @@ impl Layout {
             .collect()
     }
 
-    /// Places a new window of `app`, following the order in docs/design.md.
-    /// `None` only when there are no outputs.
+    /// Places a new window of `app` with no client hints and no bar.
     pub fn place(&mut self, app: &str, pointer: (i32, i32)) -> Option<(WinId, Step)> {
+        self.place_with(app, pointer, Hints::default(), false)
+    }
+
+    /// Places a new window of `app`, following the order in docs/design.md; it floats if no step
+    /// fits. `None` only when there are no outputs.
+    pub fn place_with(
+        &mut self,
+        app: &str,
+        pointer: (i32, i32),
+        hints: Hints,
+        decorated: bool,
+    ) -> Option<(WinId, Step)> {
         let here = self
             .outputs
             .iter()
@@ -540,11 +845,10 @@ impl Layout {
             .or(self.outputs.first())?
             .clone();
         let mem = self.memory.get(app).cloned();
-        let size = mem
-            .as_ref()
-            .map_or((here.area.w / 2, here.area.h), |m| m.size);
-
-        let (output, cells, step) = self.find_spot(&here, size, pointer, mem.as_ref());
+        let need = self.need_for(app, hints, decorated, (here.area.w / 2, here.area.h));
+        let (output, cells, step) = self
+            .find_spot(&here, need, pointer, mem.as_ref())
+            .unwrap_or((here.name.clone(), Cells::default(), Step::Floating));
 
         let id = self.next_id;
         self.next_id += 1;
@@ -555,13 +859,16 @@ impl Layout {
             app: app.to_string(),
             output: output.clone(),
             cells,
+            decorated,
+            hints,
+            floating: step == Step::Floating,
             ..Tile::default()
         });
         self.touch(id);
         let fresh = Memory {
             output,
             cells,
-            size,
+            size: need.size,
             stamp: self.clock,
         };
         match step {
@@ -569,6 +876,7 @@ impl Layout {
             Step::Tabbed(_) => {
                 self.memory.entry(app.to_string()).or_insert(fresh).stamp = self.clock;
             }
+            Step::Floating => {}
             _ => {
                 self.memory.insert(app.to_string(), fresh);
             }
@@ -576,27 +884,31 @@ impl Layout {
         Some((id, step))
     }
 
+    /// The placement order. `None` when no step fits, so the window floats.
     fn find_spot(
         &mut self,
         here: &Output,
-        size: (i32, i32),
+        need: Need,
         pointer: (i32, i32),
         mem: Option<&Memory>,
-    ) -> (String, Cells, Step) {
+    ) -> Option<(String, Cells, Step)> {
         if let Some(m) = mem
-            && self.output(&m.output).is_some()
+            && let Some(o) = self.output(&m.output)
             && self.is_free(&m.output, m.cells)
+            && need.holds(o, m.cells)
         {
-            return (m.output.clone(), m.cells, Step::Remembered);
+            return Some((m.output.clone(), m.cells, Step::Remembered));
         }
-        if let Some(c) = self.nearest_free(here, size, pointer) {
-            return (here.name.clone(), c, Step::Nearest);
-        }
-        if let Some(c) = self.smaller_free(here, size, pointer) {
-            return (here.name.clone(), c, Step::Smaller);
-        }
-        if let Some(c) = self.shrink_for(here, size, pointer) {
-            return (here.name.clone(), c, Step::Shrunk);
+        if let Some((want, min)) = need.spans(here) {
+            if let Some(c) = self.nearest_free(here, want, pointer) {
+                return Some((here.name.clone(), c, Step::Nearest));
+            }
+            if let Some(c) = self.smaller_free(here, want, min, pointer) {
+                return Some((here.name.clone(), c, Step::Smaller));
+            }
+            if let Some(c) = self.shrink_for(here, want, min, pointer) {
+                return Some((here.name.clone(), c, Step::Shrunk));
+            }
         }
         let others: Vec<Output> = self
             .outputs
@@ -605,67 +917,72 @@ impl Layout {
             .cloned()
             .collect();
         for o in &others {
-            if let Some(c) = self.nearest_free(o, size, o.area.center()) {
-                return (o.name.clone(), c, Step::OtherOutput);
+            if let Some((want, _)) = need.spans(o)
+                && let Some(c) = self.nearest_free(o, want, o.area.center())
+            {
+                return Some((o.name.clone(), c, Step::OtherOutput));
             }
         }
-        let dist = |c: Cells| dist2(here.cells_rect(c).center(), pointer);
-        match self
+        // A tab, below a bar, in the nearest tile that holds it and every member.
+        let mut near: Vec<&Tile> = self
             .tiles
             .iter()
-            .filter(|t| t.output == here.name)
-            .min_by_key(|t| dist(t.cells))
-        {
-            Some(t) => (here.name.clone(), t.cells, Step::Tabbed(t.id)),
-            // Unreachable: an empty output always has room.
-            None => {
-                let (cols, rows) = here.span_for(size);
-                let c = Cells {
-                    col: 0,
-                    row: 0,
-                    cols,
-                    rows,
-                };
-                (here.name.clone(), c, Step::Nearest)
-            }
-        }
+            .filter(|t| t.output == here.name && !t.floating)
+            .collect();
+        near.sort_by_key(|t| dist2(here.cells_rect(t.cells).center(), pointer));
+        near.into_iter()
+            .find(|t| {
+                span_holds(here, t.cells, need.min, true)
+                    && self.fit_in(&self.group(t.id), here, t.cells, true)
+            })
+            .map(|t| (here.name.clone(), t.cells, Step::Tabbed(t.id)))
     }
 
     fn output(&self, name: &str) -> Option<&Output> {
         self.outputs.iter().find(|o| o.name == name)
     }
 
+    /// No tile is in `c`; floats hold no cells.
     fn is_free(&self, output: &str, c: Cells) -> bool {
         !self
             .tiles
             .iter()
-            .any(|t| t.output == output && t.cells.overlaps(&c))
+            .any(|t| t.output == output && !t.floating && t.cells.overlaps(&c))
     }
 
-    /// The empty rect of `size` whose centre is closest to `pointer`.
-    fn nearest_free(&self, o: &Output, size: (i32, i32), pointer: (i32, i32)) -> Option<Cells> {
-        let (cols, rows) = o.span_for(size);
+    /// The empty rect of `span` whose centre is closest to `pointer`.
+    fn nearest_free(&self, o: &Output, span: (i32, i32), pointer: (i32, i32)) -> Option<Cells> {
+        let (cols, rows) = span;
         spots(cols, rows)
             .filter(|&c| self.is_free(&o.name, c))
             .min_by_key(|&c| dist2(o.cells_rect(c).center(), pointer))
     }
 
-    /// The largest empty rect between the minimum and `size`; ties go to the one nearest
+    /// The largest empty rect between the `min` and `want` spans; ties go to the one nearest
     /// `pointer`.
-    fn smaller_free(&self, o: &Output, size: (i32, i32), pointer: (i32, i32)) -> Option<Cells> {
-        let (want_c, want_r) = o.span_for(size);
-        let (min_c, min_r) = o.span_for((MIN_W, MIN_H));
+    fn smaller_free(
+        &self,
+        o: &Output,
+        (want_c, want_r): (i32, i32),
+        (min_c, min_r): (i32, i32),
+        pointer: (i32, i32),
+    ) -> Option<Cells> {
         (min_r..=want_r)
             .flat_map(|rows| (min_c..=want_c).flat_map(move |cols| spots(cols, rows)))
             .filter(|&c| self.is_free(&o.name, c))
             .min_by_key(|&c| (-c.cols * c.rows, dist2(o.cells_rect(c).center(), pointer)))
     }
 
-    /// Takes columns from the tiles in the new window's rows until it gets an equal share, then
-    /// slides them apart, in order, to open one gap near `pointer`. Moves nothing on failure.
-    fn shrink_for(&mut self, o: &Output, size: (i32, i32), pointer: (i32, i32)) -> Option<Cells> {
-        let (want_c, rows) = o.span_for(size);
-        let (min_c, _) = o.span_for((MIN_W, MIN_H));
+    /// Takes columns from the tiles in the new window's rows, never below their own floor, until
+    /// it gets an equal share (at least its `min` columns), then slides them apart, in order, to
+    /// open one gap near `pointer`. Moves nothing on failure.
+    fn shrink_for(
+        &mut self,
+        o: &Output,
+        (want_c, rows): (i32, i32),
+        (min_c, _): (i32, i32),
+        pointer: (i32, i32),
+    ) -> Option<Cells> {
         let band = (0..=ROWS - rows)
             .map(|row| Cells {
                 col: 0,
@@ -675,7 +992,7 @@ impl Layout {
             })
             .min_by_key(|&b| (o.cells_rect(b).center().1 - pointer.1).abs())?;
         let (mut row, others): (Vec<usize>, Vec<usize>) = (0..self.tiles.len())
-            .filter(|&i| self.tiles[i].output == o.name)
+            .filter(|&i| self.tiles[i].output == o.name && !self.tiles[i].floating)
             .partition(|&i| self.tiles[i].cells.overlaps(&band));
         row.sort_by_key(|&i| self.tiles[i].cells.col);
         let cells: Vec<Cells> = row.iter().map(|&i| self.tiles[i].cells).collect();
@@ -693,10 +1010,14 @@ impl Layout {
                 self.memory.get(app).map_or(COLS, |m| o.span_for(m.size).0)
             })
             .collect();
+        let floors: Vec<i32> = row
+            .iter()
+            .map(|&i| self.floor(self.tiles[i].id).0)
+            .collect();
         let mut widths: Vec<i32> = cells.iter().map(|c| c.cols).collect();
         while COLS - widths.iter().sum::<i32>() < target {
             let v = (0..n)
-                .filter(|&k| widths[k] > min_c)
+                .filter(|&k| widths[k] > floors[k])
                 .max_by_key(|&k| (widths[k] > wants[k], widths[k]))?;
             widths[v] -= 1;
         }
@@ -763,6 +1084,18 @@ fn spots(cols: i32, rows: i32) -> impl Iterator<Item = Cells> {
     })
 }
 
+fn largest_min<'a>(tiles: impl Iterator<Item = &'a Tile>) -> (i32, i32) {
+    tiles.fold((0, 0), |(w, h), t| {
+        (w.max(t.hints.min.0), h.max(t.hints.min.1))
+    })
+}
+
+/// `c` on `o` is at least the span a window of client minimum `min` needs, below a bar if `bar`.
+fn span_holds(o: &Output, c: Cells, min: (i32, i32), bar: bool) -> bool {
+    o.min_span(min, bar)
+        .is_some_and(|(cols, rows)| c.cols >= cols && c.rows >= rows)
+}
+
 /// Squared distance; saturates instead of overflowing on wild pointer coordinates.
 fn dist2((ax, ay): (i32, i32), (bx, by): (i32, i32)) -> u64 {
     let d = |a: i32, b: i32| u64::from(a.abs_diff(b)).pow(2);
@@ -772,6 +1105,8 @@ fn dist2((ax, ay): (i32, i32), (bx, by): (i32, i32)) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::{Action, Button, Done};
+    use drag::Hit;
 
     fn out(name: &str, x: i32, y: i32, w: i32, h: i32, priority: u32) -> Output {
         Output {
@@ -1489,5 +1824,625 @@ mod tests {
     #[test]
     fn no_outputs_places_nothing() {
         assert_eq!(Layout::default().place("a", (0, 0)), None);
+    }
+
+    // Client sizes (job 017).
+
+    const FIXED: (i32, i32) = (1220, 600);
+    const LATE: (i32, i32) = (995, 710);
+
+    fn fixed() -> Hints {
+        Hints::new(FIXED, FIXED)
+    }
+
+    fn overlaps(a: Rect, b: Rect) -> bool {
+        a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h
+    }
+
+    fn inside(a: Rect, b: Rect) -> bool {
+        a.x >= b.x && a.y >= b.y && a.x + a.w <= b.x + b.w && a.y + a.h <= b.y + b.h
+    }
+
+    /// The ultrawide's grid under its panels, as in the design table.
+    fn uw_panels() -> Output {
+        out("uwp", 44, 0, 3428, 1332, 0)
+    }
+
+    #[test]
+    fn ac1_hints_are_sanitised_and_repeats_change_nothing() {
+        assert_eq!(Hints::new((0, 0), (0, 0)), Hints::default());
+        let h = Hints::new((100_000, 5), (0, 70_000));
+        assert_eq!((h.min, h.max), ((MAX_PX, 5), (0, MAX_PX)));
+        let h = Hints::new((800, 600), (400, 700));
+        assert_eq!(
+            (h.min, h.max),
+            ((800, 600), (0, 700)),
+            "max below min dropped"
+        );
+        let h = Hints::new((-5, i32::MIN), (i32::MIN, -1));
+        assert_eq!(h, Hints::default());
+
+        let mut l = layout(vec![ultrawide()]);
+        let (id, _) = l.place("bmm", (10, 10)).unwrap();
+        assert_ne!(l.set_hints(id, (70_000, 600), (0, 0)), Fit::Unchanged);
+        let before = (l.tiles.clone(), l.memory.clone(), l.clock, l.memory_text());
+        for _ in 0..1000 {
+            assert_eq!(l.set_hints(id, (70_000, 600), (0, 0)), Fit::Unchanged);
+            assert_eq!(l.set_hints(id, (MAX_PX, 600), (-3, 0)), Fit::Unchanged);
+        }
+        assert_eq!(
+            (l.tiles.clone(), l.memory.clone(), l.clock, l.memory_text()),
+            before
+        );
+        assert_eq!(
+            l.set_hints(99, FIXED, FIXED),
+            Fit::Unchanged,
+            "no such tile"
+        );
+    }
+
+    /// `min_span`'s worst-case rule, checked at every grid position.
+    fn assert_boundary(o: &Output, min: (i32, i32), bar: bool, span: (i32, i32)) {
+        let top = if bar { STRIP + BAR } else { STRIP };
+        for c in spots(span.0, span.1) {
+            let r = o.window_rect(c, top);
+            assert!(r.w >= min.0 && r.h >= min.1, "{} {c:?}: {r:?}", o.name);
+        }
+        let short = |cols, rows| {
+            spots(cols, rows).any(|c| {
+                let r = o.window_rect(c, top);
+                r.w < min.0 || r.h < min.1
+            })
+        };
+        assert!(short(span.0 - 1, span.1), "{} one column fewer", o.name);
+        assert!(short(span.0, span.1 - 1), "{} one row fewer", o.name);
+    }
+
+    #[test]
+    fn ac2_effective_minimum_span_is_the_worst_case() {
+        let k_panels = out("4kp", 0, 0, 3828, 2148, 0);
+        let cases = [
+            (uw_panels(), FIXED, true, (9, 6)),
+            (uw_panels(), LATE, false, (8, 7)),
+            (uhd(), FIXED, true, (8, 4)),
+            (uhd(), LATE, false, (7, 5)),
+            (k_panels.clone(), FIXED, true, (8, 4)),
+            (k_panels, LATE, false, (7, 5)),
+        ];
+        for (o, min, bar, span) in cases {
+            assert_eq!(o.min_span(min, bar), Some(span), "{} {min:?}", o.name);
+            assert_boundary(&o, min, bar, span);
+        }
+        let lp = out("lp", 0, 0, 1113, 691, 0);
+        assert_eq!(
+            lp.min_span(FIXED, true),
+            None,
+            "1220 is wider than the grid"
+        );
+        assert_eq!(
+            lp.min_span(LATE, false),
+            None,
+            "710 is taller than the grid"
+        );
+        assert_eq!(lp.min_span((1220, 10), false), None);
+        assert_eq!(lp.min_span((10, 710), false), None);
+        assert_eq!(
+            lp.min_span((1101, 679), false),
+            Some((COLS, ROWS)),
+            "the whole grid"
+        );
+        for o in sample_outputs() {
+            let navi = Some(o.span_for((MIN_W, MIN_H)));
+            for (min, bar) in [
+                ((0, 0), false),
+                ((10, 10), true),
+                ((MIN_W - GAP, MIN_H - GAP - BAR), true),
+                ((MIN_W - GAP, MIN_H - GAP), false),
+            ] {
+                assert_eq!(o.min_span(min, bar), navi, "{} {min:?}", o.name);
+            }
+        }
+    }
+
+    #[test]
+    fn ac3_fixed_size_gets_its_size_on_an_empty_ultrawide() {
+        let mut l = layout(vec![ultrawide()]);
+        let (id, step) = l.place_with("upd", (1720, 700), fixed(), true).unwrap();
+        assert_eq!(step, Step::Nearest);
+        let k = cells_of(&l, id);
+        assert_eq!((k.cols, k.rows), (9, 6));
+        let o = ultrawide();
+        let w = o.window_rect(k, STRIP + BAR);
+        let r = l.rect(id).unwrap();
+        assert_eq!(
+            r,
+            Rect {
+                w: 1220,
+                h: 600,
+                ..w
+            }
+        );
+        assert_eq!(l.clip(id), Some(r));
+        assert_eq!(l.bar(id).unwrap().rect.w, 1220);
+        let focus = crate::theme::rgba(crate::theme::ACCENT, 1.0);
+        let frames = overlay(&l, None, (0, 0), 0, Some(id));
+        assert!(
+            frames
+                .iter()
+                .any(|&(f, k)| k == focus && f.w == 1220 + 4 && f.h == 2)
+        );
+        assert!(
+            !frames.iter().any(|&(f, _)| f.x >= r.x + r.w + 2),
+            "nothing in the leftover"
+        );
+    }
+
+    #[test]
+    fn ac4_neighbours_shrink_to_their_own_minimum_for_a_fixed_window() {
+        let mut l = layout(vec![ultrawide()]);
+        let (a, b) = two_halves(&mut l);
+        let memory = l.memory_text();
+        let (id, step) = l.place_with("upd", (3400, 10), fixed(), true).unwrap();
+        assert_eq!(step, Step::Shrunk);
+        assert!(cells_of(&l, id).cols >= 9);
+        assert_no_overlap(&l);
+        for n in [a, b] {
+            assert!(
+                cells_of(&l, n).cols >= l.floor(n).0,
+                "{:?}",
+                cells_of(&l, n)
+            );
+        }
+        assert!(l.rect(id).unwrap().w == 1220 && l.rect(id).unwrap().h == 600);
+        for (line, app) in memory.lines().skip(1).zip(["b", "a"]) {
+            assert!(l.memory_text().contains(line), "{app}'s memory changed");
+        }
+
+        // Neighbours whose client minimum is 11 columns can't make room: the 4K, else a float,
+        // since 1410 px high they can't take a tab's bar either.
+        for with_4k in [false, true] {
+            let mut outputs = vec![ultrawide()];
+            if with_4k {
+                outputs.push(out("4k", 0, -2160, 3840, 2160, 1));
+            }
+            let mut l = layout(outputs);
+            let (a, b) = two_halves(&mut l);
+            for id in [a, b] {
+                assert_eq!(l.set_hints(id, (1500, 1410), (0, 0)), Fit::Fits);
+                assert_eq!(l.floor(id), (11, 12));
+            }
+            let (id, step) = l.place_with("upd", (3400, 10), fixed(), true).unwrap();
+            let t = l.tile(id).unwrap();
+            match with_4k {
+                true => {
+                    assert_eq!(step, Step::OtherOutput);
+                    assert_eq!(
+                        (t.output.as_str(), t.cells.cols, t.cells.rows),
+                        ("4k", 8, 4)
+                    );
+                }
+                false => assert!(step == Step::Floating && t.floating),
+            }
+            assert_eq!(
+                (cells_of(&l, a), cells_of(&l, b)),
+                (cells(0, 0, 12, 12), cells(12, 0, 12, 12))
+            );
+        }
+    }
+
+    /// The laptop alone with a fixed 1220 x 600 float and a tile beside it.
+    fn laptop_float() -> (Layout, WinId, WinId) {
+        let mut l = layout(vec![laptop()]);
+        let (f, step) = l.place_with("upd", (500, 300), fixed(), true).unwrap();
+        assert_eq!(step, Step::Floating);
+        assert!(l.is_free("laptop", FULL), "the float holds no cells");
+        let (t, step) = l.place("term", (500, 300)).unwrap();
+        assert_eq!(step, Step::Nearest);
+        (l, f, t)
+    }
+
+    #[test]
+    fn ac5_too_big_for_any_tile_floats() {
+        let (mut l, f, t) = laptop_float();
+        let float = l.tile(f).unwrap().clone();
+        assert!(float.floating && float.cells == Cells::default());
+        assert!(l.is_free("laptop", float.cells));
+        let a = laptop().area;
+        let (outer, clip) = (l.frame(f).unwrap().0, l.clip(f).unwrap());
+        assert!(inside(outer, a) && inside(clip, a));
+        assert!(
+            (outer.x - a.x - (a.x + a.w - outer.x - outer.w)).abs() <= 1,
+            "{outer:?}"
+        );
+        assert!(
+            (outer.y - a.y - (a.y + a.h - outer.y - outer.h)).abs() <= 1,
+            "{outer:?}"
+        );
+        assert_eq!(
+            (clip.w, clip.h),
+            (a.w, 600),
+            "1220 is wider than the laptop"
+        );
+        assert!(l.too_small(f));
+        assert_eq!(outer.h, 600 + BAR);
+
+        // Over the float, only its buttons; with it minimized, the tile's zones show through.
+        let mut through = 0;
+        for x in (outer.x..outer.x + outer.w).step_by(7) {
+            for y in (outer.y..outer.y + outer.h).step_by(5) {
+                let hit = l.hit((x, y));
+                assert!(
+                    hit.is_none_or(|h| matches!(h, Hit::Button(id, _) if id == f)),
+                    "{hit:?}"
+                );
+            }
+        }
+        let buttons = l.bar(f).unwrap().buttons;
+        assert_eq!(buttons.len(), 3);
+        let close = buttons[2].1;
+        assert_eq!(
+            l.hit((close.x + 4, close.y + 4)),
+            Some(Hit::Button(f, Button::Close))
+        );
+
+        assert!(!l.maximize(f), "maximize is refused");
+        assert!(l.fullscreen(f));
+        assert_eq!(l.rect(f), Some(laptop().full));
+        assert!(l.unfullscreen(f));
+        assert_eq!(l.clip(f), Some(clip));
+        assert!(l.tile(f).unwrap().floating);
+        assert!(l.minimize(f) && !l.visible(f));
+        for x in (outer.x..outer.x + outer.w).step_by(7) {
+            for y in (outer.y..outer.y + outer.h).step_by(5) {
+                through += usize::from(l.hit((x, y)).is_some_and(|h| h.id() == t));
+            }
+        }
+        assert!(through > 0, "the tile's zones are under the float");
+        assert!(l.activate(f) && l.visible(f));
+
+        // Nothing tabs into it; moves never target it.
+        for n in 0..6 {
+            let (_, step) = l.place(&format!("app{n}"), (500, 300)).unwrap();
+            assert_ne!(step, Step::Tabbed(f));
+        }
+        let mut l = laptop_float().0;
+        let centre = l.clip(f).unwrap().center();
+        let strip = l.zone(Hit::Strip(t)).unwrap().center();
+        let mut d = Drag::press(&l, strip).expect("the tile's strip, beside the float");
+        d.motion(&mut l, centre, 0);
+        d.motion(&mut l, centre, 1000);
+        let done = d.release(&mut l, centre, 1000);
+        assert!(
+            !matches!(done, Some(Done::Layout("tabbed" | "swapped", _))),
+            "{done:?}"
+        );
+        assert_eq!(l.tile(f).unwrap(), &float);
+
+        // With the 4K connected it tiles there; unplugging re-runs the fit from the main output.
+        let mut l = layout(vec![laptop(), out("4k", 2000, 0, 3840, 2160, 1)]);
+        let (id, step) = l.place_with("upd", (500, 300), fixed(), true).unwrap();
+        assert_eq!(step, Step::OtherOutput);
+        let k = l.tile(id).unwrap();
+        assert_eq!(
+            (k.output.as_str(), k.cells.cols, k.cells.rows),
+            ("4k", 8, 4)
+        );
+        let (mut l, f, _) = laptop_float();
+        l.set_outputs(vec![laptop(), out("uw", 2000, 0, 3440, 1440, 1)]);
+        l.remove_output("laptop");
+        let k = l.tile(f).unwrap();
+        assert!(!k.floating && k.output == "uw" && k.home.is_none(), "{k:?}");
+        let (mut l, f, _) = laptop_float();
+        l.set_outputs(vec![laptop(), out("lp2", 2000, 0, 1125, 703, 1)]);
+        l.remove_output("laptop");
+        let k = l.tile(f).unwrap();
+        assert!(k.floating && k.output == "lp2", "{k:?}");
+        assert!(inside(l.clip(f).unwrap(), l.output("lp2").unwrap().area));
+    }
+
+    #[test]
+    fn a_float_always_has_navis_buttons_and_minimizing_uncovers_the_tiles() {
+        // A client that draws its own title bar (no xdg-decoration) still gets navi's bar.
+        let mut l = layout(vec![laptop()]);
+        let (t, _) = l.place("term", (500, 300)).unwrap();
+        let (f, step) = l
+            .place_with("bmm", (500, 300), Hints::new(LATE, (0, 0)), false)
+            .unwrap();
+        assert_eq!(step, Step::Floating);
+        assert!(l.has_bar(f));
+        let buttons = l.bar(f).unwrap().buttons;
+        let kinds: Vec<Button> = buttons.iter().map(|b| b.0).collect();
+        assert_eq!(kinds, [Button::Minimize, Button::Maximize, Button::Close]);
+        let minimize = buttons[0].1;
+        let at = (minimize.x + 4, minimize.y + 4);
+        assert_eq!(l.hit(at), Some(Hit::Button(f, Button::Minimize)));
+        assert!(inside(l.frame(f).unwrap().0, laptop().full));
+        let d = Drag::press(&l, at).unwrap();
+        assert_eq!(
+            d.release(&mut l, at, 10),
+            Some(Done::Click(Action::Minimize, f))
+        );
+        assert!(!l.visible(f));
+        let strip = l.zone(Hit::Strip(t)).unwrap().center();
+        assert_eq!(
+            l.hit(strip),
+            Some(Hit::Strip(t)),
+            "the tile is reachable again"
+        );
+        assert!(l.activate(f) && l.visible(f), "the dock restores it");
+        assert_eq!(
+            l.set_decorated(f, true),
+            Fit::Fits,
+            "a float keeps its place"
+        );
+    }
+
+    #[test]
+    fn a_float_keeps_its_minimum_height_on_the_monitor_and_a_margin_when_it_fits() {
+        // A band of 44 px over a 1125 x 703 laptop: 590 px don't fit a tile below a bar.
+        let mut o = laptop();
+        o.area = Rect {
+            x: 0,
+            y: 44,
+            w: 1125,
+            h: 600,
+        };
+        let mut l = layout(vec![o.clone()]);
+        let (f, step) = l
+            .place_with("tall", (500, 300), Hints::new((300, 590), (0, 0)), false)
+            .unwrap();
+        assert_eq!(step, Step::Floating);
+        let (outer, clip) = (l.frame(f).unwrap().0, l.clip(f).unwrap());
+        assert_eq!(clip.h, 590, "not clamped to the area");
+        assert_eq!(outer.y, o.area.y + FLOAT_MARGIN, "its bar below the band");
+        assert!(inside(outer, o.full) && !l.too_small(f));
+
+        // Floating only because the neighbours can't give way: it fits, FLOAT_MARGIN inside.
+        let (mut l, ids) = quarters();
+        for id in [ids[0], ids[1], ids[3]] {
+            l.set_hints(id, (840, 0), (0, 0));
+        }
+        assert_eq!(l.set_hints(ids[2], LATE, (0, 0)), Fit::Floated);
+        let a = ultrawide().area;
+        let inset = Rect {
+            x: a.x + FLOAT_MARGIN,
+            y: a.y + FLOAT_MARGIN,
+            w: a.w - 2 * FLOAT_MARGIN,
+            h: a.h - 2 * FLOAT_MARGIN,
+        };
+        assert!(inside(l.frame(ids[2]).unwrap().0, inset));
+
+        let mut l = layout(vec![laptop()]);
+        let (f, _) = l
+            .place_with("huge", (10, 10), Hints::new((2000, 1500), (0, 0)), false)
+            .unwrap();
+        assert!(l.too_small(f) && inside(l.frame(f).unwrap().0, laptop().full));
+        // Too big for the monitor: cut, its bar still below the band.
+        let mut l = layout(vec![o.clone()]);
+        let huge = Hints::new((2000, 1500), (0, 0));
+        let (f, _) = l.place_with("huge", (10, 300), huge, false).unwrap();
+        let outer = l.frame(f).unwrap().0;
+        assert!(
+            l.too_small(f) && outer.y == o.area.y && inside(outer, o.full),
+            "{outer:?}"
+        );
+    }
+
+    #[test]
+    fn a_late_bar_refits_and_a_re_place_ends_fullscreen() {
+        // 1410 px high holds 12 rows without a bar, not below one.
+        let mut l = layout(vec![ultrawide()]);
+        let (a, _) = l.place("a", (10, 10)).unwrap();
+        assert_eq!(l.set_hints(a, (0, 1410), (0, 0)), Fit::Fits);
+        assert_eq!(l.set_decorated(a, false), Fit::Unchanged);
+        assert_eq!(l.set_decorated(a, true), Fit::Floated);
+
+        let (mut l, [_, _, late, _]) = quarters();
+        assert!(l.fullscreen(late));
+        assert!(matches!(l.set_hints(late, LATE, (0, 0)), Fit::Replaced(..)));
+        assert!(!l.is_fullscreen(late));
+    }
+
+    /// Four quarters on the ultrawide; the third is "late".
+    fn quarters() -> (Layout, [WinId; 4]) {
+        let mut l = layout(vec![ultrawide()]);
+        let (a, b) = two_halves(&mut l);
+        let (late, _) = l.place("late", (3400, 10)).unwrap();
+        let (d, _) = l.place("d", (3400, 10)).unwrap();
+        for id in [a, b, late, d] {
+            assert_eq!(cells_of(&l, id).cols, 6);
+        }
+        (l, [a, b, late, d])
+    }
+
+    fn assert_no_overlap(l: &Layout) {
+        let tiles: Vec<&Tile> = l.tiles.iter().filter(|t| !t.floating).collect();
+        for (i, t) in tiles.iter().enumerate() {
+            for u in &tiles[i + 1..] {
+                let same = t.output == u.output && t.cells == u.cells;
+                assert!(
+                    same || t.output != u.output || !t.cells.overlaps(&u.cells),
+                    "{t:?} {u:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ac6_a_late_minimum_re_places_or_floats() {
+        // Half the ultrawide already holds 995 x 710.
+        let mut l = layout(vec![ultrawide()]);
+        let (a, _) = two_halves(&mut l);
+        let before = l.tiles.clone();
+        assert_eq!(l.set_hints(a, LATE, (0, 0)), Fit::Fits);
+        assert_eq!(cells_of(&l, a), before[0].cells);
+
+        let (mut l, [_, _, late, _]) = quarters();
+        let Fit::Replaced(output, k) = l.set_hints(late, LATE, (0, 0)) else {
+            panic!("not re-placed");
+        };
+        assert_eq!((output.as_str(), cells_of(&l, late)), ("uw", k));
+        assert!(k.cols >= 8 && k.rows >= 7, "{k:?}");
+        assert_no_overlap(&l);
+        let r = ultrawide().cells_rect(k);
+        assert_eq!(
+            (l.memory["late"].cells, l.memory["late"].size),
+            (k, (r.w, r.h))
+        );
+        assert_eq!(l.set_hints(late, LATE, (0, 0)), Fit::Unchanged);
+
+        // Neighbours at their client minimum, no tile big enough to tab into, no other output.
+        let (mut l, ids) = quarters();
+        for &id in &ids {
+            if id != ids[2] {
+                assert_eq!(l.set_hints(id, (840, 0), (0, 0)), Fit::Fits);
+            }
+        }
+        assert_eq!(l.set_hints(ids[2], LATE, (0, 0)), Fit::Floated);
+        assert!(l.tile(ids[2]).unwrap().floating);
+        let mut l = layout(vec![laptop()]);
+        let (id, _) = l.place("late", (10, 10)).unwrap();
+        assert_eq!(l.set_hints(id, LATE, (0, 0)), Fit::Floated);
+    }
+
+    #[test]
+    fn ac7_a_relaxed_minimum_tiles_a_float_and_frees_a_tiles_floor() {
+        let (mut l, f, _) = laptop_float();
+        let Fit::Tiled(output, k) = l.set_hints(f, (400, 300), (0, 0)) else {
+            panic!("not tiled");
+        };
+        let t = l.tile(f).unwrap();
+        assert!(!t.floating && t.output == output && t.cells == k);
+        assert_no_overlap(&l);
+
+        let mut l = layout(vec![ultrawide()]);
+        let (id, _) = l
+            .place_with("late", (10, 10), Hints::new(LATE, (0, 0)), false)
+            .unwrap();
+        let was = cells_of(&l, id);
+        assert_eq!(l.floor(id), (8, 7));
+        assert_eq!(l.set_hints(id, (0, 0), (0, 0)), Fit::Fits);
+        assert_eq!(cells_of(&l, id), was, "keeps its cells");
+        assert_eq!(l.floor(id), ultrawide().span_for((MIN_W, MIN_H)));
+        while l.keyboard_adjust(id, Side::Right, Nudge::Shrink).is_ok() {}
+        while l.keyboard_adjust(id, Side::Bottom, Nudge::Shrink).is_ok() {}
+        let k = cells_of(&l, id);
+        assert_eq!((k.cols, k.rows), ultrawide().span_for((MIN_W, MIN_H)));
+    }
+
+    #[test]
+    fn ac10_a_max_is_wanted_and_clamps_the_rect() {
+        let mut l = layout(vec![ultrawide()]);
+        let small = Hints::new((0, 0), (800, 600));
+        let (id, step) = l.place_with("small", (1720, 700), small, false).unwrap();
+        assert_eq!(step, Step::Nearest);
+        let k = cells_of(&l, id);
+        assert_eq!(
+            (k.cols, k.rows),
+            ultrawide().span_for((800 + GAP, 600 + GAP))
+        );
+        assert!(k.cols < 12, "not half the monitor");
+        let r = l.rect(id).unwrap();
+        assert!(r.w <= 800 && r.h <= 600, "{r:?}");
+        assert!(l.maximize(id));
+        let full = ultrawide().window_rect(FULL, STRIP);
+        assert_eq!(
+            l.rect(id),
+            Some(Rect {
+                w: 800,
+                h: 600,
+                ..full
+            })
+        );
+        assert!(l.fullscreen(id));
+        assert_eq!(l.rect(id), Some(ultrawide().full));
+    }
+
+    #[test]
+    fn ac11_a_re_placed_size_persists_and_floats_leave_memory_alone() {
+        let (mut l, [_, _, late, _]) = quarters();
+        let Fit::Replaced(_, k) = l.set_hints(late, LATE, (0, 0)) else {
+            panic!("not re-placed");
+        };
+        let text = l.memory_text();
+        assert!(text.starts_with("navi-memory 2\n"));
+        let r = ultrawide().cells_rect(k);
+        let line = format!(
+            "late uw {} {} {} {} {} {}",
+            k.col, k.row, k.cols, k.rows, r.w, r.h
+        );
+        assert!(text.contains(&line), "{text}");
+
+        let mut fresh = layout(vec![ultrawide()]);
+        fresh.load_memory(&text).unwrap();
+        let hints = Hints::new(LATE, (0, 0));
+        let (id, step) = fresh.place_with("late", (10, 10), hints, false).unwrap();
+        assert_eq!((step, cells_of(&fresh, id)), (Step::Remembered, k));
+        assert_eq!(fresh.set_hints(id, LATE, (0, 0)), Fit::Unchanged);
+
+        let mut l = layout(vec![laptop()]);
+        l.place("upd", (10, 10)).unwrap();
+        l.remove(0);
+        let text = l.memory_text();
+        let (f, step) = l.place_with("upd", (10, 10), fixed(), true).unwrap();
+        assert_eq!(step, Step::Floating);
+        assert_eq!(l.set_hints(f, (1300, 600), (0, 0)), Fit::Floated);
+        assert_eq!(l.memory_text(), text);
+    }
+
+    /// Every rig layout from these tests, plus client sizes and a float.
+    fn sized_layouts() -> Vec<Layout> {
+        let mut out = vec![rig_with_tiles().0, quarters().0, laptop_float().0];
+        let mut l = layout(vec![ultrawide()]);
+        two_halves(&mut l);
+        l.place_with("upd", (3400, 10), fixed(), true).unwrap();
+        l.place_with("small", (3400, 10), Hints::new((0, 0), (500, 400)), false)
+            .unwrap();
+        out.push(l);
+        let (mut l, [_, _, late, _]) = quarters();
+        l.set_hints(late, LATE, (0, 0));
+        out.push(l);
+        let mut l = layout(rig());
+        for n in 0..9 {
+            l.place_with(
+                &format!("app{n}"),
+                (2000, 2200),
+                Hints::new((0, 0), (900, 700)),
+                n % 2 == 0,
+            )
+            .unwrap();
+        }
+        l.place_with("upd", (100, 2400), fixed(), true).unwrap();
+        out.push(l);
+        out
+    }
+
+    #[test]
+    fn ac12_clips_never_overlap_other_tiles_or_zones() {
+        for l in sized_layouts() {
+            let shown: Vec<&Tile> = l.tiles.iter().filter(|t| l.visible(t.id)).collect();
+            for t in &shown {
+                let clip = l.clip(t.id).unwrap();
+                let o = l.output(&t.output).unwrap();
+                if t.floating {
+                    assert!(inside(clip, o.full), "{t:?}");
+                    continue;
+                }
+                assert!(inside(clip, l.frame(t.id).unwrap().0), "{t:?}");
+                for u in shown.iter().filter(|u| u.id != t.id && !u.floating) {
+                    assert!(!overlaps(clip, l.clip(u.id).unwrap()), "{t:?} {u:?}");
+                    let zones = [
+                        Hit::Strip(u.id),
+                        Hit::Edge(u.id, Side::Left),
+                        Hit::Edge(u.id, Side::Right),
+                        Hit::Edge(u.id, Side::Top),
+                        Hit::Edge(u.id, Side::Bottom),
+                    ];
+                    for z in zones.into_iter().filter_map(|h| l.zone(h)) {
+                        assert!(!overlaps(clip, z), "{t:?} {u:?} {z:?}");
+                    }
+                }
+            }
+        }
     }
 }

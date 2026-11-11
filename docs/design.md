@@ -18,8 +18,8 @@ These come from hands-on tests of COSMIC and niri. Each one names the thing that
    else.
 4. **Resizing is predictable.** Dragging an edge moves that edge, snaps to the grid, and changes
    only the windows that touch it.
-5. **Tiling is not a toggle.** There's no "tiling mode" to turn on. Dialogs and popups float;
-   everything else tiles.
+5. **Tiling is not a toggle.** There's no "tiling mode" to turn on. Dialogs, popups and windows
+   too big for any tile float; everything else tiles.
 6. **Every window stays on screen.** A window never scrolls or slides off its monitor. (niri
    puts windows on an endless strip that runs off the edge.)
 
@@ -58,27 +58,35 @@ used apps, and navi ignores a damaged file. A file from the 12 × 6 grid (`navi-
 read with its cells doubled, which keeps the same layout, and is saved in the new format on the
 next change.
 
-If navi has no memory for an app, it gets half the monitor's width at full height. Wayland gives
-an app no way to ask for a size before it's first placed.
+If navi has no memory for an app, it gets half the monitor's width at full height. Either way,
+the size is raised to the app's minimum and lowered to its maximum (see *Client sizes*), so a
+fixed-size app wants exactly its size.
 
 ### Placing a new window
 
-These steps are tried in order. The first one that fits wins.
+These steps are tried in order. The first one that fits wins. "The minimum" here is the
+window's effective minimum span: navi's (about 320×240 logical px, rounded up to whole cells), or
+the fewest cells that hold the app's own minimum size anywhere on the grid, below the bar if the
+tile has one, where that is larger. The wanted size is the remembered one, raised and lowered to
+the app's limits.
 
-1. **Where the app was last time**, if those cells are empty on that monitor.
-2. **The nearest empty rectangle** of the remembered size on the monitor with the pointer.
-3. **Open smaller.** The nearest empty rectangle at less than the remembered size, but no
-   smaller than the minimum (about 320×240 logical px, rounded up to whole cells).
+1. **Where the app was last time**, if those cells are empty on that monitor and hold its
+   minimum size.
+2. **The nearest empty rectangle** of the wanted size on the monitor with the pointer.
+3. **Open smaller.** The nearest empty rectangle at less than the wanted size, but no
+   smaller than the minimum.
 4. **Shrink the neighbours.** The new window's target width is an equal share of the monitor's
    columns (24 ÷ the number of tiles in that row, counting the new one), or its remembered width
    if that is smaller, and never below the minimum. Tiles give back one column at a time, largest
    first, until the target fits. Tiles larger than their remembered size go first. Tiles may
    slide sideways, keeping their order, so the freed columns form one gap. No tile shrinks below
-   the minimum. Shrinking never changes what navi remembers for an app. On the ultrawide, two
+   its own minimum. Shrinking never changes what navi remembers for an app. On the ultrawide, two
    half-width apps plus a third become 8 + 8 + 8 columns, and a fourth makes 6 + 6 + 6 + 6.
 5. **Another monitor** that has room, by monitor priority (see *Monitors*).
 6. **Tab with the nearest tile.** This happens only when every tile is already at its minimum
-   (principle 3).
+   (principle 3), and only with a tile whose cells hold the new window and every member of the
+   group below a tab bar.
+7. **Float.** When nothing fits, the window floats centred on the monitor (see *Client sizes*).
 
 When a window closes, its cells stay empty. Other windows don't jump to fill them. You use the
 space when you want it.
@@ -92,10 +100,12 @@ space when you want it.
   cell the pointer does, from the first one, and is clamped to the grid of the monitor under the
   pointer. If that spot is taken by a tile the pointer isn't over, the preview is the nearest
   free spot to it, or none. Drop the window onto another tile to swap them. Hold the window over the middle of a tile for about
-  half a second, and the drop forms tabs instead.
+  half a second, and the drop forms tabs instead. A swap or tab that would put a window into
+  cells below its minimum (a tab group's bar included) cancels.
 - **Resize:** drag any tile edge. It moves in whole cells. When two tiles share that edge, both
-  change. Nothing else changes (principle 4). The edge stops when a tile reaches its minimum. The
-  new size becomes that app's remembered size.
+  change. Nothing else changes (principle 4). The edge stops when a tile reaches its minimum,
+  which is the app's own minimum where that is larger. The new size becomes that app's
+  remembered size.
 - **Diagonal resize:** drag a corner in the gaps around a window to change its width and height
   together. The corner target is the 32 px nearest each corner of the tile's cells in every
   direction: the ends of the side and bottom gaps, and the outer 26 px of each end of the strip,
@@ -125,7 +135,8 @@ Every press changes exactly one grid cell.
 - **Alt + Arrow** moves the focused tile one cell in that direction, preserving its size. Tiles
   behind it stay put.
 - **Super + Arrow** grows that side by one cell; **Super + Shift + Arrow** shrinks it by one,
-  never below the minimum size. Shrinking never changes another tile.
+  never below the minimum size (the app's own minimum where that is larger, as everywhere in this
+  section). Shrinking never changes another tile.
 - Growing or moving into touching tiles takes the cell from them: each tile touching that side
   (minimized ones included) moves its touching edge one cell away, and its other edges stay. If
   any of them would drop below the minimum size, nothing changes. Neither crosses the monitor's
@@ -140,6 +151,57 @@ Every press changes exactly one grid cell.
   drag takes precedence. Settings can swap the two modifiers; Shift goes with the grow one.
   Ctrl, the other modifier, or Shift with the move modifier leave the chord to apps.
 
+### Client sizes
+
+An app may state a minimum and a maximum window size (xdg-toplevel `set_min_size` and
+`set_max_size`; 0 means no limit). navi treats both as untrusted: values are capped at 65535 px,
+a maximum below the minimum is ignored, and hints equal to the stored ones change nothing, so an
+app that resends them on every commit costs nothing. X11 size hints aren't read.
+
+- **Placement** uses the minimum and the wanted size, as *Placing a new window* says. A tab group's
+  minimum is its largest member's.
+- **The rect.** A window is sized to its cells, clamped to its maximum and anchored at the top-left,
+  maximized too; the leftover px stay empty, and the bar and frame hug the window. A fixed 1220 ×
+  600 app on the ultrawide gets 9 × 6 cells and is configured to exactly 1220 × 600. Fullscreen
+  isn't clamped.
+- **Late hints.** An app may change its limits after it's placed. If its cells still hold the new
+  minimum, nothing moves. Otherwise it is placed again through the placement order, its own cells
+  counting as free and its centre standing in for the pointer, and navi remembers the new size; if
+  nothing fits, it floats. A re-placed window leaves fullscreen and maximize. A relaxed minimum
+  never moves anything: it only lowers the floor for later resizes and shrinking. A bar that
+  appears later (the app switches to navi's decorations) is checked the same way. One window is
+  refitted at most once a second; hints that change faster are applied as they stand then, so an
+  app flipping its minimum on every commit can't make navi re-place it and save memory each frame.
+- **Floats.** A window too big for any tile floats centred in what the panels leave of its
+  monitor, 8 px from their edges, at its wanted size below navi's bar. Every float gets the bar
+  and its ⌄ ⌃ ✕, even an app that draws its own title bar, so it can always be minimized or closed
+  to see the tiles behind it; the dock brings it back. Where the app's minimum is larger than that
+  area, the float takes what the minimum needs of the monitor below the top panel, past the
+  bottom one, which stays on top of it; its bar never goes under the top panel. Only a minimum
+  larger than that is cut, which is logged. It holds no cells, so tiles
+  are placed under it; it has no strip, edges or corners, and only its bar's buttons take clicks
+  over it. Minimize hides it, fullscreen covers the monitor and returns it to floating, and
+  maximize does nothing. It never tabs and isn't a move or swap target. It draws, with its bar and
+  frame, above every tile and its decorations and below the panels and the lock screen; its
+  dialogs draw above it. It tiles again only when its hints change and a step fits, or when it
+  reopens, and doesn't change what navi remembers. Unplugging its monitor runs the placement order
+  again from the main monitor. Floats can't be moved or resized yet.
+- **The clip.** Every tiled or floating window's own surfaces are drawn and take pointer input
+  only inside its rect: the clamped tile rect, the float's rect, or the monitor while fullscreen.
+  A popup (menu, tooltip) of a tiled or floating window is kept inside that window's rect: navi
+  slides, flips or shrinks it there when it's placed, and draws and hits it only there, whatever
+  size the app asks for or attaches. So a popup, with or without a grab, can't cover or take
+  input meant for a neighbouring tile. A popup of a dialog is kept on its monitor. A window that draws larger, such as a CSD
+  shadow or a buffer bigger than its configure, is cropped there, and a click just outside it
+  reaches what's below. So no app draws over, or takes clicks meant for, another tile or navi's
+  zones. Dialogs aren't clipped: a dialog, sized by its app, can still cover neighbouring tiles
+  and take their clicks while it's shown.
+- **Logs.** One `info` line per change: `client size hints` (app, id, min, max and the outcome),
+  then `re-placed`, `floating: no tile fits` (and `floating: its minimum is bigger than the
+  monitor` when it is) or `tiled again` with the cells or rect, and `clipped`
+  with both sizes when a window's geometry is larger than its clip rect. An app that alternates its
+  hints logs at most one refit a second.
+
 ### Tabs
 
 - A tab group shows one window at a time. Above it, a 24 px bar sits between the strip and the
@@ -148,7 +210,7 @@ Every press changes exactly one grid cell.
   come later, since titles would need fonts in the compositor and fonts stay out of it. For now a
   tab tells you its window only by position.
 - Click a tab to switch to it. Drag a tab out (8 px or more) to untab that window: it lands where
-  its preview shows, at its remembered size, as a moved window does, or tabs into another tile
+  its preview shows, at its wanted size, as a moved window does, or tabs into another tile
   after a half-second hold. Dropping it on another tile without the hold, or within half a cell
   of where you grabbed it, cancels.
 
@@ -539,7 +601,9 @@ session.
     elements in `render::Frame` for both backends: one antialiased rounded-rect shader for frames,
     strips, tab bars and drag previews, one rounded-clip texture shader around each tiled window
     (top corners only where no bar sits above). Dialogs, popups, fullscreen and the lock surface
-    are never clipped. Clipping can disable direct scanout for tiled windows.
+    are never clipped. It replaces the square crop each tiled and floating window already gets
+    (`Layout::clip`, *Client sizes*), with the same one rect per window. Clipping can disable
+    direct scanout for tiled windows.
   - **Frosted panels.** Blur behind navi-bar's panels via `ext-background-effect-v1`, advertised
     only to navi-bar like layer-shell, with each panel's region capped at 16 rectangles, clamped
     to the surface and rounded by `RADIUS`. Only the wallpaper is blurred, once per output and

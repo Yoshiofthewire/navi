@@ -86,8 +86,7 @@ impl Navi {
             match self.seat.get_keyboard().and_then(|k| k.current_focus()) {
                 Some(crate::focus::Focus::X11(parent)) => Some(parent.window_id()),
                 _ => self
-                    .space
-                    .element_under(self.pointer_location())
+                    .window_under(self.pointer_location())
                     .and_then(|(w, _)| w.x11_surface())
                     .map(|p| p.window_id()),
             }
@@ -116,6 +115,9 @@ impl Navi {
             window: window.clone(),
             tile,
             last_size: x.geometry().size,
+            clipped: None,
+            refitted: None,
+            refit_queued: false,
             want_fullscreen: false,
             escaped: false,
             x11_parent,

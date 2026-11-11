@@ -18,7 +18,7 @@ const HEADER: &str = "navi-memory 2";
 const HEADER_V1: &str = "navi-memory 1";
 const MAX_ENTRIES: usize = 512;
 const MAX_NAME: usize = 255;
-const MAX_PX: i32 = 65535;
+pub(super) const MAX_PX: i32 = 65535;
 
 /// Printable ASCII without whitespace, so a name is one field on one line and no escape.
 pub fn safe(name: &str) -> bool {
