@@ -18,7 +18,7 @@ use smithay::{
             },
         },
     },
-    desktop::{LayerMap, PopupManager, Window, WindowSurface, layer_map_for_output},
+    desktop::{LayerMap, Window, WindowSurface, layer_map_for_output},
     output::Output,
     utils::{Point, Rectangle, Scale, Transform},
     wayland::shell::wlr_layer::Layer,
@@ -397,8 +397,8 @@ pub fn send_frames(state: &mut Navi, output: &Output) {
 }
 
 /// The floating and the tiled windows over `geo`, each top first. A window's own surfaces are
-/// cropped to its clip rect; its popups aren't. `rect` maps a global logical rect to `geo`'s
-/// physical px.
+/// cropped to its clip rect, its popups to their configured geometry on their output. `rect`
+/// maps a global logical rect to `geo`'s physical px.
 fn windows<R>(
     renderer: &mut R,
     state: &Navi,
@@ -423,8 +423,17 @@ where
         let loc = (loc - w.geometry().loc - geo.loc).to_physical_precise_round(scale);
         let (float, clip) = state.stacking(w);
         let out = if float { &mut floats } else { &mut tiles };
-        let (popups, own) = window_elements(renderer, w, loc, scale);
-        out.extend(popups.into_iter().map(Frame::from));
+        for (surface, at, popup) in state.popups(w) {
+            let at = (at - geo.loc).to_physical_precise_round(scale);
+            let k = Kind::Unspecified;
+            let tree = render_elements_from_surface_tree(renderer, &surface, at, scale, 1.0, k);
+            out.extend(
+                tree.into_iter()
+                    .filter_map(|e| CropRenderElement::from_element(e, scale, rect(popup)))
+                    .map(Frame::from),
+            );
+        }
+        let own = window_elements(renderer, w, loc, scale);
         match clip {
             Some(c) => out.extend(
                 own.into_iter()
@@ -437,42 +446,24 @@ where
     (floats, tiles)
 }
 
-/// A window's popups and its own surface tree, top first, as `Window` renders them.
+/// A window's own surface tree, without its popups.
 fn window_elements<R>(
     renderer: &mut R,
     w: &Window,
     loc: Point<i32, smithay::utils::Physical>,
     scale: f64,
-) -> (
-    Vec<WaylandSurfaceRenderElement<R>>,
-    Vec<WaylandSurfaceRenderElement<R>>,
-)
+) -> Vec<WaylandSurfaceRenderElement<R>>
 where
     R: Renderer + ImportAll,
     R::TextureId: Texture + Clone + Send + 'static,
 {
-    let WindowSurface::Wayland(t) = w.underlying_surface() else {
-        let own = AsRenderElements::<R>::render_elements(w, renderer, loc, scale.into(), 1.0);
-        return (Vec::new(), own);
-    };
-    let surface = t.wl_surface();
-    let popups = PopupManager::popups_for_surface(surface)
-        .flat_map(|(popup, offset)| {
-            let offset =
-                (w.geometry().loc + offset - popup.geometry().loc).to_physical_precise_round(scale);
-            render_elements_from_surface_tree(
-                renderer,
-                popup.wl_surface(),
-                loc + offset,
-                scale,
-                1.0,
-                Kind::Unspecified,
-            )
-        })
-        .collect();
-    let own =
-        render_elements_from_surface_tree(renderer, surface, loc, scale, 1.0, Kind::Unspecified);
-    (popups, own)
+    match w.underlying_surface() {
+        WindowSurface::Wayland(t) => {
+            let k = Kind::Unspecified;
+            render_elements_from_surface_tree(renderer, t.wl_surface(), loc, scale, 1.0, k)
+        }
+        _ => AsRenderElements::<R>::render_elements(w, renderer, loc, scale.into(), 1.0),
+    }
 }
 
 /// The output's upper layer surfaces, and its lower layers, top first. While a window is

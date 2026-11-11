@@ -21,6 +21,8 @@ pub const STRIP: i32 = 8;
 pub const BAR: i32 = 24;
 pub const MIN_W: i32 = 320;
 pub const MIN_H: i32 = 240;
+/// A float's distance from the panels and screen edges, while it fits.
+const FLOAT_MARGIN: i32 = STRIP;
 
 pub type WinId = u64;
 
@@ -44,6 +46,10 @@ pub struct Rect {
 }
 
 impl Rect {
+    pub fn new(x: i32, y: i32, w: i32, h: i32) -> Rect {
+        Rect { x, y, w, h }
+    }
+
     fn center(&self) -> (i32, i32) {
         (self.x + self.w / 2, self.y + self.h / 2)
     }
@@ -444,10 +450,31 @@ impl Layout {
             return Fit::Unchanged;
         };
         t.hints = hints;
-        let t = t.clone();
+        self.refit(id)
+    }
+
+    /// Whether the app asked navi to draw its controls. A tile whose window no longer fits below
+    /// its new bar is refitted as `set_hints` does; a float always has the bar.
+    pub fn set_decorated(&mut self, id: WinId, on: bool) -> Fit {
+        let Some(t) = self.tile_mut(id).filter(|t| t.decorated != on) else {
+            return Fit::Unchanged;
+        };
+        t.decorated = on;
+        match t.floating {
+            true => Fit::Fits,
+            false => self.refit(id),
+        }
+    }
+
+    /// Places `id` again if its cells no longer hold its window, or if it floats.
+    fn refit(&mut self, id: WinId) -> Fit {
+        let Some(t) = self.tile(id).cloned() else {
+            return Fit::Unchanged;
+        };
         let Some(o) = self.output(&t.output).cloned() else {
             return Fit::Fits;
         };
+        let hints = t.hints;
         let need = Need {
             size: (0, 0),
             min: hints.min,
@@ -489,23 +516,56 @@ impl Layout {
             None => (here.name.clone(), Cells::default(), true),
         };
         t.maximized = false;
+        t.fullscreen = false;
         self.tiles.insert(i, t);
         spot
     }
 
-    /// A float's window: its wanted size, centred in its output's area and clamped to it.
+    /// A float's window, below its bar: its wanted size, centred in its output's area,
+    /// `FLOAT_MARGIN` from its edges. Where that's below the app's minimum it takes what the
+    /// minimum needs of the whole output, past the panels (which stay on top), but its bar never
+    /// goes above the area, so its buttons stay in reach.
     fn float_rect(&self, t: &Tile, o: &Output) -> Rect {
-        let bar = if self.has_bar(t.id) { BAR } else { 0 };
-        let a = o.area;
-        let need = self.need_for(&t.app, t.hints, bar > 0, (a.w / 2, a.h));
-        let w = (need.size.0 - GAP).clamp(1, a.w.max(1));
-        let h = (need.size.1 - GAP - bar).clamp(1, (a.h - bar).max(1));
+        let (f, m) = (o.full, FLOAT_MARGIN);
+        let a = Rect {
+            x: o.area.x + m,
+            y: o.area.y + m,
+            w: (o.area.w - 2 * m).max(1),
+            h: (o.area.h - 2 * m).max(1),
+        };
+        let need = self.need_for(&t.app, t.hints, true, (a.w / 2, a.h));
+        let (min_w, min_h) = t.hints.min;
+        let bottom = f.y + f.h;
+        let w = (need.size.0 - GAP).min(a.w).max(min_w).min(f.w).max(1);
+        let h = (need.size.1 - GAP - BAR).min(a.h - BAR).max(min_h);
+        let h = h.min(bottom - o.area.y - BAR).max(1);
+        let x = match w <= a.w {
+            true => a.x + (a.w - w) / 2,
+            false => f.x + (f.w - w) / 2,
+        };
+        let outer = h + BAR;
+        let top = match outer <= a.h {
+            true => a.y + (a.h - outer) / 2,
+            false => a.y.min(bottom - outer).max(o.area.y),
+        };
         Rect {
-            x: a.x + (a.w - w) / 2,
-            y: a.y + (a.h - h - bar) / 2 + bar,
+            x,
+            y: top + BAR,
             w,
             h,
         }
+    }
+
+    /// `id` floats with a minimum bigger than its output can show, so part of it is cut.
+    pub fn too_small(&self, id: WinId) -> bool {
+        let Some((t, o)) = self
+            .tile(id)
+            .and_then(|t| Some((t, self.output(&t.output)?)))
+        else {
+            return false;
+        };
+        let r = self.float_rect(t, o);
+        t.floating && (r.w < t.hints.min.0 || r.h < t.hints.min.1)
     }
 
     pub fn tiles(&self) -> &[Tile] {
@@ -538,15 +598,12 @@ impl Layout {
         let o = self.output(&t.output)?;
         if t.floating {
             let r = self.float_rect(t, o);
-            let bar = if self.has_bar(id) { BAR } else { 0 };
-            return Some((
-                Rect {
-                    y: r.y - bar,
-                    h: r.h + bar,
-                    ..r
-                },
-                r,
-            ));
+            let bar = Rect {
+                y: r.y - BAR,
+                h: r.h + BAR,
+                ..r
+            };
+            return Some((bar, r));
         }
         let cells = match self.maximized(t) {
             true => FULL,
@@ -623,19 +680,14 @@ impl Layout {
             .is_some_and(|t| !t.minimized && self.active(id) == Some(id) && !self.covered(t))
     }
 
-    /// Tabbed, or showing a window that wants navi's controls.
+    /// Tabbed, floating, or showing a window that wants navi's controls. A float always has
+    /// them, so it can be minimized or closed whatever the app draws.
     pub fn has_bar(&self, id: WinId) -> bool {
-        let decorated = self
+        let controls = self
             .active(id)
             .and_then(|a| self.tile(a))
-            .is_some_and(|a| a.decorated);
-        decorated || self.group(id).len() > 1
-    }
-
-    pub fn set_decorated(&mut self, id: WinId, on: bool) {
-        if let Some(t) = self.tile_mut(id) {
-            t.decorated = on;
-        }
+            .is_some_and(|a| a.decorated || a.floating);
+        controls || self.group(id).len() > 1
     }
 
     fn tile_mut(&mut self, id: WinId) -> Option<&mut Tile> {
@@ -1053,6 +1105,7 @@ fn dist2((ax, ay): (i32, i32), (bx, by): (i32, i32)) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::{Action, Button, Done};
     use drag::Hit;
 
     fn out(name: &str, x: i32, y: i32, w: i32, h: i32, priority: u32) -> Output {
@@ -2005,7 +2058,12 @@ mod tests {
             (outer.y - a.y - (a.y + a.h - outer.y - outer.h)).abs() <= 1,
             "{outer:?}"
         );
-        assert_eq!((clip.w, clip.h), (a.w, 600), "clamped to the area");
+        assert_eq!(
+            (clip.w, clip.h),
+            (a.w, 600),
+            "1220 is wider than the laptop"
+        );
+        assert!(l.too_small(f));
         assert_eq!(outer.h, 600 + BAR);
 
         // Over the float, only its buttons; with it minimized, the tile's zones show through.
@@ -2080,6 +2138,109 @@ mod tests {
         let k = l.tile(f).unwrap();
         assert!(k.floating && k.output == "lp2", "{k:?}");
         assert!(inside(l.clip(f).unwrap(), l.output("lp2").unwrap().area));
+    }
+
+    #[test]
+    fn a_float_always_has_navis_buttons_and_minimizing_uncovers_the_tiles() {
+        // A client that draws its own title bar (no xdg-decoration) still gets navi's bar.
+        let mut l = layout(vec![laptop()]);
+        let (t, _) = l.place("term", (500, 300)).unwrap();
+        let (f, step) = l
+            .place_with("bmm", (500, 300), Hints::new(LATE, (0, 0)), false)
+            .unwrap();
+        assert_eq!(step, Step::Floating);
+        assert!(l.has_bar(f));
+        let buttons = l.bar(f).unwrap().buttons;
+        let kinds: Vec<Button> = buttons.iter().map(|b| b.0).collect();
+        assert_eq!(kinds, [Button::Minimize, Button::Maximize, Button::Close]);
+        let minimize = buttons[0].1;
+        let at = (minimize.x + 4, minimize.y + 4);
+        assert_eq!(l.hit(at), Some(Hit::Button(f, Button::Minimize)));
+        assert!(inside(l.frame(f).unwrap().0, laptop().full));
+        let d = Drag::press(&l, at).unwrap();
+        assert_eq!(
+            d.release(&mut l, at, 10),
+            Some(Done::Click(Action::Minimize, f))
+        );
+        assert!(!l.visible(f));
+        let strip = l.zone(Hit::Strip(t)).unwrap().center();
+        assert_eq!(
+            l.hit(strip),
+            Some(Hit::Strip(t)),
+            "the tile is reachable again"
+        );
+        assert!(l.activate(f) && l.visible(f), "the dock restores it");
+        assert_eq!(
+            l.set_decorated(f, true),
+            Fit::Fits,
+            "a float keeps its place"
+        );
+    }
+
+    #[test]
+    fn a_float_keeps_its_minimum_height_on_the_monitor_and_a_margin_when_it_fits() {
+        // A band of 44 px over a 1125 x 703 laptop: 590 px don't fit a tile below a bar.
+        let mut o = laptop();
+        o.area = Rect {
+            x: 0,
+            y: 44,
+            w: 1125,
+            h: 600,
+        };
+        let mut l = layout(vec![o.clone()]);
+        let (f, step) = l
+            .place_with("tall", (500, 300), Hints::new((300, 590), (0, 0)), false)
+            .unwrap();
+        assert_eq!(step, Step::Floating);
+        let (outer, clip) = (l.frame(f).unwrap().0, l.clip(f).unwrap());
+        assert_eq!(clip.h, 590, "not clamped to the area");
+        assert_eq!(outer.y, o.area.y + FLOAT_MARGIN, "its bar below the band");
+        assert!(inside(outer, o.full) && !l.too_small(f));
+
+        // Floating only because the neighbours can't give way: it fits, FLOAT_MARGIN inside.
+        let (mut l, ids) = quarters();
+        for id in [ids[0], ids[1], ids[3]] {
+            l.set_hints(id, (840, 0), (0, 0));
+        }
+        assert_eq!(l.set_hints(ids[2], LATE, (0, 0)), Fit::Floated);
+        let a = ultrawide().area;
+        let inset = Rect {
+            x: a.x + FLOAT_MARGIN,
+            y: a.y + FLOAT_MARGIN,
+            w: a.w - 2 * FLOAT_MARGIN,
+            h: a.h - 2 * FLOAT_MARGIN,
+        };
+        assert!(inside(l.frame(ids[2]).unwrap().0, inset));
+
+        let mut l = layout(vec![laptop()]);
+        let (f, _) = l
+            .place_with("huge", (10, 10), Hints::new((2000, 1500), (0, 0)), false)
+            .unwrap();
+        assert!(l.too_small(f) && inside(l.frame(f).unwrap().0, laptop().full));
+        // Too big for the monitor: cut, its bar still below the band.
+        let mut l = layout(vec![o.clone()]);
+        let huge = Hints::new((2000, 1500), (0, 0));
+        let (f, _) = l.place_with("huge", (10, 300), huge, false).unwrap();
+        let outer = l.frame(f).unwrap().0;
+        assert!(
+            l.too_small(f) && outer.y == o.area.y && inside(outer, o.full),
+            "{outer:?}"
+        );
+    }
+
+    #[test]
+    fn a_late_bar_refits_and_a_re_place_ends_fullscreen() {
+        // 1410 px high holds 12 rows without a bar, not below one.
+        let mut l = layout(vec![ultrawide()]);
+        let (a, _) = l.place("a", (10, 10)).unwrap();
+        assert_eq!(l.set_hints(a, (0, 1410), (0, 0)), Fit::Fits);
+        assert_eq!(l.set_decorated(a, false), Fit::Unchanged);
+        assert_eq!(l.set_decorated(a, true), Fit::Floated);
+
+        let (mut l, [_, _, late, _]) = quarters();
+        assert!(l.fullscreen(late));
+        assert!(matches!(l.set_hints(late, LATE, (0, 0)), Fit::Replaced(..)));
+        assert!(!l.is_fullscreen(late));
     }
 
     /// Four quarters on the ultrawide; the third is "late".
@@ -2264,7 +2425,7 @@ mod tests {
                 let clip = l.clip(t.id).unwrap();
                 let o = l.output(&t.output).unwrap();
                 if t.floating {
-                    assert!(inside(clip, o.area), "{t:?}");
+                    assert!(inside(clip, o.full), "{t:?}");
                     continue;
                 }
                 assert!(inside(clip, l.frame(t.id).unwrap().0), "{t:?}");

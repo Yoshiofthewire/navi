@@ -167,10 +167,18 @@ app that resends them on every commit costs nothing. X11 size hints aren't read.
 - **Late hints.** An app may change its limits after it's placed. If its cells still hold the new
   minimum, nothing moves. Otherwise it is placed again through the placement order, its own cells
   counting as free and its centre standing in for the pointer, and navi remembers the new size; if
-  nothing fits, it floats. A relaxed minimum never moves anything: it only lowers the floor for
-  later resizes and shrinking.
+  nothing fits, it floats. A re-placed window leaves fullscreen and maximize. A relaxed minimum
+  never moves anything: it only lowers the floor for later resizes and shrinking. A bar that
+  appears later (the app switches to navi's decorations) is checked the same way. One window is
+  refitted at most once a second; hints that change faster are applied as they stand then, so an
+  app flipping its minimum on every commit can't make navi re-place it and save memory each frame.
 - **Floats.** A window too big for any tile floats centred in what the panels leave of its
-  monitor, at its wanted size plus its bar, clamped to that area. It holds no cells, so tiles
+  monitor, 8 px from their edges, at its wanted size below navi's bar. Every float gets the bar
+  and its ⌄ ⌃ ✕, even an app that draws its own title bar, so it can always be minimized or closed
+  to see the tiles behind it; the dock brings it back. Where the app's minimum is larger than that
+  area, the float takes what the minimum needs of the monitor below the top panel, past the
+  bottom one, which stays on top of it; its bar never goes under the top panel. Only a minimum
+  larger than that is cut, which is logged. It holds no cells, so tiles
   are placed under it; it has no strip, edges or corners, and only its bar's buttons take clicks
   over it. Minimize hides it, fullscreen covers the monitor and returns it to floating, and
   maximize does nothing. It never tabs and isn't a move or swap target. It draws, with its bar and
@@ -178,16 +186,19 @@ app that resends them on every commit costs nothing. X11 size hints aren't read.
   dialogs draw above it. It tiles again only when its hints change and a step fits, or when it
   reopens, and doesn't change what navi remembers. Unplugging its monitor runs the placement order
   again from the main monitor. Floats can't be moved or resized yet.
-- **The clip.** Every tiled or floating window's own surfaces (not its popups, which are already
-  kept on the monitor) are drawn and take pointer input only inside its rect: the clamped tile rect,
-  the float's rect, or the monitor while fullscreen. A window that draws larger, such as a CSD
+- **The clip.** Every tiled or floating window's own surfaces are drawn and take pointer input
+  only inside its rect: the clamped tile rect, the float's rect, or the monitor while fullscreen.
+  A popup (menu, tooltip) is drawn and hit only inside the geometry navi configured for it, cut
+  to the monitor it starts on, whatever size of buffer it attaches, so a popup without a grab
+  can't cover or take clicks from the windows around it. A window that draws larger, such as a CSD
   shadow or a buffer bigger than its configure, is cropped there, and a click just outside it
   reaches what's below. So no app draws over, or takes clicks meant for, another tile or navi's
   zones. Dialogs aren't clipped.
 - **Logs.** One `info` line per change: `client size hints` (app, id, min, max and the outcome),
-  then `re-placed`, `floating: no tile fits` or `tiled again` with the cells or rect, and `clipped`
+  then `re-placed`, `floating: no tile fits` (and `floating: its minimum is bigger than the
+  monitor` when it is) or `tiled again` with the cells or rect, and `clipped`
   with both sizes when a window's geometry is larger than its clip rect. An app that alternates its
-  hints on every commit can log a line per commit, like `client committed size`.
+  hints logs at most one refit a second.
 
 ### Tabs
 

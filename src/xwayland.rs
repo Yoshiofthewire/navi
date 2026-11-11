@@ -116,6 +116,8 @@ impl Navi {
             tile,
             last_size: x.geometry().size,
             clipped: None,
+            refitted: None,
+            refit_queued: false,
             want_fullscreen: false,
             escaped: false,
             x11_parent,

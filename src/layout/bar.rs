@@ -51,7 +51,7 @@ impl Layout {
         };
         let active = self.tile(self.active(id)?)?;
         let right = rect.x + rect.w;
-        let all: &[Button] = match active.decorated && !active.minimized {
+        let all: &[Button] = match (active.decorated || active.floating) && !active.minimized {
             true => &[Button::Minimize, Button::Maximize, Button::Close],
             false => &[],
         };

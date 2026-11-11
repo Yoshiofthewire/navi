@@ -7,6 +7,7 @@ use smithay::{
     desktop::{
         LayerSurface, PopupKind, PopupManager, Space, Window, WindowSurfaceType,
         find_popup_root_surface, get_popup_toplevel_coords, layer_map_for_output,
+        utils::under_from_surface_tree,
     },
     input::{
         Seat, SeatHandler, SeatState,
@@ -56,7 +57,7 @@ use smithay::{
             },
             xdg::{
                 PopupSurface, PositionerState, SurfaceCachedState, ToplevelSurface,
-                XdgShellHandler, XdgShellState, XdgToplevelSurfaceData,
+                XdgPopupSurfaceData, XdgShellHandler, XdgShellState, XdgToplevelSurfaceData,
                 decoration::{XdgDecorationHandler, XdgDecorationState},
             },
         },
@@ -91,6 +92,9 @@ pub struct Managed {
     pub(crate) last_size: Size<i32, Logical>,
     /// The geometry and clip rect last logged as clipped.
     pub(crate) clipped: Option<(Size<i32, Logical>, Rect)>,
+    /// When its size hints were last applied, and whether a later refit is already timed.
+    pub(crate) refitted: Option<std::time::Instant>,
+    pub(crate) refit_queued: bool,
     /// Asked for fullscreen before it was placed.
     pub(crate) want_fullscreen: bool,
     /// Left fullscreen by Super+Esc: its fullscreen requests are refused until the user next
@@ -288,13 +292,20 @@ impl Navi {
     /// rest. A window's own surfaces take input only inside its clip rect; its popups anywhere.
     pub fn window_under(&self, pos: Point<f64, Logical>) -> Option<(&Window, Under)> {
         let under = |w: &Window, clip: Option<Rect>| -> Option<Under> {
+            let popup = self.popups(w).into_iter().find_map(|(s, loc, clip)| {
+                let all = WindowSurfaceType::ALL;
+                let (s, p) = clip
+                    .contains(px(pos))
+                    .then(|| under_from_surface_tree(&s, pos, loc, all))??;
+                Some((s, p.to_f64()))
+            });
+            if popup.is_some() {
+                return popup;
+            }
             let loc = self.space.element_location(w)? - w.geometry().loc;
-            let at = pos - loc.to_f64();
             let own = WindowSurfaceType::TOPLEVEL | WindowSurfaceType::SUBSURFACE;
             let inside = clip.is_none_or(|c| c.contains(px(pos)));
-            let (s, p) = w
-                .surface_under(at, WindowSurfaceType::POPUP)
-                .or_else(|| inside.then(|| w.surface_under(at, own)).flatten())?;
+            let (s, p) = inside.then(|| w.surface_under(pos - loc.to_f64(), own))??;
             Some((s, (p + loc).to_f64()))
         };
         let pass = |floats: bool| {
@@ -306,6 +317,30 @@ impl Navi {
             })
         };
         pass(true).or_else(|| pass(false))
+    }
+
+    /// `w`'s popups, top first: each surface, where its tree is drawn (global) and the rect it's
+    /// drawn and hit inside, its configured geometry cut to the output it starts on. What the
+    /// client attaches beyond that is cropped, so a grab-less popup can't cover other windows.
+    pub fn popups(&self, w: &Window) -> Vec<(WlSurface, Point<i32, Logical>, Rect)> {
+        let (Some(loc), Some(t)) = (self.space.element_location(w), w.toplevel()) else {
+            return Vec::new();
+        };
+        let popups = PopupManager::popups_for_surface(t.wl_surface());
+        popups
+            .filter_map(|(popup, offset)| {
+                let size = with_states(popup.wl_surface(), |s| {
+                    let d = s.data_map.get::<XdgPopupSurfaceData>()?;
+                    Some(d.lock().ok()?.current.geometry.size)
+                })?;
+                let at = loc + offset;
+                let o = self.space.output_under(at.to_f64()).next()?;
+                let g = self.space.output_geometry(o)?;
+                let full = Rect::new(g.loc.x, g.loc.y, g.size.w, g.size.h);
+                let clip = intersect(Rect::new(at.x, at.y, size.w, size.h), full)?;
+                Some((popup.wl_surface().clone(), at - popup.geometry().loc, clip))
+            })
+            .collect()
     }
 
     /// Whether `w` stacks with the floats (a float or a float's dialog), and the rect its own
@@ -1064,8 +1099,10 @@ impl Navi {
         let id = self.tile_of(toplevel.wl_surface());
         info!(app, ?id, ?mode, "decoration");
         if let Some(id) = id {
-            self.layout
+            let fit = self
+                .layout
                 .set_decorated(id, mode == Decoration::ServerSide);
+            self.report_fit(id, &app, fit);
             // Sends the new mode with the new size.
             self.apply_layout();
         }
@@ -1109,7 +1146,6 @@ impl Navi {
                     self.layout.fullscreen(id);
                 }
                 info!(app, id, ?mode, "decoration");
-                self.layout.set_decorated(id, mode == Some(Decor::Server));
                 surface.with_pending_state(|s| {
                     for t in [
                         xdg_toplevel::State::TiledLeft,
@@ -1124,7 +1160,7 @@ impl Navi {
                 let rect = self.layout.rect(id);
                 info!(app, id, ?step, ?tile, ?rect, "placed");
                 if step == layout::Step::Floating {
-                    info!(app, id, min = ?hints.min, max = ?hints.max, ?rect, "floating: no tile fits");
+                    self.log_float(id, &app);
                 }
                 self.memory.sync(&self.layout);
             }
@@ -1143,40 +1179,51 @@ impl Navi {
     /// After a commit of `root`: refits a placed xdg toplevel whose min/max size changed, and logs
     /// a geometry larger than its clip rect once per change of either.
     fn refit(&mut self, root: &WlSurface) {
-        let Some(m) = self
+        let Some(i) = self
             .windows
             .iter()
-            .find(|m| window_surface(&m.window).as_ref() == Some(root))
+            .position(|m| window_surface(&m.window).as_ref() == Some(root))
         else {
             return;
         };
+        let m = &self.windows[i];
         let (Some(id), app) = (m.tile, window_app(&m.window)) else {
             return;
         };
-        if m.window.toplevel().is_some() {
-            let (min, max) = size_hints(root);
-            let fit = self.layout.set_hints(id, min, max);
-            if fit != Fit::Unchanged {
-                let h = self.layout.tile(id).map(|t| t.hints).unwrap_or_default();
-                let (min, max) = (h.min, h.max);
-                info!(app, id, ?min, ?max, ?fit, "client size hints");
-                match &fit {
-                    Fit::Replaced(output, cells) => {
-                        info!(app, id, ?min, ?max, output, ?cells, "re-placed");
+        let (min, max) = size_hints(root);
+        let changed = self
+            .layout
+            .tile(id)
+            .is_some_and(|t| t.hints != layout::Hints::new(min, max));
+        if m.window.toplevel().is_some() && changed {
+            let now = std::time::Instant::now();
+            match refit_wait(m.refitted, now) {
+                // Coalesced: the timer applies whatever hints are current then.
+                Some(_) if m.refit_queued => {}
+                Some(wait) => {
+                    let surface = root.clone();
+                    let timer = Timer::from_duration(wait);
+                    let timed = self.loop_handle.insert_source(timer, move |_, _, data| {
+                        let s = &mut data.state;
+                        let m = s.windows.iter_mut();
+                        let mut m =
+                            m.filter(|m| window_surface(&m.window).as_ref() == Some(&surface));
+                        if let Some(m) = m.next() {
+                            m.refit_queued = false;
+                        }
+                        s.refit(&surface);
+                        TimeoutAction::Drop
+                    });
+                    match timed {
+                        Ok(_) => self.windows[i].refit_queued = true,
+                        Err(e) => warn!(app, id, "size hints not timed: {e}"),
                     }
-                    Fit::Tiled(output, cells) => {
-                        info!(app, id, ?min, ?max, output, ?cells, "tiled again");
-                    }
-                    Fit::Floated => {
-                        let rect = self.layout.rect(id);
-                        info!(app, id, ?min, ?max, ?rect, "floating: no tile fits");
-                    }
-                    Fit::Unchanged | Fit::Fits => {}
                 }
-                if matches!(fit, Fit::Replaced(..) | Fit::Tiled(..)) {
-                    self.memory.sync(&self.layout);
+                None => {
+                    self.windows[i].refitted = Some(now);
+                    let fit = self.layout.set_hints(id, min, max);
+                    self.report_fit(id, &app, fit);
                 }
-                self.apply_layout();
             }
         }
         let clip = self.layout.clip(id);
@@ -1197,6 +1244,45 @@ impl Navi {
                 let (w, h, clip_w, clip_h) = (size.w, size.h, clip.w, clip.h);
                 info!(app, id, w, h, clip_w, clip_h, "clipped");
             }
+        }
+    }
+
+    /// Logs what a refit of `id` did and applies it; a new tile's spot is saved.
+    fn report_fit(&mut self, id: WinId, app: &str, fit: Fit) {
+        if fit == Fit::Unchanged {
+            return;
+        }
+        let h = self.layout.tile(id).map(|t| t.hints).unwrap_or_default();
+        let (min, max) = (h.min, h.max);
+        info!(app, id, ?min, ?max, ?fit, "client size hints");
+        match &fit {
+            Fit::Replaced(output, cells) => {
+                info!(app, id, ?min, ?max, output, ?cells, "re-placed");
+            }
+            Fit::Tiled(output, cells) => {
+                info!(app, id, ?min, ?max, output, ?cells, "tiled again");
+            }
+            Fit::Floated => self.log_float(id, app),
+            Fit::Unchanged | Fit::Fits => {}
+        }
+        if matches!(fit, Fit::Replaced(..) | Fit::Tiled(..)) {
+            self.memory.sync(&self.layout);
+        }
+        self.apply_layout();
+    }
+
+    fn log_float(&self, id: WinId, app: &str) {
+        let h = self.layout.tile(id).map(|t| t.hints).unwrap_or_default();
+        let (min, max, rect) = (h.min, h.max, self.layout.rect(id));
+        info!(app, id, ?min, ?max, ?rect, "floating: no tile fits");
+        if self.layout.too_small(id) {
+            info!(
+                app,
+                id,
+                ?min,
+                ?rect,
+                "floating: its minimum is bigger than the monitor"
+            );
         }
     }
 
@@ -1356,7 +1442,6 @@ pub fn set_identity(output: &Output, id: String) {
 /// navi-bar's taskbar namespace; only navi-bar has layer shell, so it can be trusted.
 const BAR: &str = "navi-bar";
 
-/// The logical pixel containing `p`.
 /// A toplevel's committed min and max size, untrusted.
 fn size_hints(s: &WlSurface) -> ((i32, i32), (i32, i32)) {
     with_states(s, |states| {
@@ -1366,6 +1451,28 @@ fn size_hints(s: &WlSurface) -> ((i32, i32), (i32, i32)) {
     })
 }
 
+/// The least time between two refits of one window: a client that changes its size hints on
+/// every commit gets at most one re-place, and one memory write, a second.
+const REFIT_PACE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How long until a window last refitted at `last` may refit again; `None` if it may now.
+fn refit_wait(
+    last: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> Option<std::time::Duration> {
+    let due = last? + REFIT_PACE;
+    (due > now).then(|| due - now)
+}
+
+/// `r` cut to `bounds`; `None` if nothing is left.
+fn intersect(r: Rect, bounds: Rect) -> Option<Rect> {
+    let (x, y) = (r.x.max(bounds.x), r.y.max(bounds.y));
+    let w = (r.x + r.w).min(bounds.x + bounds.w) - x;
+    let h = (r.y + r.h).min(bounds.y + bounds.h) - y;
+    (w > 0 && h > 0).then_some(Rect { x, y, w, h })
+}
+
+/// The logical pixel containing `p`.
 pub fn px(p: Point<f64, Logical>) -> (i32, i32) {
     (p.x.floor() as i32, p.y.floor() as i32)
 }
@@ -1539,6 +1646,8 @@ impl XdgShellHandler for Navi {
             tile: None,
             last_size: Size::default(),
             clipped: None,
+            refitted: None,
+            refit_queued: false,
             want_fullscreen: false,
             escaped: false,
             x11_parent: None,
@@ -1892,5 +2001,32 @@ mod tests {
             ..Default::default()
         };
         assert!(privileged(Some(&bar)));
+    }
+
+    #[test]
+    fn refits_are_paced_to_one_a_second() {
+        let t = std::time::Instant::now();
+        let ms = std::time::Duration::from_millis;
+        assert_eq!(refit_wait(None, t), None);
+        assert_eq!(refit_wait(Some(t), t), Some(REFIT_PACE));
+        assert_eq!(refit_wait(Some(t), t + ms(400)), Some(ms(600)));
+        assert_eq!(refit_wait(Some(t), t + REFIT_PACE), None);
+        assert_eq!(refit_wait(Some(t), t + ms(5000)), None);
+    }
+
+    #[test]
+    fn popups_are_cut_to_their_output() {
+        let full = Rect::new(0, 0, 1280, 800);
+        let r = Rect::new;
+        assert_eq!(
+            intersect(r(100, 100, 200, 50), full),
+            Some(r(100, 100, 200, 50))
+        );
+        assert_eq!(
+            intersect(r(-50, 700, 5000, 5000), full),
+            Some(r(0, 700, 1280, 100))
+        );
+        assert_eq!(intersect(r(1280, 0, 10, 10), full), None);
+        assert_eq!(intersect(r(10, 10, 0, 10), full), None);
     }
 }
