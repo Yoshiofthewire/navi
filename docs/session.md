@@ -58,6 +58,8 @@ there, and Ctrl+Alt+Backspace brings the console back. Then pick "navi" on the l
   Home/End to move, Enter to launch, Esc to close; the keyboard then returns to your window.
   Not while locked, and not over a fullscreen app on the taskbar's monitor (Super+Esc first).
   With sticky keys on, a lone Super tap latches Super instead.
+- **Super + 1…9:** focus or restore the Nth running app in the dock; **Super + Tab** /
+  **Super + Shift + Tab** step to the next or previous one, skipping minimized apps.
 
 These work for native Wayland and X11 tiles and move/resize a tab group together. Changes are
 remembered. Maximized/fullscreen windows keep their geometry. Floating dialogs and launcher

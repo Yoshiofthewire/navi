@@ -1,6 +1,7 @@
 //! Persistent desktop IDs and one dock slot per application, pinned apps first.
 
 use crate::{
+    control::DockKey,
     desktop::{self, Entry},
     files::{read_bytes, write_private, xdg_dir},
 };
@@ -157,6 +158,55 @@ pub fn apps(pins: &[String], entries: &[Entry], windows: &[Running<'_>]) -> Vec<
     apps
 }
 
+/// The Nth (1-based) app with windows, in dock order. Pins that aren't running take no number.
+pub fn slot(apps: &[App], n: u8) -> Option<usize> {
+    let mut running = (0..apps.len()).filter(|&i| !apps[i].windows.is_empty());
+    running.nth(usize::from(n).checked_sub(1)?)
+}
+
+/// The next (or previous) running app after the focused one, wrapping, skipping all-minimized
+/// apps. With nothing focused: the first (or last). `None` if no other app qualifies.
+pub fn cycle(apps: &[App], forward: bool) -> Option<usize> {
+    let n = apps.len();
+    let from =
+        apps.iter()
+            .position(|a| a.focused)
+            .unwrap_or(if forward { n.checked_sub(1)? } else { 0 });
+    let ok = |&i: &usize| !apps[i].windows.is_empty() && !apps[i].minimized && !apps[i].focused;
+    (1..=n)
+        .map(|k| {
+            if forward {
+                (from + k) % n
+            } else {
+                (from + n - k) % n
+            }
+        })
+        .find(ok)
+}
+
+/// What a dock key activates: `(app, window)`, indices into `apps` and `windows`, or why
+/// nothing. The window is the app's first visible one in opening order, else its first.
+pub fn key(
+    apps: &[App],
+    windows: &[Running<'_>],
+    key: DockKey,
+) -> Result<(usize, usize), &'static str> {
+    let app = match key {
+        DockKey::Slot(n) => slot(apps, n).ok_or("no running app in that slot")?,
+        DockKey::Cycle { forward } => cycle(apps, forward).ok_or("no other app to cycle to")?,
+    };
+    let a = &apps[app];
+    if a.focused {
+        return Err("already focused");
+    }
+    let visible = a
+        .windows
+        .iter()
+        .find(|&&w| windows.get(w).is_some_and(|w| !w.minimized));
+    let win = visible.or(a.windows.first()).ok_or("no window")?;
+    Ok((app, *win))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,6 +286,122 @@ mod tests {
             super::apps(&["terminal.desktop".into()], &entries, &[])[0]
                 .windows
                 .is_empty()
+        );
+    }
+
+    fn entry(id: &str) -> Entry {
+        Entry {
+            id: id.into(),
+            name: id.into(),
+            icon: None,
+            argv: vec![id.into()],
+            wm_class: None,
+            category: Category::System,
+        }
+    }
+
+    fn run(app_id: &str, focused: bool, minimized: bool) -> Running<'_> {
+        Running {
+            app_id,
+            focused,
+            minimized,
+        }
+    }
+
+    /// Pins `[a (not running), b]`; windows c, b, d opened in that order.
+    fn dock(windows: &[Running<'_>]) -> Vec<App> {
+        apps(
+            &["a.desktop".into(), "b.desktop".into()],
+            &[entry("a.desktop"), entry("b.desktop")],
+            windows,
+        )
+    }
+
+    fn names(apps: &[App], at: Option<usize>) -> Option<&str> {
+        at.map(|i| apps[i].app_id.as_str())
+    }
+
+    #[test]
+    fn slots_count_running_apps_in_dock_order() {
+        let w = [
+            run("c", false, false),
+            run("b", false, false),
+            run("d", false, false),
+        ];
+        let d = dock(&w);
+        assert_eq!(d.len(), 4, "a is pinned, not running");
+        let got: Vec<_> = (0..=5).map(|n| names(&d, slot(&d, n))).collect();
+        assert_eq!(
+            got,
+            [None, Some("b.desktop"), Some("c"), Some("d"), None, None]
+        );
+        assert_eq!(key(&d, &w, DockKey::Slot(1)), Ok((1, 1)));
+        assert_eq!(key(&d, &w, DockKey::Slot(2)), Ok((2, 0)));
+        assert_eq!(
+            key(&d, &w, DockKey::Slot(4)),
+            Err("no running app in that slot")
+        );
+    }
+
+    #[test]
+    fn slot_picks_the_first_visible_window_and_leaves_the_focused_app_alone() {
+        // c has a minimized window, then a visible one; d's only windows are minimized.
+        let w = [
+            run("c", false, true),
+            run("c", false, false),
+            run("d", false, true),
+            run("d", false, true),
+            run("b", true, false),
+        ];
+        let d = dock(&w);
+        assert_eq!(key(&d, &w, DockKey::Slot(2)), Ok((2, 1)), "visible c");
+        assert_eq!(
+            key(&d, &w, DockKey::Slot(3)),
+            Ok((3, 2)),
+            "first d, restored"
+        );
+        // b is focused: nothing to do, however often it's pressed.
+        for _ in 0..2 {
+            assert_eq!(key(&d, &w, DockKey::Slot(1)), Err("already focused"));
+        }
+    }
+
+    #[test]
+    fn cycle_steps_in_dock_order_wraps_and_skips_minimized_apps() {
+        let at =
+            |focus: &str, min: &str| ["c", "b", "d", "e"].map(|id| run(id, id == focus, id == min));
+        let next = |w: &[Running<'_>], forward| {
+            let d = dock(w);
+            names(&d, cycle(&d, forward)).map(str::to_owned)
+        };
+        let s = |x: &str| Some(x.to_owned());
+        // Dock order: b (pinned), c, d, e.
+        let w = at("c", "");
+        assert_eq!((next(&w, true), next(&w, false)), (s("d"), s("b.desktop")));
+        let w = at("e", "");
+        assert_eq!(next(&w, true), s("b.desktop"), "wraps forward");
+        let w = at("b", "");
+        assert_eq!(next(&w, false), s("e"), "wraps backward");
+        // A minimized d is skipped both ways.
+        let w = at("c", "d");
+        assert_eq!(next(&w, true), s("e"));
+        let w = at("e", "d");
+        assert_eq!(next(&w, false), s("c"));
+        // Nothing focused: first or last eligible.
+        let w = at("", "b");
+        assert_eq!((next(&w, true), next(&w, false)), (s("c"), s("e")));
+        let w = at("", "e");
+        assert_eq!(next(&w, false), s("d"));
+        // Only the focused app is eligible, or nothing is.
+        let w = [run("c", true, false), run("d", false, true)];
+        assert_eq!((next(&w, true), next(&w, false)), (None, None));
+        let w = [run("c", false, true)];
+        assert_eq!((next(&w, true), next(&w, false)), (None, None));
+        assert_eq!((next(&[], true), next(&[], false)), (None, None));
+        let d = dock(&w);
+        assert_eq!(
+            key(&d, &w, DockKey::Cycle { forward: true }),
+            Err("no other app to cycle to")
         );
     }
 }

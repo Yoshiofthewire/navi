@@ -986,6 +986,26 @@ mod tests {
         data.state.pointer_button(0x110, true, true, 10);
         data.state.pointer_button(0x110, true, false, 11);
         assert!(ask(&mut event_loop, &mut data), "a click lifts the guard");
+        // navi-bar activating it keeps it fullscreen with no guard; activating another window
+        // on its output (a tile with no client stands in) ends it with the Super+Esc guard.
+        let (other, _) = data.state.layout.place("other", (1200, 700)).unwrap();
+        assert!(
+            ask(&mut event_loop, &mut data),
+            "a new window is no user exit"
+        );
+        data.state.bar_activate(id);
+        assert!(data.state.layout.is_fullscreen(id));
+        data.state.bar_activate(other);
+        assert!(!data.state.layout.is_fullscreen(id));
+        assert!(
+            !ask(&mut event_loop, &mut data),
+            "refused after a bar activation"
+        );
+        data.state.layout.remove(other);
+        data.state.apply_layout();
+        data.state.pointer_button(0x110, true, true, 12);
+        data.state.pointer_button(0x110, true, false, 13);
+        assert!(ask(&mut event_loop, &mut data), "a click lifts it");
         request(0);
         pump(&mut event_loop, &mut data, |d| {
             !d.state.layout.is_fullscreen(id)

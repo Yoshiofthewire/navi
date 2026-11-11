@@ -82,6 +82,8 @@ Build as your normal user. For a debug build, use `cargo build --locked` and `./
 | Shrink a side by one cell | **Super + Shift + Left / Right / Up / Down** |
 | Lock screen / retry a crashed locker | **Super + L** |
 | Leave fullscreen on the focused monitor | **Super + Esc** |
+| Focus or restore the Nth running app in the dock | **Super + 1…9** |
+| Focus the next / previous running app in the dock | **Super + Tab** / **Super + Shift + Tab** |
 | Open or close the app launcher | **Super** (tap; with sticky keys on it latches instead) |
 | Quit Navi while unlocked | **Ctrl + Alt + Backspace** |
 | Switch VT in a hardware session | **Ctrl + Alt + F1…F12** |

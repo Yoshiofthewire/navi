@@ -165,6 +165,8 @@ Every press changes exactly one grid cell.
   the pointer's); the window goes back to its tile. Super+Esc is navi's: apps never see it,
   whether or not anything is fullscreen. A window left by Super+Esc can't go fullscreen again
   until the user types a non-modifier key that is no navi shortcut into it, or clicks it.
+  The same guard holds a fullscreen window ended because the user activated another window
+  through the taskbar (a click or a dock key), so the app can't cover the user's choice again.
   Its dialogs still float over it.
 
 ## Monitors
@@ -225,7 +227,13 @@ bundling a degoogled, resource-tested Chromium variant is reserved for a future 
   active-window indicator. The logo opens the launcher. Pinned apps come first, in pin order;
   other running apps follow in opening order. Each app has one icon, with up to three dots for
   its windows. Click an app to launch it if closed, focus or restore it if running, or cycle its
-  windows when already focused. Minimized apps are dimmed.
+  windows when already focused. Minimized apps are dimmed. **Super+1…9** focuses or restores
+  the Nth running app (pinned apps that aren't running take no number) at its first visible
+  window, else its first; on the focused app it does nothing. **Super+Tab** and
+  **Super+Shift+Tab** step focus to the next or previous running app in dock order, wrapping,
+  and skip apps whose windows are all minimized. Both are navi's (apps never see them), work over
+  fullscreen, and follow the activation rule: another window on a fullscreen monitor ends that
+  fullscreen. The top-row digit keys count on any layout; the keypad doesn't.
 - **Pins:** use the **Pin / Unpin** button beside an app in the launcher, press Insert on a
   selected app, or right-click an app's dock icon. Pins survive restarts in
   `$XDG_CONFIG_HOME/navi/pins` (default `~/.config/navi/pins`): `navi-pins 1`, then one installed
@@ -485,8 +493,9 @@ session.
 - Grid size: hard-coded at 24 × 12; no per-monitor or configurable grid.
 - More look references, beyond the logo.
 - Is this a daily driver? That decides whether laptop polish is in v1.
-- The dock's window slots need a pointer: there's no keyboard access to them yet, and the bar
-  exposes nothing to screen readers.
+- Screen readers: navi-bar draws its own pixels with no toolkit, so it has no accessibility
+  tree, and the dock and launcher button are invisible to them. Exposing them means building
+  one, e.g. an AT-SPI adapter such as `accesskit_unix` (a new crate tree and D-Bus surface).
 
 ## Settings application
 

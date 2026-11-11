@@ -216,19 +216,19 @@ fn run() -> Result<(), String> {
             }
         })
         .map_err(|e| e.to_string())?;
-    let (toggle_tx, toggle_rx) = channel::channel();
+    let (command_tx, command_rx) = channel::channel();
     event_loop
         .handle()
-        .insert_source(toggle_rx, |event, _, bar| {
-            if let channel::Event::Msg(()) = event {
-                bar.toggle_menu();
-            }
+        .insert_source(command_rx, |event, _, bar| match event {
+            channel::Event::Msg(control::Command::ToggleMenu) => bar.toggle_menu(),
+            channel::Event::Msg(control::Command::Dock(key)) => bar.dock_key(key),
+            channel::Event::Closed => {}
         })
         .map_err(|e| e.to_string())?;
     let control = match control {
         Some(stream) => Some(std::sync::Arc::new(std::sync::Mutex::new(
-            control::reader(stream, move || {
-                let _ = toggle_tx.send(());
+            control::reader(stream, move |c| {
+                let _ = command_tx.send(c);
             })
             .map_err(|e| e.to_string())?,
         ))),
@@ -542,16 +542,34 @@ impl Bar {
         Some(self.pending.remove(at).1)
     }
 
+    fn running(&self) -> Vec<dock::Running<'_>> {
+        let windows = self.shown().map(|w| dock::Running {
+            app_id: &w.app_id,
+            focused: w.activated,
+            minimized: w.minimized,
+        });
+        windows.collect()
+    }
+
     fn dock_apps(&self) -> Vec<dock::App> {
-        let windows: Vec<dock::Running<'_>> = self
-            .shown()
-            .map(|w| dock::Running {
-                app_id: &w.app_id,
-                focused: w.activated,
-                minimized: w.minimized,
-            })
-            .collect();
-        dock::apps(&self.pins.ids, &self.entries, &windows)
+        dock::apps(&self.pins.ids, &self.entries, &self.running())
+    }
+
+    /// Super+1..9 or Super+Tab, sent by navi: activates as a dock click does.
+    fn dock_key(&mut self, key: control::DockKey) {
+        let windows = self.running();
+        let apps = dock::apps(&self.pins.ids, &self.entries, &windows);
+        match dock::key(&apps, &windows, key) {
+            Ok((app, win)) => {
+                info!(?key, app_id = apps[app].app_id, "dock key");
+                let h = self.shown().nth(win).map(|w| w.handle.clone());
+                if let (Some(h), Some(seat)) = (h, &self.seat) {
+                    h.activate(seat);
+                }
+                self.close_menu();
+            }
+            Err(why) => debug!(?key, why, "dock key does nothing"),
+        }
     }
 
     fn toggle_pin(&mut self, entry: usize) {

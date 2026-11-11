@@ -179,10 +179,7 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, WinId> for Navi {
             return;
         }
         match request {
-            handle::Request::Activate { .. } => {
-                info!(id, by = "bar", "activate");
-                state.focus_or_restore(id);
-            }
+            handle::Request::Activate { .. } => state.bar_activate(id),
             handle::Request::Close => {
                 info!(id, by = "bar", "close");
                 state.close_window(id);
