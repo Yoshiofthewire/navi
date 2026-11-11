@@ -2,7 +2,7 @@
 
 use crate::{
     CalloopData,
-    layout::{Layout, WinId},
+    layout::{Hints, Layout, Step, WinId},
     state::{Managed, Navi, window_app},
 };
 use smithay::wayland::selection::{
@@ -15,7 +15,10 @@ use smithay::wayland::selection::{
 use smithay::{
     delegate_xwayland_shell,
     desktop::Window,
-    reexports::{calloop::LoopHandle, wayland_server::protocol::wl_surface::WlSurface},
+    reexports::{
+        calloop::LoopHandle, wayland_server::protocol::wl_surface::WlSurface,
+        x11rb::properties::WmSizeHints,
+    },
     utils::{Logical, Rectangle},
     wayland::xwayland_shell::{XWaylandShellHandler, XWaylandShellState},
     xwayland::{
@@ -68,6 +71,21 @@ pub fn start(handle: &LoopHandle<'static, CalloopData>, state: &Navi) -> Option<
     }
 }
 
+/// An X11 window's `WM_NORMAL_HINTS` minimum and maximum, untrusted; unset is 0, no limit.
+/// Read raw: Smithay's `min_size()` builds a `Size`, which panics on a negative value in debug
+/// builds. navi sets no XWayland client scale, so these px are logical.
+pub(crate) fn x11_hints(x: &X11Surface) -> ((i32, i32), (i32, i32)) {
+    min_max(x.size_hints())
+}
+
+fn min_max(h: Option<WmSizeHints>) -> ((i32, i32), (i32, i32)) {
+    let h = h.unwrap_or_default();
+    (
+        h.min_size.unwrap_or_default(),
+        h.max_size.unwrap_or_default(),
+    )
+}
+
 impl Navi {
     pub fn map_x11(&mut self, x: X11Surface) {
         if x.wl_surface().is_none()
@@ -99,15 +117,25 @@ impl Navi {
         let mut tile = None;
         if !floating {
             let app = window_app(&window);
-            if let Some((id, step)) = self.layout.place(&app, self.pointer_px()) {
-                self.layout.set_decorated(id, !x.is_decorated());
+            let (min, max) = x11_hints(&x);
+            let hints = Hints::new(min, max);
+            let at = self.pointer_px();
+            if let Some((id, step)) = self.layout.place_with(&app, at, hints, !x.is_decorated()) {
+                if hints != Hints::default() {
+                    info!(app, id, min = ?hints.min, max = ?hints.max, "client size hints");
+                }
                 if x.is_fullscreen() {
                     self.layout.fullscreen(id);
                 } else if x.is_maximized() {
                     self.layout.maximize(id);
                 }
                 tile = Some(id);
-                info!(app, id, ?step, "X11 placed");
+                let tile = self.layout.tile(id).map(|t| (t.output.clone(), t.cells));
+                let rect = self.layout.rect(id);
+                info!(app, id, ?step, ?tile, ?rect, "X11 placed");
+                if step == Step::Floating {
+                    self.log_float(id, &app);
+                }
                 self.memory.sync(&self.layout);
             }
         }
@@ -281,8 +309,13 @@ impl XwmHandler for Navi {
             self.recenter_x11();
         }
     }
-    fn property_notify(&mut self, _: XwmId, _: X11Surface, _: WmWindowProperty) {
-        self.refresh_toplevels();
+    fn property_notify(&mut self, _: XwmId, x: X11Surface, prop: WmWindowProperty) {
+        match (prop, x.wl_surface()) {
+            // `refit` paces it and ignores windows without a tile.
+            (WmWindowProperty::NormalHints, Some(root)) => self.refit(&root),
+            (WmWindowProperty::NormalHints, None) => {}
+            _ => self.refresh_toplevels(),
+        }
     }
     fn maximize_request(&mut self, _: XwmId, x: X11Surface) {
         self.x11_request(&x, Layout::maximize);
@@ -573,11 +606,24 @@ mod tests {
         }
     }
 
-    /// Real X server, real X11 events, no host display or GPU. Run explicitly in CI.
     #[test]
-    #[ignore = "requires the Xwayland executable"]
-    fn x11_lifecycle_and_input() {
-        let mut event_loop = EventLoop::try_new().unwrap();
+    fn unset_x11_hints_are_no_limit() {
+        assert_eq!(min_max(None), ((0, 0), (0, 0)));
+        let only_min = WmSizeHints {
+            min_size: Some((-5, 70_000)),
+            ..WmSizeHints::new()
+        };
+        assert_eq!(min_max(Some(only_min)), ((-5, 70_000), (0, 0)));
+        let only_max = WmSizeHints {
+            max_size: Some((400, 300)),
+            ..WmSizeHints::new()
+        };
+        assert_eq!(min_max(Some(only_max)), ((0, 0), (400, 300)));
+    }
+
+    /// navi with one 1280 × 720 test output and a fresh layout, not yet running Xwayland.
+    fn harness() -> (EventLoop<'static, CalloopData>, CalloopData) {
+        let event_loop = EventLoop::try_new().unwrap();
         let mut display = Display::new().unwrap();
         let mut state = Navi::new(
             display.handle(),
@@ -616,11 +662,19 @@ mod tests {
                 },
             )
             .unwrap();
-        let mut data = CalloopData {
+        let data = CalloopData {
             state,
             display,
             udev: None,
         };
+        (event_loop, data)
+    }
+
+    /// Real X server, real X11 events, no host display or GPU. Run explicitly in CI.
+    #[test]
+    #[ignore = "requires the Xwayland executable"]
+    fn x11_lifecycle_and_input() {
+        let (mut event_loop, mut data) = harness();
         // Bind the same privileged window list that navi-bar uses, over a real Wayland socket.
         let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
         data.state
@@ -1321,5 +1375,343 @@ mod tests {
         conn.destroy_window(window).unwrap();
         conn.flush().unwrap();
         pump(&mut event_loop, &mut data, |d| d.state.windows.is_empty());
+    }
+
+    /// `WM_NORMAL_HINTS` through the real XWM: read at map and on change, paced by `refit`, and
+    /// ignored for dialogs and menus. Named so CI's `x11_lifecycle_and_input` filter runs it.
+    #[test]
+    #[ignore = "requires the Xwayland executable"]
+    fn x11_lifecycle_and_input_size_hints() {
+        use crate::layout::{BAR, Fit, GAP, Hints, Rect, STRIP};
+        let (mut event_loop, mut data) = harness();
+        let xdisplay = start(&event_loop.handle(), &data.state).expect("spawn Xwayland");
+        pump(&mut event_loop, &mut data, |d| d.state.xwm.is_some());
+        let (conn, screen) = smithay::reexports::x11rb::connect(Some(&xdisplay)).unwrap();
+        let root = conn.setup().roots[screen].root;
+        let hints = |min: Option<(i32, i32)>, max: Option<(i32, i32)>| WmSizeHints {
+            min_size: min,
+            max_size: max,
+            ..WmSizeHints::new()
+        };
+        let set = |w: u32, h: &WmSizeHints| {
+            h.set_normal_hints(&conn, w).unwrap();
+            conn.flush().unwrap();
+        };
+        // Hints, and WM_TRANSIENT_FOR or override-redirect, are set before the window maps.
+        let create =
+            |class: &str, (x, y, w, h): (i16, i16, u16, u16), size: Option<WmSizeHints>| {
+                let win = conn.generate_id().unwrap();
+                let menu = class == "menu";
+                conn.create_window(
+                    smithay::reexports::x11rb::COPY_DEPTH_FROM_PARENT,
+                    win,
+                    root,
+                    x,
+                    y,
+                    w,
+                    h,
+                    0,
+                    WindowClass::INPUT_OUTPUT,
+                    0,
+                    &CreateWindowAux::new()
+                        .background_pixel(0x224466)
+                        .override_redirect(u32::from(menu)),
+                )
+                .unwrap();
+                let wm_class = format!("{class}\0{class}\0");
+                conn.change_property8(
+                    PropMode::REPLACE,
+                    win,
+                    AtomEnum::WM_CLASS,
+                    AtomEnum::STRING,
+                    wm_class.as_bytes(),
+                )
+                .unwrap();
+                if let Some(size) = size {
+                    size.set_normal_hints(&conn, win).unwrap();
+                }
+                win
+            };
+        let map = |win: u32| {
+            conn.map_window(win).unwrap();
+            conn.flush().unwrap();
+        };
+        let managed = |d: &CalloopData, win: u32| {
+            d.state
+                .windows
+                .iter()
+                .position(|m| m.window.x11_surface().is_some_and(|x| x.window_id() == win))
+        };
+        let destroy = |event_loop: &mut EventLoop<CalloopData>, data: &mut CalloopData, win| {
+            conn.destroy_window(win).unwrap();
+            conn.flush().unwrap();
+            pump(event_loop, data, |d| managed(d, win).is_none());
+        };
+        // The XWM handles one connection's requests in order: once a later title shows, every
+        // earlier request from it has been handled.
+        let mut syncs = 0;
+        let mut sync = |event_loop: &mut EventLoop<CalloopData>, data: &mut CalloopData, win| {
+            syncs += 1;
+            let title = format!("sync {syncs}");
+            conn.change_property8(
+                PropMode::REPLACE,
+                win,
+                AtomEnum::WM_NAME,
+                AtomEnum::STRING,
+                title.as_bytes(),
+            )
+            .unwrap();
+            conn.flush().unwrap();
+            pump(event_loop, data, |d| {
+                managed(d, win).is_some_and(|i| {
+                    crate::state::window_title(&d.state.windows[i].window) == title
+                })
+            });
+        };
+        let tile_of = |d: &CalloopData, win| managed(d, win).and_then(|i| d.state.windows[i].tile);
+        let geometry = |d: &CalloopData, win| {
+            let i = managed(d, win).unwrap();
+            let g = d.state.windows[i].window.x11_surface().unwrap().geometry();
+            Rect::new(g.loc.x, g.loc.y, g.size.w, g.size.h)
+        };
+        // The window rect its cells give it, before any max clamp; the output has no panels.
+        let cells_window = |d: &CalloopData, id| {
+            let t = d.state.layout.tile(id).unwrap();
+            let full = Rect::new(0, 0, 1280, 720);
+            let o = crate::layout::Output {
+                name: t.output.clone(),
+                area: full,
+                full,
+                priority: 0,
+            };
+            let r = o.cells_rect(t.cells);
+            let top = STRIP + if d.state.layout.has_bar(id) { BAR } else { 0 };
+            (r.w - GAP, r.h - top - (GAP - STRIP))
+        };
+        let overlapped = |d: &CalloopData, id| {
+            let a = d.state.layout.tile(id).unwrap();
+            d.state.layout.tiles().iter().any(|b| {
+                let (a, b) = (a.cells, b.cells);
+                b != a
+                    && a.col < b.col + b.cols
+                    && b.col < a.col + a.cols
+                    && a.row < b.row + b.rows
+                    && b.row < a.row + a.rows
+            })
+        };
+
+        // AC1: no hints is Hints::default(); the neighbour stays mapped throughout.
+        let plain = create("plain", (0, 0, 320, 240), None);
+        map(plain);
+        pump(&mut event_loop, &mut data, |d| tile_of(d, plain).is_some());
+        let neighbour = tile_of(&data, plain).unwrap();
+        assert_eq!(
+            data.state.layout.tile(neighbour).unwrap().hints,
+            Hints::default()
+        );
+        // Negative is no limit, above 65535 is capped, a max below its min is dropped.
+        let raw = hints(Some((-5, 300)), Some((70_000, 200)));
+        let odd = create("odd", (0, 0, 320, 240), Some(raw));
+        map(odd);
+        pump(&mut event_loop, &mut data, |d| tile_of(d, odd).is_some());
+        let t = data
+            .state
+            .layout
+            .tile(tile_of(&data, odd).unwrap())
+            .unwrap();
+        assert_eq!(t.hints, Hints::new((-5, 300), (70_000, 200)));
+        assert_eq!(
+            t.hints,
+            Hints {
+                min: (0, 300),
+                max: (65535, 0)
+            }
+        );
+        destroy(&mut event_loop, &mut data, odd);
+
+        // AC2: a fixed size that fits is configured to exactly that size.
+        let fixed = hints(Some((400, 300)), Some((400, 300)));
+        let win = create("fixed", (0, 0, 320, 240), Some(fixed));
+        map(win);
+        pump(&mut event_loop, &mut data, |d| tile_of(d, win).is_some());
+        let id = tile_of(&data, win).unwrap();
+        let t = data.state.layout.tile(id).unwrap();
+        assert_eq!(t.hints, Hints::new((400, 300), (400, 300)));
+        assert!(!t.floating);
+        let rect = data.state.layout.rect(id).unwrap();
+        assert_eq!((rect.w, rect.h), (400, 300));
+        pump(&mut event_loop, &mut data, |d| geometry(d, win) == rect);
+        let (w, h) = cells_window(&data, id);
+        assert!(w >= 400 && h >= 300, "{w} × {h}");
+        assert!(!overlapped(&data, id));
+        destroy(&mut event_loop, &mut data, win);
+
+        // AC3: too big for any tile floats inside the output and refuses maximize.
+        let huge = hints(Some((2000, 1500)), None);
+        let win = create("huge", (0, 0, 320, 240), Some(huge));
+        map(win);
+        pump(&mut event_loop, &mut data, |d| tile_of(d, win).is_some());
+        let id = tile_of(&data, win).unwrap();
+        let t = data.state.layout.tile(id).unwrap();
+        assert!(t.floating);
+        assert_eq!(t.cells, crate::layout::Cells::default());
+        let rect = data.state.layout.rect(id).unwrap();
+        pump(&mut event_loop, &mut data, |d| geometry(d, win) == rect);
+        let clip = data.state.layout.clip(id).unwrap();
+        assert!(clip.x >= 0 && clip.y >= 0 && clip.x + clip.w <= 1280 && clip.y + clip.h <= 720);
+        let atom = |name: &[u8]| conn.intern_atom(false, name).unwrap().reply().unwrap().atom;
+        let (net_state, horz, vert) = (
+            atom(b"_NET_WM_STATE"),
+            atom(b"_NET_WM_STATE_MAXIMIZED_HORZ"),
+            atom(b"_NET_WM_STATE_MAXIMIZED_VERT"),
+        );
+        conn.send_event(
+            false,
+            root,
+            EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY,
+            ClientMessageEvent::new(32, win, net_state, [1, horz, vert, 1, 0]),
+        )
+        .unwrap();
+        sync(&mut event_loop, &mut data, win);
+        assert!(!data.state.layout.is_maximized(id));
+        assert!(data.state.layout.tile(id).unwrap().floating);
+        destroy(&mut event_loop, &mut data, win);
+
+        // AC4: a late minimum arrives through property_notify and re-places the tile.
+        let win = create("late", (0, 0, 320, 240), None);
+        map(win);
+        pump(&mut event_loop, &mut data, |d| tile_of(d, win).is_some());
+        let id = tile_of(&data, win).unwrap();
+        let before = data.state.layout.rect(id).unwrap();
+        let min = (before.w + 100, 100);
+        assert!(min.0 <= 1000, "{before:?}");
+        let late = hints(Some(min), None);
+        set(win, &late);
+        pump(&mut event_loop, &mut data, |d| {
+            d.state.layout.tile(id).unwrap().hints.min == min
+        });
+        let (w, h) = cells_window(&data, id);
+        assert!(w >= min.0 && h >= min.1, "{w} × {h}");
+        assert!(!overlapped(&data, id));
+        let rect = data.state.layout.rect(id).unwrap();
+        pump(&mut event_loop, &mut data, |d| geometry(d, win) == rect);
+        // The same hints again change nothing.
+        let i = managed(&data, win).unwrap();
+        let (cells, refitted) = (
+            data.state.layout.tile(id).unwrap().cells,
+            data.state.windows[i].refitted,
+        );
+        set(win, &late);
+        sync(&mut event_loop, &mut data, win);
+        assert_eq!(data.state.layout.tile(id).unwrap().cells, cells);
+        assert_eq!(data.state.windows[i].refitted, refitted);
+        assert!(!data.state.windows[i].refit_queued);
+        // Too big floats it; no minimum tiles it again. Each waits on the queued refit.
+        set(win, &huge);
+        pump(&mut event_loop, &mut data, |d| {
+            d.state.layout.tile(id).unwrap().floating
+        });
+        set(win, &hints(None, None));
+        pump(&mut event_loop, &mut data, |d| {
+            !d.state.layout.tile(id).unwrap().floating
+        });
+        let t = data.state.layout.tile(id).unwrap();
+        assert_eq!(t.hints, Hints::default());
+        assert_ne!(t.cells, crate::layout::Cells::default());
+        assert!(!overlapped(&data, id));
+        let rect = data.state.layout.rect(id).unwrap();
+        pump(&mut event_loop, &mut data, |d| geometry(d, win) == rect);
+        destroy(&mut event_loop, &mut data, win);
+
+        // AC5: changes within REFIT_PACE coalesce; the timer applies the hints current then.
+        let win = create("paced", (0, 0, 320, 240), None);
+        map(win);
+        pump(&mut event_loop, &mut data, |d| tile_of(d, win).is_some());
+        let id = tile_of(&data, win).unwrap();
+        let i = managed(&data, win).unwrap();
+        set(win, &hints(Some((300, 100)), None));
+        pump(&mut event_loop, &mut data, |d| {
+            d.state.layout.tile(id).unwrap().hints.min == (300, 100)
+        });
+        let first = data.state.windows[i].refitted.unwrap();
+        for w in [310, 320, 330] {
+            set(win, &hints(Some((w, 100)), None));
+        }
+        let mut seen = Vec::new();
+        pump(&mut event_loop, &mut data, |d| {
+            let min = d.state.layout.tile(id).unwrap().hints.min;
+            if seen.last() != Some(&min) {
+                seen.push(min);
+            }
+            min == (330, 100)
+        });
+        assert_eq!(
+            seen,
+            [(300, 100), (330, 100)],
+            "no intermediate hints applied"
+        );
+        let second = data.state.windows[i].refitted.unwrap();
+        assert!(
+            second - first >= Duration::from_secs(1),
+            "{:?}",
+            second - first
+        );
+        assert!(!data.state.windows[i].refit_queued);
+        destroy(&mut event_loop, &mut data, win);
+
+        // AC6: a transient dialog ignores its hints: no tile, its own size, centred on its parent.
+        let parent = data
+            .state
+            .space
+            .element_geometry(&data.state.window_of(neighbour).unwrap())
+            .unwrap();
+        for min in [(160, 100), (2000, 1500)] {
+            let tiles = data.state.layout.tiles().len();
+            let dialog = create(
+                "dialog",
+                (0, 0, 200, 120),
+                Some(hints(Some(min), Some(min))),
+            );
+            conn.change_property32(
+                PropMode::REPLACE,
+                dialog,
+                AtomEnum::WM_TRANSIENT_FOR,
+                AtomEnum::WINDOW,
+                &[plain],
+            )
+            .unwrap();
+            map(dialog);
+            pump(&mut event_loop, &mut data, |d| managed(d, dialog).is_some());
+            let at = parent.loc + (parent.size - (200, 120).into()).downscale(2).to_point();
+            pump(&mut event_loop, &mut data, |d| {
+                geometry(d, dialog) == Rect::new(at.x, at.y, 200, 120)
+            });
+            assert_eq!(tile_of(&data, dialog), None);
+            assert_eq!(data.state.layout.tiles().len(), tiles);
+            // A late change is ignored too.
+            set(dialog, &hints(Some((500, 400)), None));
+            sync(&mut event_loop, &mut data, dialog);
+            assert_eq!(tile_of(&data, dialog), None);
+            assert_eq!(geometry(&data, dialog), Rect::new(at.x, at.y, 200, 120));
+            destroy(&mut event_loop, &mut data, dialog);
+        }
+        // An override-redirect menu with hints keeps its X11 geometry.
+        data.state.focus(data.state.window_of(neighbour));
+        let menu = create(
+            "menu",
+            (70, 80, 100, 60),
+            Some(hints(Some((500, 400)), None)),
+        );
+        map(menu);
+        pump(&mut event_loop, &mut data, |d| managed(d, menu).is_some());
+        assert_eq!(tile_of(&data, menu), None);
+        assert_eq!(geometry(&data, menu), Rect::new(70, 80, 100, 60));
+        destroy(&mut event_loop, &mut data, menu);
+        assert_eq!(
+            data.state.layout.set_hints(neighbour, (0, 0), (0, 0)),
+            Fit::Unchanged,
+            "the neighbour's hints were never touched"
+        );
+        destroy(&mut event_loop, &mut data, plain);
     }
 }
