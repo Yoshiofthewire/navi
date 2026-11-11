@@ -178,8 +178,11 @@ pub struct Navi {
     /// Counts keyboard moves: a token is the user's only while the keyboard hasn't moved since
     /// it was made.
     pub(crate) focus_moves: u64,
-    /// The latest left-button press navi delivered: its serial and surface, for a press token.
-    pub(crate) last_press: Option<(u32, WlSurface)>,
+    /// The latest left-button press navi delivered: its serial, its surface and how long that
+    /// had been on screen, for a press token.
+    pub(crate) last_press: Option<(u32, WlSurface, Option<std::time::Duration>)>,
+    /// When each shown layer surface came on screen (`activation::track_shown`), kept per frame.
+    pub(crate) layers_shown: Vec<(WlSurface, std::time::Instant)>,
     /// Counts left-button presses, delivered or not: a press token dies with the next one.
     pub(crate) presses: u64,
     /// The window that held the keyboard before the one holding it now, whether the user gave
@@ -300,6 +303,7 @@ impl Navi {
             focus_by_user: false,
             focus_moves: 0,
             last_press: None,
+            layers_shown: Vec::new(),
             presses: 0,
             before_focus: None,
             before_layer: Default::default(),

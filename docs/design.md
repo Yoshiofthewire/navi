@@ -592,10 +592,12 @@ session.
   rule that every accepted activation moves the keyboard. One exception to the keyboard rule:
   the notification cards never take the keyboard, so navi-bar may also get a token with the
   serial of the latest left-button press navi delivered to that same navi-bar surface (never
-  another client's, an older or made-up serial, or while locked; one token per press). It works
-  once, within 10 s, and only while the keyboard hasn't moved and no other click came since it
-  was made, or the keyboard is already on the window being activated; then it focuses as the
-  user's. The window you were typing in keeps the keyboard until the app takes it.
+  another client's, an older or made-up serial, or while locked; one token per press), and only
+  once that surface has been on screen 500 ms: cards revealed when fullscreen or the lock ends
+  restart that clock, so a click as they appear mints nothing. It works once, within 10 s, and
+  only while the keyboard hasn't moved and no other click came since it was made, or the
+  keyboard is already on the window being activated; then it focuses as the user's. The window
+  you were typing in keeps the keyboard until the app takes it.
 - **Locking** uses `ext-session-lock`, advertised only on the dedicated socket Navi gives its
   swaylock child. Applications, including the bar, cannot bind it. Normal windows, layers,
   wallpaper, decorations and cursors are excluded from locked output frames; normal keyboard,

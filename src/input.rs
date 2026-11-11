@@ -637,7 +637,11 @@ impl Navi {
         // new focus period, so it can ask for an activation token.
         let serial = SERIAL_COUNTER.next_serial();
         if left && pressed {
-            self.last_press = pointer.current_focus().map(|s| (u32::from(serial), s));
+            self.last_press = pointer.current_focus().map(|s| {
+                let now = std::time::Instant::now();
+                let shown = crate::activation::shown_for(&self.layers_shown, &s, now);
+                (u32::from(serial), s, shown)
+            });
         }
         pointer.button(
             self,
