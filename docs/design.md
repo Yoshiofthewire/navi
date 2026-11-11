@@ -88,15 +88,22 @@ space when you want it.
 - **Move:** hover near a tile's top edge and a thin strip lights up. Left-drag it. The grid
   appears faintly, fainter still where cells are under 80 px (a small or high-scale screen), and
   one glowing preview shows where the window will land. The preview is the window's remembered
-  size, snapped under the pointer, and it's clamped to stay on screen. Drop
-  the window onto another tile to swap them. Hold the window over the middle of a tile for about
+  size, and the point you grabbed stays under the pointer: the preview moves a cell for every
+  cell the pointer does, from the first one, and is clamped to the grid of the monitor under the
+  pointer. If that spot is taken by a tile the pointer isn't over, the preview is the nearest
+  free spot to it, or none. Drop the window onto another tile to swap them. Hold the window over the middle of a tile for about
   half a second, and the drop forms tabs instead.
 - **Resize:** drag any tile edge. It moves in whole cells. When two tiles share that edge, both
   change. Nothing else changes (principle 4). The edge stops when a tile reaches its minimum. The
   new size becomes that app's remembered size.
 - **Diagonal resize:** drag a corner in the gaps around a window to change its width and height
-  together. The 32 px nearest each corner of an edge is the corner target; it never takes pixels
-  from the app, tabs or window buttons. At a four-window junction, both shared boundaries move.
+  together. The corner target is the 32 px nearest each corner of the tile's cells in every
+  direction: the ends of the side and bottom gaps, and the outer 26 px of each end of the strip,
+  so a top corner is as easy to hit as a bottom one. A 320 px tile keeps 256 px of strip that
+  moves. Corner targets never take pixels from the app, tabs or window buttons, and a hovered or
+  pressed corner lights its edges (and its strip end), so it reads as a resize. On the monitor's
+  top border a top corner moves the top down only. At a four-window junction, both shared
+  boundaries move.
 - **Fill toward an edge:** double-click an edge (two clicks within 400 ms, moving less than 8 px)
   to extend that side to the monitor's usable edge. The opposite side stays put. It uses the same
   grid, neighbor and minimum-size rules as dragging, so another tile can stop it short. Panels
@@ -108,7 +115,7 @@ space when you want it.
 - Dragging a tab moves only that tab; resizing a tab group's edge resizes the group.
 - The "middle" of a tile is the inner half of it, in both directions.
 - The top edge of a tile on the monitor's top border isn't draggable; the strip owns that gap.
-- Drop a window back on itself to cancel a move. A drag also cancels, putting everything back,
+- Drop a window within half a cell of where you grabbed it to cancel a move. A drag also cancels, putting everything back,
   when the pointer leaves every monitor or the nested window loses focus.
 
 ### Keyboard window controls
@@ -140,18 +147,21 @@ Every press changes exactly one grid cell.
   tabs are outlined, and minimized ones are a dimmed blue. Tabs have no titles or icons yet; those
   come later, since titles would need fonts in the compositor and fonts stay out of it. For now a
   tab tells you its window only by position.
-- Click a tab to switch to it. Drag a tab out (8 px or more) to untab that window: it lands in the
-  nearest free space at its remembered size, or tabs into another tile after a half-second hold.
-  Dropping it on another tile without the hold, or back on its own group, cancels.
+- Click a tab to switch to it. Drag a tab out (8 px or more) to untab that window: it lands where
+  its preview shows, at its remembered size, as a moved window does, or tabs into another tile
+  after a half-second hold. Dropping it on another tile without the hold, or within half a cell
+  of where you grabbed it, cancels.
 
 ### Window controls
 
 - Apps that draw their own title bar (Konsole, Firefox) keep it. Apps that ask for server-side
-  decorations get a 24 px bar with **minimize, maximize and close** buttons on the right; the rest
+  decorations, or bind xdg-decoration and leave the choice to navi, get a 24 px bar with **minimize, maximize and close** buttons on the right; the rest
   of the bar moves the window, like the strip above it. The buttons are Breeze-like line
   glyphs in the text colour, as in Navi Settings and the utilities: a chevron down, a chevron up
   and a plain cross, antialiased at the output's scale, on a rounded selected fill under the
-  pointer. Close asks the app to close; navi never kills it.
+  pointer. They are 24 px squares, flush right and touching, as tight as KWin's. Navi Settings'
+  and the GTK utilities' header buttons use the same 24 px boxes with no space between them.
+  Close asks the app to close; navi never kills it.
 - **Maximize** covers the monitor's whole grid until clicked again; it isn't fullscreen. The
   window's cells and remembered size don't change, and the other windows on that monitor hide
   until it's undone. A new window on that monitor undoes it, so a new window is always visible.

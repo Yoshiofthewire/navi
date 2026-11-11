@@ -12,12 +12,12 @@ pub enum Decor {
     Server,
 }
 
-/// What the app asked for, except that a dialog (a toplevel with a parent) always draws its own,
-/// so it never gets a navi bar or buttons.
-pub fn decoration(has_parent: bool, requested: Decor) -> Decor {
+/// What the app asked for, `None` (no preference) being navi's bar. A dialog (a toplevel with a
+/// parent) always draws its own, so it never gets a navi bar or buttons.
+pub fn decoration(has_parent: bool, requested: Option<Decor>) -> Decor {
     match has_parent {
         true => Decor::Client,
-        false => requested,
+        false => requested.unwrap_or(Decor::Server),
     }
 }
 
@@ -137,7 +137,7 @@ mod tests {
     use super::super::{
         COLS, Cells, FULL, MIN_H, MIN_W, Output, ROWS, STRIP, Tile,
         drag::{
-            Done, Drag, buttons,
+            Done, Drag, Side, buttons,
             tests::{assert_valid, at, c, drag, uw, with, zones},
         },
     };
@@ -285,10 +285,19 @@ mod tests {
             for p in [(x, top), (x + BAR - 1, top + BAR - 1), (x + 12, top + 12)] {
                 assert_eq!(l.hit(p), Some(Hit::Button(0, b)), "{p:?}");
             }
-            assert_eq!(l.hit((x, top - 1)), Some(Hit::Strip(0)), "the strip above");
+            // The strip above; its last 26 px are the top-right corner.
+            let above = match k {
+                1 => Hit::Corner(0, Side::Right, Side::Top),
+                _ => Hit::Strip(0),
+            };
+            assert_eq!(l.hit((x, top - 1)), Some(above));
         }
         assert_eq!(l.hit((right - 3 * BAR - 1, top + 12)), Some(Hit::Strip(0)));
-        assert_eq!(l.hit((r.x, 0)), Some(Hit::Strip(0)));
+        assert_eq!(l.hit((r.x + 26, 0)), Some(Hit::Strip(0)));
+        assert_eq!(
+            l.hit((r.x + 25, 0)),
+            Some(Hit::Corner(0, Side::Left, Side::Top))
+        );
         assert_eq!(l.hit((500, 700)), None);
         assert_eq!(l.hit((500, r.y)), None);
 
@@ -310,10 +319,11 @@ mod tests {
                 _ => Some(Hit::Tab(1)),
             };
             assert_eq!(l.hit((x, bar.rect.y + 5)), want, "x {x}");
+            let ends = x < bar.rect.x + 26 || x >= bar.rect.x + bar.rect.w - 26;
             assert_eq!(
-                l.hit((x, 5)),
-                Some(Hit::Strip(1)),
-                "the strip above the tabs"
+                l.hit((x, 5)) == Some(Hit::Strip(1)),
+                !ends,
+                "the strip above the tabs, x {x}"
             );
         }
         l.set_decorated(0, true);
@@ -407,13 +417,11 @@ mod tests {
         assert_eq!(l.memory["a1"].cells, HALF_R);
         assert_eq!(l.memory["a1"].size, size);
 
-        // Its own group's cells: nothing changes.
+        // Back within half a cell of the press: nothing changes.
         let mut l = with(&[HALF_L, HALF_L]);
         let tiles = l.tiles.clone();
-        assert_eq!(
-            drag(&mut l, from, &[((3000, 700), 0), ((800, 700), 10)]),
-            None
-        );
+        let back = (from.0 - 60, from.1 + 50);
+        assert_eq!(drag(&mut l, from, &[((3000, 700), 0), (back, 10)]), None);
         assert_eq!(l.tiles, tiles);
 
         // Over another tile: only a hold tabs, and nothing is previewed before it.
@@ -651,18 +659,47 @@ mod tests {
         );
     }
 
+    /// Job 016 AC11: no preference is navi's bar for a toplevel; dialogs always draw their own.
     #[test]
     fn dialogs_always_draw_their_own_decorations() {
+        assert_eq!(decoration(false, None), Decor::Server);
+        assert_eq!(decoration(true, None), Decor::Client);
         for requested in [Decor::Client, Decor::Server] {
-            assert_eq!(decoration(true, requested), Decor::Client);
-            assert_eq!(decoration(false, requested), requested);
+            assert_eq!(decoration(true, Some(requested)), Decor::Client);
+            assert_eq!(decoration(false, Some(requested)), requested);
         }
         // A tiled toplevel that asks for server-side gets navi's bar and buttons.
         let mut l = with(&[HALF_L]);
-        l.set_decorated(0, decoration(false, Decor::Server) == Decor::Server);
+        l.set_decorated(0, decoration(false, Some(Decor::Server)) == Decor::Server);
         assert_eq!(l.bar(0).map(|b| b.buttons.len()), Some(3));
-        l.set_decorated(0, decoration(true, Decor::Server) == Decor::Server);
+        l.set_decorated(0, decoration(true, Some(Decor::Server)) == Decor::Server);
         assert_eq!(l.bar(0), None);
+    }
+
+    /// Job 016 AC3: three `BAR`-square buttons, flush right and touching, as tight as KWin's.
+    #[test]
+    fn window_buttons_are_bar_squares_flush_right_and_touching() {
+        for cells in [HALF_L, c(6, 3, 3, 2), FULL] {
+            let mut l = with(&[cells]);
+            l.set_decorated(0, true);
+            let bar = l.bar(0).unwrap();
+            let order: Vec<Button> = bar.buttons.iter().map(|&(b, _)| b).collect();
+            assert_eq!(order, [Button::Minimize, Button::Maximize, Button::Close]);
+            let mut x = bar.rect.x + bar.rect.w;
+            for &(b, r) in bar.buttons.iter().rev() {
+                assert_eq!(
+                    r,
+                    Rect {
+                        x: x - BAR,
+                        y: bar.rect.y,
+                        w: BAR,
+                        h: BAR
+                    },
+                    "{b:?} in {cells:?}"
+                );
+                x -= BAR;
+            }
+        }
     }
 
     #[test]
