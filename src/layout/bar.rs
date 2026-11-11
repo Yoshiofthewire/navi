@@ -43,7 +43,7 @@ impl Layout {
         if !self.has_bar(id) {
             return None;
         }
-        let (_, r) = self.frame(id)?;
+        let (_, r) = self.frame(self.active(id)?)?;
         let rect = Rect {
             y: r.y - BAR,
             h: BAR,
