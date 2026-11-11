@@ -227,22 +227,64 @@ aspect, gravity, position) are ignored.
   Otherwise a float tiles again when its hints change and a step fits, or when it reopens, and
   doesn't change what navi remembers. Unplugging its monitor runs the placement order again from
   the main monitor.
-- **The clip.** Every tiled or floating window's own surfaces are drawn and take pointer input
-  only inside its rect: the clamped tile rect, the float's rect, or the monitor while fullscreen.
-  A popup (menu, tooltip) of a tiled or floating window is kept inside that window's rect: navi
-  slides, flips or shrinks it there when it's placed, and draws and hits it only there, whatever
-  size the app asks for or attaches. So a popup, with or without a grab, can't cover or take
-  input meant for a neighbouring tile. A popup of a dialog is kept on its monitor. A window that draws larger, such as a CSD
-  shadow or a buffer bigger than its configure, is cropped there, and a click just outside it
-  reaches what's below. So no app draws over, or takes clicks meant for, another tile or navi's
-  zones. Dialogs aren't clipped: a dialog, sized by its app, can still cover neighbouring tiles
-  and take their clicks while it's shown.
+- **The clip.** Every window's own surfaces are drawn and take pointer input only inside its
+  rect: the clamped tile rect, the float's rect, a dialog's rect, or the monitor while
+  fullscreen. A popup (menu, tooltip) is kept inside its window's rect: navi slides, flips or
+  shrinks it there when it's placed, and draws and hits it only there, whatever size the app asks
+  for or attaches. So a popup, with or without a grab, can't cover or take input meant for a
+  neighbouring tile. A window that draws larger, such as a CSD shadow or a buffer bigger than its
+  configure, is cropped there, and a click just outside it reaches what's below. So no app draws
+  over, or takes clicks meant for, another tile or navi's zones, except through a dialog, below.
+- **Dialogs.** A dialog (an xdg toplevel with a parent, or an X11 `WM_TRANSIENT_FOR` window) has a
+  *root*: the first tiled or floating window up its parents. The walk stops after 8 steps or on a
+  loop; a chain that ends without a tiled window, is too deep or loops makes an *orphan*. Its
+  *family* is every window with the same root; an orphan's is its own app's windows. A dialog
+  stays inside its root's monitor's bounds, the same as a float's (the area, 8 px in); an orphan
+  uses the monitor it was last shown on, else the main one. navi sends every dialog those bounds
+  (`configure_bounds`) and never sizes it otherwise, but a dialog larger than its bounds on an
+  axis is configured once with that axis lowered to the bound, at most once a second. That size
+  stays its configured size until it asks for another, even if the bounds later grow. It is
+  centred on its parent (a tile's or float's rect, or a parent dialog's), then slid into the
+  bounds, again whenever the parent moves or resizes, the panels change, or it commits a new size.
+  Its rect is its clip, and every shown dialog has navi's frame around it, so even a transparent
+  one can be seen. Inside its monitor a dialog may cover neighbouring tiles, so a file picker
+  larger than its window still works, but it is always visible where it takes clicks. A new dialog
+  takes the keyboard only if a window of its own family holds it; otherwise it maps without it
+  (logged), *waits*, and gets it when the user clicks it, or focuses its parent from the dock or
+  Super+N and then clicks it. A waiting dialog's frame is full accent (1 px), its root's dock icon
+  has an accent dot and, in a tab group, its root's tab an accent line along its bottom, until the
+  dialog is focused. An orphan never takes the keyboard on map. A dialog hides while its root is
+  hidden or minimized, and loses the keyboard; it comes back with it. When a dialog's parent
+  closes, it hangs from that parent's own parent if it had one, else it is an orphan centred in
+  its last bounds; a closed window that had the keyboard gives it back only to the user's last
+  choice: a dialog to its parent, any other window to the window that had the keyboard right
+  before it, and only if the user gave that focus, the keyboard hasn't moved since, and that
+  window is still visible (not hidden, minimized or wholly covered) on the same monitor, outside
+  the lock; otherwise to nobody. Every hide (a dialog with its parent, a re-parent to a hidden
+  window, an X11 menu with its parent) takes the keyboard off the hidden window before the next
+  key.
+- **Stacking order.** Windows stack by one rank: the last time they were raised, by the user (a
+  click, the dock, Super+N, or an activation whose token came from the dock or from a window the
+  user focused) or by opening and taking the keyboard. Any other activation (a token minted by a
+  window that took the keyboard on its own, or one redeemed after the keyboard moved) neither
+  raises the window nor takes the keyboard: it only marks the window's dock entry and tab, as a
+  waiting dialog does, until the user switches to it. navi's own refocus (giving the keyboard back
+  after a close or a hide) raises nothing. A family stacks by its newest raise, its dialogs above
+  its root, and an X11 menu (override-redirect) above its X11 parent's family, so a window the
+  user raises later covers it. An orphan dialog's family is its own parent chain: it keeps only
+  what the user raised of its old family, else goes just below the window on top when it becomes
+  an orphan, so a window that opens and closes at once hands nothing on. Nothing else moves a
+  window up: a commit, a re-parent, a map or a re-show (after a minimize, a fullscreen or
+  maximize, a tab switch, an unplug) puts every window back at its rank, so no app can put itself
+  above a window the user raised later.
 - **Logs.** One `info` line per change: `client size hints` (app, id, min, max and the outcome),
   then `re-placed`, `floating: no tile fits` (and `floating: its minimum is bigger than the
   monitor` when it is) or `tiled again` with the cells or rect (`by="room freed"` when a float
   takes freed cells), `float moved` / `float resized` with the rect, and `clipped`
   with both sizes when a window's geometry is larger than its clip rect. An app that alternates its
-  hints logs at most one refit a second.
+  hints logs at most one refit a second. `dialog: capped to its monitor` (its size, the cap and
+  its rect, once per dialog per bounds), `dialog: focus refused` (app and root) when a new dialog
+  maps without the keyboard, and `dialog: re-resolved` (old and new root) when a parent closes.
 
 ### Tabs
 
@@ -277,7 +319,9 @@ aspect, gravity, position) are ignored.
   back. A minimized tab stays in the bar, dimmed, and clicking it brings it back.
 - An app's own maximize and minimize buttons do exactly what navi's do. Hidden windows can't
   maximize or minimize, so a window nobody can see can't hide the ones they can.
-- Dialogs stay floating over their parent, hide while it's hidden, and re-centre when it moves.
+- Dialogs stay floating over their parent, inside its monitor, framed; they hide while their
+  root is hidden and re-centre when the parent moves (*Dialogs* above). Focusing a window brings
+  its dialogs in front of it. Apps can't move or resize their own dialogs.
 - **Fullscreen** (the app asks for it) covers the whole monitor, taskbar included, on the
   monitor the window is on, and hides the other windows there; the taskbar can't be seen or
   clicked meanwhile, but keeps its space. It ends when the app leaves fullscreen, closes or is
@@ -348,13 +392,16 @@ bundling a degoogled, resource-tested Chromium variant is reserved for a future 
   slots and a blue active-window indicator. The launcher opens 12 px above it. The logo opens the launcher. Pinned apps come first, in pin order;
   other running apps follow in opening order. Each app has one icon, with up to three dots for
   its windows. Click an app to launch it if closed, focus or restore it if running, or cycle its
-  windows when already focused. Minimized apps are dimmed. **Super+1…9** focuses or restores
-  the Nth running app (pinned apps that aren't running take no number) at its first visible
-  window, else its first; on the focused app it does nothing. **Super+Tab** and
-  **Super+Shift+Tab** step focus to the next or previous running app in dock order, wrapping,
-  and skip apps whose windows are all minimized. Both are navi's (apps never see them), work over
-  fullscreen, and follow the activation rule: another window on a fullscreen monitor ends that
-  fullscreen. The top-row digit keys count on any layout; the keypad doesn't.
+  windows when already focused. Minimized apps are dimmed. An app with a window waiting for the
+  user (a dialog refused the keyboard, *Dialogs*, or an activation that wasn't the user's,
+  *Stacking order*) has an accent dot at its icon's corner until that window is focused, so it
+  can be found even while minimized or hidden.
+  **Super+1…9** focuses or restores the Nth running app (pinned apps that aren't running take no
+  number) at its first visible window, else its first; on the focused app it does nothing.
+  **Super+Tab** and **Super+Shift+Tab** step focus to the next or previous running app in dock
+  order, wrapping, and skip apps whose windows are all minimized. Both are navi's (apps never see
+  them), work over fullscreen, and follow the activation rule: another window on a fullscreen
+  monitor ends that fullscreen. The top-row digit keys count on any layout; the keypad doesn't.
 - **Pins:** use the **Pin / Unpin** button beside an app in the launcher, press Insert on a
   selected app, or right-click an app's dock icon. Pins survive restarts in
   `$XDG_CONFIG_HOME/navi/pins` (default `~/.config/navi/pins`): `navi-pins 1`, then one installed
@@ -435,9 +482,9 @@ bundling a degoogled, resource-tested Chromium variant is reserved for a future 
   purple, amber or pink accents; Accessibility offers high contrast. These are opt-in variants
   of the same system, preserving geometry, hierarchy and instant state changes. The
   window with the keyboard has a 2 px accent frame just outside it, in the gap; every other shown
-  window has a dim 1 px one, so the gaps read as thin neon lines and the grab strips stay easy to
-  find. A lit strip or edge, the bars and the minimized strips draw in front of the frames, and
-  the shell's panels in front of all of them.
+  window, dialogs included, has a dim 1 px one, so the gaps read as thin neon lines and the grab
+  strips stay easy to find. A lit strip or edge, the bars and the minimized strips draw in front
+  of the frames, and the shell's panels in front of all of them.
   The shell's panels (dock, launcher, status band, session menu and notification cards) float:
   12 px (`INSET`) from the screen edges and from what they sit next to, with 10 px corners
   (`RADIUS`), the shell fill and a 1 px rim. The dock and band, which sit over the wallpaper,
@@ -532,7 +579,10 @@ session.
   the keyboard, with a serial from its current focus (no older than its keyboard enter, no newer
   than navi's latest). Each works once, within 10 s, and only while the keyboard is still on the
   surface that asked or on the one being activated, so an app can't stash tokens and take focus
-  back after you've moved on.
+  back after you've moved on. Only an activation by the user (a token from the dock, or from a
+  window the user focused, redeemed before the keyboard moved) restores, raises and focuses the
+  window; any other only marks its dock entry and tab (*Stacking order*). This replaces job 006's
+  rule that every accepted activation moves the keyboard.
 - **Locking** uses `ext-session-lock`, advertised only on the dedicated socket Navi gives its
   swaylock child. Applications, including the bar, cannot bind it. Normal windows, layers,
   wallpaper, decorations and cursors are excluded from locked output frames; normal keyboard,
@@ -626,9 +676,12 @@ session.
   This keeps complete events within the backend's 4096-byte buffer. The metadata reaches the
   dock. X11 keyboard focus is set as well as Wayland focus. Tiled X11 windows get their minimum
   and maximum size from `WM_NORMAL_HINTS`, as *Client sizes* says; transient dialogs and menus
-  ignore those hints. Transient dialogs follow their
-  parents and hide with them; override-redirect
-  menus keep their X11 geometry and require an X11 parent. Clipboard transfers are bridged,
+  ignore those hints. Transient dialogs follow the *Dialogs* rule: the same bounds, cap (in their
+  X11 configure), frame and focus rule as Wayland dialogs. A transient naming another X client's
+  window isn't refused: X11 clients on one Xwayland already see and inject each other's input,
+  so it gains nothing navi could deny, and it can never name a Wayland window, so the focus rule
+  still keeps it from taking keys from Wayland apps. Override-redirect menus keep their X11
+  geometry, unclipped, and show only while their X11 parent does. Clipboard transfers are bridged,
   with X11 access gated on keyboard focus. Clipboard MIME names containing NULs or exceeding
   2048 bytes are rejected; accepted names are preserved exactly. Primary selection, cross-protocol drag-and-drop,
   and automatic XWayland crash recovery remain unimplemented. Install the `Xwayland` executable

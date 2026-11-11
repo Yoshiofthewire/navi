@@ -173,6 +173,28 @@ impl<W: Clone> BeforeLayer<W> {
     }
 }
 
+/// What navi knows when a window that held the keyboard closes, about a window it could give
+/// the keyboard back to: its parent (a dialog's), or the window that held it just before.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HandBack {
+    /// That focus was the user's (a click, the dock, Super+N, a user activation).
+    pub user_gave: bool,
+    /// The keyboard moved again since it left that window (only the closing window may have
+    /// held it in between).
+    pub moved_since: bool,
+    /// Some of the window is where a click would reach it: shown, not minimized, not covered.
+    pub exposed: bool,
+    /// It is on the closing window's output.
+    pub same_output: bool,
+    pub locked: bool,
+}
+
+/// Whether the keyboard may go back: only to a focus the user gave, held right before the
+/// closing window, to a window the user can see where the closed one was. Else to nobody.
+pub fn may_hand_back(h: HandBack) -> bool {
+    h.user_gave && !h.moved_since && h.exposed && h.same_output && !h.locked
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,5 +305,52 @@ mod tests {
             x.commit(BAR, true, false, false, None, SHOWN),
             Some(Handoff::Take)
         );
+    }
+
+    /// Round 12 (s25-handback-click): the hand-back goes only to a user-given focus held just
+    /// before, on a window the user can see on the same output, outside the lock.
+    #[test]
+    fn a_closed_window_hands_the_keyboard_back_only_to_the_users_last_choice() {
+        let ok = HandBack {
+            user_gave: true,
+            moved_since: false,
+            exposed: true,
+            same_output: true,
+            locked: false,
+        };
+        assert!(may_hand_back(ok));
+        for (no, why) in [
+            (
+                HandBack {
+                    user_gave: false,
+                    ..ok
+                },
+                "took the keyboard on its own",
+            ),
+            (
+                HandBack {
+                    moved_since: true,
+                    ..ok
+                },
+                "the keyboard moved on since",
+            ),
+            (
+                HandBack {
+                    exposed: false,
+                    ..ok
+                },
+                "hidden, minimized or covered",
+            ),
+            (
+                HandBack {
+                    same_output: false,
+                    ..ok
+                },
+                "on another output",
+            ),
+            (HandBack { locked: true, ..ok }, "across the lock"),
+        ] {
+            assert!(!may_hand_back(no), "{why}");
+        }
     }
 }

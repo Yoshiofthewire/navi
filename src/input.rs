@@ -580,7 +580,7 @@ impl Navi {
                     Some(Done::Click(Action::Activate | Action::Restore, id)) => {
                         let shown = self.window_of(id).filter(|_| self.layout.visible(id));
                         if shown.is_some() {
-                            self.focus(shown);
+                            self.focus_by(shown, crate::state::Raise::User);
                         }
                     }
                     _ => {}
@@ -607,7 +607,7 @@ impl Navi {
                     .and_then(|id| self.window_of(id)),
                 None => self.window_under(pos).map(|(w, _)| w.clone()),
             };
-            self.focus(clicked);
+            self.focus_by(clicked, crate::state::Raise::User);
             // Other buttons go on with no pointer focus over a zone, so neither the press nor
             // its release reaches a client.
             if hit.is_some() && left {

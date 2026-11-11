@@ -13,11 +13,46 @@ fn no_older(a: u32, b: u32) -> bool {
 /// A token is made only for a request from the surface holding keyboard focus, carrying a serial
 /// from that focus period: no older than the focus's enter (`focus_since`, `None` when the
 /// surface isn't focused) and not newer than `now`, the latest serial navi has made. A made-up
-/// serial is refused, so a focused app can't mint tokens without an input event.
+/// serial is refused. The enter serial itself counts, so a window navi focused on its own (a new
+/// one) can mint a token without input; `minted_by_user` keeps that from raising as the user.
 pub fn may_issue(serial: Option<u32>, focus_since: Option<u32>, now: u32) -> bool {
     match (serial, focus_since) {
         (Some(s), Some(since)) => no_older(s, since) && no_older(now, s),
         _ => false,
+    }
+}
+
+/// Whether a token's activation raises as the user would: it came from navi-bar (the dock, the
+/// launcher), or from a window that holds the keyboard because the user gave it (a click, the
+/// dock, Super+N, a user activation). A window that took the keyboard on its own (new on map) or
+/// by navi's refocus mints tokens that only mark the window (`on_redeem`).
+pub fn minted_by_user(navi_bar: bool, focus_by_user: bool) -> bool {
+    navi_bar || focus_by_user
+}
+
+/// Whether redeeming a token raises as the user would: navi-bar's always; another only if it was
+/// minted from a focus the user gave and the keyboard hasn't moved since (`moves`, counted at
+/// mint and now). A stale user token, redeemed after the user went elsewhere, still activates
+/// but raises nothing.
+pub fn user_raise(bar: bool, user: bool, minted_at: u64, now: u64) -> bool {
+    bar || user && minted_at == now
+}
+
+/// What redeeming a valid token does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Redeem {
+    /// The user's: restore, raise and focus the window.
+    Focus,
+    /// Anyone else's: leave the keyboard and the stacking order alone; mark the window's dock
+    /// entry and tab until the user switches to it.
+    Mark,
+}
+
+/// A user token focuses; any other only marks.
+pub fn on_redeem(user: bool) -> Redeem {
+    match user {
+        true => Redeem::Focus,
+        false => Redeem::Mark,
     }
 }
 
@@ -70,6 +105,57 @@ mod tests {
         assert!(may_issue(Some(41), Some(40), 41));
         // A press serial made before the enter, as navi used to send, would be refused.
         assert!(!may_issue(Some(39), Some(40), 41));
+    }
+
+    /// Round 6 security (s17-act): a window that got the keyboard by mapping can mint a token with
+    /// its enter serial, but that token is not a user's; the dock's and a clicked window's are.
+    #[test]
+    fn only_a_users_focus_mints_a_user_token() {
+        // The new window's own enter serial is accepted ...
+        assert!(may_issue(Some(29), Some(29), 30));
+        // ... but it isn't the user's.
+        assert!(!minted_by_user(false, false));
+        assert!(minted_by_user(false, true), "a window the user clicked");
+        assert!(minted_by_user(true, false), "navi-bar");
+    }
+
+    /// Round 7 security (s18-stale): a user token redeemed after the keyboard moved (the user went
+    /// to another app, a new window took it) raises nothing; navi-bar's always does.
+    #[test]
+    fn a_user_token_raises_only_while_its_focus_holds() {
+        assert!(
+            user_raise(false, true, 5, 5),
+            "asker still holds the user's focus"
+        );
+        assert!(!user_raise(false, true, 5, 6), "the keyboard moved since");
+        assert!(
+            !user_raise(false, true, 5, 9),
+            "moved to the target, a new window"
+        );
+        assert!(!user_raise(false, false, 5, 5), "never the user's");
+        assert!(user_raise(true, false, 5, 9), "navi-bar");
+    }
+
+    /// Round 11 (Yoshi's decision): an activation that isn't the user's neither raises nor takes
+    /// the keyboard; it only marks the window. A user token focuses.
+    #[test]
+    fn only_a_user_activation_takes_the_keyboard() {
+        assert_eq!(on_redeem(user_raise(false, true, 5, 5)), Redeem::Focus);
+        assert_eq!(
+            on_redeem(user_raise(true, false, 5, 9)),
+            Redeem::Focus,
+            "navi-bar"
+        );
+        assert_eq!(
+            on_redeem(user_raise(false, true, 5, 6)),
+            Redeem::Mark,
+            "stale"
+        );
+        assert_eq!(
+            on_redeem(user_raise(false, false, 5, 5)),
+            Redeem::Mark,
+            "self-focused"
+        );
     }
 
     #[test]

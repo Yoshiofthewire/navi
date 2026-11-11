@@ -168,6 +168,7 @@ impl Navi {
     pub fn protect_session(&mut self) {
         if !self.lock.active {
             self.lock.active = true;
+            self.before_focus = None;
             self.isolate_lock_input();
             self.lock_outputs_changed();
         }
@@ -415,6 +416,7 @@ impl SessionLockHandler for Navi {
             return;
         }
         self.lock.active = true;
+        self.before_focus = None;
         self.lock.owner = Some(confirmation.ext_session_lock().clone());
         self.lock.confirmation = Some(confirmation);
         self.lock.surfaces.clear();

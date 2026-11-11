@@ -18,6 +18,10 @@ pub const YES: u8 = 1;
 pub const TOGGLE_MENU: u8 = 2;
 pub const CYCLE_NEXT: u8 = 3;
 pub const CYCLE_PREV: u8 = 4;
+/// navi → navi-bar, in a window-list handle's states: a dialog of that window waits for the user.
+/// Outside the protocol's values, as only navi-bar sees the window list.
+#[allow(dead_code)]
+pub const ATTENTION: u32 = 0x6e61_7601;
 /// Slot n (1..=9) is `SLOT_1 + n - 1`.
 pub const SLOT_1: u8 = 5;
 const SLOT_9: u8 = SLOT_1 + 8;

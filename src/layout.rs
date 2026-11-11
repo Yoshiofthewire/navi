@@ -3,11 +3,14 @@
 use std::collections::HashMap;
 
 mod bar;
+pub mod dialog;
 mod drag;
 mod float;
 mod memory;
 pub use bar::{Button, Decor, decoration};
-pub use drag::{Action, Done, Drag, EdgeClicks, Hit, Nudge, Side, buttons, float_overlay, overlay};
+pub use drag::{
+    Action, Done, Drag, EdgeClicks, Hit, Nudge, Side, buttons, dialog_frame, float_overlay, overlay,
+};
 use memory::MAX_PX;
 pub use memory::safe;
 
@@ -189,6 +192,10 @@ pub struct Tile {
     pub floating: bool,
     /// A float's window rect once the user moved or resized it; never remembered.
     pub user_rect: Option<Rect>,
+    /// A dialog of its family waits for the user (refused the keyboard): its tab is marked.
+    pub attention: bool,
+    /// Its family's newest raise, from navi's one stacking order: floats are ordered by it first.
+    pub rank: u64,
 }
 
 impl Tile {
@@ -577,6 +584,24 @@ impl Layout {
         &self.tiles
     }
 
+    /// Sets `id`'s stacking rank (`Tile::rank`).
+    pub fn set_rank(&mut self, id: WinId, rank: u64) {
+        if let Some(t) = self.tile_mut(id) {
+            t.rank = rank;
+        }
+    }
+
+    /// Marks exactly the tiles in `ids` as wanting attention. Returns whether any mark changed.
+    pub fn set_attention(&mut self, ids: &[WinId]) -> bool {
+        let mut changed = false;
+        for t in &mut self.tiles {
+            let want = ids.contains(&t.id);
+            changed |= t.attention != want;
+            t.attention = want;
+        }
+        changed
+    }
+
     pub fn tile(&self, id: WinId) -> Option<&Tile> {
         self.tiles.iter().find(|t| t.id == id)
     }
@@ -943,7 +968,7 @@ impl Layout {
             .map(|t| (here.name.clone(), t.cells, Step::Tabbed(t.id)))
     }
 
-    fn output(&self, name: &str) -> Option<&Output> {
+    pub fn output(&self, name: &str) -> Option<&Output> {
         self.outputs.iter().find(|o| o.name == name)
     }
 
@@ -2672,6 +2697,71 @@ mod tests {
         // Focus brings f in front; then its zones take the point back from g's dialog.
         assert!(l.raise(f));
         assert_eq!(l.hit_under(x, Some(g)), Some(Hit::Button(f, Button::Close)));
+    }
+
+    /// PR #39 audit P2: floats follow the stacking ranks first. Restoring or activating the rear
+    /// float without a raise (navi's `Raise::Not`: a token that isn't the user's) touches its
+    /// stamp but leaves the drawn and hit order alone; a raise of its family puts it in front.
+    #[test]
+    fn floats_follow_the_raise_ranks() {
+        let (mut l, _, f) = blocked(vec![], fixed());
+        let (g, _) = l.place_with("upd2", (1720, 600), fixed(), true).unwrap();
+        // g half a window to the right of f, over f's right band.
+        l.keyboard_adjust(g, Side::Right, Nudge::Move).unwrap();
+        l.set_rank(f, 2);
+        l.set_rank(g, 4);
+        assert_eq!(l.floats(), [g, f]);
+        // They overlap: a point in both windows belongs to the front one.
+        let (front, rear) = (l.clip(g).unwrap(), l.clip(f).unwrap());
+        let p = (front.x + front.w / 2, front.y + front.h / 2);
+        assert!(rear.contains(p) && front.contains(p));
+        // f's right band runs under g's window: g, in front, takes the point.
+        let band = l.float_zone(f, Side::Right).unwrap();
+        let q = (band.x + 1, band.y + band.h / 2);
+        assert!(front.contains(q));
+        assert_eq!(l.hit(q), None, "inside g's window");
+        // A minimize and an activation without a raise: the stamp moves, the order doesn't.
+        l.minimize(f);
+        assert!(l.activate(f));
+        assert_eq!(l.floats(), [g, f], "no raise, no move");
+        assert_eq!(l.hit(q), None, "g still covers f's band");
+        // A raise of f's family (its rank passes g's) puts it in front.
+        l.set_rank(f, 6);
+        assert_eq!(l.floats(), [f, g]);
+        assert_eq!(l.hit(q).map(|h| h.id()), Some(f), "f's band is f's again");
+    }
+
+    /// Job 020 AC5: a front float's dialog of a dialog has the float as its root, so it covers
+    /// the rear float's zones as the float's own dialog does.
+    #[test]
+    fn floats_dialog_of_dialog_covers_the_zones_behind_it() {
+        use dialog::{Root, place, root};
+        let (mut l, _, f) = blocked(vec![], fixed());
+        let (g, _) = l.place_with("upd2", (1720, 600), fixed(), true).unwrap();
+        for _ in 0..3 {
+            l.keyboard_adjust(g, Side::Left, Nudge::Move).unwrap();
+        }
+        assert_eq!(l.floats(), [g, f]);
+        // Windows 0: float g, 1: its dialog, 2: that dialog's dialog.
+        let parents = [None, Some(0), Some(1)];
+        let owner = root(2, |i| parents[i], |i| (i == 0).then_some(g));
+        assert_eq!(owner, Root::Tiled(g));
+        let Root::Tiled(owner) = owner else {
+            unreachable!()
+        };
+        let (front, rear) = (l.clip(g).unwrap(), outer_of(&l, f));
+        let b = bounds_of(&l, g);
+        let d1 = place(front, (200, 200), b);
+        let d2 = place(d1, (b.w, front.h), b);
+        let band = (rear.x + rear.w + 3, rear.y + rear.h / 2);
+        assert!(!front.contains(band) && d2.contains(band), "{d2:?}");
+        assert!(l.hit(band).is_some_and(|h| h.id() == f));
+        assert_eq!(
+            l.hit_under(band, Some(owner)),
+            None,
+            "the chain is in front"
+        );
+        assert_eq!(l.hit_under(band, Some(f)), l.hit(band));
     }
 
     /// Round 1 (security probe): unplugging the monitor under a float drag leaves the float on a

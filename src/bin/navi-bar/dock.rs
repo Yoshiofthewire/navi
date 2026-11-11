@@ -103,6 +103,7 @@ pub struct Running<'a> {
     pub app_id: &'a str,
     pub focused: bool,
     pub minimized: bool,
+    pub attention: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -112,6 +113,8 @@ pub struct App {
     pub windows: Vec<usize>,
     pub focused: bool,
     pub minimized: bool,
+    /// One of its windows has a dialog waiting for the user.
+    pub attention: bool,
     pub pinned: bool,
 }
 
@@ -126,6 +129,7 @@ pub fn apps(pins: &[String], entries: &[Entry], windows: &[Running<'_>]) -> Vec<
                 windows: Vec::new(),
                 focused: false,
                 minimized: false,
+                attention: false,
                 pinned: true,
             })
         })
@@ -143,6 +147,7 @@ pub fn apps(pins: &[String], entries: &[Entry], windows: &[Running<'_>]) -> Vec<
                 windows: Vec::new(),
                 focused: false,
                 minimized: true,
+                attention: false,
                 pinned: false,
             });
             apps.len() - 1
@@ -153,6 +158,7 @@ pub fn apps(pins: &[String], entries: &[Entry], windows: &[Running<'_>]) -> Vec<
         }
         app.windows.push(i);
         app.focused |= win.focused;
+        app.attention |= win.attention;
         app.minimized &= win.minimized;
     }
     apps
@@ -260,16 +266,19 @@ mod tests {
                 app_id: "term",
                 focused: false,
                 minimized: true,
+                attention: false,
             },
             Running {
                 app_id: "terminal",
                 focused: true,
                 minimized: false,
+                attention: false,
             },
             Running {
                 app_id: "unknown",
                 focused: false,
                 minimized: false,
+                attention: false,
             },
         ];
         let apps = apps(
@@ -305,6 +314,7 @@ mod tests {
             app_id,
             focused,
             minimized,
+            attention: false,
         }
     }
 
@@ -341,6 +351,16 @@ mod tests {
             key(&d, &w, DockKey::Slot(4)),
             Err("no running app in that slot")
         );
+    }
+
+    #[test]
+    fn a_waiting_window_marks_its_app() {
+        let mut quiet = run("a", false, false);
+        let mut waiting = run("a", false, true);
+        waiting.attention = true;
+        quiet.attention = false;
+        let apps = apps(&[], &[], &[quiet, waiting, run("b", false, false)]);
+        assert!(apps[0].attention && !apps[1].attention);
     }
 
     #[test]

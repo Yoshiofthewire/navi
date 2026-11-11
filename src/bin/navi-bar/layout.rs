@@ -11,6 +11,8 @@ pub const BAR_H: i32 = DOCK_H + INSET;
 pub const SLOT: i32 = 36;
 const TARGET: i32 = 32;
 pub const ICON: i32 = 24;
+/// The attention dot on a dock icon whose app has a dialog waiting, in px.
+const ATTENTION_DOT: i32 = 8;
 const DOCK_PAD: i32 = 8;
 const DOCK_H: i32 = 40;
 const PAD: i32 = 12;
@@ -48,6 +50,8 @@ pub enum Hit {
 pub struct Slot {
     pub focused: bool,
     pub minimized: bool,
+    /// A dialog of the app waits for the user: an accent dot at the icon's corner.
+    pub attention: bool,
     pub running: usize,
     pub pinned: bool,
 }
@@ -349,7 +353,17 @@ impl Layout {
                 out.push(Item::Round(t, 8, SELECTED));
             }
             let alpha = if slot.minimized { MINIMIZED_ALPHA } else { 1.0 };
-            out.push(Item::Icon(IconOf::Window(i), centred(t, ICON), alpha));
+            let icon = centred(t, ICON);
+            out.push(Item::Icon(IconOf::Window(i), icon, alpha));
+            if slot.attention {
+                let dot = Rect {
+                    x: icon.x + icon.w - ATTENTION_DOT / 2,
+                    y: icon.y - ATTENTION_DOT / 2,
+                    w: ATTENTION_DOT,
+                    h: ATTENTION_DOT,
+                };
+                out.push(Item::Round(dot, ATTENTION_DOT / 2, ACCENT));
+            }
             if slot.running > 0 {
                 let count = slot.running.min(3) as i32;
                 let start = t.x + (t.w - (count * 5 - 2)) / 2;
@@ -442,6 +456,29 @@ mod tests {
             let p = open.panel().unwrap();
             assert_eq!(p.y + p.h + INSET, open.bar().y);
         }
+    }
+
+    /// Round 4: an app with a dialog waiting for the user gets an accent dot on its dock icon.
+    #[test]
+    fn a_waiting_dialog_marks_its_dock_icon() {
+        let l = Layout::new(2, false);
+        let slots = [
+            Slot {
+                running: 1,
+                attention: true,
+                ..Slot::default()
+            },
+            Slot {
+                running: 1,
+                ..Slot::default()
+            },
+        ];
+        let items = l.draw(&slots, None, &[], &[], None, "");
+        let dots: Vec<_> = items
+            .iter()
+            .filter(|i| matches!(i, Item::Round(r, _, c) if r.w == ATTENTION_DOT && *c == ACCENT))
+            .collect();
+        assert_eq!(dots.len(), 1);
     }
 
     #[test]

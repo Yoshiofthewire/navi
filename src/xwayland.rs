@@ -140,7 +140,7 @@ impl Navi {
             }
         }
         self.windows.push(Managed {
-            window: window.clone(),
+            window,
             tile,
             last_size: x.geometry().size,
             clipped: None,
@@ -149,10 +149,22 @@ impl Navi {
             want_fullscreen: false,
             escaped: false,
             x11_parent,
+            // `recenter_dialogs` resolves a transient's parent.
+            up: None,
+            fresh: false,
+            waiting: false,
+            rank: 0,
+            user_rank: 0,
+            floor: 0,
+            born: self.raises,
+            asked: None,
+            placed: None,
+            last_output: None,
+            capped_for: None,
         });
         self.apply_layout();
-        if !x.is_override_redirect() && self.space.element_location(&window).is_some() {
-            self.focus(Some(window));
+        if !x.is_override_redirect() {
+            self.focus_new(self.windows.len() - 1);
         }
     }
 
@@ -164,8 +176,7 @@ impl Navi {
         else {
             return;
         };
-        let m = self.windows.remove(at);
-        self.space.unmap_elem(&m.window);
+        let m = self.forget(at);
         if let Some(id) = m.tile {
             self.layout.remove(id);
             info!(id, "X11 closed; its cells stay empty");
@@ -174,46 +185,42 @@ impl Navi {
         self.refresh_toplevels();
     }
 
-    /// Transient dialogs follow their parent; override-redirect menus keep their X11 geometry.
+    /// Places the X11 menus, then moves the keyboard off any window that isn't shown (a focused
+    /// menu hidden with its parent).
     pub fn recenter_x11(&mut self) {
-        let floating: Vec<_> = self
+        self.place_menus();
+        self.keep_focus_mapped(&[]);
+    }
+
+    /// Override-redirect menus keep their X11 geometry and show only while their X11 parent is
+    /// shown; `recenter_dialogs` places transients.
+    pub(crate) fn place_menus(&mut self) {
+        let menus: Vec<_> = self
             .windows
             .iter()
             .filter(|m| m.tile.is_none())
             .filter_map(|m| {
-                Some((
-                    m.window.clone(),
-                    m.window.x11_surface()?.clone(),
-                    m.x11_parent,
-                ))
+                let x = m.window.x11_surface()?;
+                x.is_override_redirect()
+                    .then(|| (m.window.clone(), x.geometry().loc, m.x11_parent))
             })
             .collect();
-        for (window, x, parent_id) in floating {
-            let parent = parent_id.and_then(|id| {
-                self.windows
-                    .iter()
-                    .find(|m| m.window.x11_surface().is_some_and(|p| p.window_id() == id))
+        let mut new = false;
+        for (window, loc, parent) in menus {
+            let shown = parent.is_some_and(|id| {
+                self.windows.iter().any(|m| {
+                    m.window.x11_surface().is_some_and(|p| p.window_id() == id)
+                        && self.space.element_location(&m.window).is_some()
+                })
             });
-            if x.is_override_redirect() && parent.is_none() {
-                self.space.unmap_elem(&window);
-                continue;
+            match shown {
+                true => new |= crate::state::put(&mut self.space, &window, (loc.x, loc.y)),
+                false => self.space.unmap_elem(&window),
             }
-            let over = match parent {
-                Some(m) => self.space.element_geometry(&m.window),
-                None => self
-                    .main_output()
-                    .and_then(|o| self.space.output_geometry(&o)),
-            };
-            let Some(over) = over else {
-                self.space.unmap_elem(&window);
-                continue;
-            };
-            let mut geo = x.geometry();
-            if !x.is_override_redirect() {
-                geo.loc = over.loc + (over.size - geo.size).downscale(2).to_point();
-                let _ = x.configure(geo);
-            }
-            self.space.map_element(window, geo.loc, false);
+        }
+        // Only a newly shown menu changes the order; dialog commits come through here too.
+        if new {
+            self.restack();
         }
     }
 
@@ -278,21 +285,27 @@ impl XwmHandler for Navi {
     ) {
         if let Some(m) = self
             .windows
-            .iter()
+            .iter_mut()
             .find(|m| m.window.x11_surface() == Some(&x))
         {
             if m.tile.is_some() {
                 self.apply_layout();
+            } else if x.is_override_redirect() {
+                self.recenter_x11();
             } else {
-                let mut geo = x.geometry();
+                // The client sees only the capped size `recenter_dialogs` configures.
+                let (mut w0, mut h0) = m.asked.unwrap_or_else(|| {
+                    let g = x.geometry().size;
+                    (g.w, g.h)
+                });
                 if let Some(w) = w {
-                    geo.size.w = (w as i32).clamp(1, 8192);
+                    w0 = w.clamp(1, 8192) as i32;
                 }
                 if let Some(h) = h {
-                    geo.size.h = (h as i32).clamp(1, 8192);
+                    h0 = h.clamp(1, 8192) as i32;
                 }
-                let _ = x.configure(geo);
-                self.recenter_x11();
+                m.asked = Some((w0, h0));
+                self.recenter_dialogs();
             }
         } else {
             let _ = x.configure(None);
@@ -314,6 +327,7 @@ impl XwmHandler for Navi {
             // `refit` paces it and ignores windows without a tile.
             (WmWindowProperty::NormalHints, Some(root)) => self.refit(&root),
             (WmWindowProperty::NormalHints, None) => {}
+            (WmWindowProperty::TransientFor, _) => self.recenter_dialogs(),
             _ => self.refresh_toplevels(),
         }
     }
@@ -1305,10 +1319,238 @@ mod tests {
         data.state.layout.activate(id);
         data.state.apply_layout();
         assert!(data.state.space.element_location(&dialog_window).is_some());
+        use crate::state::Raise;
+        // navi's own focus raises nothing.
+        let raises = data.state.raises;
+        data.state.focus(Some(dialog_window.clone()));
+        assert_eq!(data.state.focused_window(), Some(dialog_window.clone()));
+        assert_eq!(data.state.raises, raises, "navi's own focus doesn't raise");
+        // A closed dialog the user focused gives the keyboard back to its parent, with no raise.
+        data.state
+            .focus_by(Some(dialog_window.clone()), Raise::User);
+        let raises = data.state.raises;
         conn.destroy_window(dialog).unwrap();
         conn.flush().unwrap();
         pump(&mut event_loop, &mut data, |d| d.state.windows.len() == 1);
+        assert_eq!(data.state.focused_window(), data.state.window_of(id));
+        assert_eq!(data.state.raises, raises, "the hand-back doesn't raise");
+        // Round 6/7 wiring: a user focus marks the keyboard as the user's; navi's refocus of the
+        // same window keeps it and doesn't count as a move; any other move clears it.
+        let parent = data.state.window_of(id);
+        data.state.focus_by(parent.clone(), Raise::User);
+        assert!(data.state.focus_by_user);
+        let moves = data.state.focus_moves;
+        data.state.focus(parent.clone());
+        assert!(
+            data.state.focus_by_user,
+            "navi's refocus of the same window keeps it"
+        );
+        assert_eq!(
+            data.state.focus_moves, moves,
+            "and the keyboard didn't move"
+        );
+        data.state.focus(None);
+        assert!(!data.state.focus_by_user);
+        assert!(data.state.focus_moves > moves);
+        data.state.focus_by(parent.clone(), Raise::New);
+        assert!(
+            !data.state.focus_by_user,
+            "a window that took the keyboard on its own"
+        );
+        data.state.focus_by(parent, Raise::User);
+        assert!(data.state.focus_by_user);
+
+        // PR #39 audit P1: a focused dialog hidden by a re-parent (to a minimized window) loses
+        // the keyboard at once, and later keys reach nobody.
+        let make = |transient_for: Option<u32>| {
+            let w = conn.generate_id().unwrap();
+            conn.create_window(
+                smithay::reexports::x11rb::COPY_DEPTH_FROM_PARENT,
+                w,
+                root,
+                0,
+                0,
+                200,
+                150,
+                0,
+                WindowClass::INPUT_OUTPUT,
+                0,
+                &CreateWindowAux::new()
+                    .background_pixel(0x664422)
+                    .event_mask(EventMask::KEY_PRESS),
+            )
+            .unwrap();
+            if let Some(p) = transient_for {
+                conn.change_property32(
+                    PropMode::REPLACE,
+                    w,
+                    AtomEnum::WM_TRANSIENT_FOR,
+                    AtomEnum::WINDOW,
+                    &[p],
+                )
+                .unwrap();
+            }
+            conn.map_window(w).unwrap();
+            conn.flush().unwrap();
+            w
+        };
+        let hidden = make(None);
+        pump(&mut event_loop, &mut data, |d| d.state.windows.len() == 2);
+        let hidden_id = data.state.windows[1].tile.expect("tiled");
+        data.state.layout.minimize(hidden_id);
+        data.state.apply_layout();
+        let hop = make(Some(window));
+        pump(&mut event_loop, &mut data, |d| d.state.windows.len() == 3);
+        let hop_window = data.state.windows[2].window.clone();
+        pump(&mut event_loop, &mut data, |d| {
+            d.state.space.element_location(&hop_window).is_some()
+        });
+        data.state.focus_by(Some(hop_window.clone()), Raise::User);
+        assert_eq!(data.state.focused_window(), Some(hop_window.clone()));
+        pump(&mut event_loop, &mut data, |_| {
+            conn.get_input_focus().unwrap().reply().unwrap().focus == hop
+        });
+        // Round 11: a menu of that dialog, which the user clicked (it takes the keyboard), hides
+        // with it and loses the keyboard too.
+        let menu = conn.generate_id().unwrap();
+        conn.create_window(
+            smithay::reexports::x11rb::COPY_DEPTH_FROM_PARENT,
+            menu,
+            root,
+            40,
+            40,
+            80,
+            60,
+            0,
+            WindowClass::INPUT_OUTPUT,
+            0,
+            &CreateWindowAux::new()
+                .override_redirect(1)
+                .background_pixel(0x226644)
+                .event_mask(EventMask::KEY_PRESS),
+        )
+        .unwrap();
+        conn.map_window(menu).unwrap();
+        conn.flush().unwrap();
+        pump(&mut event_loop, &mut data, |d| d.state.windows.len() == 4);
+        let menu_window = data.state.windows[3].window.clone();
+        assert_eq!(
+            data.state.windows[3].x11_parent,
+            Some(hop),
+            "the focused transient"
+        );
+        assert!(data.state.space.element_location(&menu_window).is_some());
+        data.state.focus_by(Some(menu_window.clone()), Raise::User);
+        assert_eq!(data.state.focused_window(), Some(menu_window.clone()));
+        conn.change_property32(
+            PropMode::REPLACE,
+            hop,
+            AtomEnum::WM_TRANSIENT_FOR,
+            AtomEnum::WINDOW,
+            &[hidden],
+        )
+        .unwrap();
+        conn.flush().unwrap();
+        pump(&mut event_loop, &mut data, |d| {
+            d.state.space.element_location(&hop_window).is_none()
+        });
+        assert!(
+            data.state.space.element_location(&menu_window).is_none(),
+            "the menu hid with it"
+        );
+        let kb = data.state.seat.get_keyboard().unwrap();
+        assert_eq!(
+            kb.current_focus(),
+            None,
+            "the hidden menu lost the keyboard"
+        );
+        data.state.keyboard_key(38u32.into(), KeyState::Pressed, 30);
+        data.state
+            .keyboard_key(38u32.into(), KeyState::Released, 31);
+        let (mut rounds, mut leaked) = (0, false);
+        pump(&mut event_loop, &mut data, |_| {
+            while let Some(event) = conn.poll_for_event().unwrap() {
+                if let Event::KeyPress(event) = event {
+                    leaked |= event.event == hop || event.event == menu;
+                }
+            }
+            rounds += 1;
+            rounds > 60
+        });
+        assert!(!leaked, "no key reached the hidden dialog");
+        for w in [menu, hop, hidden] {
+            conn.destroy_window(w).unwrap();
+        }
+        conn.flush().unwrap();
+        pump(&mut event_loop, &mut data, |d| d.state.windows.len() == 1);
         data.state.focus(data.state.window_of(id));
+
+        // Round 12: a closed window hands the keyboard back only to the user's last choice.
+        let parent = data.state.window_of(id);
+        let close = |data: &mut CalloopData, event_loop: &mut EventLoop<CalloopData>, w: u32| {
+            conn.destroy_window(w).unwrap();
+            conn.flush().unwrap();
+            pump(event_loop, data, |d| d.state.windows.len() == 1);
+        };
+        let open = |data: &mut CalloopData, event_loop: &mut EventLoop<CalloopData>| {
+            let w = make(None);
+            pump(event_loop, data, |d| d.state.windows.len() == 2);
+            let win = data.state.windows[1].window.clone();
+            pump(event_loop, data, |d| {
+                d.state.space.element_location(&win).is_some()
+            });
+            (w, win)
+        };
+        // Allowed: the user was on the parent, then on B; B closes.
+        data.state.focus_by(parent.clone(), Raise::User);
+        let (b, b_win) = open(&mut data, &mut event_loop);
+        data.state.focus_by(Some(b_win), Raise::User);
+        close(&mut data, &mut event_loop, b);
+        assert_eq!(
+            data.state.focused_window(),
+            parent,
+            "back to the user's last choice"
+        );
+        // Refused: the parent took the keyboard on its own before the user went to B.
+        data.state.focus_by(parent.clone(), Raise::New);
+        let (b, b_win) = open(&mut data, &mut event_loop);
+        data.state.focus_by(Some(b_win), Raise::User);
+        close(&mut data, &mut event_loop, b);
+        assert_eq!(
+            data.state.focused_window(),
+            None,
+            "not a focus the user gave"
+        );
+        // Refused: the keyboard moved on (to nobody) after leaving the parent.
+        data.state.focus_by(parent.clone(), Raise::User);
+        let (b, b_win) = open(&mut data, &mut event_loop);
+        data.state.focus_by(Some(b_win.clone()), Raise::User);
+        data.state.focus(None);
+        data.state.focus_by(Some(b_win), Raise::User);
+        close(&mut data, &mut event_loop, b);
+        assert_eq!(data.state.focused_window(), None, "a gap since the parent");
+        // Refused: the parent is minimized (hidden) when B closes.
+        data.state.focus_by(parent.clone(), Raise::User);
+        let (b, b_win) = open(&mut data, &mut event_loop);
+        data.state.focus_by(Some(b_win), Raise::User);
+        data.state.layout.minimize(id);
+        data.state.apply_layout();
+        close(&mut data, &mut event_loop, b);
+        assert_eq!(data.state.focused_window(), None, "the parent is hidden");
+        data.state.layout.activate(id);
+        data.state.apply_layout();
+        // Refused: across the lock (it clears what the user left).
+        data.state.focus_by(parent.clone(), Raise::User);
+        let (b, b_win) = open(&mut data, &mut event_loop);
+        data.state.focus_by(Some(b_win), Raise::User);
+        data.state.before_focus = None;
+        close(&mut data, &mut event_loop, b);
+        assert_eq!(
+            data.state.focused_window(),
+            None,
+            "nothing left to go back to"
+        );
+        data.state.focus(parent);
         let menu = conn.generate_id().unwrap();
         conn.create_window(
             smithay::reexports::x11rb::COPY_DEPTH_FROM_PARENT,
