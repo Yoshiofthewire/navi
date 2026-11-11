@@ -32,7 +32,7 @@ pub enum Button {
 
 #[derive(Debug, PartialEq)]
 pub struct Bar {
-    /// The gap above the window, full window width.
+    /// Directly above the window, full window width, below the grab strip.
     pub rect: Rect,
     /// One per member of a tabbed group, by id.
     pub tabs: Vec<(WinId, Rect)>,
@@ -45,12 +45,11 @@ impl Layout {
         if !self.has_bar(id) {
             return None;
         }
-        let (c, r) = self.frame(id)?;
+        let (_, r) = self.frame(id)?;
         let rect = Rect {
-            x: r.x,
-            y: c.y,
-            w: r.w,
-            h: r.y - c.y,
+            y: r.y - BAR,
+            h: BAR,
+            ..r
         };
         let active = self.tile(self.active(id)?)?;
         let right = rect.x + rect.w;
@@ -170,7 +169,7 @@ pub fn draw(l: &Layout, id: WinId, bar: &Bar, hover: Option<Hit>) -> Vec<(Rect, 
 #[cfg(test)]
 mod tests {
     use super::super::{
-        COLS, Cells, FULL, GAP, MIN_H, MIN_W, Output, ROWS, Tile,
+        COLS, Cells, FULL, MIN_H, MIN_W, Output, ROWS, STRIP, Tile,
         drag::{
             Done, Drag,
             tests::{assert_valid, at, c, drag, uw, with, zones},
@@ -282,16 +281,25 @@ mod tests {
         let (cr, plain) = (o.cells_rect(HALF_L), o.tile_rect(HALF_L));
         let mut l = with(&[HALF_L]);
         assert_eq!(l.rect(0), Some(plain));
-        assert_eq!(plain.y, cr.y + GAP);
+        assert_eq!(plain.y, cr.y + STRIP);
         l.set_decorated(0, true);
         let r = l.rect(0).unwrap();
-        assert_eq!(r.y, cr.y + BAR);
-        assert_eq!(r.h, plain.h - (BAR - GAP));
+        // The bar sits between the strip and the window.
+        assert_eq!(r.y, cr.y + STRIP + BAR);
+        assert_eq!(r.h, plain.h - BAR);
+        assert_eq!(
+            l.bar(0).unwrap().rect,
+            Rect {
+                y: cr.y + STRIP,
+                h: BAR,
+                ..r
+            }
+        );
         assert_eq!((r.x, r.w), (plain.x, plain.w));
 
         let mut l = with(&[HALF_L, HALF_L]);
         assert_eq!(l.rect(0), l.rect(1));
-        assert_eq!(l.rect(0).unwrap().y, cr.y + BAR);
+        assert_eq!(l.rect(0).unwrap().y, cr.y + STRIP + BAR);
         l.remove(1);
         assert_eq!(l.rect(0), Some(plain));
     }
@@ -301,21 +309,22 @@ mod tests {
         let mut l = with(&[HALF_L]);
         l.set_decorated(0, true);
         let r = l.rect(0).unwrap();
-        let right = r.x + r.w;
+        let (right, top) = (r.x + r.w, r.y - BAR);
         for (k, b) in [
             (3, Button::Minimize),
             (2, Button::Maximize),
             (1, Button::Close),
         ] {
             let x = right - k * BAR;
-            for p in [(x, 0), (x + BAR - 1, BAR - 1), (x + 12, 12)] {
+            for p in [(x, top), (x + BAR - 1, top + BAR - 1), (x + 12, top + 12)] {
                 assert_eq!(l.hit(p), Some(Hit::Button(0, b)), "{p:?}");
             }
+            assert_eq!(l.hit((x, top - 1)), Some(Hit::Strip(0)), "the strip above");
         }
-        assert_eq!(l.hit((right - 3 * BAR - 1, 12)), Some(Hit::Strip(0)));
+        assert_eq!(l.hit((right - 3 * BAR - 1, top + 12)), Some(Hit::Strip(0)));
         assert_eq!(l.hit((r.x, 0)), Some(Hit::Strip(0)));
         assert_eq!(l.hit((500, 700)), None);
-        assert_eq!(l.hit((500, BAR)), None);
+        assert_eq!(l.hit((500, r.y)), None);
 
         // Tabs in id order with 2 px gaps; buttons only once the active tile is decorated.
         let mut l = with(&[HALF_L, HALF_L]);
@@ -334,7 +343,12 @@ mod tests {
                 _ if x < tb.x => None,
                 _ => Some(Hit::Tab(1)),
             };
-            assert_eq!(l.hit((x, 5)), want, "x {x}");
+            assert_eq!(l.hit((x, bar.rect.y + 5)), want, "x {x}");
+            assert_eq!(
+                l.hit((x, 5)),
+                Some(Hit::Strip(1)),
+                "the strip above the tabs"
+            );
         }
         l.set_decorated(0, true);
         assert!(
@@ -378,7 +392,7 @@ mod tests {
                         bar.tabs,
                         partition(
                             Rect {
-                                y: 0,
+                                y: STRIP,
                                 h: BAR,
                                 ..area
                             },
@@ -468,7 +482,7 @@ mod tests {
         let (rects, memory) = ([l.rect(0), l.rect(1)], l.memory.clone());
         let tiles = l.tiles.clone();
         assert_eq!(click_button(&mut l, 0, Button::Maximize), Some("maximized"));
-        assert_eq!(l.rect(0), Some(uw().window_rect(FULL, BAR)));
+        assert_eq!(l.rect(0), Some(uw().window_rect(FULL, STRIP + BAR)));
         assert!(!l.visible(1));
         assert_eq!(l.hit((1720, 700)), None, "b's left edge");
         assert_eq!(l.hit((2500, 1437)), None, "b's bottom edge");
@@ -552,7 +566,7 @@ mod tests {
         let mut l = with(&[HALF_L, HALF_R]);
         let before = (l.tiles.clone(), [l.rect(0), l.rect(1)]);
         assert!(l.maximize(0));
-        assert_eq!(l.rect(0), Some(uw().window_rect(FULL, GAP)));
+        assert_eq!(l.rect(0), Some(uw().window_rect(FULL, STRIP)));
         assert!(!l.visible(1));
         assert!(hits(&l).iter().all(|h| *h == Hit::Strip(0)));
         let maximized = l.tiles.clone();
@@ -698,10 +712,10 @@ mod tests {
         d.motion(&mut l, (3000, 700), 0);
         assert_eq!(
             preview(&l, &d, (3000, 700)),
-            Some(uw().window_rect(HALF_R, BAR))
+            Some(uw().window_rect(HALF_R, STRIP + BAR))
         );
         d.release(&mut l, (3000, 700), 10);
-        assert_eq!(l.rect(0), Some(uw().window_rect(HALF_R, BAR)));
+        assert_eq!(l.rect(0), Some(uw().window_rect(HALF_R, STRIP + BAR)));
 
         // A held tab-in will have a bar; an undecorated untab won't.
         let mut l = with(&[HALF_L, HALF_L, HALF_R]);
@@ -709,7 +723,7 @@ mod tests {
         d.motion(&mut l, (2500, 700), 0);
         assert_eq!(
             preview(&l, &d, (2500, 700)),
-            Some(uw().window_rect(HALF_R, BAR))
+            Some(uw().window_rect(HALF_R, STRIP + BAR))
         );
         let mut l = with(&[HALF_L, HALF_L]);
         let mut d = Drag::press(&l, mid(tab(&l, 1))).unwrap();
@@ -722,7 +736,7 @@ mod tests {
         let mut l = with(&[HALF_L, HALF_R]);
         assert!(l.maximize(0));
         let strip = l.zone(Hit::Strip(0)).unwrap();
-        assert_eq!((strip.w, strip.h), (uw().window_rect(FULL, GAP).w, GAP));
+        assert_eq!((strip.w, strip.h), (uw().window_rect(FULL, STRIP).w, STRIP));
         assert_eq!(
             zones(&l, None, (100, 2), 0),
             vec![(strip, rgba(ACCENT, 1.0))]

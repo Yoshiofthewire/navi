@@ -11,16 +11,28 @@ pub use memory::safe;
 
 pub const COLS: i32 = 24;
 pub const ROWS: i32 = 12;
-/// Space between tiles in logical px. Tiles are inset by half of it, and by all of it at the top,
-/// where the grab strip will go.
-pub const GAP: i32 = 8;
-/// A tab bar's height, which replaces the strip's `GAP` above tabbed and server-decorated tiles.
+/// The visible space between tiles, and from a tile to the screen edge or a panel, in logical px.
+pub const GAP: i32 = 12;
+/// The grab strip above each tile, inside the gap; `GAP - STRIP` is left below the tile.
+pub const STRIP: i32 = 8;
+/// A tab bar's height, between the strip and a tabbed or server-decorated window.
 /// 24 px is WCAG 2.5.8's minimum target size.
 pub const BAR: i32 = 24;
 pub const MIN_W: i32 = 320;
 pub const MIN_H: i32 = 240;
 
 pub type WinId = u64;
+
+/// The grid inside `zone`, inset so an edge tile's window (or bar) is `GAP` from the zone's edge:
+/// the tile's own gap supplies the rest.
+pub fn grid_in(zone: Rect) -> Rect {
+    Rect {
+        x: zone.x + GAP / 2,
+        y: zone.y + GAP - STRIP,
+        w: zone.w - GAP,
+        h: zone.h - GAP,
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rect {
@@ -101,17 +113,17 @@ impl Output {
 
     /// Where the window itself goes: `cells_rect` minus the gap.
     pub fn tile_rect(&self, c: Cells) -> Rect {
-        self.window_rect(c, GAP)
+        self.window_rect(c, STRIP)
     }
 
-    /// `tile_rect` with `top` px above the window instead of `GAP`.
+    /// `tile_rect` with `top` px above the window instead of `STRIP`.
     fn window_rect(&self, c: Cells, top: i32) -> Rect {
         let r = self.cells_rect(c);
         Rect {
             x: r.x + GAP / 2,
             y: r.y + top,
             w: (r.w - GAP).max(1),
-            h: (r.h - top - GAP / 2).max(1),
+            h: (r.h - top - (GAP - STRIP)).max(1),
         }
     }
 
@@ -302,7 +314,7 @@ impl Layout {
             true => FULL,
             false => t.cells,
         };
-        let top = if self.has_bar(id) { BAR } else { GAP };
+        let top = if self.has_bar(id) { STRIP + BAR } else { STRIP };
         Some((o.cells_rect(cells), o.window_rect(cells, top)))
     }
 
@@ -873,6 +885,25 @@ mod tests {
         }
     }
 
+    /// The grid table in docs/design.md's Layout model.
+    #[test]
+    fn design_table_matches() {
+        let r = |x, y, w, h| Rect { x, y, w, h };
+        for ((w, h), zone, area, span, most) in [
+            ((3440, 1440), (0, 1440), (3428, 1428), (3, 3), 8),
+            ((3440, 1440), (44, 1440 - 96), (3428, 1332), (3, 3), 8),
+            ((3840, 2160), (0, 2160), (3828, 2148), (3, 2), 8),
+            ((1125, 703), (0, 703), (1113, 691), (7, 5), 3),
+        ] {
+            let full = r(0, 0, w, h);
+            let a = crate::wallpaper::usable_area(full, r(0, zone.0, w, zone.1));
+            let o = out("o", a.x, a.y, a.w, a.h, 0);
+            assert_eq!((a.w, a.h), area);
+            assert_eq!(o.span_for((MIN_W, MIN_H)), span, "{area:?}");
+            assert_eq!(COLS / span.0, most);
+        }
+    }
+
     #[test]
     fn common_splits_are_exact() {
         let uw = ultrawide();
@@ -912,9 +943,9 @@ mod tests {
         assert_eq!(
             k.tile_rect(cells(0, 0, 8, 4)),
             Rect {
-                x: 4,
+                x: 6,
                 y: 8,
-                w: 1272,
+                w: 1268,
                 h: 708
             }
         );
@@ -1202,9 +1233,9 @@ mod tests {
         assert_eq!(
             l.rect(id).unwrap(),
             Rect {
-                x: 4,
+                x: 6,
                 y: -2152,
-                w: 1912,
+                w: 1908,
                 h: 2148
             }
         );
@@ -1272,7 +1303,7 @@ mod tests {
 
         // A maximize from before fullscreen survives it.
         assert!(l.maximize(a) && l.fullscreen(a));
-        let maximized = l.output("4k").unwrap().window_rect(FULL, GAP);
+        let maximized = l.output("4k").unwrap().window_rect(FULL, STRIP);
         assert_eq!(l.unfullscreen_output("4k"), vec![a]);
         assert!(l.is_maximized(a) && !l.visible(b));
         assert_eq!(l.rect(a), Some(maximized));

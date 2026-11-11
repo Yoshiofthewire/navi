@@ -162,6 +162,8 @@ where
     let pointer = state.pointer_px();
     let mut out: Vec<Frame<R>> = Vec::new();
     let mut decorations = Vec::new();
+    // Only the square pointer draws over the shell's panels; tile decorations go under them.
+    let mut above_panels = 0;
     let full = layout::Rect {
         x: geo.loc.x,
         y: geo.loc.y,
@@ -190,6 +192,7 @@ where
             }
         }
         Arrow::Square if on_output => {
+            above_panels = 1;
             let r = layout::Rect {
                 x: pointer.0,
                 y: pointer.1,
@@ -212,12 +215,13 @@ where
         .filter(|(r, _)| overlaps(*r, full))
         .map(|(r, color)| (rect(r), color)),
     );
-    out.extend(solids.elements(decorations).into_iter().map(Frame::from));
-    out.extend(
-        surfaces(renderer, state, output, geo, scale)
-            .into_iter()
-            .map(Frame::from),
-    );
+    let mut tiles = solids.elements(decorations);
+    let pointer: Vec<_> = tiles.drain(..above_panels).collect();
+    out.extend(pointer.into_iter().map(Frame::from));
+    let (panels, rest) = surfaces(renderer, state, output, geo, scale);
+    out.extend(panels.into_iter().map(Frame::from));
+    out.extend(tiles.into_iter().map(Frame::from));
+    out.extend(rest.into_iter().map(Frame::from));
     if let Some(w) = wallpaper.as_ref() {
         match wallpaper_element(renderer, w, (geo.size.w, geo.size.h)) {
             Ok(e) => out.push(Frame::from(e)),
@@ -270,15 +274,18 @@ pub fn send_frames(state: &mut Navi, output: &Output) {
     layers.cleanup();
 }
 
-/// The output's layer surfaces and windows, top first. While a window is fullscreen there, the
-/// Top layer (the taskbar) is left out.
+/// The output's upper layer surfaces, then its windows and lower layers, top first. While a
+/// window is fullscreen there, the Top layer (the taskbar) is left out.
 fn surfaces<R>(
     renderer: &mut R,
     state: &Navi,
     output: &Output,
     geo: Rectangle<i32, smithay::utils::Logical>,
     scale: f64,
-) -> Vec<WaylandSurfaceRenderElement<R>>
+) -> (
+    Vec<WaylandSurfaceRenderElement<R>>,
+    Vec<WaylandSurfaceRenderElement<R>>,
+)
 where
     R: Renderer + ImportAll,
     R::TextureId: Texture + Clone + Send + 'static,
@@ -288,19 +295,17 @@ where
         true => &[Layer::Overlay],
         false => &[Layer::Overlay, Layer::Top],
     };
-    let mut out = layers(renderer, &map, upper, scale);
-    out.extend(
-        state
-            .space
-            .render_elements_for_region(renderer, &geo, scale, 1.0),
-    );
+    let panels = layers(renderer, &map, upper, scale);
+    let mut out = state
+        .space
+        .render_elements_for_region(renderer, &geo, scale, 1.0);
     out.extend(layers(
         renderer,
         &map,
         &[Layer::Bottom, Layer::Background],
         scale,
     ));
-    out
+    (panels, out)
 }
 
 /// The surfaces on `which` layers, in that order, the most recently mapped first.
