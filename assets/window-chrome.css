@@ -12,3 +12,14 @@ headerbar > windowhandle > box { padding: 0; }
 headerbar button { background: transparent; border-color: transparent; padding: 4px 8px; margin-top: 0; margin-bottom: 0; }
 headerbar button:hover { background: #262c38; }
 headerbar button image { color: #d0d4dc; }
+/* Icon buttons and window controls are navi's 24 px squares (a 16 px icon), and the controls
+   touch, as in navi's own bar; no theme margin or spacing widens them. */
+headerbar button.image-button, headerbar windowcontrols > button, headerbar button.titlebutton {
+  min-width: 16px; min-height: 16px; padding: 4px; margin: 0; border: none; border-radius: 6px;
+}
+headerbar windowcontrols > button > image, headerbar button.titlebutton image {
+  min-width: 16px; min-height: 16px; padding: 0; margin: 0; background: none; box-shadow: none;
+}
+headerbar windowcontrols { margin: 0; padding: 0; }
+/* GTK 3 boxes its title buttons with the header's 6 px spacing, which CSS can't set. */
+headerbar button.titlebutton + button.titlebutton { margin-left: -6px; }
