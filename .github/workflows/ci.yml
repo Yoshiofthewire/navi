@@ -14,6 +14,30 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # TEMPORARY (job 023): repeat the Settings step to catch the intermittent segfault.
+  settings-loop:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libxkbcommon-dev libwayland-dev pkg-config libudev-dev libinput-dev libseat-dev libgbm-dev libdrm-dev xwayland libegl1 libgl1-mesa-dri libegl-mesa0 swaylock meson ninja-build wayland-protocols libcairo2-dev libgtk-3-dev libpam0g-dev curl patch python3-gi gir1.2-gtk-4.0 gir1.2-gtk-3.0 librsvg2-common adwaita-icon-theme shared-mime-info fonts-noto-core thunar dbus-daemon xdg-dbus-proxy libsecret-tools gir1.2-secret-1 network-manager-gnome xvfb gettext
+      - name: Versions
+        run: python3 -c "import sys, gi; gi.require_version('Gtk', '4.0'); from gi.repository import GLib, Gtk; print(sys.version, gi.__version__, GLib.glib_version, (Gtk.get_major_version(), Gtk.get_minor_version(), Gtk.get_micro_version()))"
+      - name: Settings loop
+        run: |
+          fails=0
+          for i in $(seq 300); do
+            if ! python3 -X faulthandler -m unittest discover -s src/settings -p 'test_*.py' > out.txt 2>&1; then
+              fails=$((fails + 1))
+              echo "::group::iteration $i failed"
+              cat out.txt
+              echo "::endgroup::"
+            fi
+          done
+          echo "failures: $fails / 300"
+          test "$fails" = 0
   check:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -43,7 +67,7 @@ jobs:
           navi_test_daemon=$(bash scripts/build-oo7-test.sh)
           python3 scripts/check-secrets.py --daemon "$navi_test_daemon" --nm-applet /usr/bin/nm-applet --xvfb /usr/bin/Xvfb --output "$RUNNER_TEMP/navi-secrets-check"
       - name: Settings model checks
-        run: python3 -m unittest discover -s src/settings -p 'test_*.py'
+        run: python3 -X faulthandler -m unittest discover -s src/settings -p 'test_*.py'
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
