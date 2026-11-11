@@ -25,7 +25,22 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libxkbcommon-dev libwayland-dev pkg-config libudev-dev libinput-dev libseat-dev libgbm-dev libdrm-dev xwayland libegl1 libgl1-mesa-dri libegl-mesa0 swaylock meson ninja-build wayland-protocols libcairo2-dev libgtk-3-dev libpam0g-dev curl patch python3-gi gir1.2-gtk-4.0 gir1.2-gtk-3.0 librsvg2-common adwaita-icon-theme shared-mime-info fonts-noto-core thunar dbus-daemon xdg-dbus-proxy libsecret-tools gir1.2-secret-1 network-manager-gnome xvfb gettext
       - name: Versions
         run: python3 -c "import sys, gi; gi.require_version('Gtk', '4.0'); from gi.repository import GLib, Gtk; print(sys.version, gi.__version__, GLib.glib_version, (Gtk.get_major_version(), Gtk.get_minor_version(), Gtk.get_micro_version()))"
+      - name: Native backtrace of first crash
+        run: |
+          sudo apt-get install -y --no-install-recommends gdb
+          sudo sysctl -w kernel.core_pattern=/tmp/core.%p
+          ulimit -c unlimited
+          for i in $(seq 200); do
+            if ! python3 -X faulthandler -m unittest discover -s src/settings -p 'test_*.py' > out.txt 2>&1; then
+              echo "iteration $i crashed"; cat out.txt
+              core=$(ls /tmp/core.* | head -1)
+              DEBUGINFOD_URLS=https://debuginfod.ubuntu.com gdb -q -batch -iex 'set debuginfod enabled on' -ex 'info threads' -ex 'thread apply all bt 25' python3 "$core"
+              exit 1
+            fi
+          done
+          echo "no crash in 200"
       - name: Settings loop
+        if: always()
         run: |
           fails=0
           for i in $(seq 300); do
