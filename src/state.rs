@@ -1501,7 +1501,10 @@ impl Navi {
                 (None, None) => {}
             }
             // Moved in place: only the user's focus restacks a dialog.
-            put(&mut self.space, &window, (r.x, r.y));
+            match self.space.element_location(&window) {
+                Some(_) => put(&mut self.space, &window, (r.x, r.y)),
+                None => self.show_dialog(i, (r.x, r.y)),
+            }
             if std::mem::take(&mut self.windows[i].fresh) {
                 fresh.push(window);
             }
@@ -1511,6 +1514,21 @@ impl Navi {
                 self.focus_new(i);
             }
         }
+    }
+
+    /// Maps hidden dialog `i` at `loc`, right above its family unless its family has the keyboard
+    /// (`dialog::stack_at`), so a re-shown or new dialog can't cover a window the user raised.
+    fn show_dialog(&mut self, i: usize, loc: (i32, i32)) {
+        let root = self.root(i);
+        let focused = dialog::may_focus_on_map(root, self.focus_root());
+        let order: Vec<Window> = self.space.elements().cloned().collect();
+        let family = |w: &Window| {
+            let j = self.windows.iter().position(|m| &m.window == w);
+            root != Root::Orphan && j.is_some_and(|j| self.root(j) == root)
+        };
+        let at = dialog::stack_at(&order, family, focused);
+        let window = self.windows[i].window.clone();
+        map_at(&mut self.space, &window, loc.into(), at);
     }
 
     /// Points each X11 transient's `up` at its current `WM_TRANSIENT_FOR` window, once navi
@@ -1762,18 +1780,29 @@ pub(crate) fn put<E: smithay::desktop::space::SpaceElement + Clone + PartialEq>(
     match space.element_location(w) {
         Some(at) if at == loc => {}
         Some(_) => {
-            let above: Vec<E> = space
-                .elements()
-                .skip_while(|e| *e != w)
-                .skip(1)
-                .cloned()
-                .collect();
-            space.map_element(w.clone(), loc, false);
-            for e in &above {
-                space.raise_element(e, false);
-            }
+            let at = space.elements().position(|e| e == w).unwrap_or(0);
+            map_at(space, w, loc, at);
         }
         None => space.map_element(w.clone(), loc, false),
+    }
+}
+
+/// Maps `w` at `loc`, at index `at` of the stacking order without it (back to front).
+fn map_at<E: smithay::desktop::space::SpaceElement + Clone + PartialEq>(
+    space: &mut Space<E>,
+    w: &E,
+    loc: Point<i32, Logical>,
+    at: usize,
+) {
+    let above: Vec<E> = space
+        .elements()
+        .filter(|e| *e != w)
+        .skip(at)
+        .cloned()
+        .collect();
+    space.map_element(w.clone(), loc, false);
+    for e in &above {
+        space.raise_element(e, false);
     }
 }
 
@@ -2412,6 +2441,10 @@ mod tests {
         assert_eq!(order(&space), ["dialog", "neighbour"]);
         assert_eq!(space.element_location(&Elem("dialog")), Some((7, 3).into()));
         put(&mut space, &Elem("new"), (1, 1));
+        // A dialog shown at index 1 lands between "dialog" and "neighbour".
+        map_at(&mut space, &Elem("shown"), (0, 0).into(), 1);
+        assert_eq!(order(&space), ["dialog", "shown", "neighbour", "new"]);
+        space.unmap_elem(&Elem("shown"));
         put(&mut space, &Elem("neighbour"), (9, 9));
         assert_eq!(order(&space), ["dialog", "neighbour", "new"]);
     }

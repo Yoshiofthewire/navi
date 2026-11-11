@@ -80,6 +80,16 @@ pub fn may_focus_on_map(dialog: Root, focus: Option<Root>) -> bool {
     matches!(dialog, Root::Tiled(_)) && focus == Some(dialog)
 }
 
+/// Where a dialog being shown goes in `order`, the shown windows back to front without it: on top
+/// while its family holds the keyboard, else right above its family's topmost window (the bottom
+/// if none is shown), so it never covers a window the user put in front of its family.
+pub fn stack_at<K>(order: &[K], in_family: impl Fn(&K) -> bool, family_focused: bool) -> usize {
+    match family_focused {
+        true => order.len(),
+        false => order.iter().rposition(in_family).map_or(0, |i| i + 1),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,6 +234,27 @@ mod tests {
         );
         assert!(!may_focus_on_map(Root::Orphan, Some(a)));
         assert!(!may_focus_on_map(Root::Orphan, None));
+    }
+
+    /// Round 2 security: a dialog shown again (a parent hop, a new dialog) goes right above its
+    /// family, not over the neighbour the user raised, unless its family has the keyboard.
+    #[test]
+    fn a_shown_dialog_stacks_above_its_family_only() {
+        let order = ["wallpaper-tile", "parent", "sibling-dialog", "neighbour"];
+        let family = |k: &&str| ["parent", "sibling-dialog"].contains(k);
+        assert_eq!(stack_at(&order, family, false), 3, "below the neighbour");
+        assert_eq!(
+            stack_at(&order, family, true),
+            4,
+            "its family is focused: on top"
+        );
+        assert_eq!(
+            stack_at(&order, |_| false, false),
+            0,
+            "no family shown: bottom"
+        );
+        assert_eq!(stack_at(&order, |k| *k == "neighbour", false), 4);
+        assert_eq!(stack_at::<&str>(&[], |_| true, false), 0);
     }
 
     #[test]
