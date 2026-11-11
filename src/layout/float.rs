@@ -175,17 +175,30 @@ impl Layout {
         floats.into_iter().map(|t| t.id).collect()
     }
 
-    /// `hit(p)`, unless the window under `p` belongs to float `over` (it or its dialog) drawn in
-    /// front of the zone: a float's window and dialogs cover the zones of every float behind it
-    /// and every tile's.
-    pub fn hit_under(&self, p: (i32, i32), over: Option<WinId>) -> Option<Hit> {
-        let hit = self.hit(p)?;
+    /// `hit(p)` without the zones the window at `p` is drawn in front of. When it belongs to float
+    /// `over` (it or its dialog), it covers the zones of every float behind it and every tile's.
+    /// Else (a tile-layer window) it covers the groups `covers` names, by their active tile: those
+    /// whose window ranks below it. No tile-layer window covers a float's zones.
+    pub fn hit_under(
+        &self,
+        p: (i32, i32),
+        over: Option<WinId>,
+        covers: impl Fn(WinId) -> bool,
+    ) -> Option<Hit> {
+        let hit = self.hit_where(p, covers)?;
         let Some(over) = over else {
             return Some(hit);
         };
         let order = self.floats();
         let rank = |id| order.iter().position(|&f| f == id).unwrap_or(usize::MAX);
         (rank(over) >= rank(hit.id())).then_some(hit)
+    }
+
+    /// Whether a tile-layer window at space rank `at` (bottom first; `None`: no such window at
+    /// the point) covers a group whose window has rank `group` (`None`: not in the space, so its
+    /// chrome draws below every window).
+    pub fn covers(at: Option<usize>, group: Option<usize>) -> bool {
+        at.is_some_and(|r| group.is_none_or(|g| r > g))
     }
 
     /// Brings float `id` to the front, as focusing it does. Returns whether it moved; a tile or

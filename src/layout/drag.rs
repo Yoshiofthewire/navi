@@ -125,6 +125,11 @@ pub enum Done {
 
 impl Layout {
     pub fn hit(&self, p: (i32, i32)) -> Option<Hit> {
+        self.hit_where(p, |_| false)
+    }
+
+    /// `hit(p)` without the zones of the groups `covered` names (by their active tile).
+    pub(super) fn hit_where(&self, p: (i32, i32), covered: impl Fn(WinId) -> bool) -> Option<Hit> {
         // Floats, and their bands, are above every tile's zones.
         if let Some(hit) = self.float_hit(p) {
             return hit;
@@ -134,7 +139,7 @@ impl Layout {
             self.tiles
                 .iter()
                 .filter(|t| !t.floating && self.active(t.id) == Some(t.id))
-                .filter(|t| !self.covered(t) && !t.fullscreen)
+                .filter(|t| !self.covered(t) && !t.fullscreen && !covered(t.id))
                 .map(|t| t.id)
         };
         // Top zones go last: where one meets the bottom zone of a tile above, that one wins.
@@ -799,10 +804,16 @@ enum State {
 pub struct Drag(State);
 
 impl Drag {
-    /// A left press at `p`: arms a click or move on a strip, tab or button, starts a resize on an
-    /// edge or corner, `None` elsewhere.
+    /// `press_on` the zone at `p`, `None` without one.
+    #[cfg(test)]
     pub fn press(l: &Layout, p: (i32, i32)) -> Option<Drag> {
-        let state = match l.hit(p)? {
+        Drag::press_on(l, l.hit(p)?, p)
+    }
+
+    /// A left press at `p` on zone `hit` (as `Navi::zone_at` found it): arms a click or move on
+    /// a strip, tab or button, starts a resize on an edge or corner.
+    pub fn press_on(l: &Layout, hit: Hit, p: (i32, i32)) -> Option<Drag> {
+        let state = match hit {
             hit @ (Hit::Strip(_) | Hit::Tab(_) | Hit::Button(..)) => State::Armed { hit, from: p },
             hit if l.tile(hit.id())?.floating => State::Float(FloatDrag::new(l, hit, p, false)?),
             hit @ (Hit::Edge(..) | Hit::Corner(..)) => State::Resize(Resize::new(l, hit, p)?),
@@ -1017,21 +1028,26 @@ impl Layout {
     }
 }
 
-/// Solid rects to draw over the windows: global logical px, premultiplied RGBA, front to back.
-/// During a move, the grid and a preview of the landing tile, more solid once the drop would tab;
-/// otherwise the hovered or pressed zone. Then every bar, the dimmed strip of each minimized
-/// untabbed tile, and last a frame around each shown window (and its bar): bright around
-/// `focused`, dim around the rest.
+/// A solid rect of a tile's or float's chrome: whose group (its active tile), global logical px,
+/// premultiplied RGBA.
+type Chrome = (WinId, Rect, [f32; 4]);
+
+/// The tiles' solid rects, front to back, each tagged with its group; `None` for what goes above
+/// every tile-layer window. During a move, the grid and a preview of the landing tile (`None`),
+/// more solid once the drop would tab; otherwise the hovered or pressed zone. Then every bar, the
+/// dimmed strip of each minimized untabbed tile, and last a frame around each shown window (and
+/// its bar): bright around `focused`, dim around the rest. `under` is the zone at the pointer
+/// (`Navi::zone_at`).
 pub fn overlay(
     l: &Layout,
     drag: Option<&Drag>,
-    p: (i32, i32),
+    under: Option<Hit>,
     now_ms: u64,
     focused: Option<WinId>,
-) -> Vec<(Rect, [f32; 4])> {
+) -> Vec<(Option<WinId>, Rect, [f32; 4])> {
     let mut out = Vec::new();
     let hover = match drag.map(|d| &d.0) {
-        None => l.hit(p),
+        None => under,
         Some(State::Armed { hit, .. }) => Some(*hit),
         Some(State::Resize(r)) => Some(r.hit),
         Some(State::Float(_)) => None,
@@ -1058,7 +1074,11 @@ pub fn overlay(
                 t => *t,
             };
             if let Some(o) = l.output(output) {
-                out.extend(move_overlay(o, target, top, alpha));
+                out.extend(
+                    move_overlay(o, target, top, alpha)
+                        .into_iter()
+                        .map(|(r, k)| (None, r, k)),
+                );
             }
             None
         }
@@ -1066,14 +1086,16 @@ pub fn overlay(
     };
     // A float's zones light in its own layer.
     let hover = hover.filter(|h| !l.tile(h.id()).is_some_and(|t| t.floating));
-    light(l, hover, &mut out);
-    decorations(l, |t| !t.floating, hover, focused, &mut out);
+    let mut tiles = Vec::new();
+    light(l, hover, &mut tiles);
+    decorations(l, |t| !t.floating, hover, focused, &mut tiles);
+    out.extend(tiles.into_iter().map(|(id, r, k)| (Some(id), r, k)));
     out
 }
 
 /// The hovered or pressed zone: a strip up to its buttons, an edge, or a corner's two edges and
 /// strip end.
-fn light(l: &Layout, hover: Option<Hit>, out: &mut Vec<(Rect, [f32; 4])>) {
+fn light(l: &Layout, hover: Option<Hit>, out: &mut Vec<Chrome>) {
     let lit = match hover {
         Some(Hit::Strip(id)) => l.zone(Hit::Strip(id)).map(|z| {
             let buttons = l.bar(id).map_or(0, |b| b.buttons.len() as i32);
@@ -1085,12 +1107,15 @@ fn light(l: &Layout, hover: Option<Hit>, out: &mut Vec<(Rect, [f32; 4])>) {
         Some(h @ Hit::Edge(..)) => l.zone(h),
         _ => None,
     };
-    out.extend(lit.map(|z| (z, accent(1.0))));
-    if let Some(Hit::Corner(id, x, y)) = hover {
+    let Some(id) = hover.map(Hit::id) else {
+        return;
+    };
+    out.extend(lit.map(|z| (id, z, accent(1.0))));
+    if let Some(Hit::Corner(_, x, y)) = hover {
         for side in [x, y] {
-            out.extend(l.zone(Hit::Edge(id, side)).map(|z| (z, accent(1.0))));
+            out.extend(l.zone(Hit::Edge(id, side)).map(|z| (id, z, accent(1.0))));
         }
-        out.extend(l.corner_strip(id, x, y).map(|z| (z, accent(1.0))));
+        out.extend(l.corner_strip(id, x, y).map(|z| (id, z, accent(1.0))));
     }
 }
 
@@ -1100,22 +1125,20 @@ fn light(l: &Layout, hover: Option<Hit>, out: &mut Vec<(Rect, [f32; 4])>) {
 pub fn float_overlay(
     l: &Layout,
     drag: Option<&Drag>,
-    p: (i32, i32),
+    under: Option<Hit>,
     focused: Option<WinId>,
-) -> Vec<(WinId, Rect, [f32; 4])> {
+) -> Vec<Chrome> {
     let mut out = Vec::new();
     let hover = match drag.map(|d| &d.0) {
-        None => l.hit(p),
+        None => under,
         Some(State::Armed { hit, .. }) => Some(*hit),
         Some(State::Float(f)) => Some(f.hit),
         Some(_) => None,
     };
     let hover = hover.filter(|h| l.tile(h.id()).is_some_and(|t| t.floating));
     for id in l.floats() {
-        let mut one = Vec::new();
-        light(l, hover.filter(|h| h.id() == id), &mut one);
-        decorations(l, |t| t.id == id, hover, focused, &mut one);
-        out.extend(one.into_iter().map(|(r, k)| (id, r, k)));
+        light(l, hover.filter(|h| h.id() == id), &mut out);
+        decorations(l, |t| t.id == id, hover, focused, &mut out);
     }
     out
 }
@@ -1126,7 +1149,7 @@ fn decorations(
     which: impl Fn(&Tile) -> bool,
     hover: Option<Hit>,
     focused: Option<WinId>,
-    out: &mut Vec<(Rect, [f32; 4])>,
+    out: &mut Vec<Chrome>,
 ) {
     let tiles = || l.tiles.iter().filter(|t| which(t));
     // Where a frame's top goes when it runs along the top of a bar, in front of it.
@@ -1143,9 +1166,13 @@ fn decorations(
                 .bar(t.id)
                 .map(|b| b.rect)
                 .or_else(|| l.zone(Hit::Strip(t.id)));
-            out.extend(z.map(|z| (z, rgba(MINIMIZED, 1.0))));
+            out.extend(z.map(|z| (t.id, z, rgba(MINIMIZED, 1.0))));
         } else if let Some(b) = l.bar(t.id) {
-            out.extend(bar::draw(l, t.id, &b, hover));
+            out.extend(
+                bar::draw(l, t.id, &b, hover)
+                    .into_iter()
+                    .map(|(r, k)| (t.id, r, k)),
+            );
         }
     }
     for t in tiles() {
@@ -1167,18 +1194,23 @@ fn decorations(
                     ..r
                 };
                 let [top, rest @ ..] = frame(r, px);
-                out.insert(front, (top, k));
-                out.extend(rest.map(|f| (f, k)));
+                out.insert(front, (t.id, top, k));
+                out.extend(rest.map(|f| (t.id, f, k)));
             }
-            None => out.extend(frame(r, px).map(|f| (f, k))),
+            None => out.extend(frame(r, px).map(|f| (t.id, f, k))),
         }
     }
 }
 
-/// Every shown bar's window buttons, and whether each is lit: under the pointer, or pressed.
-pub fn buttons(l: &Layout, drag: Option<&Drag>, p: (i32, i32)) -> Vec<(WinId, Button, Rect, bool)> {
+/// Every shown bar's window buttons, and whether each is lit: the zone `under` the pointer, or
+/// pressed.
+pub fn buttons(
+    l: &Layout,
+    drag: Option<&Drag>,
+    under: Option<Hit>,
+) -> Vec<(WinId, Button, Rect, bool)> {
     let hover = match drag.map(|d| &d.0) {
-        None => l.hit(p),
+        None => under,
         Some(State::Armed { hit, .. }) => Some(*hit),
         Some(_) => None,
     };
@@ -1192,6 +1224,31 @@ pub fn buttons(l: &Layout, drag: Option<&Drag>, p: (i32, i32)) -> Vec<(WinId, Bu
                 .map(move |(b, r)| (id, b, r, hover == Some(Hit::Button(id, b))))
         })
         .collect()
+}
+
+/// The tile layer, top first. `chrome` is `overlay`'s and the buttons' (a group's, or `None`
+/// for the drag grid and preview), `windows` the tile layer's windows top first, each tagged
+/// with the group it is the active window of. The grid and preview go above every window, a
+/// group's chrome right above its window, and chrome whose window isn't drawn (a minimized
+/// strip) below them all.
+pub fn tile_stack<T>(
+    chrome: Vec<(Option<WinId>, T)>,
+    windows: Vec<(Option<WinId>, Vec<T>)>,
+) -> Vec<T> {
+    let (top, mut rest): (Vec<_>, Vec<_>) = chrome.into_iter().partition(|(g, _)| g.is_none());
+    let mut out: Vec<T> = top.into_iter().map(|(_, c)| c).collect();
+    for (group, own) in windows {
+        if group.is_some() {
+            let (mine, other) = std::mem::take(&mut rest)
+                .into_iter()
+                .partition(|(g, _)| *g == group);
+            rest = other;
+            out.extend(mine.into_iter().map(|(_, c)| c));
+        }
+        out.extend(own);
+    }
+    out.extend(rest.into_iter().map(|(_, c)| c));
+    out
 }
 
 /// A dialog's frame around its rect `r`, as a tile's: bright while it has the keyboard, else dim;
@@ -1264,6 +1321,18 @@ fn move_overlay(o: &Output, target: Target, top: i32, alpha: f32) -> Vec<(Rect, 
 pub(super) mod tests {
     use super::*;
 
+    /// `overlay` with the pointer at `p` and no window there, untagged.
+    pub(in crate::layout) fn overlay_at(
+        l: &Layout,
+        drag: Option<&Drag>,
+        p: (i32, i32),
+        now_ms: u64,
+        focused: Option<WinId>,
+    ) -> Vec<(Rect, [f32; 4])> {
+        let out = overlay(l, drag, l.hit(p), now_ms, focused);
+        out.into_iter().map(|(_, r, k)| (r, k)).collect()
+    }
+
     /// The overlay with no focus and without the dim frames every shown tile has.
     pub(in crate::layout) fn zones(
         l: &Layout,
@@ -1271,7 +1340,7 @@ pub(super) mod tests {
         p: (i32, i32),
         now_ms: u64,
     ) -> Vec<(Rect, [f32; 4])> {
-        let mut out = overlay(l, drag, p, now_ms, None);
+        let mut out = overlay_at(l, drag, p, now_ms, None);
         out.retain(|&(_, k)| k != accent(IDLE_ALPHA));
         out
     }
@@ -1397,6 +1466,80 @@ pub(super) mod tests {
     }
 
     // Points on the ultrawide. Cells are 143 or 144 x 120 px; a is cols 0..12, b cols 12..24.
+    /// Job 028 AC2: a group's chrome draws right above its window, at the window's place in the
+    /// space; the drag grid and preview above every window, a minimized strip below them all.
+    #[test]
+    fn tile_chrome_stacks_with_its_window() {
+        let (a, b, m) = (0, 1, 2);
+        let chrome = || {
+            let chrome = [(None, "preview"), (Some(a), "A's chrome")];
+            chrome
+                .into_iter()
+                .chain([(Some(m), "strip"), (Some(b), "B's chrome")])
+        };
+        let win = |name, group| (group, vec![name]);
+        let stack = |windows| tile_stack(chrome().collect(), windows);
+        assert_eq!(
+            stack(vec![
+                win("dialog", None),
+                win("B", Some(b)),
+                win("A", Some(a))
+            ]),
+            [
+                "preview",
+                "dialog",
+                "B's chrome",
+                "B",
+                "A's chrome",
+                "A",
+                "strip"
+            ]
+        );
+        assert_eq!(
+            stack(vec![
+                win("B", Some(b)),
+                win("dialog", None),
+                win("A", Some(a))
+            ]),
+            [
+                "preview",
+                "B's chrome",
+                "B",
+                "dialog",
+                "A's chrome",
+                "A",
+                "strip"
+            ]
+        );
+
+        // `overlay` tags the grid and preview `None`, a minimized strip and every bar, light and
+        // frame with their own group.
+        let mut l = with(&[c(0, 0, 8, 12), c(8, 0, 8, 12), c(16, 0, 8, 12)]);
+        l.set_decorated(b, true);
+        assert!(l.minimize(m));
+        let mut d = Drag::press(&l, A_STRIP).unwrap();
+        d.motion(&mut l, (A_STRIP.0 + 40, A_STRIP.1 + 300), 0);
+        assert!(matches!(d.0, State::Move { .. }));
+        let o = overlay(&l, Some(&d), None, 0, Some(a));
+        let preview = (None, accent(PREVIEW_ALPHA));
+        assert!(o.iter().any(|&(g, _, k)| (g, k) == preview));
+        assert!(
+            o.contains(&(
+                Some(m),
+                l.bar(m)
+                    .map_or_else(|| l.zone(Hit::Strip(m)).unwrap(), |b| b.rect),
+                rgba(MINIMIZED, 1.0)
+            ))
+        );
+        let tagged = |id| o.iter().filter(|(g, ..)| *g == Some(id)).count();
+        assert!(tagged(a) >= 4 && tagged(b) >= 5, "{o:?}");
+        let tops = o.iter().position(|(g, ..)| g.is_some()).unwrap();
+        assert!(
+            o[tops..].iter().all(|(g, ..)| g.is_some()),
+            "grid and preview first"
+        );
+    }
+
     const A_STRIP: (i32, i32) = (100, 2);
     const B_MIDDLE: (i32, i32) = (2500, 700);
     const B_RIM: (i32, i32) = (1800, 100);
@@ -2512,19 +2655,19 @@ pub(super) mod tests {
         };
         let mut l = halves();
         let (left, right) = (l.rect(0).unwrap(), l.rect(1).unwrap());
-        let o = overlay(&l, None, (500, 700), 0, Some(0));
+        let o = overlay_at(&l, None, (500, 700), 0, Some(0));
         assert_eq!(o.len(), 8);
         framed(&o, left, FOCUS_PX, 1.0);
         framed(&o, right, IDLE_PX, IDLE_ALPHA);
         assert_eq!(accent(IDLE_ALPHA), rgba(ACCENT, 0.3));
 
-        let o = overlay(&l, None, (500, 700), 0, None);
+        let o = overlay_at(&l, None, (500, 700), 0, None);
         assert!(o.iter().all(|&(_, k)| k == accent(IDLE_ALPHA)));
         framed(&o, left, IDLE_PX, IDLE_ALPHA);
         framed(&o, right, IDLE_PX, IDLE_ALPHA);
 
         // A hovered strip is in front of its tile's frame.
-        let o = overlay(&l, None, A_STRIP, 0, Some(0));
+        let o = overlay_at(&l, None, A_STRIP, 0, Some(0));
         let strip = o.iter().position(|&(r, _)| r.h == STRIP).unwrap();
         let frame = o
             .iter()
@@ -2534,7 +2677,7 @@ pub(super) mod tests {
 
         // Minimized, under a maximize and fullscreen: no frame.
         let frames_of = |l: &Layout, id: WinId| {
-            let o = overlay(l, None, (500, 700), 0, Some(id));
+            let o = overlay_at(l, None, (500, 700), 0, Some(id));
             o.iter().filter(|&&(_, k)| k == accent(1.0)).count()
         };
         assert_eq!(frames_of(&l, 1), 4);
@@ -2547,14 +2690,14 @@ pub(super) mod tests {
         let mut l = halves();
         l.fullscreen(1);
         assert_eq!(frames_of(&l, 1), 0, "fullscreen");
-        assert!(overlay(&l, None, (500, 700), 0, Some(1)).is_empty());
+        assert!(overlay_at(&l, None, (500, 700), 0, Some(1)).is_empty());
 
         // Round 1: a decorated window's frame takes in its bar; the top line runs along the bar's
         // top rows in front of it, and the sides start at the bar's top.
         let mut l = halves();
         l.set_decorated(0, true);
         let (bar, win) = (l.bar(0).unwrap().rect, l.rect(0).unwrap());
-        let o = overlay(&l, None, (500, 700), 0, Some(0));
+        let o = overlay_at(&l, None, (500, 700), 0, Some(0));
         let top = Rect {
             x: win.x - FOCUS_PX,
             y: bar.y,

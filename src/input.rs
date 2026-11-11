@@ -614,8 +614,8 @@ impl Navi {
             self.focus_by(clicked, crate::state::Raise::User);
             // Other buttons go on with no pointer focus over a zone, so neither the press nor
             // its release reaches a client.
-            if hit.is_some() && left {
-                self.drag = Drag::press(&self.layout, px(pos));
+            if let Some(h) = hit.filter(|_| left) {
+                self.drag = Drag::press_on(&self.layout, h, px(pos));
                 if let Some(h @ (Hit::Strip(id) | Hit::Edge(id, _) | Hit::Corner(id, ..))) = hit
                     && self.layout.too_small(id)
                 {

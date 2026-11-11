@@ -304,6 +304,38 @@ mod tests {
         assert_eq!(l.rect(0), Some(plain));
     }
 
+    /// Job 028 AC1: a tile-layer window ranked above group B (a neighbour's dialog) covers B's
+    /// ✕, strip, tab, edge and corner; ranked below B (B raised later), or covering only A, it
+    /// doesn't. `covers` names the groups whose window ranks below it.
+    #[test]
+    fn a_window_above_a_group_covers_its_zones() {
+        let mut l = with(&[HALF_L, HALF_R, HALF_R]);
+        let (a, b) = (0, l.active(1).unwrap());
+        let other = 3 - b;
+        l.set_decorated(b, true);
+        let (bar, r) = (l.bar(b).unwrap().rect, l.rect(b).unwrap());
+        let strip = bar.y - STRIP / 2;
+        let edge = l.zone(Hit::Edge(b, Side::Right)).unwrap();
+        let points = [
+            (
+                mid(button(&l, b, Button::Close)),
+                Hit::Button(b, Button::Close),
+            ),
+            ((r.x + r.w / 2, strip), Hit::Strip(b)),
+            (mid(tab(&l, other)), Hit::Tab(other)),
+            (mid(edge), Hit::Edge(b, Side::Right)),
+            ((r.x + 2, strip), Hit::Corner(b, Side::Left, Side::Top)),
+        ];
+        for (p, want) in points {
+            assert_eq!(l.hit(p), Some(want), "{p:?}");
+            assert_eq!(l.hit_under(p, None, |g| g == b), None, "above B: {p:?}");
+            let below = l.hit_under(p, None, |_| false);
+            assert_eq!(below, Some(want), "below B: {p:?}");
+            let only_a = l.hit_under(p, None, |g| g == a);
+            assert_eq!(only_a, Some(want), "covering only A: {p:?}");
+        }
+    }
+
     #[test]
     fn ac2_bar_hit_zones() {
         let mut l = with(&[HALF_L]);
@@ -674,13 +706,13 @@ mod tests {
         let close = button(&l, 1, Button::Close);
         let lit = zones(&l, None, mid(close), 0);
         assert!(!lit.iter().any(|&(r, _)| r == close));
-        let glyphs = buttons(&l, None, mid(close));
+        let glyphs = buttons(&l, None, l.hit(mid(close)));
         assert_eq!(glyphs.len(), 3);
         assert!(glyphs.contains(&(1, Button::Close, close, true)));
         assert!(glyphs.iter().filter(|g| g.3).count() == 1);
-        assert!(buttons(&l, None, away).iter().all(|g| !g.3));
+        assert!(buttons(&l, None, l.hit(away)).iter().all(|g| !g.3));
         let d = Drag::press(&l, mid(close)).unwrap();
-        assert!(buttons(&l, Some(&d), away).contains(&(1, Button::Close, close, true)));
+        assert!(buttons(&l, Some(&d), l.hit(away)).contains(&(1, Button::Close, close, true)));
 
         // Inactive tabs are outlined; minimized ones are the same dimmed accent as a strip.
         for side in outline(tab(&l, 2)) {

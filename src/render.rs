@@ -216,6 +216,8 @@ impl Wallpaper {
 
 /// A frame of a float's, tagged with the float.
 type Owned<R> = (Option<layout::WinId>, Frame<R>);
+/// A tile-layer window's frames, tagged with the tile it is (`None` for a dialog or menu).
+type Tiled<R> = (Option<layout::WinId>, Vec<Frame<R>>);
 
 /// How the pointer is drawn on this output.
 pub enum Arrow<'a> {
@@ -311,24 +313,25 @@ where
         }
         _ => {}
     }
-    decorations.extend(
-        layout::overlay(
-            &state.layout,
-            state.drag.as_ref(),
-            pointer,
-            state.now_ms(),
-            state.focused_tile(),
-        )
-        .into_iter()
-        .filter(|(r, _)| overlaps(*r, full))
-        .map(|(r, color)| (rect(r), color)),
-    );
+    let under = state.zone_at(state.pointer_location());
+    let (groups, tile_overlay): (Vec<Option<layout::WinId>>, Vec<_>) = layout::overlay(
+        &state.layout,
+        state.drag.as_ref(),
+        under,
+        state.now_ms(),
+        state.focused_tile(),
+    )
+    .into_iter()
+    .filter(|(_, r, _)| overlaps(*r, full))
+    .map(|(g, r, color)| (g, (rect(r), color)))
+    .unzip();
+    decorations.extend(tile_overlay);
     // Float decorations follow the tiles', so one buffer list keeps every id stable.
     let tile_decorations = decorations.len();
     let float_overlay = layout::float_overlay(
         &state.layout,
         state.drag.as_ref(),
-        pointer,
+        under,
         state.focused_tile(),
     );
     let float_overlay = float_overlay
@@ -338,13 +341,13 @@ where
         .map(|(id, r, color)| (id, (rect(r), color)))
         .unzip();
     decorations.extend(float_decorations);
-    let buttons = layout::buttons(&state.layout, state.drag.as_ref(), pointer)
+    let buttons = layout::buttons(&state.layout, state.drag.as_ref(), under)
         .into_iter()
         .filter(|&(.., r, _)| overlaps(r, full))
         .map(|(id, b, r, lit)| (id, b, lit, rect(r)))
         .collect();
     let floating = |id| state.layout.tile(id).is_some_and(|t| t.floating);
-    let (float_glyphs, mut glyphs): (Vec<_>, Vec<_>) = solids
+    let (float_glyphs, glyphs): (Vec<_>, Vec<_>) = solids
         .glyphs(renderer, buttons)
         .into_iter()
         .partition(|(id, _)| floating(*id));
@@ -352,6 +355,12 @@ where
     let mut tiles = solids.elements(decorations);
     let float_decorations = owners.into_iter().zip(tiles.split_off(tile_decorations));
     let mut pointer: Vec<_> = tiles.drain(..above_panels).collect();
+    // Buttons on their bar, each group's chrome tagged for `tile_stack`.
+    let chrome: Vec<(Option<layout::WinId>, Frame<R>)> = glyphs
+        .into_iter()
+        .map(|(id, e)| (Some(id), Frame::from(e)))
+        .chain(groups.into_iter().zip(tiles.into_iter().map(Frame::from)))
+        .collect();
     let (mut panels, mut lower) = surfaces(renderer, state, output, scale);
     // Every shown dialog's frame, so even a transparent one is seen: bright with the keyboard.
     let focus = state
@@ -379,7 +388,8 @@ where
         .into_iter()
         .map(|w| (w, frame_elements.by_ref().take(4).collect()))
         .collect();
-    let (float_windows, mut windows) = windows(renderer, state, geo, scale, rect, frames);
+    let (float_windows, windows) = windows(renderer, state, geo, scale, rect, frames);
+    let mut tile_layer = layout::tile_stack(chrome, windows);
     // Each float's buttons, bar and frame right above its own window and dialogs, front float
     // first, so a float in front covers all of a float behind it.
     let mut float_frames: Vec<Owned<R>> = float_glyphs
@@ -402,12 +412,8 @@ where
             Part::Pointer => out.extend(pointer.drain(..).map(Frame::from)),
             Part::Panels => out.extend(panels.drain(..).map(Frame::from)),
             Part::Floats => out.append(&mut floats),
-            Part::Glyphs => out.extend(glyphs.drain(..).map(|(_, e)| Frame::from(e))),
-            Part::Decorations => out.extend(tiles.drain(..).map(Frame::from)),
-            Part::Windows => {
-                out.append(&mut windows);
-                out.extend(lower.drain(..).map(Frame::from));
-            }
+            Part::Tiles => out.append(&mut tile_layer),
+            Part::Lower => out.extend(lower.drain(..).map(Frame::from)),
         }
     }
     if let Some(w) = wallpaper.as_ref() {
@@ -433,22 +439,21 @@ enum Part {
     /// Floats, front first, each with its buttons, bar and frame above its window, dialogs and
     /// popups.
     Floats,
-    /// The window buttons on navi's bars.
-    Glyphs,
-    /// navi's tile bars, frames, strips and drag previews.
-    Decorations,
-    /// Tiled windows, their dialogs and popups, and the lower layers.
-    Windows,
+    /// The tile layer (`layout::tile_stack`): the drag grid and preview, then tiled windows,
+    /// dialogs, menus and their popups in space order, each group's bar, buttons and frame right
+    /// above its window; minimized strips last.
+    Tiles,
+    /// The Bottom and Background layers.
+    Lower,
 }
 
 /// Top first, above the wallpaper.
-const STACK: [Part; 6] = [
+const STACK: [Part; 5] = [
     Part::Pointer,
     Part::Panels,
     Part::Floats,
-    Part::Glyphs,
-    Part::Decorations,
-    Part::Windows,
+    Part::Tiles,
+    Part::Lower,
 ];
 
 fn overlaps(a: layout::Rect, b: layout::Rect) -> bool {
@@ -501,10 +506,10 @@ fn track_layers(state: &mut Navi, output: &Output) {
     state.layers_shown.retain(|(s, _)| s.is_alive());
 }
 
-/// The floating windows, by the float they belong to, and the tiled ones over `geo`, each top
-/// first. A window's own surfaces are cropped to its clip rect, its popups to their configured
-/// geometry on their output; a dialog's `frames` go right above it. `rect` maps a global logical
-/// rect to `geo`'s physical px.
+/// The floating windows, by the float they belong to, and the tile layer's over `geo`, each
+/// top first. A window's own surfaces are cropped to its clip rect, its popups to their
+/// configured geometry on their output; a dialog's `frames` go right above it. `rect` maps a
+/// global logical rect to `geo`'s physical px.
 fn windows<R>(
     renderer: &mut R,
     state: &Navi,
@@ -512,7 +517,7 @@ fn windows<R>(
     scale: f64,
     rect: impl Fn(layout::Rect) -> Physical,
     mut frames: Vec<(Window, Vec<SolidColorRenderElement>)>,
-) -> (Vec<Owned<R>>, Vec<Frame<R>>)
+) -> (Vec<Owned<R>>, Vec<Tiled<R>>)
 where
     R: Renderer + ImportAll + ImportMem,
     R::TextureId: Texture + Clone + Send + 'static,
@@ -557,7 +562,7 @@ where
                 let owner = state.float_owner(w);
                 floats.extend(out.into_iter().map(|f| (owner, f)));
             }
-            false => tiles.extend(out),
+            false => tiles.push((state.tile_id(w), out)),
         }
     }
     (floats, tiles)
@@ -669,17 +674,13 @@ mod tests {
     fn panels_draw_above_window_bars() {
         let at = |p| STACK.iter().position(|&q| q == p).unwrap();
         assert_eq!(at(Part::Pointer), 0);
-        assert!(at(Part::Panels) < at(Part::Glyphs));
+        assert!(at(Part::Panels) < at(Part::Tiles));
         assert!(at(Part::Panels) < at(Part::Floats), "floats below navi");
         assert!(
-            at(Part::Glyphs) < at(Part::Decorations),
-            "buttons on their bar"
+            at(Part::Floats) < at(Part::Tiles),
+            "floats above the whole tile layer"
         );
-        assert!(
-            at(Part::Floats) < at(Part::Glyphs),
-            "floats above every tile's decorations"
-        );
-        assert!(at(Part::Decorations) < at(Part::Windows));
+        assert!(at(Part::Tiles) < at(Part::Lower));
     }
 
     #[test]

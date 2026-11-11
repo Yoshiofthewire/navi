@@ -258,7 +258,7 @@ aspect, gravity, position) are ignored.
   showing until it closes some. A window that draws larger, such as a CSD shadow or a buffer
   bigger than its configure, is cropped there, and a click just outside it reaches what's below.
   So no app draws over, or takes clicks meant for, another tile or navi's zones, except through
-  a dialog, below.
+  a dialog in front of that tile (below, and *Stacking order*).
 - **Dialogs.** A dialog (an xdg toplevel with a parent, or an X11 `WM_TRANSIENT_FOR` window) has a
   *root*: the first tiled or floating window up its parents. The walk stops after 8 steps or on a
   loop; a chain that ends without a tiled window, is too deep or loops makes an *orphan*. Its
@@ -272,22 +272,24 @@ aspect, gravity, position) are ignored.
   bounds, again whenever the parent moves or resizes, the panels change, or it commits a new size.
   Its rect is its clip, and every shown dialog has navi's frame around it, so even a transparent
   one can be seen. Inside its monitor a dialog may cover neighbouring tiles, so a file picker
-  larger than its window still works, but it is always visible where it takes clicks. A new dialog
-  takes the keyboard only if a window of its own family holds it; otherwise it maps without it
-  (logged), *waits*, and gets it when the user clicks it, or focuses its parent from the dock or
-  Super+N and then clicks it. A waiting dialog's frame is full accent (1 px), its root's dock icon
-  has an accent dot and, in a tab group, its root's tab an accent line along its bottom, until the
-  dialog is focused. An orphan never takes the keyboard on map. A dialog hides while its root is
-  hidden or minimized, and loses the keyboard; it comes back with it. When a dialog's parent
-  closes, it hangs from that parent's own parent if it had one, else it is an orphan centred in
-  its last bounds. A closed window that had the keyboard gives it back: a dialog to its parent,
-  any other window to the window that had the keyboard right before it. It goes back only if the
-  user gave that focus and the keyboard hasn't moved since, or, for a dialog, if the parent held
-  the keyboard right before the dialog took it and the keyboard hasn't moved since (the parent
-  gets back only what it held). Either way that window must still be visible (not hidden,
-  minimized or wholly covered) on the same monitor, outside the lock; otherwise the keyboard goes
-  to nobody. Every hide (a dialog with its parent, a re-parent to a hidden window, an X11 menu
-  with its parent) takes the keyboard off the hidden window before the next key.
+  larger than its window still works, but it is always visible where it takes clicks. While it is
+  in front of a neighbour it covers that neighbour's bar, buttons and frame too, and takes the
+  clicks there; clicking the neighbour's window outside it brings the neighbour back on top.
+  A new dialog takes the keyboard only if a window of its own family holds it; otherwise it maps
+  without it (logged), *waits*, and gets it when the user clicks it, or focuses its parent from
+  the dock or Super+N and then clicks it. A waiting dialog's frame is full accent (1 px), its
+  root's dock icon has an accent dot and, in a tab group, its root's tab an accent line along its
+  bottom, until the dialog is focused. An orphan never takes the keyboard on map. A dialog hides
+  while its root is hidden or minimized, and loses the keyboard; it comes back with it. When a
+  dialog's parent closes, it hangs from that parent's own parent if it had one, else it is an
+  orphan centred in its last bounds. A closed window that had the keyboard gives it back: a dialog
+  to its parent, any other window to the window that had the keyboard right before it. It goes
+  back only if the user gave that focus and the keyboard hasn't moved since, or, for a dialog, if
+  the parent held the keyboard right before the dialog took it and the keyboard hasn't moved since
+  (the parent gets back only what it held). Either way that window must still be visible (not
+  hidden, minimized or wholly covered) on the same monitor, outside the lock; otherwise the
+  keyboard goes to nobody. Every hide (a dialog with its parent, a re-parent to a hidden window,
+  an X11 menu with its parent) takes the keyboard off the hidden window before the next key.
 - **Stacking order.** Windows stack by one rank: the last time they were raised, by the user (a
   click, the dock, Super+N, or an activation whose token came from the dock or from a window the
   user focused) or by opening and taking the keyboard. Any other activation (a token minted by a
@@ -301,7 +303,13 @@ aspect, gravity, position) are ignored.
   an orphan, so a window that opens and closes at once hands nothing on. Nothing else moves a
   window up: a commit, a re-parent, a map or a re-show (after a minimize, a fullscreen or
   maximize, a tab switch, an unplug) puts every window back at its rank, so no app can put itself
-  above a window the user raised later.
+  above a window the user raised later. navi's chrome stacks in the same order: each shown tile
+  group's bar, tabs, buttons, frame and lit zone draw right above the group's window, so a dialog,
+  orphan or X11 menu above that window covers them, and a neighbour the user raises later covers
+  the dialog, chrome included. Minimized strips draw below every tiled window and dialog, the
+  move grid and preview above them; floats, with their chrome, stay above all of it. Zones follow
+  the drawing: a tile's zone takes the pointer only where no window above its group's window is,
+  so a click over a dialog's rect reaches the dialog, whatever chrome lies beneath it.
 - **Logs.** One `info` line per change: `client size hints` (app, id, min, max and the outcome),
   then `re-placed`, `floating: no tile fits` (and `floating: its minimum is bigger than the
   monitor` when it is) or `tiled again` with the cells or rect (`by="room freed"` when a float
@@ -521,8 +529,9 @@ bundling a degoogled, resource-tested Chromium variant is reserved for a future 
   of the same system, preserving geometry, hierarchy and instant state changes. The
   window with the keyboard has a 2 px accent frame just outside it, in the gap; every other shown
   window, dialogs included, has a dim 1 px one, so the gaps read as thin neon lines and the grab
-  strips stay easy to find. A lit strip or edge, the bars and the minimized strips draw in front
-  of the frames, and the shell's panels in front of all of them.
+  strips stay easy to find. A tile's lit strip or edge and its bar draw in front of its frame,
+  a window stacked above the tile (a dialog) in front of all three, and the shell's panels in
+  front of everything.
   The shell's panels (dock, launcher, status band, session menu and notification cards) float:
   12 px (`INSET`) from the screen edges and from what they sit next to, with 10 px corners
   (`RADIUS`), the shell fill and a 1 px rim. The dock and band, which sit over the wallpaper,

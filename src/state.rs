@@ -435,12 +435,20 @@ impl Navi {
         Some(Rect::new(g.loc.x, g.loc.y, g.size.w, g.size.h))
     }
 
-    /// navi's zone at `pos`, unless a float's window or dialog drawn over it is there.
+    /// navi's zone at `pos`, unless the window there is drawn over it: a float's window or
+    /// dialog, or a tile-layer window above the zone's group window in the space.
     pub fn zone_at(&self, pos: Point<f64, Logical>) -> Option<layout::Hit> {
-        let over = self
-            .window_under(pos)
-            .and_then(|(w, _)| self.float_owner(w));
-        self.layout.hit_under(px(pos), over)
+        let under = self.window_under(pos).map(|(w, _)| w);
+        let over = under.and_then(|w| self.float_owner(w));
+        let rank = |w: &Window| self.space.elements().position(|e| e == w);
+        let at = under.filter(|_| over.is_none()).and_then(rank);
+        let covers = |g| Layout::covers(at, self.window_of(g).as_ref().and_then(rank));
+        self.layout.hit_under(px(pos), over, covers)
+    }
+
+    /// The tile `w` is the window of; `None` for dialogs and menus.
+    pub fn tile_id(&self, w: &Window) -> Option<WinId> {
+        self.windows.iter().find(|m| &m.window == w)?.tile
     }
 
     /// The float `w` is, or whose dialog it is.
