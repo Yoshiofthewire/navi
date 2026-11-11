@@ -20,12 +20,14 @@ use smithay::{
     },
     desktop::{LayerMap, Window, WindowSurface, layer_map_for_output},
     output::Output,
+    reexports::wayland_server::Resource,
     utils::{Point, Rectangle, Scale, Transform},
     wayland::shell::wlr_layer::Layer,
 };
 use tracing::warn;
 
 use crate::{
+    activation,
     cursor::Cursor,
     image::Image,
     layout, monitors,
@@ -426,6 +428,7 @@ pub fn clear() -> [f32; 4] {
 /// Frame callbacks for what `output` shows, after a frame.
 pub fn send_frames(state: &mut Navi, output: &Output) {
     let time = state.start_time.elapsed();
+    track_layers(state, output);
     if state.lock.active {
         for (o, s) in &state.lock.surfaces {
             if o == output && s.alive() {
@@ -449,6 +452,18 @@ pub fn send_frames(state: &mut Navi, output: &Output) {
         layer.send_frame(output, time, Some(Duration::ZERO), on_output);
     }
     layers.cleanup();
+}
+
+/// Notes which of `output`'s layer surfaces are on screen after this frame, and since when.
+fn track_layers(state: &mut Navi, output: &Output) {
+    let (now, locked) = (std::time::Instant::now(), state.lock.active);
+    let fullscreen = state.layout.fullscreen_on(&identity(output));
+    let map = layer_map_for_output(output);
+    for l in map.layers() {
+        let shown = activation::layer_shown(l.layer() == Layer::Top, fullscreen, locked);
+        activation::track_shown(&mut state.layers_shown, l.wl_surface(), shown, now);
+    }
+    state.layers_shown.retain(|(s, _)| s.is_alive());
 }
 
 /// The floating windows, by the float they belong to, and the tiled ones over `geo`, each top

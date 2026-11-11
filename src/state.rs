@@ -178,6 +178,13 @@ pub struct Navi {
     /// Counts keyboard moves: a token is the user's only while the keyboard hasn't moved since
     /// it was made.
     pub(crate) focus_moves: u64,
+    /// The latest left-button press navi delivered: its serial, its surface and how long that
+    /// had been on screen, for a press token.
+    pub(crate) last_press: Option<(u32, WlSurface, Option<std::time::Duration>)>,
+    /// When each shown layer surface came on screen (`activation::track_shown`), kept per frame.
+    pub(crate) layers_shown: Vec<(WlSurface, std::time::Instant)>,
+    /// Counts left-button presses, delivered or not: a press token dies with the next one.
+    pub(crate) presses: u64,
     /// The window that held the keyboard before the one holding it now, whether the user gave
     /// it that focus, and `focus_moves` once the keyboard left it.
     pub(crate) before_focus: Option<(Window, bool, u64)>,
@@ -295,6 +302,9 @@ impl Navi {
             raises: 0,
             focus_by_user: false,
             focus_moves: 0,
+            last_press: None,
+            layers_shown: Vec::new(),
+            presses: 0,
             before_focus: None,
             before_layer: Default::default(),
             seat_state,
@@ -2049,8 +2059,10 @@ struct UserToken {
     bar: bool,
     /// The asker held a keyboard focus the user gave it.
     user: bool,
-    /// `Navi::focus_moves` when it was made.
-    moves: u64,
+    /// `Navi::focus_moves` and `Navi::presses` when it was made.
+    moves: (u64, u64),
+    /// Made from a pointer press, not a keyboard focus (`activation::may_issue_press`).
+    press: bool,
 }
 
 /// Whether a focus raises the window to the front of the stacking order.
@@ -2591,23 +2603,38 @@ impl XdgActivationHandler for Navi {
             .map(u32::from);
         let serial = data.serial.as_ref().map(|(s, _)| u32::from(*s));
         let now = u32::from(SERIAL_COUNTER.next_serial());
-        let issued = may_issue(serial, since, now);
         let asker = data
             .client_id
             .clone()
             .and_then(|c| self.display_handle.backend_handle().get_client_data(c).ok());
         let navi_bar = privileged(asker.as_ref().and_then(|d| d.downcast_ref::<ClientState>()));
+        let focused = may_issue(serial, since, now);
+        let press = !focused
+            && activation::may_issue_press(
+                navi_bar,
+                self.lock.active,
+                serial,
+                data.surface.as_ref(),
+                self.last_press.as_ref(),
+            );
+        if press {
+            // One token per press.
+            self.last_press = None;
+        }
+        let issued = focused || press;
         let user = activation::minted_by_user(navi_bar, self.focus_by_user);
         let token = UserToken {
             bar: navi_bar,
             user,
-            moves: self.focus_moves,
+            moves: (self.focus_moves, self.presses),
+            press,
         };
         data.user_data.insert_if_missing(|| token);
         info!(
             app = data.app_id,
             ?serial,
             ?since,
+            press,
             issued,
             user,
             "activation token"
@@ -2631,19 +2658,26 @@ impl XdgActivationHandler for Navi {
             .get_keyboard()
             .and_then(|kb| kb.current_focus())
             .and_then(|f| f.surface());
-        let focus_kept = activation::focus_kept(
-            focus.as_ref(),
-            data.surface.as_ref(),
-            &surface,
-            self.handback.as_ref(),
-        );
+        let focus_kept = match data.user_data.get::<UserToken>() {
+            Some(t) if t.press => activation::press_kept(
+                t.moves,
+                (self.focus_moves, self.presses),
+                focus.as_ref() == Some(&surface),
+            ),
+            _ => activation::focus_kept(
+                focus.as_ref(),
+                data.surface.as_ref(),
+                &surface,
+                self.handback.as_ref(),
+            ),
+        };
         let age = data.timestamp.elapsed();
         match id.filter(|_| may_redeem(first_use, age, focus_kept)) {
             Some(id) => {
                 // Only a token from a focus the user gave, still held, raises and takes the
                 // keyboard; any other only marks the window for the user.
                 let user = data.user_data.get::<UserToken>().is_some_and(|t| {
-                    activation::user_raise(t.bar, t.user, t.moves, self.focus_moves)
+                    activation::user_raise(t.bar, t.user, t.moves.0, self.focus_moves)
                 });
                 match activation::on_redeem(user) {
                     activation::Redeem::Focus => {

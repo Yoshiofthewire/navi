@@ -1,6 +1,6 @@
 //! xdg-activation rules: who gets a token, and when one still works.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// How long a token works after it was made.
 pub const TTL: Duration = Duration::from_secs(10);
@@ -54,6 +54,70 @@ pub fn on_redeem(user: bool) -> Redeem {
         true => Redeem::Focus,
         false => Redeem::Mark,
     }
+}
+
+/// How long a layer must have been on screen before a press on it can mint a press token: a
+/// card revealed under a click (fullscreen or the lock ending) can't catch it.
+pub const SHOWN_FOR: Duration = Duration::from_millis(500);
+
+/// A token navi-bar asks for from a pointer press on a surface that never holds the keyboard (the
+/// notification cards): only navi-bar's, never while locked, and only with the serial of the
+/// latest left-button press navi delivered (`press`: serial, surface, and how long that surface
+/// had been shown then), on that same surface, shown at least `SHOWN_FOR`.
+pub fn may_issue_press<S: PartialEq>(
+    navi_bar: bool,
+    locked: bool,
+    serial: Option<u32>,
+    asker: Option<&S>,
+    press: Option<&(u32, S, Option<Duration>)>,
+) -> bool {
+    navi_bar
+        && !locked
+        && matches!((serial, asker, press), (Some(s), Some(a), Some((p, on, shown)))
+            if s == *p && a == on && shown.is_some_and(|d| d >= SHOWN_FOR))
+}
+
+/// Whether a layer is on screen: nothing is while locked, and a fullscreen window hides its
+/// output's Top layer (the taskbar, the cards).
+pub fn layer_shown(top: bool, fullscreen: bool, locked: bool) -> bool {
+    !locked && !(top && fullscreen)
+}
+
+/// Keeps when each shown layer surface came on screen: a newly shown one starts now, a hidden
+/// one is dropped, so showing it again restarts its clock.
+pub fn track_shown<S: PartialEq + Clone>(
+    since: &mut Vec<(S, Instant)>,
+    surface: &S,
+    shown: bool,
+    now: Instant,
+) {
+    let at = since.iter().position(|(s, _)| s == surface);
+    match (shown, at) {
+        (true, None) => since.push((surface.clone(), now)),
+        (false, Some(i)) => {
+            since.remove(i);
+        }
+        _ => {}
+    }
+}
+
+/// How long `surface` has been on screen at `now`, if it is.
+pub fn shown_for<S: PartialEq>(
+    since: &[(S, Instant)],
+    surface: &S,
+    now: Instant,
+) -> Option<Duration> {
+    since
+        .iter()
+        .find(|(s, _)| s == surface)
+        .map(|(_, t)| now.saturating_duration_since(*t))
+}
+
+/// Whether focus stayed for a press token: neither the keyboard moved nor the user pressed the
+/// left button again since it was minted (keyboard moves and presses, counted at mint and now),
+/// or the keyboard is already on the window the token activates.
+pub fn press_kept(minted_at: (u64, u64), now: (u64, u64), on_target: bool) -> bool {
+    minted_at == now || on_target
 }
 
 /// A token works once, up to `TTL` after it was made, and only while focus hasn't moved away:
@@ -226,5 +290,125 @@ mod tests {
         assert!(!may_redeem(false, Duration::ZERO, true), "second use");
         // Issued while focused, then focus moved to another surface; redeemed at 1 s.
         assert!(!may_redeem(true, s(1), false), "focus moved");
+    }
+
+    const CARDS: u8 = 5;
+
+    #[test]
+    fn ac1_a_card_press_mints_a_token_only_for_navi_bar() {
+        let armed = Some(SHOWN_FOR);
+        let press = Some((41, CARDS, armed));
+        assert!(may_issue_press(
+            true,
+            false,
+            Some(41),
+            Some(&CARDS),
+            press.as_ref()
+        ));
+        assert!(
+            !may_issue_press(false, false, Some(41), Some(&CARDS), press.as_ref()),
+            "not navi-bar"
+        );
+        assert!(
+            !may_issue_press(true, false, Some(40), Some(&CARDS), press.as_ref()),
+            "an older press"
+        );
+        assert!(
+            !may_issue_press(true, false, Some(4000), Some(&CARDS), press.as_ref()),
+            "made up"
+        );
+        assert!(
+            !may_issue_press(true, false, None, Some(&CARDS), press.as_ref()),
+            "no serial"
+        );
+        let elsewhere = Some((41, KONSOLE, armed));
+        assert!(
+            !may_issue_press(true, false, Some(41), Some(&CARDS), elsewhere.as_ref()),
+            "the press went to another surface"
+        );
+        assert!(
+            !may_issue_press(true, false, Some(41), None, press.as_ref()),
+            "no surface"
+        );
+        assert!(
+            !may_issue_press(true, false, Some(41), Some(&CARDS), None),
+            "no press"
+        );
+        assert!(
+            !may_issue_press(true, true, Some(41), Some(&CARDS), press.as_ref()),
+            "locked"
+        );
+    }
+
+    /// Round 3 (audit P2): cards hidden by a fullscreen window, or the lock, are new on screen
+    /// when it ends; a click in their first 500 ms there mints nothing, however old the card.
+    #[test]
+    fn a_card_revealed_after_fullscreen_mints_nothing_for_500_ms() {
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        let mut since = Vec::new();
+        // Shown long ago, then a fullscreen window hides the Top layer for a while.
+        track_shown(&mut since, &CARDS, layer_shown(true, false, false), t0);
+        track_shown(
+            &mut since,
+            &CARDS,
+            layer_shown(true, true, false),
+            t0 + ms(2000),
+        );
+        assert_eq!(shown_for(&since, &CARDS, t0 + ms(5000)), None, "hidden");
+        // Fullscreen ends at 5 s: the clock restarts.
+        let shown = t0 + ms(5000);
+        track_shown(&mut since, &CARDS, layer_shown(true, false, false), shown);
+        let press = |at| Some((41, CARDS, shown_for(&since, &CARDS, at)));
+        let mint = |at| may_issue_press(true, false, Some(41), Some(&CARDS), press(at).as_ref());
+        assert!(!mint(shown), "revealed under the click");
+        assert!(!mint(shown + ms(499)));
+        assert!(mint(shown + ms(500)));
+        // Frames while shown keep the first time.
+        track_shown(&mut since, &CARDS, true, shown + ms(300));
+        assert_eq!(shown_for(&since, &CARDS, shown + ms(500)), Some(ms(500)));
+        // The lock hides every layer; fullscreen leaves layers other than Top alone.
+        assert!(!layer_shown(false, false, true));
+        assert!(layer_shown(false, true, false));
+        // A press on a surface never seen shown mints nothing.
+        assert!(!may_issue_press(
+            true,
+            false,
+            Some(41),
+            Some(&CARDS),
+            Some((41, CARDS, None)).as_ref()
+        ));
+    }
+
+    #[test]
+    fn ac2_a_press_token_focuses_once_fresh_and_while_the_keyboard_stays() {
+        let s = Duration::from_secs;
+        // navi-bar's token raises as the user (`user_raise` with `bar`).
+        let redeem = |first, age, kept| {
+            may_redeem(first, age, kept).then(|| on_redeem(user_raise(true, false, 7, 7)))
+        };
+        let fresh = press_kept((7, 3), (7, 3), false);
+        assert_eq!(redeem(true, s(1), fresh), Some(Redeem::Focus));
+        assert_eq!(redeem(true, s(10), fresh), Some(Redeem::Focus));
+        assert_eq!(redeem(false, s(1), fresh), None, "second use");
+        assert_eq!(
+            redeem(true, Duration::from_millis(10_001), fresh),
+            None,
+            "after TTL"
+        );
+        assert_eq!(
+            redeem(true, s(1), press_kept((7, 3), (8, 3), false)),
+            None,
+            "the keyboard moved to another window"
+        );
+        assert_eq!(
+            redeem(true, s(1), press_kept((7, 3), (7, 4), false)),
+            None,
+            "the user clicked again, in the window that holds the keyboard"
+        );
+        assert!(
+            press_kept((7, 3), (8, 4), true),
+            "the keyboard is already on the target"
+        );
     }
 }
