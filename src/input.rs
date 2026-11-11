@@ -539,6 +539,10 @@ impl Navi {
         };
         let pos = pointer.current_location();
         self.super_tap.button(button, pressed);
+        if left && pressed {
+            self.last_press = None;
+            self.presses += 1;
+        }
         if !left {
             self.edge_clicks = Default::default();
         }
@@ -629,14 +633,18 @@ impl Navi {
             true => ButtonState::Pressed,
             false => ButtonState::Released,
         };
+        // After any focus change above: a click that focuses a surface carries a serial from its
+        // new focus period, so it can ask for an activation token.
+        let serial = SERIAL_COUNTER.next_serial();
+        if left && pressed {
+            self.last_press = pointer.current_focus().map(|s| (u32::from(serial), s));
+        }
         pointer.button(
             self,
             &ButtonEvent {
                 button,
                 state,
-                // After any focus change above: a click that focuses a surface carries a serial
-                // from its new focus period, so it can ask for an activation token.
-                serial: SERIAL_COUNTER.next_serial(),
+                serial,
                 time,
             },
         );

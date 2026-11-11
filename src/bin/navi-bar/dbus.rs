@@ -260,7 +260,16 @@ mod tests {
                         if value["op"] == "action" {
                             let id = value["id"].as_u64().unwrap() as u32;
                             let (_, sender) = notes.iter().find(|(n, _)| *n == id).unwrap();
-                            action(&notifications, sender, id, value["key"].as_str().unwrap());
+                            // A token here only exercises the signal routing; production
+                            // Settings actions never carry one.
+                            let token = value["token"].as_str();
+                            action(
+                                &notifications,
+                                sender,
+                                id,
+                                value["key"].as_str().unwrap(),
+                                token,
+                            );
                         }
                         reply.send(serde_json::json!({
                             "ok": true,
@@ -283,6 +292,21 @@ mod tests {
             .status()
             .expect("start isolated D-Bus integration");
         assert!(status.success(), "notification-only proxy isolation failed");
+    }
+
+    #[test]
+    fn ac3_the_token_goes_before_the_action() {
+        assert_eq!(
+            signals(7, "default", Some("tok")),
+            [
+                Signal::ActivationToken(7, "tok"),
+                Signal::ActionInvoked(7, "default")
+            ]
+        );
+        assert_eq!(
+            signals(7, "default", None),
+            [Signal::ActionInvoked(7, "default")]
+        );
     }
 
     #[test]
@@ -364,6 +388,32 @@ impl SettingsServer {
     }
 }
 
-pub fn action(conn: &Connection, sender: &str, id: u32, key: &str) {
-    let _ = conn.emit_signal(Some(sender), PATH, NAME, "ActionInvoked", &(id, key));
+/// A signal for an invoked action.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Signal<'a> {
+    ActivationToken(u32, &'a str),
+    ActionInvoked(u32, &'a str),
+}
+
+/// What an action sends, in order: the token first, so the app can raise itself on the action.
+pub fn signals<'a>(id: u32, key: &'a str, token: Option<&'a str>) -> Vec<Signal<'a>> {
+    let token = token.map(|t| Signal::ActivationToken(id, t));
+    token
+        .into_iter()
+        .chain([Signal::ActionInvoked(id, key)])
+        .collect()
+}
+
+/// Sends an action's signals to the notification's sender only, never broadcast.
+pub fn action(conn: &Connection, sender: &str, id: u32, key: &str, token: Option<&str>) {
+    for s in signals(id, key, token) {
+        let _ = match s {
+            Signal::ActivationToken(id, t) => {
+                conn.emit_signal(Some(sender), PATH, NAME, "ActivationToken", &(id, t))
+            }
+            Signal::ActionInvoked(id, k) => {
+                conn.emit_signal(Some(sender), PATH, NAME, "ActionInvoked", &(id, k))
+            }
+        };
+    }
 }

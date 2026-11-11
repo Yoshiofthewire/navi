@@ -56,6 +56,28 @@ pub fn on_redeem(user: bool) -> Redeem {
     }
 }
 
+/// A token navi-bar asks for from a pointer press on a surface that never holds the keyboard (the
+/// notification cards): only navi-bar's, never while locked, and only with the serial of the
+/// latest left-button press navi delivered (`press`: serial and surface), on that same surface.
+pub fn may_issue_press<S: PartialEq>(
+    navi_bar: bool,
+    locked: bool,
+    serial: Option<u32>,
+    asker: Option<&S>,
+    press: Option<&(u32, S)>,
+) -> bool {
+    navi_bar
+        && !locked
+        && matches!((serial, asker, press), (Some(s), Some(a), Some((p, on))) if s == *p && a == on)
+}
+
+/// Whether focus stayed for a press token: neither the keyboard moved nor the user pressed the
+/// left button again since it was minted (keyboard moves and presses, counted at mint and now),
+/// or the keyboard is already on the window the token activates.
+pub fn press_kept(minted_at: (u64, u64), now: (u64, u64), on_target: bool) -> bool {
+    minted_at == now || on_target
+}
+
 /// A token works once, up to `TTL` after it was made, and only while focus hasn't moved away:
 /// the surface that asked for it, or the one it activates, still holds the keyboard.
 pub fn may_redeem(first_use: bool, age: Duration, focus_kept: bool) -> bool {
@@ -226,5 +248,84 @@ mod tests {
         assert!(!may_redeem(false, Duration::ZERO, true), "second use");
         // Issued while focused, then focus moved to another surface; redeemed at 1 s.
         assert!(!may_redeem(true, s(1), false), "focus moved");
+    }
+
+    const CARDS: u8 = 5;
+
+    #[test]
+    fn ac1_a_card_press_mints_a_token_only_for_navi_bar() {
+        let press = Some((41, CARDS));
+        assert!(may_issue_press(
+            true,
+            false,
+            Some(41),
+            Some(&CARDS),
+            press.as_ref()
+        ));
+        assert!(
+            !may_issue_press(false, false, Some(41), Some(&CARDS), press.as_ref()),
+            "not navi-bar"
+        );
+        assert!(
+            !may_issue_press(true, false, Some(40), Some(&CARDS), press.as_ref()),
+            "an older press"
+        );
+        assert!(
+            !may_issue_press(true, false, Some(4000), Some(&CARDS), press.as_ref()),
+            "made up"
+        );
+        assert!(
+            !may_issue_press(true, false, None, Some(&CARDS), press.as_ref()),
+            "no serial"
+        );
+        let elsewhere = Some((41, KONSOLE));
+        assert!(
+            !may_issue_press(true, false, Some(41), Some(&CARDS), elsewhere.as_ref()),
+            "the press went to another surface"
+        );
+        assert!(
+            !may_issue_press(true, false, Some(41), None, press.as_ref()),
+            "no surface"
+        );
+        assert!(
+            !may_issue_press(true, false, Some(41), Some(&CARDS), None),
+            "no press"
+        );
+        assert!(
+            !may_issue_press(true, true, Some(41), Some(&CARDS), press.as_ref()),
+            "locked"
+        );
+    }
+
+    #[test]
+    fn ac2_a_press_token_focuses_once_fresh_and_while_the_keyboard_stays() {
+        let s = Duration::from_secs;
+        // navi-bar's token raises as the user (`user_raise` with `bar`).
+        let redeem = |first, age, kept| {
+            may_redeem(first, age, kept).then(|| on_redeem(user_raise(true, false, 7, 7)))
+        };
+        let fresh = press_kept((7, 3), (7, 3), false);
+        assert_eq!(redeem(true, s(1), fresh), Some(Redeem::Focus));
+        assert_eq!(redeem(true, s(10), fresh), Some(Redeem::Focus));
+        assert_eq!(redeem(false, s(1), fresh), None, "second use");
+        assert_eq!(
+            redeem(true, Duration::from_millis(10_001), fresh),
+            None,
+            "after TTL"
+        );
+        assert_eq!(
+            redeem(true, s(1), press_kept((7, 3), (8, 3), false)),
+            None,
+            "the keyboard moved to another window"
+        );
+        assert_eq!(
+            redeem(true, s(1), press_kept((7, 3), (7, 4), false)),
+            None,
+            "the user clicked again, in the window that holds the keyboard"
+        );
+        assert!(
+            press_kept((7, 3), (8, 4), true),
+            "the keyboard is already on the target"
+        );
     }
 }

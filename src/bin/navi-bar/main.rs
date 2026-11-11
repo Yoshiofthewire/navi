@@ -99,7 +99,7 @@ fn text_px() -> f32 {
     TEXT_SIZE.load(std::sync::atomic::Ordering::Relaxed) as f32
 }
 static TEXT_SIZE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(14);
-/// How long a launch waits for its activation token.
+/// How long a launch or a card's action waits for its activation token.
 const TOKEN_WAIT: Duration = Duration::from_secs(1);
 /// The status band across the top of the main output.
 const BAND_H: i32 = session::BAND_H;
@@ -309,7 +309,7 @@ fn run() -> Result<(), String> {
         pin_message: String::new(),
         icons: Icons::new(themes),
         font,
-        launches: 0,
+        asks: 0,
         pending: Vec::new(),
         closed: false,
     };
@@ -438,19 +438,27 @@ struct Bar {
     pin_message: String,
     icons: Icons,
     font: Option<fontdue::Font>,
-    launches: u64,
-    /// Launches waiting for a token, by number.
-    pending: Vec<(u64, Entry)>,
+    asks: u64,
+    /// What waits for a token, by number.
+    pending: Vec<(u64, Pending)>,
     closed: bool,
 }
 
-/// A token request for launch number `seq`.
-struct Launch {
+/// What waits for a token.
+enum Pending {
+    Launch(Entry),
+    /// A card's `default` action: the note's id and sender, and its `NotificationClosed`, sent
+    /// after the action.
+    Action(u32, String, Option<Closed>),
+}
+
+/// A token request for pending number `seq`.
+struct TokenRequest {
     seq: u64,
     data: RequestData,
 }
 
-impl RequestDataExt for Launch {
+impl RequestDataExt for TokenRequest {
     fn app_id(&self) -> Option<&str> {
         self.data.app_id()
     }
@@ -518,36 +526,60 @@ impl Bar {
         let Some(e) = self.entries.get(entry).cloned() else {
             return;
         };
-        self.launches += 1;
-        let seq = self.launches;
+        let (app_id, surface) = (Some(e.id.clone()), self.layer.wl_surface().clone());
+        self.ask_token(Pending::Launch(e), app_id, serial, surface, qh);
+        self.close_menu();
+    }
+
+    /// Asks for an activation token for the press or key with `serial` on `surface`; `p` goes
+    /// on with it, or without one after `TOKEN_WAIT`.
+    fn ask_token(
+        &mut self,
+        p: Pending,
+        app_id: Option<String>,
+        serial: u32,
+        surface: wl_surface::WlSurface,
+        qh: &QueueHandle<Self>,
+    ) {
+        self.asks += 1;
+        let seq = self.asks;
         let data = RequestData {
-            app_id: Some(e.id.clone()),
+            app_id,
             seat_and_serial: self.seat.clone().map(|s| (s, serial)),
-            surface: Some(self.layer.wl_surface().clone()),
+            surface: Some(surface),
         };
         self.activation
-            .request_token_with_data(qh, Launch { seq, data });
-        self.pending.push((seq, e));
+            .request_token_with_data(qh, TokenRequest { seq, data });
+        self.pending.push((seq, p));
         let timer = Timer::from_duration(TOKEN_WAIT);
         let wait = self.loop_handle.insert_source(timer, move |_, _, bar| {
-            if let Some(e) = bar.take_pending(seq) {
-                warn!(
-                    id = e.id,
-                    "no activation token within 1 s: launching without one"
-                );
-                spawn(&e, None);
+            if let Some(p) = bar.take_pending(seq) {
+                warn!("no activation token within 1 s: going on without one");
+                bar.go_on(p, None);
             }
             TimeoutAction::Drop
         });
         if let Err(e) = wait {
             warn!("token timer: {e}");
         }
-        self.close_menu();
     }
 
-    fn take_pending(&mut self, seq: u64) -> Option<Entry> {
+    fn take_pending(&mut self, seq: u64) -> Option<Pending> {
         let at = self.pending.iter().position(|p| p.0 == seq)?;
         Some(self.pending.remove(at).1)
+    }
+
+    fn go_on(&mut self, p: Pending, token: Option<&str>) {
+        match p {
+            Pending::Launch(e) => spawn(&e, token),
+            Pending::Action(id, sender, closed) => {
+                if let Some(conn) = &self.dbus {
+                    dbus::action(conn, &sender, id, "default", token);
+                }
+                info!(id, token = token.is_some(), "card action");
+                self.emit(closed.into_iter().collect());
+            }
+        }
     }
 
     fn running(&self) -> Vec<dock::Running<'_>> {
@@ -1108,7 +1140,8 @@ impl Bar {
                                 && n.actions.iter().any(|(k, _)| k == key)
                         });
                         if let (Some(note), Some(conn)) = (note, self.dbus.as_ref()) {
-                            dbus::action(conn, &note.sender, note.id, key);
+                            // Settings' click lands in another process: no token to vouch for it.
+                            dbus::action(conn, &note.sender, note.id, key, None);
                             serde_json::json!({"ok":true})
                         } else {
                             serde_json::json!({"ok":false,"error":"Notification action expired"})
@@ -1566,11 +1599,11 @@ fn spawn(e: &Entry, token: Option<&str>) {
 }
 
 impl ActivationHandler for Bar {
-    type RequestData = Launch;
+    type RequestData = TokenRequest;
 
-    fn new_token(&mut self, token: String, data: &Launch) {
-        if let Some(e) = self.take_pending(data.seq) {
-            spawn(&e, Some(&token));
+    fn new_token(&mut self, token: String, data: &TokenRequest) {
+        if let Some(p) = self.take_pending(data.seq) {
+            self.go_on(p, Some(&token));
         }
     }
 }
@@ -1913,19 +1946,26 @@ impl PointerHandler for Bar {
             let on_cards = self.cards_layer.as_ref().map(|l| l.wl_surface()) == Some(&e.surface);
             if on_cards {
                 if let PointerEventKind::Press {
-                    button: BTN_LEFT, ..
+                    button: BTN_LEFT,
+                    serial,
+                    ..
                 } = e.kind
                 {
                     let (x, y) = (e.position.0 as i32, e.position.1 as i32);
                     let clicked = cards::hit(&self.cards, x, y);
-                    if let Some(note) = self.notes.shown().iter().find(|n| Some(n.id) == clicked)
-                        && note.actions.iter().any(|(k, _)| k == "default")
-                        && let Some(conn) = &self.dbus
-                    {
-                        dbus::action(conn, &note.sender, note.id, "default");
-                    }
+                    let action = clicked.and_then(|id| self.notes.default_action(id));
                     let dismissed = clicked.and_then(|id| self.notes.dismiss(id));
-                    self.emit(dismissed.into_iter().collect());
+                    match action.filter(|_| self.dbus.is_some()) {
+                        // The token lets the app raise itself. Its card hides now; its
+                        // `NotificationClosed` follows the action, or clients waiting on the
+                        // card would quit before it.
+                        Some((id, sender)) => {
+                            let action = Pending::Action(id, sender, dismissed);
+                            self.ask_token(action, None, serial, e.surface.clone(), qh);
+                            self.show_cards();
+                        }
+                        None => self.emit(dismissed.into_iter().collect()),
+                    }
                 }
                 continue;
             }
@@ -2013,7 +2053,7 @@ delegate_keyboard!(Bar);
 delegate_pointer!(Bar);
 delegate_layer!(Bar);
 delegate_registry!(Bar);
-delegate_activation!(Bar, Launch);
+delegate_activation!(Bar, TokenRequest);
 
 #[cfg(test)]
 mod tests {

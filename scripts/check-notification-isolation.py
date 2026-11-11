@@ -82,19 +82,44 @@ def check(bus, shell):
                     else:
                         raise AssertionError(f'Notification-only client reached shell {value["op"]} via {destination}')
             assert notification_owner != shell_owner, 'Settings must have a separate bus owner'
-            received = []
-            subscription = bus.signal_subscribe(notification_owner, NOTIFICATIONS, 'ActionInvoked',
-                '/org/freedesktop/Notifications', None, Gio.DBusSignalFlags.NONE,
-                lambda *args: received.append(args[-2].unpack()), None)
-            try:
-                assert request(bus, shell, op='action', id=private_id, key='default')['ok']
+            # The notifying client (`bus`) gets the token, then the action; another client
+            # on the bus, subscribed to the same signals, gets neither.
+            other = Gio.DBusConnection.new_for_address_sync(
+                os.environ['DBUS_SESSION_BUS_ADDRESS'],
+                Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT |
+                Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION, None, None)
+            received, overheard = [], []
+            def listen(connection, into):
+                return [connection.signal_subscribe(notification_owner, NOTIFICATIONS, name,
+                    '/org/freedesktop/Notifications', None, Gio.DBusSignalFlags.NONE,
+                    lambda *args: into.append((args[-3], args[-2].unpack())), None)
+                    for name in ('ActivationToken', 'ActionInvoked')]
+            subscriptions = [(bus, s) for s in listen(bus, received)]
+            subscriptions += [(other, s) for s in listen(other, overheard)]
+            def wait_for(want):
                 end = time.monotonic() + 3
-                while (private_id, 'default') not in received and time.monotonic() < end:
+                while len(received) < len(want) and time.monotonic() < end:
                     GLib.MainContext.default().iteration(False)
                     time.sleep(.01)
-                assert (private_id, 'default') in received, 'Trusted Settings action was not delivered'
+                # Let anything misrouted arrive too.
+                end = time.monotonic() + .3
+                while time.monotonic() < end:
+                    GLib.MainContext.default().iteration(False)
+                    time.sleep(.01)
+                assert received == want, (received, want)
+                assert overheard == [], overheard
+                received.clear()
+            try:
+                assert request(bus, shell, op='action', id=private_id, key='default')['ok']
+                wait_for([('ActionInvoked', (private_id, 'default'))])
+                assert request(bus, shell, op='action', id=private_id, key='default',
+                               token='isolation-token')['ok']
+                wait_for([('ActivationToken', (private_id, 'isolation-token')),
+                          ('ActionInvoked', (private_id, 'default'))])
             finally:
-                bus.signal_unsubscribe(subscription)
+                for connection, subscription in subscriptions:
+                    connection.signal_unsubscribe(subscription)
+                other.close_sync(None)
         finally:
             if sandbox:
                 sandbox.close_sync(None)
@@ -104,7 +129,8 @@ def check(bus, shell):
             except subprocess.TimeoutExpired:
                 proxy.kill()
                 proxy.wait()
-    print('PASS: notification-only proxy rejects shell history/actions; notifications and trusted Settings work')
+    print('PASS: notification-only proxy rejects shell history/actions; notifications and trusted Settings work; '
+          'ActivationToken precedes ActionInvoked, sender only')
 
 
 def main():

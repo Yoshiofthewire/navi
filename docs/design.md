@@ -468,10 +468,14 @@ bundling a degoogled, resource-tested Chromium variant is reserved for a future 
   plain-text cards use the existing 1–10 second lifetime and per-sender/global rate limits.
   Images, icon paths and sound hints remain ignored. Live actions emit only to the original
   unique sender; a default action runs on a card click, and other actions are explicit in
-  Settings. Replacing/closing is still sender-scoped. Global enable, Do Not Disturb,
-  per-app blocking and a 50-entry in-memory history are configurable. Blocked notifications
-  never enter history. History/actions require an unlocked compositor settings check.
-  Fullscreen and locking hide notification surfaces. Optional UnifiedPush is a separate,
+  Settings. A card click first asks navi for an activation token for that press and sends it
+  to the sender as `ActivationToken`, then `ActionInvoked`, so the app can raise itself as a dock
+  click would; with no token within 1 s it sends `ActionInvoked` alone, which only marks the
+  window. Actions from Settings never carry a token: that click is in another process. The
+  card's `NotificationClosed` follows the action. Replacing/closing is still sender-scoped.
+  Global enable, Do Not Disturb, per-app blocking and a 50-entry in-memory history are
+  configurable. Blocked notifications never enter history. History/actions require an unlocked
+  compositor settings check. Fullscreen and locking hide notification surfaces. Optional UnifiedPush is a separate,
   owned external distributor, disabled by default; payloads reach their participating apps,
   which decide whether to notify. See [Settings](settings.md) and [UnifiedPush](unifiedpush.md).
 - **Laptop alone:** the same layout with a slimmer taskbar.
@@ -583,7 +587,13 @@ session.
   back after you've moved on. Only an activation by the user (a token from the dock, or from a
   window the user focused, redeemed before the keyboard moved) restores, raises and focuses the
   window; any other only marks its dock entry and tab (*Stacking order*). This replaces job 006's
-  rule that every accepted activation moves the keyboard.
+  rule that every accepted activation moves the keyboard. One exception to the keyboard rule:
+  the notification cards never take the keyboard, so navi-bar may also get a token with the
+  serial of the latest left-button press navi delivered to that same navi-bar surface (never
+  another client's, an older or made-up serial, or while locked; one token per press). It works
+  once, within 10 s, and only while the keyboard hasn't moved and no other click came since it
+  was made, or the keyboard is already on the window being activated; then it focuses as the
+  user's. The window you were typing in keeps the keyboard until the app takes it.
 - **Locking** uses `ext-session-lock`, advertised only on the dedicated socket Navi gives its
   swaylock child. Applications, including the bar, cannot bind it. Normal windows, layers,
   wallpaper, decorations and cursors are excluded from locked output frames; normal keyboard,

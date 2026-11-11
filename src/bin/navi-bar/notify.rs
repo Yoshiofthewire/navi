@@ -139,6 +139,16 @@ impl Notes {
         Some((id, CLOSED))
     }
 
+    /// A click on card `id` invokes its `default` action: the id and sender to signal, if it has
+    /// one. A card without one sends nothing and asks for no token.
+    pub fn default_action(&self, id: u32) -> Option<(u32, String)> {
+        let n = self.shown.iter().find(|n| n.id == id)?;
+        n.actions
+            .iter()
+            .any(|(k, _)| k == "default")
+            .then(|| (n.id, n.sender.clone()))
+    }
+
     /// A click on its card.
     pub fn dismiss(&mut self, id: u32) -> Option<Closed> {
         let at = self.shown.iter().position(|n| n.id == id)?;
@@ -263,6 +273,26 @@ mod tests {
 
     fn ids(n: &Notes) -> Vec<u32> {
         n.shown().iter().map(|n| n.id).collect()
+    }
+
+    #[test]
+    fn ac3_only_a_default_action_is_invoked_from_a_card() {
+        let mut n = Notes::default();
+        let (plain, _) = n.notify(0, ":1.1", &req("a"));
+        let with = Request {
+            actions: vec![("default".into(), "Open".into())],
+            ..req("b")
+        };
+        let (id, _) = n.notify(0, ":1.2", &with);
+        let other = Request {
+            actions: vec![("reply".into(), "Reply".into())],
+            ..req("c")
+        };
+        let (other, _) = n.notify(0, ":1.3", &other);
+        assert_eq!(n.default_action(id), Some((id, ":1.2".into())));
+        assert_eq!(n.default_action(plain), None);
+        assert_eq!(n.default_action(other), None);
+        assert_eq!(n.default_action(99), None, "no such card");
     }
 
     #[test]
