@@ -587,7 +587,7 @@ impl Navi {
                     .active(h.id())
                     .filter(|&id| self.layout.visible(id))
                     .and_then(|id| self.window_of(id)),
-                None => self.space.element_under(pos).map(|(w, _)| w.clone()),
+                None => self.window_under(pos).map(|(w, _)| w.clone()),
             };
             self.focus(clicked);
             // Other buttons go on with no pointer focus over a zone, so neither the press nor

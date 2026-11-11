@@ -14,10 +14,11 @@ use smithay::{
                 render_elements,
                 solid::{SolidColorBuffer, SolidColorRenderElement},
                 surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree},
+                utils::CropRenderElement,
             },
         },
     },
-    desktop::{LayerMap, layer_map_for_output},
+    desktop::{LayerMap, PopupManager, Window, WindowSurface, layer_map_for_output},
     output::Output,
     utils::{Point, Rectangle, Scale, Transform},
     wayland::shell::wlr_layer::Layer,
@@ -37,6 +38,8 @@ render_elements! {
     pub Frame<R> where R: ImportAll + ImportMem;
     Overlay=SolidColorRenderElement,
     Surface=WaylandSurfaceRenderElement<R>,
+    /// A tiled or floating window's own surfaces, cropped to its clip rect.
+    Clipped=CropRenderElement<WaylandSurfaceRenderElement<R>>,
     /// The wallpaper and the pointer.
     Memory=MemoryRenderBufferRenderElement<R>,
 }
@@ -67,12 +70,12 @@ impl Solids {
             .collect()
     }
 
-    /// The window buttons' glyphs; textures of buttons no longer shown are dropped.
+    /// The window buttons' glyphs, by window; textures of buttons no longer shown are dropped.
     fn glyphs<R>(
         &mut self,
         renderer: &mut R,
         buttons: Vec<(layout::WinId, layout::Button, bool, Physical)>,
-    ) -> Vec<MemoryRenderBufferRenderElement<R>>
+    ) -> Vec<(layout::WinId, MemoryRenderBufferRenderElement<R>)>
     where
         R: Renderer + ImportMem,
         R::TextureId: Texture + Clone + Send + 'static,
@@ -109,7 +112,7 @@ impl Solids {
                 None,
                 Kind::Unspecified,
             ) {
-                Ok(e) => out.push(e),
+                Ok(e) => out.push((id, e)),
                 Err(e) => warn!("window button not drawn: {e:?}"),
             }
         }
@@ -271,23 +274,43 @@ where
         .filter(|(r, _)| overlaps(*r, full))
         .map(|(r, color)| (rect(r), color)),
     );
+    // Float decorations follow the tiles', so one buffer list keeps every id stable.
+    let tile_decorations = decorations.len();
+    decorations.extend(
+        layout::float_overlay(&state.layout, state.focused_tile())
+            .into_iter()
+            .filter(|(r, _)| overlaps(*r, full))
+            .map(|(r, color)| (rect(r), color)),
+    );
     let buttons = layout::buttons(&state.layout, state.drag.as_ref(), pointer)
         .into_iter()
         .filter(|&(.., r, _)| overlaps(r, full))
         .map(|(id, b, r, lit)| (id, b, lit, rect(r)))
         .collect();
-    let mut glyphs = solids.glyphs(renderer, buttons);
+    let floating = |id| state.layout.tile(id).is_some_and(|t| t.floating);
+    let (mut float_glyphs, mut glyphs): (Vec<_>, Vec<_>) = solids
+        .glyphs(renderer, buttons)
+        .into_iter()
+        .partition(|(id, _)| floating(*id));
     // `Solids::elements` keeps order, and the square pointer is the first decoration.
     let mut tiles = solids.elements(decorations);
+    let mut floats = tiles.split_off(tile_decorations);
     let mut pointer: Vec<_> = tiles.drain(..above_panels).collect();
-    let (mut panels, mut windows) = surfaces(renderer, state, output, geo, scale);
+    let (mut panels, mut lower) = surfaces(renderer, state, output, scale);
+    let (mut float_windows, mut windows) = windows(renderer, state, geo, scale, rect);
     for part in STACK {
         match part {
             Part::Pointer => out.extend(pointer.drain(..).map(Frame::from)),
             Part::Panels => out.extend(panels.drain(..).map(Frame::from)),
-            Part::Glyphs => out.extend(glyphs.drain(..).map(Frame::from)),
+            Part::FloatGlyphs => out.extend(float_glyphs.drain(..).map(|(_, e)| Frame::from(e))),
+            Part::FloatDecorations => out.extend(floats.drain(..).map(Frame::from)),
+            Part::Floats => out.append(&mut float_windows),
+            Part::Glyphs => out.extend(glyphs.drain(..).map(|(_, e)| Frame::from(e))),
             Part::Decorations => out.extend(tiles.drain(..).map(Frame::from)),
-            Part::Windows => out.extend(windows.drain(..).map(Frame::from)),
+            Part::Windows => {
+                out.append(&mut windows);
+                out.extend(lower.drain(..).map(Frame::from));
+            }
         }
     }
     if let Some(w) = wallpaper.as_ref() {
@@ -310,18 +333,27 @@ enum Part {
     Pointer,
     /// The Overlay and Top layers: navi-bar's panels.
     Panels,
+    /// The window buttons on floats' bars.
+    FloatGlyphs,
+    /// Floats' bars and frames.
+    FloatDecorations,
+    /// Floating windows, their dialogs and popups.
+    Floats,
     /// The window buttons on navi's bars.
     Glyphs,
     /// navi's tile bars, frames, strips and drag previews.
     Decorations,
-    /// Windows, their popups and the lower layers.
+    /// Tiled windows, their dialogs and popups, and the lower layers.
     Windows,
 }
 
 /// Top first, above the wallpaper.
-const STACK: [Part; 5] = [
+const STACK: [Part; 8] = [
     Part::Pointer,
     Part::Panels,
+    Part::FloatGlyphs,
+    Part::FloatDecorations,
+    Part::Floats,
     Part::Glyphs,
     Part::Decorations,
     Part::Windows,
@@ -364,13 +396,91 @@ pub fn send_frames(state: &mut Navi, output: &Output) {
     layers.cleanup();
 }
 
-/// The output's upper layer surfaces, then its windows and lower layers, top first. While a
-/// window is fullscreen there, the Top layer (the taskbar) is left out.
+/// The floating and the tiled windows over `geo`, each top first. A window's own surfaces are
+/// cropped to its clip rect; its popups aren't. `rect` maps a global logical rect to `geo`'s
+/// physical px.
+fn windows<R>(
+    renderer: &mut R,
+    state: &Navi,
+    geo: Rectangle<i32, smithay::utils::Logical>,
+    scale: f64,
+    rect: impl Fn(layout::Rect) -> Physical,
+) -> (Vec<Frame<R>>, Vec<Frame<R>>)
+where
+    R: Renderer + ImportAll + ImportMem,
+    R::TextureId: Texture + Clone + Send + 'static,
+{
+    let (mut floats, mut tiles) = (Vec::new(), Vec::new());
+    for w in state.space.elements().rev() {
+        let (Some(loc), Some(bbox)) =
+            (state.space.element_location(w), state.space.element_bbox(w))
+        else {
+            continue;
+        };
+        if !geo.overlaps(bbox) {
+            continue;
+        }
+        let loc = (loc - w.geometry().loc - geo.loc).to_physical_precise_round(scale);
+        let (float, clip) = state.stacking(w);
+        let out = if float { &mut floats } else { &mut tiles };
+        let (popups, own) = window_elements(renderer, w, loc, scale);
+        out.extend(popups.into_iter().map(Frame::from));
+        match clip {
+            Some(c) => out.extend(
+                own.into_iter()
+                    .filter_map(|e| CropRenderElement::from_element(e, scale, rect(c)))
+                    .map(Frame::from),
+            ),
+            None => out.extend(own.into_iter().map(Frame::from)),
+        }
+    }
+    (floats, tiles)
+}
+
+/// A window's popups and its own surface tree, top first, as `Window` renders them.
+fn window_elements<R>(
+    renderer: &mut R,
+    w: &Window,
+    loc: Point<i32, smithay::utils::Physical>,
+    scale: f64,
+) -> (
+    Vec<WaylandSurfaceRenderElement<R>>,
+    Vec<WaylandSurfaceRenderElement<R>>,
+)
+where
+    R: Renderer + ImportAll,
+    R::TextureId: Texture + Clone + Send + 'static,
+{
+    let WindowSurface::Wayland(t) = w.underlying_surface() else {
+        let own = AsRenderElements::<R>::render_elements(w, renderer, loc, scale.into(), 1.0);
+        return (Vec::new(), own);
+    };
+    let surface = t.wl_surface();
+    let popups = PopupManager::popups_for_surface(surface)
+        .flat_map(|(popup, offset)| {
+            let offset =
+                (w.geometry().loc + offset - popup.geometry().loc).to_physical_precise_round(scale);
+            render_elements_from_surface_tree(
+                renderer,
+                popup.wl_surface(),
+                loc + offset,
+                scale,
+                1.0,
+                Kind::Unspecified,
+            )
+        })
+        .collect();
+    let own =
+        render_elements_from_surface_tree(renderer, surface, loc, scale, 1.0, Kind::Unspecified);
+    (popups, own)
+}
+
+/// The output's upper layer surfaces, and its lower layers, top first. While a window is
+/// fullscreen there, the Top layer (the taskbar) is left out.
 fn surfaces<R>(
     renderer: &mut R,
     state: &Navi,
     output: &Output,
-    geo: Rectangle<i32, smithay::utils::Logical>,
     scale: f64,
 ) -> (
     Vec<WaylandSurfaceRenderElement<R>>,
@@ -386,16 +496,8 @@ where
         false => &[Layer::Overlay, Layer::Top],
     };
     let panels = layers(renderer, &map, upper, scale);
-    let mut out = state
-        .space
-        .render_elements_for_region(renderer, &geo, scale, 1.0);
-    out.extend(layers(
-        renderer,
-        &map,
-        &[Layer::Bottom, Layer::Background],
-        scale,
-    ));
-    (panels, out)
+    let lower = layers(renderer, &map, &[Layer::Bottom, Layer::Background], scale);
+    (panels, lower)
 }
 
 /// The surfaces on `which` layers, in that order, the most recently mapped first.
@@ -461,8 +563,18 @@ mod tests {
         assert_eq!(at(Part::Pointer), 0);
         assert!(at(Part::Panels) < at(Part::Glyphs));
         assert!(
+            at(Part::Panels) < at(Part::FloatGlyphs),
+            "floats below navi"
+        );
+        assert!(
             at(Part::Glyphs) < at(Part::Decorations),
             "buttons on their bar"
+        );
+        assert!(at(Part::FloatGlyphs) < at(Part::FloatDecorations));
+        assert!(at(Part::FloatDecorations) < at(Part::Floats));
+        assert!(
+            at(Part::Floats) < at(Part::Glyphs),
+            "floats above every tile's decorations"
         );
         assert!(at(Part::Decorations) < at(Part::Windows));
     }

@@ -55,8 +55,8 @@ use smithay::{
                 WlrLayerShellHandler, WlrLayerShellState,
             },
             xdg::{
-                PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
-                XdgToplevelSurfaceData,
+                PopupSurface, PositionerState, SurfaceCachedState, ToplevelSurface,
+                XdgShellHandler, XdgShellState, XdgToplevelSurfaceData,
                 decoration::{XdgDecorationHandler, XdgDecorationState},
             },
         },
@@ -71,7 +71,7 @@ use tracing::{info, warn};
 use crate::CalloopData;
 use crate::activation::{self, may_issue, may_redeem};
 use crate::focus::{Focus, Handoff};
-use crate::layout::{self, Decor, Drag, Layout, Rect, WinId, decoration};
+use crate::layout::{self, Decor, Drag, Fit, Layout, Rect, WinId, decoration};
 use crate::monitors::{BarHover, Hover};
 use crate::persist::{self, Store};
 use crate::toplevels::{self, Toplevels};
@@ -80,12 +80,17 @@ use smithay::wayland::seat::WaylandFocus;
 use smithay::wayland::xwayland_shell::XWaylandShellState;
 use smithay::xwayland::{X11Wm, XWaylandClientData};
 
+/// A surface under the pointer, and where its origin is.
+type Under = (WlSurface, Point<f64, Logical>);
+
 /// A toplevel navi knows about. It's unmapped until its first commit, when its app ID is known.
 pub struct Managed {
     pub window: Window,
     /// `None` for dialogs, which float over their parent.
     pub tile: Option<WinId>,
     pub(crate) last_size: Size<i32, Logical>,
+    /// The geometry and clip rect last logged as clipped.
+    pub(crate) clipped: Option<(Size<i32, Logical>, Rect)>,
     /// Asked for fullscreen before it was placed.
     pub(crate) want_fullscreen: bool,
     /// Left fullscreen by Super+Esc: its fullscreen requests are refused until the user next
@@ -275,17 +280,43 @@ impl Navi {
         px(self.pointer_location())
     }
 
-    fn window_surface_under(
-        &self,
-        pos: Point<f64, Logical>,
-    ) -> Option<(WlSurface, Point<f64, Logical>)> {
-        self.space
-            .element_under(pos)
-            .and_then(|(window, location)| {
-                window
-                    .surface_under(pos - location.to_f64(), WindowSurfaceType::ALL)
-                    .map(|(s, p)| (s, (p + location).to_f64()))
+    fn window_surface_under(&self, pos: Point<f64, Logical>) -> Option<Under> {
+        self.window_under(pos).map(|(_, under)| under)
+    }
+
+    /// The window at `pos` and its surface there, top down: floats and their dialogs above the
+    /// rest. A window's own surfaces take input only inside its clip rect; its popups anywhere.
+    pub fn window_under(&self, pos: Point<f64, Logical>) -> Option<(&Window, Under)> {
+        let under = |w: &Window, clip: Option<Rect>| -> Option<Under> {
+            let loc = self.space.element_location(w)? - w.geometry().loc;
+            let at = pos - loc.to_f64();
+            let own = WindowSurfaceType::TOPLEVEL | WindowSurfaceType::SUBSURFACE;
+            let inside = clip.is_none_or(|c| c.contains(px(pos)));
+            let (s, p) = w
+                .surface_under(at, WindowSurfaceType::POPUP)
+                .or_else(|| inside.then(|| w.surface_under(at, own)).flatten())?;
+            Some((s, (p + loc).to_f64()))
+        };
+        let pass = |floats: bool| {
+            self.space.elements().rev().find_map(|w| {
+                let (float, clip) = self.stacking(w);
+                (float == floats)
+                    .then(|| Some((w, under(w, clip)?)))
+                    .flatten()
             })
+        };
+        pass(true).or_else(|| pass(false))
+    }
+
+    /// Whether `w` stacks with the floats (a float or a float's dialog), and the rect its own
+    /// surfaces are drawn and hit inside; dialogs have none.
+    pub fn stacking(&self, w: &Window) -> (bool, Option<Rect>) {
+        let Some(m) = self.windows.iter().find(|m| &m.window == w) else {
+            return (false, None);
+        };
+        let owner = self.owner(m).and_then(|id| self.layout.tile(id));
+        let clip = m.tile.and_then(|id| self.layout.clip(id));
+        (owner.is_some_and(|t| t.floating), clip)
     }
 
     /// The topmost layer surface at `pos` on one of `layers`, and the surface under `pos` in it.
@@ -314,8 +345,7 @@ impl Navi {
     /// zone or window in between.
     pub fn layer_at(&self, pos: Point<f64, Logical>) -> Option<LayerSurface> {
         let lower = || {
-            let clear =
-                self.layout.hit(px(pos)).is_none() && self.space.element_under(pos).is_none();
+            let clear = self.layout.hit(px(pos)).is_none() && self.window_under(pos).is_none();
             clear.then(|| self.layer_under(pos, [Layer::Bottom, Layer::Background]))?
         };
         self.layer_under(pos, [Layer::Overlay, Layer::Top])
@@ -652,6 +682,11 @@ impl Navi {
             .windows
             .iter()
             .find(|m| window_surface(&m.window).as_ref() == Some(&focus))?;
+        self.owner(m)
+    }
+
+    /// `m`'s tile, or a dialog's parent's.
+    fn owner(&self, m: &Managed) -> Option<WinId> {
         if m.tile.is_some() {
             return m.tile;
         }
@@ -1061,7 +1096,14 @@ impl Navi {
                 .get_pointer()
                 .map(|p| p.current_location().to_i32_round())
                 .unwrap_or_default();
-            if let Some((id, step)) = self.layout.place(&app, (pointer.x, pointer.y)) {
+            let (min, max) = size_hints(surface.wl_surface());
+            let hints = layout::Hints::new(min, max);
+            let decorated = mode == Some(Decor::Server);
+            let at = (pointer.x, pointer.y);
+            if let Some((id, step)) = self.layout.place_with(&app, at, hints, decorated) {
+                if hints != layout::Hints::default() {
+                    info!(app, id, min = ?hints.min, max = ?hints.max, "client size hints");
+                }
                 self.windows[idx].tile = Some(id);
                 if self.windows[idx].want_fullscreen {
                     self.layout.fullscreen(id);
@@ -1081,6 +1123,9 @@ impl Navi {
                 let tile = self.layout.tile(id).map(|t| (t.output.clone(), t.cells));
                 let rect = self.layout.rect(id);
                 info!(app, id, ?step, ?tile, ?rect, "placed");
+                if step == layout::Step::Floating {
+                    info!(app, id, min = ?hints.min, max = ?hints.max, ?rect, "floating: no tile fits");
+                }
                 self.memory.sync(&self.layout);
             }
         }
@@ -1092,6 +1137,66 @@ impl Navi {
         let window = self.windows[idx].window.clone();
         if self.space.element_location(&window).is_some() {
             self.focus(Some(window));
+        }
+    }
+
+    /// After a commit of `root`: refits a placed xdg toplevel whose min/max size changed, and logs
+    /// a geometry larger than its clip rect once per change of either.
+    fn refit(&mut self, root: &WlSurface) {
+        let Some(m) = self
+            .windows
+            .iter()
+            .find(|m| window_surface(&m.window).as_ref() == Some(root))
+        else {
+            return;
+        };
+        let (Some(id), app) = (m.tile, window_app(&m.window)) else {
+            return;
+        };
+        if m.window.toplevel().is_some() {
+            let (min, max) = size_hints(root);
+            let fit = self.layout.set_hints(id, min, max);
+            if fit != Fit::Unchanged {
+                let h = self.layout.tile(id).map(|t| t.hints).unwrap_or_default();
+                let (min, max) = (h.min, h.max);
+                info!(app, id, ?min, ?max, ?fit, "client size hints");
+                match &fit {
+                    Fit::Replaced(output, cells) => {
+                        info!(app, id, ?min, ?max, output, ?cells, "re-placed");
+                    }
+                    Fit::Tiled(output, cells) => {
+                        info!(app, id, ?min, ?max, output, ?cells, "tiled again");
+                    }
+                    Fit::Floated => {
+                        let rect = self.layout.rect(id);
+                        info!(app, id, ?min, ?max, ?rect, "floating: no tile fits");
+                    }
+                    Fit::Unchanged | Fit::Fits => {}
+                }
+                if matches!(fit, Fit::Replaced(..) | Fit::Tiled(..)) {
+                    self.memory.sync(&self.layout);
+                }
+                self.apply_layout();
+            }
+        }
+        let clip = self.layout.clip(id);
+        let Some(m) = self
+            .windows
+            .iter_mut()
+            .find(|m| window_surface(&m.window).as_ref() == Some(root))
+        else {
+            return;
+        };
+        let size = m.window.geometry().size;
+        let over = clip
+            .filter(|c| size.w > c.w || size.h > c.h)
+            .map(|c| (size, c));
+        if over != m.clipped {
+            m.clipped = over;
+            if let Some((size, clip)) = over {
+                let (w, h, clip_w, clip_h) = (size.w, size.h, clip.w, clip.h);
+                info!(app, id, w, h, clip_w, clip_h, "clipped");
+            }
         }
     }
 
@@ -1252,6 +1357,15 @@ pub fn set_identity(output: &Output, id: String) {
 const BAR: &str = "navi-bar";
 
 /// The logical pixel containing `p`.
+/// A toplevel's committed min and max size, untrusted.
+fn size_hints(s: &WlSurface) -> ((i32, i32), (i32, i32)) {
+    with_states(s, |states| {
+        let mut cached = states.cached_state.get::<SurfaceCachedState>();
+        let c = cached.current();
+        ((c.min_size.w, c.min_size.h), (c.max_size.w, c.max_size.h))
+    })
+}
+
 pub fn px(p: Point<f64, Logical>) -> (i32, i32) {
     (p.x.floor() as i32, p.y.floor() as i32)
 }
@@ -1316,6 +1430,7 @@ impl CompositorHandler for Navi {
                     info!(app, w = size.w, h = size.h, "client committed size");
                 }
             }
+            self.refit(&root);
         }
 
         if let Some(idx) = self.windows.iter().position(|m| {
@@ -1423,6 +1538,7 @@ impl XdgShellHandler for Navi {
             window: Window::new_wayland_window(surface),
             tile: None,
             last_size: Size::default(),
+            clipped: None,
             want_fullscreen: false,
             escaped: false,
             x11_parent: None,
