@@ -172,6 +172,9 @@ pub struct Navi {
     pub(crate) exclusive: crate::focus::Exclusive<WlSurface, Window>,
     /// navi's last return of the keyboard from a layer to a window, until focus moves again.
     pub(crate) handback: Option<(WlSurface, WlSurface)>,
+    /// Whether the keyboard's holder got it from the user (`Raise::User`): tokens it mints then
+    /// raise as the user would.
+    pub(crate) focus_by_user: bool,
     /// The raise clock, in steps of 2 so an orphan's floor fits just below a raise.
     pub(crate) raises: u64,
     /// The window that held the keyboard when a click gave it to a layer.
@@ -284,6 +287,7 @@ impl Navi {
             exclusive: Default::default(),
             handback: None,
             raises: 0,
+            focus_by_user: false,
             before_layer: Default::default(),
             seat_state,
             popups: PopupManager::default(),
@@ -884,7 +888,7 @@ impl Navi {
             info!(id = ended, by = "bar", "fullscreen left");
             self.guard_fullscreen(ended);
         }
-        self.focus_or_restore(id);
+        self.focus_or_restore(id, Raise::User);
     }
 
     /// Refuses a fullscreen request from a window the user took out of fullscreen.
@@ -1031,7 +1035,7 @@ impl Navi {
 
     /// Focus or restore, from the bar or an activation token: `id` is shown in its group,
     /// restored, uncovered, and gets keyboard focus.
-    pub fn focus_or_restore(&mut self, id: WinId) {
+    pub fn focus_or_restore(&mut self, id: WinId, by: Raise) {
         if self.lock.active {
             return;
         }
@@ -1039,7 +1043,7 @@ impl Navi {
             self.apply_layout();
         }
         if self.layout.visible(id) {
-            self.focus_by(self.window_of(id), Raise::User);
+            self.focus_by(self.window_of(id), by);
         }
     }
 
@@ -1160,7 +1164,12 @@ impl Navi {
                 w.set_activated(false);
             }),
         }
-        if kb.current_focus() != target {
+        let moved = kb.current_focus() != target;
+        // navi's own refocus of the same window keeps what the user gave it.
+        if moved || by == Raise::User {
+            self.focus_by_user = by == Raise::User && target.is_some();
+        }
+        if moved {
             let focus = surface.as_ref().map(|s| match self.tile_of(s) {
                 Some(id) => id.to_string(),
                 None => "dialog".into(),
@@ -1550,8 +1559,8 @@ impl Navi {
         }
     }
 
-    /// Sorts the shown windows into the one stacking order (`dialog::stack_order`): families by
-    /// their newest user raise, so no map or re-show puts a family above a window raised later.
+    /// Sorts the shown windows into the one stacking order (`dialog::ranks`): families by their
+    /// newest raise, so no map or re-show puts a family above a window raised later.
     pub(crate) fn restack(&mut self) {
         let mut wins: Vec<dialog::Stacked> =
             (0..self.windows.len()).map(|i| self.stacked(i)).collect();
@@ -1564,7 +1573,7 @@ impl Navi {
             .unwrap_or(0);
         for (m, w) in self.windows.iter_mut().zip(wins.iter_mut()) {
             if matches!(w.kin, dialog::Kin::Orphan(_)) && m.floor == 0 {
-                m.floor = top.saturating_sub(1).max(1);
+                m.floor = dialog::fresh_floor(top);
                 w.floor = m.floor;
             }
         }
@@ -1737,11 +1746,12 @@ impl Navi {
     pub(crate) fn forget(&mut self, i: usize) -> Managed {
         let mut roots: Vec<Root> = (0..self.windows.len()).map(|j| self.root(j)).collect();
         // Its dialogs keep its family's place only as far as the user raised it.
-        let family = (0..self.windows.len())
-            .filter(|&j| j == i || roots[i] != Root::Orphan && roots[j] == roots[i])
-            .map(|j| self.windows[j].user_rank.max(self.windows[j].floor))
-            .max()
-            .unwrap_or(0);
+        let family = dialog::inherited_floor(
+            (0..self.windows.len())
+                .filter(|&j| j == i || roots[i] != Root::Orphan && roots[j] == roots[i])
+                .map(|j| &self.windows[j])
+                .map(|m| (m.user_rank, m.floor)),
+        );
         let had_keys = self.focused_window().as_ref() == Some(&self.windows[i].window);
         roots.remove(i);
         let gone = self.windows.remove(i);
@@ -1931,6 +1941,9 @@ fn restack_space<E: smithay::desktop::space::SpaceElement + Clone + PartialEq>(
             .for_each(|&i| space.raise_element(&shown[i], false));
     }
 }
+
+/// On an activation token: whether it was minted from a focus the user gave.
+struct UserToken(bool);
 
 /// Whether a focus raises the window to the front of the stacking order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2470,11 +2483,19 @@ impl XdgActivationHandler for Navi {
         let serial = data.serial.as_ref().map(|(s, _)| u32::from(*s));
         let now = u32::from(SERIAL_COUNTER.next_serial());
         let issued = may_issue(serial, since, now);
+        let asker = data
+            .client_id
+            .clone()
+            .and_then(|c| self.display_handle.backend_handle().get_client_data(c).ok());
+        let navi_bar = privileged(asker.as_ref().and_then(|d| d.downcast_ref::<ClientState>()));
+        let user = activation::minted_by_user(navi_bar, self.focus_by_user);
+        data.user_data.insert_if_missing(|| UserToken(user));
         info!(
             app = data.app_id,
             ?serial,
             ?since,
             issued,
+            user,
             "activation token"
         );
         issued
@@ -2505,8 +2526,12 @@ impl XdgActivationHandler for Navi {
         let age = data.timestamp.elapsed();
         match id.filter(|_| may_redeem(first_use, age, focus_kept)) {
             Some(id) => {
-                info!(id, by = "activation", "activate");
-                self.focus_or_restore(id);
+                // Only a token from a focus the user gave raises; any other moves the keyboard
+                // but leaves the stacking order as it is.
+                let user = data.user_data.get::<UserToken>().is_some_and(|t| t.0);
+                info!(id, by = "activation", user, "activate");
+                let by = if user { Raise::User } else { Raise::Not };
+                self.focus_or_restore(id, by);
             }
             None => info!(?id, first_use, ?age, focus_kept, "activation refused"),
         }

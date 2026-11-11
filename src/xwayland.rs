@@ -1310,13 +1310,16 @@ mod tests {
         data.state.layout.activate(id);
         data.state.apply_layout();
         assert!(data.state.space.element_location(&dialog_window).is_some());
-        // A closed dialog that held the keyboard gives it back to its parent.
+        // A closed dialog that held the keyboard gives it back to its parent. navi's own focus
+        // (and the hand-back) raises nothing.
+        let raises = data.state.raises;
         data.state.focus(Some(dialog_window.clone()));
         assert_eq!(data.state.focused_window(), Some(dialog_window.clone()));
         conn.destroy_window(dialog).unwrap();
         conn.flush().unwrap();
         pump(&mut event_loop, &mut data, |d| d.state.windows.len() == 1);
         assert_eq!(data.state.focused_window(), data.state.window_of(id));
+        assert_eq!(data.state.raises, raises, "navi's own focus doesn't raise");
         let menu = conn.generate_id().unwrap();
         conn.create_window(
             smithay::reexports::x11rb::COPY_DEPTH_FROM_PARENT,

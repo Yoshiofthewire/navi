@@ -156,6 +156,21 @@ pub fn ranks(wins: &[Stacked]) -> Vec<Rank> {
         .collect()
 }
 
+/// A new orphan's floor, with nothing inherited: just below `top`, the newest raise of a tile
+/// family. Raises step by 2, so it never ties one.
+pub fn fresh_floor(top: u64) -> u64 {
+    top.saturating_sub(1).max(1)
+}
+
+/// What a closed window's dialogs inherit from its family's `(user_rank, floor)`s: user raises
+/// only, so a window that raised itself by opening hands nothing on.
+pub fn inherited_floor(family: impl Iterator<Item = (u64, u64)>) -> u64 {
+    family
+        .map(|(user, floor)| user.max(floor))
+        .max()
+        .unwrap_or(0)
+}
+
 /// The windows' indices, back to front.
 pub fn stack_order(ranks: &[Rank]) -> Vec<usize> {
     let mut order: Vec<usize> = (0..ranks.len()).collect();
@@ -398,6 +413,29 @@ mod tests {
             },
         ];
         assert_eq!(order(&inherited), [0, 1]);
+    }
+
+    /// Round 6 code: the floors `restack` and `forget` give an orphan. F opened (raise 8, no user
+    /// raise) and closed: its dialog inherits 0 and then gets a fresh floor below the top tile.
+    #[test]
+    fn orphan_floors_come_only_from_user_raises() {
+        let f_family = [(0, 0), (0, 0)];
+        assert_eq!(inherited_floor(f_family.into_iter()), 0);
+        let user_family = [(6, 0), (0, 3)];
+        assert_eq!(inherited_floor(user_family.into_iter()), 6);
+        assert_eq!(inherited_floor(std::iter::empty()), 0);
+        // Top tile raised at 8 (the probe): the orphan sits at 7, below it.
+        assert_eq!(fresh_floor(8), 7);
+        assert_eq!(fresh_floor(0), 1, "never 0, which means unset");
+        let wins = [
+            win(Kin::Tiled(0), false, 8, 8),
+            Stacked {
+                floor: fresh_floor(8),
+                ..win(Kin::Orphan(1), true, 0, 0)
+            },
+            win(Kin::Tiled(2), false, 4, 4),
+        ];
+        assert_eq!(order(&wins), [2, 1, 0]);
     }
 
     /// Round 5 security (s16-xor): an X11 menu rides its parent's family, above its dialogs, and
