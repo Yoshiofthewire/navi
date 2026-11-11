@@ -188,12 +188,14 @@ app that resends them on every commit costs nothing. X11 size hints aren't read.
   again from the main monitor. Floats can't be moved or resized yet.
 - **The clip.** Every tiled or floating window's own surfaces are drawn and take pointer input
   only inside its rect: the clamped tile rect, the float's rect, or the monitor while fullscreen.
-  A popup (menu, tooltip) is drawn and hit only inside the geometry navi configured for it, cut
-  to the monitor it starts on, whatever size of buffer it attaches, so a popup without a grab
-  can't cover or take clicks from the windows around it. A window that draws larger, such as a CSD
+  A popup (menu, tooltip) of a tiled or floating window is kept inside that window's rect: navi
+  slides, flips or shrinks it there when it's placed, and draws and hits it only there, whatever
+  size the app asks for or attaches. So a popup, with or without a grab, can't cover or take
+  input meant for a neighbouring tile. A popup of a dialog is kept on its monitor. A window that draws larger, such as a CSD
   shadow or a buffer bigger than its configure, is cropped there, and a click just outside it
   reaches what's below. So no app draws over, or takes clicks meant for, another tile or navi's
-  zones. Dialogs aren't clipped.
+  zones. Dialogs aren't clipped: a dialog, sized by its app, can still cover neighbouring tiles
+  and take their clicks while it's shown.
 - **Logs.** One `info` line per change: `client size hints` (app, id, min, max and the outcome),
   then `re-placed`, `floating: no tile fits` (and `floating: its minimum is bigger than the
   monitor` when it is) or `tiled again` with the cells or rect, and `clipped`

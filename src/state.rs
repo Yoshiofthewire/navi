@@ -320,11 +320,19 @@ impl Navi {
     }
 
     /// `w`'s popups, top first: each surface, where its tree is drawn (global) and the rect it's
-    /// drawn and hit inside, its configured geometry cut to the output it starts on. What the
-    /// client attaches beyond that is cropped, so a grab-less popup can't cover other windows.
+    /// drawn and hit inside: its configured geometry cut to the rect its window is kept in
+    /// (`popup_bounds`). The client picks a popup's size, so the bound is what stops a popup
+    /// without a grab from covering, or taking input meant for, a neighbouring tile.
     pub fn popups(&self, w: &Window) -> Vec<(WlSurface, Point<i32, Logical>, Rect)> {
-        let (Some(loc), Some(t)) = (self.space.element_location(w), w.toplevel()) else {
+        let (Some(loc), Some(t), Some(bounds)) = (
+            self.space.element_location(w),
+            w.toplevel(),
+            self.popup_bounds(w),
+        ) else {
             return Vec::new();
+        };
+        let add = |a: Point<i32, Logical>, b: Point<i32, Logical>| {
+            Point::from((a.x.saturating_add(b.x), a.y.saturating_add(b.y)))
         };
         let popups = PopupManager::popups_for_surface(t.wl_surface());
         popups
@@ -333,14 +341,24 @@ impl Navi {
                     let d = s.data_map.get::<XdgPopupSurfaceData>()?;
                     Some(d.lock().ok()?.current.geometry.size)
                 })?;
-                let at = loc + offset;
-                let o = self.space.output_under(at.to_f64()).next()?;
-                let g = self.space.output_geometry(o)?;
-                let full = Rect::new(g.loc.x, g.loc.y, g.size.w, g.size.h);
-                let clip = intersect(Rect::new(at.x, at.y, size.w, size.h), full)?;
-                Some((popup.wl_surface().clone(), at - popup.geometry().loc, clip))
+                let at = add(loc, offset);
+                let clip = intersect(Rect::new(at.x, at.y, size.w, size.h), bounds)?;
+                let origin = add(at, Point::from((0, 0)) - popup.geometry().loc);
+                Some((popup.wl_surface().clone(), origin, clip))
             })
             .collect()
+    }
+
+    /// Where `w`'s popups are kept: its tile's or float's clip rect, else (a dialog, a window not
+    /// placed) the output it's on.
+    fn popup_bounds(&self, w: &Window) -> Option<Rect> {
+        if let Some(clip) = self.stacking(w).1 {
+            return Some(clip);
+        }
+        let g = self.space.element_geometry(w)?;
+        let o = self.space.output_under(g.loc.to_f64()).next()?;
+        let g = self.space.output_geometry(o)?;
+        Some(Rect::new(g.loc.x, g.loc.y, g.size.w, g.size.h))
     }
 
     /// Whether `w` stacks with the floats (a float or a float's dialog), and the rect its own
@@ -1347,14 +1365,18 @@ impl Navi {
         let Some(window_geo) = self.space.element_geometry(window) else {
             return;
         };
-        let Some(output) = self.space.output_under(window_geo.loc.to_f64()).next() else {
+        // The popup's own rect is the client's to pick: slide, flip or resize it into its window.
+        let Some(b) = self.popup_bounds(window) else {
             return;
         };
-        let Some(mut target) = self.space.output_geometry(output) else {
-            return;
-        };
-        target.loc -= get_popup_toplevel_coords(&PopupKind::Xdg(popup.clone()));
-        target.loc -= window_geo.loc;
+        // Relative to the popup's parent; its offsets are the client's, so saturating.
+        let up = get_popup_toplevel_coords(&PopupKind::Xdg(popup.clone()));
+        let sub = |v: i32, a: i32, b: i32| v.saturating_sub(a).saturating_sub(b);
+        let (x, y) = (
+            sub(b.x, up.x, window_geo.loc.x),
+            sub(b.y, up.y, window_geo.loc.y),
+        );
+        let target = Rectangle::new((x, y).into(), (b.w, b.h).into());
         popup.with_pending_state(|s| {
             s.geometry = s.positioner.get_unconstrained_geometry(target);
         });
@@ -1464,11 +1486,14 @@ fn refit_wait(
     (due > now).then(|| due - now)
 }
 
-/// `r` cut to `bounds`; `None` if nothing is left.
+/// `r` cut to `bounds`; `None` if nothing is left. `r` is untrusted, so the sums are in i64.
 fn intersect(r: Rect, bounds: Rect) -> Option<Rect> {
+    let end = |a: i32, len: i32| i64::from(a) + i64::from(len);
     let (x, y) = (r.x.max(bounds.x), r.y.max(bounds.y));
-    let w = (r.x + r.w).min(bounds.x + bounds.w) - x;
-    let h = (r.y + r.h).min(bounds.y + bounds.h) - y;
+    let w = end(r.x, r.w).min(end(bounds.x, bounds.w)) - i64::from(x);
+    let h = end(r.y, r.h).min(end(bounds.y, bounds.h)) - i64::from(y);
+    // Inside `bounds`, so these fit.
+    let (w, h) = (i32::try_from(w).ok()?, i32::try_from(h).ok()?);
     (w > 0 && h > 0).then_some(Rect { x, y, w, h })
 }
 
@@ -2015,7 +2040,7 @@ mod tests {
     }
 
     #[test]
-    fn popups_are_cut_to_their_output() {
+    fn popups_are_cut_to_their_bounds() {
         let full = Rect::new(0, 0, 1280, 800);
         let r = Rect::new;
         assert_eq!(
@@ -2028,5 +2053,15 @@ mod tests {
         );
         assert_eq!(intersect(r(1280, 0, 10, 10), full), None);
         assert_eq!(intersect(r(10, 10, 0, 10), full), None);
+        // Client-sized extremes: no overflow.
+        let max = i32::MAX;
+        assert_eq!(
+            intersect(r(12, 0, max, max), full),
+            Some(r(12, 0, 1268, 800))
+        );
+        assert_eq!(intersect(r(max, max, max, max), full), None);
+        assert_eq!(intersect(r(i32::MIN, i32::MIN, max, max), full), None);
+        assert_eq!(intersect(r(-5, -5, max, max), full), Some(full));
+        assert_eq!(intersect(r(0, 0, 10, 10), r(max - 5, 0, max, max)), None);
     }
 }
