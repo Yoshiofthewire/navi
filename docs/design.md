@@ -277,19 +277,19 @@ aspect, gravity, position) are ignored.
   clicks there; clicking the neighbour's window outside it brings the neighbour back on top.
   A new dialog takes the keyboard only if a window of its own family holds it; otherwise it maps
   without it (logged), *waits*, and gets it when the user clicks it, or focuses its parent from
-  the dock or Super+N and then clicks it. A waiting dialog's frame is full accent (1 px), its root's dock icon
-  has an accent dot and, in a tab group, its root's tab an accent line along its bottom, until the
-  dialog is focused. An orphan never takes the keyboard on map. A dialog hides while its root is
-  hidden or minimized, and loses the keyboard; it comes back with it. When a dialog's parent
-  closes, it hangs from that parent's own parent if it had one, else it is an orphan centred in
-  its last bounds. A closed window that had the keyboard gives it back: a dialog to its parent,
-  any other window to the window that had the keyboard right before it. It goes back only if the
-  user gave that focus and the keyboard hasn't moved since, or, for a dialog, if the parent held
-  the keyboard right before the dialog took it and the keyboard hasn't moved since (the parent
-  gets back only what it held). Either way that window must still be visible (not hidden,
-  minimized or wholly covered) on the same monitor, outside the lock; otherwise the keyboard goes
-  to nobody. Every hide (a dialog with its parent, a re-parent to a hidden window, an X11 menu
-  with its parent) takes the keyboard off the hidden window before the next key.
+  the dock or Super+N and then clicks it. A waiting dialog's frame is full accent (1 px), its
+  root's dock icon has an accent dot and, in a tab group, its root's tab an accent line along its
+  bottom, until the dialog is focused. An orphan never takes the keyboard on map. A dialog hides
+  while its root is hidden or minimized, and loses the keyboard; it comes back with it. When a
+  dialog's parent closes, it hangs from that parent's own parent if it had one, else it is an
+  orphan centred in its last bounds. A closed window that had the keyboard gives it back: a dialog
+  to its parent, any other window to the window that had the keyboard right before it. It goes
+  back only if the user gave that focus and the keyboard hasn't moved since, or, for a dialog, if
+  the parent held the keyboard right before the dialog took it and the keyboard hasn't moved since
+  (the parent gets back only what it held). Either way that window must still be visible (not
+  hidden, minimized or wholly covered) on the same monitor, outside the lock; otherwise the
+  keyboard goes to nobody. Every hide (a dialog with its parent, a re-parent to a hidden window,
+  an X11 menu with its parent) takes the keyboard off the hidden window before the next key.
 - **Stacking order.** Windows stack by one rank: the last time they were raised, by the user (a
   click, the dock, Super+N, or an activation whose token came from the dock or from a window the
   user focused) or by opening and taking the keyboard. Any other activation (a token minted by a
