@@ -1795,12 +1795,16 @@ impl Navi {
                 .map(|m| (m.user_rank, m.floor)),
         );
         let had_keys = self.focused_window().as_ref() == Some(&self.windows[i].window);
-        // What the hand-back needs, before the close moves anything.
-        let (user, moves, before) = (
-            self.focus_by_user,
-            self.focus_moves,
-            self.before_focus.take(),
-        );
+        // What the hand-back needs, before the close moves anything. Another window's close
+        // keeps `before_focus`, unless it is that window.
+        let (user, moves) = (self.focus_by_user, self.focus_moves);
+        let before = if had_keys
+            || (self.before_focus.as_ref()).is_some_and(|b| b.0 == self.windows[i].window)
+        {
+            self.before_focus.take()
+        } else {
+            None
+        };
         let outputs = self.space.outputs_for_element(&self.windows[i].window);
         roots.remove(i);
         let gone = self.windows.remove(i);
@@ -1826,27 +1830,44 @@ impl Navi {
         }
         self.recenter_dialogs();
         self.sync_attention();
-        // A closed window that had the keyboard gives it back, only to a focus the user gave:
-        // a dialog to its parent, else to the window that had it just before (`may_hand_back`).
-        let check = |w: &Window, user_gave: bool, moved_since: bool| HandBack {
-            user_gave,
-            moved_since,
-            exposed: self.exposed(w),
-            // (Both on none only in the headless test.)
-            same_output: {
-                let on = self.space.outputs_for_element(w);
-                on.iter().any(|o| outputs.contains(o)) || on.is_empty() && outputs.is_empty()
-            },
-            locked: self.lock.active,
-        };
+        // A closed window that had the keyboard gives it back (`may_hand_back`): a dialog to its
+        // parent, else to the window that had it just before.
         let parent = gone.up.clone().filter(|_| gone.tile.is_none());
         let back = match (parent, before) {
-            (Some(up), _) => Some((up, user, false)),
-            (None, Some((w, user, at))) => Some((w, user, at != moves)),
+            (Some(up), before) => {
+                let held_before = before.as_ref().is_some_and(|b| b.0 == up);
+                let moved_after = before.is_none_or(|b| b.2 != moves);
+                let how = HandBack {
+                    user_gave: user,
+                    held_before,
+                    moved_after,
+                    ..HandBack::default()
+                };
+                Some((up, how))
+            }
+            (None, Some((w, user_gave, at))) => {
+                let how = HandBack {
+                    user_gave,
+                    moved_since: at != moves,
+                    ..HandBack::default()
+                };
+                Some((w, how))
+            }
             (None, None) => None,
         };
-        let back = back.filter(|(w, user, moved)| may_hand_back(check(w, *user, *moved)));
-        if had_keys && let Some((w, ..)) = back {
+        let back = back.filter(|(w, how)| {
+            may_hand_back(HandBack {
+                exposed: self.exposed(w),
+                // (Both on none only in the headless test.)
+                same_output: {
+                    let on = self.space.outputs_for_element(w);
+                    on.iter().any(|o| outputs.contains(o)) || on.is_empty() && outputs.is_empty()
+                },
+                locked: self.lock.active,
+                ..*how
+            })
+        });
+        if had_keys && let Some((w, _)) = back {
             self.focus(Some(w));
         }
         gone
