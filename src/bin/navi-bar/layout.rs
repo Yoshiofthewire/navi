@@ -3,11 +3,11 @@
 use crate::{
     desktop::{Category, Entry},
     menu::{Menu, ROWS, Row},
-    theme::{ACCENT, BAR_BG, BG, DIM, INK, SELECTED},
+    theme::{ACCENT, BAR_BG, DIM, INK, INK_ON_ACCENT, INSET, PANEL_EDGE, Panel, SELECTED},
 };
 
-/// 40 px of dock, floating 8 px above the screen edge.
-pub const BAR_H: i32 = 48;
+/// 40 px of dock, floating `INSET` above the screen edge.
+pub const BAR_H: i32 = DOCK_H + INSET;
 pub const SLOT: i32 = 36;
 const TARGET: i32 = 32;
 pub const ICON: i32 = 24;
@@ -21,8 +21,7 @@ const FOOTER_H: i32 = 32;
 pub const ROW_H: i32 = 36;
 pub const ROW_ICON: i32 = 24;
 pub const PANEL_H: i32 = 2 * PAD + HEADER_H + SEARCH_H + 8 + ROWS as i32 * ROW_H + FOOTER_H;
-const PANEL_GAP: i32 = 8;
-const OUTLINE: u32 = crate::theme::SHELL_EDGE;
+const PANEL_GAP: i32 = INSET;
 pub const MINIMIZED_ALPHA: f32 = 0.45;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,10 +59,19 @@ pub enum IconOf {
     Folder(Category),
     Session(&'static str),
 }
+impl IconOf {
+    /// Folder and session glyphs are UI marks, drawn in INK so they hold 3:1 on any panel and
+    /// scheme; app icons and the logo keep their colours.
+    pub fn tint(self) -> Option<u32> {
+        matches!(self, IconOf::Folder(_) | IconOf::Session(_)).then_some(INK)
+    }
+}
 #[derive(Clone, Debug, PartialEq)]
 pub enum Item {
     Fill(Rect, u32),
     Round(Rect, i32, u32),
+    /// A floating panel: translucent `BAR_BG` with a rim of this colour and width.
+    Panel(Rect, Panel, u32, i32),
     Icon(IconOf, Rect, f32),
     Text(String, Rect, u32),
     Field(String, Rect),
@@ -208,8 +216,7 @@ impl Layout {
     ) -> Vec<Item> {
         let mut out = Vec::new();
         if let (Some(p), Some(m)) = (self.panel(), menu) {
-            out.push(Item::Round(p, 14, OUTLINE));
-            out.push(Item::Round(inset(p, 1), 13, BG));
+            out.push(Item::Panel(p, Panel::Popup, PANEL_EDGE, 1));
             let back = m.folder().is_some() || !m.query().is_empty();
             let mut title = self.header(p);
             if back {
@@ -229,7 +236,9 @@ impl Layout {
             }
             out.push(Item::Text(m.title().into(), title, INK));
             let search = self.search(p);
-            out.push(Item::Round(search, 8, BAR_BG));
+            // A rim gives the field its shape on any panel, high contrast included.
+            out.push(Item::Round(search, 8, PANEL_EDGE));
+            out.push(Item::Round(inset(search, 1), 7, SELECTED));
             out.push(Item::Field(m.query().into(), inset_x(search, 12)));
             if m.rows().next().is_none() {
                 out.push(Item::Text(
@@ -286,7 +295,7 @@ impl Layout {
                             },
                         ));
                         let ink = if hover == Some(Hit::Pin(k)) {
-                            BG
+                            INK_ON_ACCENT
                         } else if pinned {
                             ACCENT
                         } else {
@@ -312,9 +321,9 @@ impl Layout {
                 out.push(Item::Fill(thumb, DIM));
             }
             let footer = Rect {
-                x: p.x + PAD + 4,
+                x: p.x + PAD,
                 y: p.h - PAD - FOOTER_H,
-                w: p.w - 2 * PAD - 8,
+                w: p.w - 2 * PAD,
                 h: FOOTER_H,
             };
             let hint = if message.is_empty() {
@@ -325,8 +334,7 @@ impl Layout {
             out.push(Item::Text(hint.into(), footer, DIM));
         }
         let b = self.bar();
-        out.push(Item::Round(b, 14, OUTLINE));
-        out.push(Item::Round(inset(b, 1), 13, BAR_BG));
+        out.push(Item::Panel(b, Panel::Bar, PANEL_EDGE, 1));
         if hover == Some(Hit::Button) || self.open {
             out.push(Item::Round(self.target(0), 8, SELECTED));
         }
@@ -366,7 +374,7 @@ impl Layout {
                         h: 2,
                     },
                     1,
-                    OUTLINE,
+                    PANEL_EDGE,
                 ));
             }
         }
@@ -384,19 +392,19 @@ fn square(x: i32, r: Rect, size: i32) -> Rect {
         h: size,
     }
 }
-fn inset_x(r: Rect, by: i32) -> Rect {
-    Rect {
-        x: r.x + by,
-        w: r.w - 2 * by,
-        ..r
-    }
-}
 fn inset(r: Rect, by: i32) -> Rect {
     Rect {
         x: r.x + by,
         y: r.y + by,
         w: r.w - 2 * by,
         h: r.h - 2 * by,
+    }
+}
+fn inset_x(r: Rect, by: i32) -> Rect {
+    Rect {
+        x: r.x + by,
+        w: r.w - 2 * by,
+        ..r
     }
 }
 
@@ -407,7 +415,7 @@ mod tests {
     #[test]
     fn compact_dock_and_folders_use_separate_click_targets() {
         let l = Layout::new(3, false);
-        assert_eq!((l.w, l.h), (160, 48));
+        assert_eq!((l.w, l.h), (160, 52));
         assert_eq!(l.bar().h, 40);
         assert_eq!(l.hit(24, 20), Some(Hit::Button));
         assert_eq!(l.hit(60, 20), Some(Hit::Window(0)));
@@ -424,6 +432,18 @@ mod tests {
         assert_eq!(short.hit(short.row(1).x + 4, short.row(1).y + 4), None);
         assert_eq!(Layout::new(0, true).with_rows(0).rows, 1);
     }
+    #[test]
+    fn ac7_dock_and_launcher_float_inset() {
+        assert_eq!(BAR_H, 52);
+        for windows in [0, 3, 12] {
+            let l = Layout::new(windows, false);
+            assert_eq!(l.bar().y + l.bar().h, l.h - INSET);
+            let open = Layout::new(windows, true).with_rows(3);
+            let p = open.panel().unwrap();
+            assert_eq!(p.y + p.h + INSET, open.bar().y);
+        }
+    }
+
     #[test]
     fn launcher_draws_folders_and_explicit_pin_actions() {
         let entries = [Entry {
@@ -469,6 +489,6 @@ mod tests {
                     .any(|i| matches!(i, Item::Text(t, ..) if t == name))
             );
         }
-        assert!(items.iter().any(|i| matches!(i, Item::Round(_, 14, _))));
+        assert!(items.iter().any(|i| matches!(i, Item::Panel(..))));
     }
 }

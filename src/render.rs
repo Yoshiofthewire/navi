@@ -41,17 +41,23 @@ render_elements! {
     Memory=MemoryRenderBufferRenderElement<R>,
 }
 
+/// A window button's glyph texture: whose, which, lit, its px size and the colours it was
+/// drawn in. One buffer per button keeps element ids unique and stable.
+type GlyphKey = (layout::WinId, layout::Button, bool, u32, (u32, u32));
+type Physical = Rectangle<i32, smithay::utils::Physical>;
+
 /// Stable decoration identities let the damage tracker recognize an unchanged desktop.
 #[derive(Default)]
-pub struct Solids(Vec<SolidColorBuffer>);
+pub struct Solids {
+    rects: Vec<SolidColorBuffer>,
+    glyphs: std::collections::HashMap<GlyphKey, MemoryRenderBuffer>,
+}
 
 impl Solids {
-    fn elements(
-        &mut self,
-        rects: Vec<(Rectangle<i32, smithay::utils::Physical>, [f32; 4])>,
-    ) -> Vec<SolidColorRenderElement> {
-        self.0.resize_with(rects.len(), SolidColorBuffer::default);
-        self.0
+    fn elements(&mut self, rects: Vec<(Physical, [f32; 4])>) -> Vec<SolidColorRenderElement> {
+        self.rects
+            .resize_with(rects.len(), SolidColorBuffer::default);
+        self.rects
             .iter_mut()
             .zip(rects)
             .map(|(buffer, (rect, color))| {
@@ -59,6 +65,56 @@ impl Solids {
                 SolidColorRenderElement::from_buffer(buffer, rect.loc, 1.0, 1.0, Kind::Unspecified)
             })
             .collect()
+    }
+
+    /// The window buttons' glyphs; textures of buttons no longer shown are dropped.
+    fn glyphs<R>(
+        &mut self,
+        renderer: &mut R,
+        buttons: Vec<(layout::WinId, layout::Button, bool, Physical)>,
+    ) -> Vec<MemoryRenderBufferRenderElement<R>>
+    where
+        R: Renderer + ImportMem,
+        R::TextureId: Texture + Clone + Send + 'static,
+    {
+        let colours = (theme::resolve(theme::INK), theme::resolve(theme::SELECTED));
+        let mut used = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for (id, b, lit, r) in buttons {
+            let size = r.size.w.max(1) as u32;
+            let key = (id, b, lit, size, colours);
+            used.insert(key);
+            let buffer = match self.glyphs.entry(key) {
+                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    let Some(px) = crate::glyph::button(b, lit, size) else {
+                        continue;
+                    };
+                    e.insert(MemoryRenderBuffer::from_slice(
+                        px.data(),
+                        Fourcc::Abgr8888,
+                        (size as i32, size as i32),
+                        1,
+                        Transform::Normal,
+                        None,
+                    ))
+                }
+            };
+            match MemoryRenderBufferRenderElement::from_buffer(
+                renderer,
+                r.loc.to_f64(),
+                buffer,
+                None,
+                None,
+                None,
+                Kind::Unspecified,
+            ) {
+                Ok(e) => out.push(e),
+                Err(e) => warn!("window button not drawn: {e:?}"),
+            }
+        }
+        self.glyphs.retain(|k, _| used.contains(k));
+        out
     }
 }
 
@@ -162,6 +218,8 @@ where
     let pointer = state.pointer_px();
     let mut out: Vec<Frame<R>> = Vec::new();
     let mut decorations = Vec::new();
+    // Only the square pointer draws over the shell's panels; tile decorations go under them.
+    let mut above_panels = 0;
     let full = layout::Rect {
         x: geo.loc.x,
         y: geo.loc.y,
@@ -190,6 +248,7 @@ where
             }
         }
         Arrow::Square if on_output => {
+            above_panels = 1;
             let r = layout::Rect {
                 x: pointer.0,
                 y: pointer.1,
@@ -212,12 +271,25 @@ where
         .filter(|(r, _)| overlaps(*r, full))
         .map(|(r, color)| (rect(r), color)),
     );
-    out.extend(solids.elements(decorations).into_iter().map(Frame::from));
-    out.extend(
-        surfaces(renderer, state, output, geo, scale)
-            .into_iter()
-            .map(Frame::from),
-    );
+    let buttons = layout::buttons(&state.layout, state.drag.as_ref(), pointer)
+        .into_iter()
+        .filter(|&(.., r, _)| overlaps(r, full))
+        .map(|(id, b, r, lit)| (id, b, lit, rect(r)))
+        .collect();
+    let mut glyphs = solids.glyphs(renderer, buttons);
+    // `Solids::elements` keeps order, and the square pointer is the first decoration.
+    let mut tiles = solids.elements(decorations);
+    let mut pointer: Vec<_> = tiles.drain(..above_panels).collect();
+    let (mut panels, mut windows) = surfaces(renderer, state, output, geo, scale);
+    for part in STACK {
+        match part {
+            Part::Pointer => out.extend(pointer.drain(..).map(Frame::from)),
+            Part::Panels => out.extend(panels.drain(..).map(Frame::from)),
+            Part::Glyphs => out.extend(glyphs.drain(..).map(Frame::from)),
+            Part::Decorations => out.extend(tiles.drain(..).map(Frame::from)),
+            Part::Windows => out.extend(windows.drain(..).map(Frame::from)),
+        }
+    }
     if let Some(w) = wallpaper.as_ref() {
         match wallpaper_element(renderer, w, (geo.size.w, geo.size.h)) {
             Ok(e) => out.push(Frame::from(e)),
@@ -232,6 +304,28 @@ where
     }
     out
 }
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Part {
+    Pointer,
+    /// The Overlay and Top layers: navi-bar's panels.
+    Panels,
+    /// The window buttons on navi's bars.
+    Glyphs,
+    /// navi's tile bars, frames, strips and drag previews.
+    Decorations,
+    /// Windows, their popups and the lower layers.
+    Windows,
+}
+
+/// Top first, above the wallpaper.
+const STACK: [Part; 5] = [
+    Part::Pointer,
+    Part::Panels,
+    Part::Glyphs,
+    Part::Decorations,
+    Part::Windows,
+];
 
 fn overlaps(a: layout::Rect, b: layout::Rect) -> bool {
     a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h
@@ -270,15 +364,18 @@ pub fn send_frames(state: &mut Navi, output: &Output) {
     layers.cleanup();
 }
 
-/// The output's layer surfaces and windows, top first. While a window is fullscreen there, the
-/// Top layer (the taskbar) is left out.
+/// The output's upper layer surfaces, then its windows and lower layers, top first. While a
+/// window is fullscreen there, the Top layer (the taskbar) is left out.
 fn surfaces<R>(
     renderer: &mut R,
     state: &Navi,
     output: &Output,
     geo: Rectangle<i32, smithay::utils::Logical>,
     scale: f64,
-) -> Vec<WaylandSurfaceRenderElement<R>>
+) -> (
+    Vec<WaylandSurfaceRenderElement<R>>,
+    Vec<WaylandSurfaceRenderElement<R>>,
+)
 where
     R: Renderer + ImportAll,
     R::TextureId: Texture + Clone + Send + 'static,
@@ -288,19 +385,17 @@ where
         true => &[Layer::Overlay],
         false => &[Layer::Overlay, Layer::Top],
     };
-    let mut out = layers(renderer, &map, upper, scale);
-    out.extend(
-        state
-            .space
-            .render_elements_for_region(renderer, &geo, scale, 1.0),
-    );
+    let panels = layers(renderer, &map, upper, scale);
+    let mut out = state
+        .space
+        .render_elements_for_region(renderer, &geo, scale, 1.0);
     out.extend(layers(
         renderer,
         &map,
         &[Layer::Bottom, Layer::Background],
         scale,
     ));
-    out
+    (panels, out)
 }
 
 /// The surfaces on `which` layers, in that order, the most recently mapped first.
@@ -359,6 +454,18 @@ where
 mod tests {
     use super::*;
     use smithay::backend::renderer::damage::OutputDamageTracker;
+
+    #[test]
+    fn panels_draw_above_window_bars() {
+        let at = |p| STACK.iter().position(|&q| q == p).unwrap();
+        assert_eq!(at(Part::Pointer), 0);
+        assert!(at(Part::Panels) < at(Part::Glyphs));
+        assert!(
+            at(Part::Glyphs) < at(Part::Decorations),
+            "buttons on their bar"
+        );
+        assert!(at(Part::Decorations) < at(Part::Windows));
+    }
 
     #[test]
     fn static_decorations_have_no_damage_but_moves_colors_and_removal_do() {

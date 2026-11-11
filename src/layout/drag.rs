@@ -1,7 +1,7 @@
 //! Moving and resizing tiles with the mouse and keyboard, as docs/design.md describes.
 
 use super::{
-    COLS, Cells, GAP, Layout, MIN_H, MIN_W, Memory, Output, ROWS, Rect, Tile, WinId,
+    COLS, Cells, GAP, Layout, MIN_H, MIN_W, Memory, Output, ROWS, Rect, STRIP, Tile, WinId,
     bar::{self, Button},
     dist2,
 };
@@ -128,7 +128,7 @@ impl Layout {
         if let Some(&(b, _)) = bar.buttons.iter().find(|(_, r)| r.contains(p)) {
             return Some(Hit::Button(id, b));
         }
-        match bar.tabs.is_empty() {
+        match bar.tabs.is_empty() || p.1 < bar.rect.y {
             true => Some(hit),
             // The 2 px between tabs are no zone.
             false => bar
@@ -188,9 +188,9 @@ impl Layout {
             Hit::Edge(_, Side::Top) if t.cells.row == 0 => return None,
             Hit::Edge(_, Side::Top) => Rect {
                 x: r.x,
-                y: c.y - GAP / 2,
+                y: c.y - (GAP - STRIP),
                 w: r.w,
-                h: GAP / 2,
+                h: GAP - STRIP,
             },
         })
     }
@@ -860,7 +860,7 @@ pub fn overlay(
                 _ if *tab => l.tile(*id).is_some_and(|t| t.decorated),
                 _ => l.has_bar(*id),
             };
-            let top = if bar { super::BAR } else { GAP };
+            let top = STRIP + if bar { super::BAR } else { 0 };
             let alpha = if held { TAB_ALPHA } else { PREVIEW_ALPHA };
             // A tab can't swap, so over a tile only a hold that will tab shows where it lands.
             let target = match target {
@@ -900,7 +900,11 @@ pub fn overlay(
         }
         let tabbed = l.group(t.id).len() > 1;
         if t.minimized && !tabbed {
-            out.extend(l.zone(Hit::Strip(t.id)).map(|z| (z, rgba(MINIMIZED, 1.0))));
+            let z = l
+                .bar(t.id)
+                .map(|b| b.rect)
+                .or_else(|| l.zone(Hit::Strip(t.id)));
+            out.extend(z.map(|z| (z, rgba(MINIMIZED, 1.0))));
         } else if let Some(b) = l.bar(t.id) {
             out.extend(bar::draw(l, t.id, &b, hover));
         }
@@ -931,6 +935,25 @@ pub fn overlay(
         }
     }
     out
+}
+
+/// Every shown bar's window buttons, and whether each is lit: under the pointer, or pressed.
+pub fn buttons(l: &Layout, drag: Option<&Drag>, p: (i32, i32)) -> Vec<(WinId, Button, Rect, bool)> {
+    let hover = match drag.map(|d| &d.0) {
+        None => l.hit(p),
+        Some(State::Armed { hit, .. }) => Some(*hit),
+        Some(_) => None,
+    };
+    l.tiles
+        .iter()
+        .filter(|t| l.active(t.id) == Some(t.id) && !l.covered(t) && !t.fullscreen)
+        .filter_map(|t| Some((t.id, l.bar(t.id)?)))
+        .flat_map(|(id, bar)| {
+            bar.buttons
+                .into_iter()
+                .map(move |(b, r)| (id, b, r, hover == Some(Hit::Button(id, b))))
+        })
+        .collect()
 }
 
 /// `px` wide rects around `r`, just outside it: top, bottom, left, right.
@@ -1129,18 +1152,18 @@ pub(super) mod tests {
     #[test]
     fn ac1_hit_zones_are_gap_px() {
         let l = halves();
-        // a's window spans x 4..1716, y 8..1436; b's starts at x 1724.
+        // a's window spans x 6..1714, y 8..1436; b's starts at x 1726.
         assert_eq!(l.hit(A_STRIP), Some(Hit::Strip(0)));
-        assert_eq!(l.hit((1715, 7)), Some(Hit::Strip(0)));
+        assert_eq!(l.hit((1713, 7)), Some(Hit::Strip(0)));
         assert_eq!(l.hit((1720, 700)), Some(Hit::Edge(1, Side::Left)));
-        assert_eq!(l.hit((1723, 700)), Some(Hit::Edge(1, Side::Left)));
-        assert_eq!(l.hit((1716, 700)), Some(Hit::Edge(0, Side::Right)));
+        assert_eq!(l.hit((1725, 700)), Some(Hit::Edge(1, Side::Left)));
+        assert_eq!(l.hit((1714, 700)), Some(Hit::Edge(0, Side::Right)));
         assert_eq!(l.hit((1719, 700)), Some(Hit::Edge(0, Side::Right)));
-        assert_eq!(l.hit((500, 1437)), Some(Hit::Edge(0, Side::Bottom)));
+        assert_eq!(l.hit((500, 1436)), Some(Hit::Edge(0, Side::Bottom)));
         assert_eq!(l.hit((500, 700)), None);
-        assert_eq!(l.hit((4, 8)), None);
+        assert_eq!(l.hit((6, 8)), None);
         for x in 0..3440 {
-            for y in 0..GAP {
+            for y in 0..STRIP {
                 assert!(!matches!(l.hit((x, y)), Some(Hit::Edge(_, Side::Top))));
             }
         }
@@ -1149,6 +1172,86 @@ pub(super) mod tests {
         assert_eq!(l.hit((500, 718)), Some(Hit::Edge(0, Side::Bottom)));
         assert_eq!(l.hit((2500, 718)), Some(Hit::Edge(2, Side::Top)));
         assert_eq!(l.hit((-5, -5)), None);
+    }
+
+    /// AC4 (visual pass): 12 px between windows and to the zone's edges, every gap px one zone.
+    #[test]
+    fn ac4_tiles_are_gap_px_apart_and_every_gap_px_is_a_zone() {
+        use crate::wallpaper::usable_area;
+        let quarters = [
+            c(0, 0, 12, 6),
+            c(12, 0, 12, 6),
+            c(0, 6, 12, 6),
+            c(12, 6, 12, 6),
+        ];
+        for (w, h) in [(3440, 1440), (3840, 2160), (1125, 703)] {
+            let full = Rect { x: 0, y: 0, w, h };
+            // A 44 px band and a 52 px dock.
+            let zone = Rect {
+                y: 44,
+                h: h - 96,
+                ..full
+            };
+            let o = Output {
+                area: usable_area(full, zone),
+                full,
+                ..uw()
+            };
+            for decorated in [false, true] {
+                let mut l = Layout {
+                    outputs: vec![o.clone()],
+                    ..with(&quarters)
+                };
+                for id in 0..4 {
+                    l.set_decorated(id, decorated);
+                }
+                let [a, b, c, d] = [0, 1, 2, 3].map(|id| l.rect(id).unwrap());
+                let top = |id| l.bar(id).map_or(l.rect(id).unwrap().y, |bar| bar.rect.y);
+                let name = format!("{w}x{h} decorated {decorated}");
+                // Between windows, or a window and the bar of the one below it.
+                assert_eq!(b.x - (a.x + a.w), GAP, "{name}");
+                assert_eq!(top(2) - (a.y + a.h), GAP, "{name}");
+                assert_eq!(top(3) - (b.y + b.h), GAP, "{name}");
+                for id in 0..4 {
+                    let (cells, r) = l.frame(id).unwrap();
+                    let above = match decorated {
+                        true => (l.bar(id).unwrap().rect.y - cells.y, r.y - top(id)),
+                        false => (r.y - cells.y, 0),
+                    };
+                    assert_eq!(
+                        above,
+                        (STRIP, if decorated { super::super::BAR } else { 0 }),
+                        "{name}"
+                    );
+                }
+                // To the screen edges and the panels' zones.
+                assert_eq!(a.x - zone.x, GAP, "{name}");
+                assert_eq!(zone.x + zone.w - (b.x + b.w), GAP, "{name}");
+                assert_eq!(top(0) - zone.y, GAP, "{name}");
+                assert_eq!(zone.y + zone.h - (d.y + d.h), GAP, "{name}");
+                assert_eq!(c.x, a.x, "{name}");
+                // Each px between the windows, inside the grid, is exactly one zone.
+                let g = o.area;
+                let in_window = |p| [a, b, c, d].iter().any(|r| r.contains(p));
+                for x in g.x..g.x + g.w {
+                    for y in g.y..g.y + g.h {
+                        let p = (x, y);
+                        match in_window(p) {
+                            // Sampled: a hit test per window px is slow.
+                            true if (x + y) % 61 == 0 => assert_eq!(l.hit(p), None, "{name} {p:?}"),
+                            true => {}
+                            false => assert!(l.hit(p).is_some(), "{name} {p:?}"),
+                        }
+                    }
+                }
+                // Edge zones are the 6 px side gaps and the 4 px below.
+                let zone_of = |side| l.zone(Hit::Edge(0, side)).unwrap();
+                assert_eq!(zone_of(Side::Left).w, GAP / 2, "{name}");
+                assert_eq!(zone_of(Side::Right).w, GAP / 2, "{name}");
+                assert_eq!(zone_of(Side::Bottom).h, GAP - STRIP, "{name}");
+                assert_eq!(l.zone(Hit::Edge(2, Side::Top)).unwrap().h, GAP - STRIP);
+            }
+        }
     }
 
     #[test]
@@ -1301,9 +1404,10 @@ pub(super) mod tests {
 
     #[test]
     fn ac7_dragging_a_tab_moves_only_that_tab() {
-        // Job 003: the bar is all tabs, and A_STRIP is in tile 0's.
+        // Job 003: the bar is all tabs, and this point is in tile 0's, below the strip.
         let mut l = with(&[c(0, 0, 12, 12), c(0, 0, 12, 12)]);
-        assert_eq!(drag(&mut l, A_STRIP, &[((3000, 700), 0)]), Some("untabbed"));
+        let tab0 = (100, STRIP + 4);
+        assert_eq!(drag(&mut l, tab0, &[((3000, 700), 0)]), Some("untabbed"));
         assert_eq!(at(&l, 0), c(12, 0, 12, 12));
         assert_eq!(at(&l, 1), c(0, 0, 12, 12));
     }
@@ -2069,10 +2173,10 @@ pub(super) mod tests {
         let mut l = halves();
         assert!(zones(&l, None, (500, 700), 0).is_empty());
         let strip = Rect {
-            x: 4,
+            x: 6,
             y: 0,
-            w: 1712,
-            h: GAP,
+            w: 1708,
+            h: STRIP,
         };
         assert_eq!(zones(&l, None, A_STRIP, 0), vec![(strip, accent(1.0))]);
         assert_eq!(
@@ -2109,7 +2213,7 @@ pub(super) mod tests {
         assert_eq!(preview_at(1499).0, uw().tile_rect(c(12, 0, 12, 12)));
         assert_eq!(
             preview_at(1500).0,
-            uw().window_rect(c(12, 0, 12, 12), super::super::BAR)
+            uw().window_rect(c(12, 0, 12, 12), STRIP + super::super::BAR)
         );
     }
 
@@ -2162,7 +2266,7 @@ pub(super) mod tests {
 
         // A hovered strip is in front of its tile's frame.
         let o = overlay(&l, None, A_STRIP, 0, Some(0));
-        let strip = o.iter().position(|&(r, _)| r.h == GAP).unwrap();
+        let strip = o.iter().position(|&(r, _)| r.h == STRIP).unwrap();
         let frame = o
             .iter()
             .position(|&(r, _)| r.w.min(r.h) == FOCUS_PX)

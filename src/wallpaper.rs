@@ -8,7 +8,7 @@ use std::rc::Rc;
 use tracing::{info, warn};
 
 use crate::image::{self, Image};
-use crate::layout::Rect;
+use crate::layout::{Rect, grid_in};
 use crate::{files, persist};
 
 const HEADER: &str = "navi-wallpaper 1";
@@ -201,15 +201,16 @@ pub fn cover(img_w: i32, img_h: i32, out_w: i32, out_h: i32) -> Rect {
     }
 }
 
-/// The grid's area: what layer surfaces leave of the output, unless that is under half the
-/// output either way or not inside it, so a client's exclusive zone can't squeeze the grid away.
+/// The grid's area: inside what layer surfaces leave of the output, unless that is under half
+/// the output either way or not inside it, so a client's exclusive zone can't squeeze the grid away.
 pub fn usable_area(output: Rect, non_exclusive: Rect) -> Rect {
     let o = output;
     let n = non_exclusive;
     let inside = n.x >= o.x && n.y >= o.y && n.x + n.w <= o.x + o.w && n.y + n.h <= o.y + o.h;
-    match inside && n.w * 2 >= o.w && n.h * 2 >= o.h {
-        true => n,
-        false => o,
+    let g = grid_in(n);
+    match inside && g.w * 2 >= o.w && g.h * 2 >= o.h {
+        true => g,
+        false => grid_in(o),
     }
 }
 
@@ -543,22 +544,24 @@ screenMapping=
     }
 
     #[test]
-    fn usable_area_keeps_half_the_output() {
+    fn ac5_usable_area_insets_the_zone_and_keeps_half_the_output() {
         let o = rect(0, 0, 1920, 1080);
-        assert_eq!(
-            usable_area(o, rect(0, 0, 1920, 1040)),
-            rect(0, 0, 1920, 1040)
-        );
-        assert_eq!(usable_area(o, rect(0, 0, 1920, 500)), o);
-        assert_eq!(usable_area(o, rect(0, 0, 900, 1080)), o);
-        assert_eq!(usable_area(o, rect(0, 0, 960, 540)), rect(0, 0, 960, 540));
-        assert_eq!(usable_area(o, rect(2000, 0, 1920, 1040)), o);
-        assert_eq!(usable_area(o, rect(0, 100, 1920, 1040)), o);
-        assert_eq!(usable_area(o, rect(0, 0, 0, 0)), o);
+        let whole = rect(6, 4, 1908, 1068);
+        // A 44 px band and a 52 px dock: 6 px in at the sides, 4 at the top, 8 at the bottom.
+        let zone = rect(0, 44, 1920, 1080 - 44 - 52);
+        assert_eq!(usable_area(o, zone), rect(6, 48, 1908, 1080 - 48 - 60));
+        // Oversized zones: the floor applies to the inset grid.
+        assert_eq!(usable_area(o, rect(0, 0, 1920, 500)), whole);
+        assert_eq!(usable_area(o, rect(0, 0, 900, 1080)), whole);
+        assert_eq!(usable_area(o, rect(0, 0, 966, 552)), whole);
+        assert_eq!(usable_area(o, rect(0, 0, 972, 552)), rect(6, 4, 960, 540));
+        assert_eq!(usable_area(o, rect(2000, 0, 1920, 1040)), whole);
+        assert_eq!(usable_area(o, rect(0, 100, 1920, 1040)), whole);
+        assert_eq!(usable_area(o, rect(0, 0, 0, 0)), whole);
         let off = rect(3440, 0, 3840, 2160);
         assert_eq!(
-            usable_area(off, rect(3440, 40, 3840, 2120)),
-            rect(3440, 40, 3840, 2120)
+            usable_area(off, rect(3440, 44, 3840, 2116)),
+            rect(3446, 48, 3828, 2104)
         );
     }
 

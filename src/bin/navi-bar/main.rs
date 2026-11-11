@@ -103,8 +103,6 @@ static TEXT_SIZE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::n
 const TOKEN_WAIT: Duration = Duration::from_secs(1);
 /// The status band across the top of the main output.
 const BAND_H: i32 = session::BAND_H;
-/// Between the status text and the band's right edge, and the cards and the output's edges.
-const EDGE: i32 = 8;
 const POWER: &str = "/sys/class/power_supply";
 
 fn main() {
@@ -270,7 +268,11 @@ fn run() -> Result<(), String> {
         band_w: 0,
         status: String::new(),
         battery: None,
-        session: session::Menu::default(),
+        session: session::Menu {
+            full: dbus::wants_export(var("NAVI_EXPORT_ENV").as_deref()),
+            ..Default::default()
+        },
+        session_since: 0,
         control,
         band_hover: false,
         session_tx,
@@ -356,6 +358,8 @@ fn band_layer(
     let surface = compositor.create_surface(qh);
     let band = layer_shell.create_layer_surface(qh, surface, Layer::Top, Some("navi-status"), None);
     band.set_anchor(Anchor::TOP | Anchor::LEFT | Anchor::RIGHT);
+    let [top, right, bottom, left] = session::BAND_MARGIN;
+    band.set_margin(top, right, bottom, left);
     band.set_size(0, BAND_H as u32);
     band.set_exclusive_zone(BAND_H);
     band.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
@@ -388,6 +392,8 @@ struct Bar {
     status: String,
     battery: Option<status::Battery>,
     session: session::Menu,
+    /// When the session menu opened, in `now_ms`: cards hidden behind it don't expire meanwhile.
+    session_since: u64,
     control: Option<std::sync::Arc<std::sync::Mutex<control::Control>>>,
     band_hover: bool,
     session_tx: channel::Sender<session::Reply>,
@@ -791,7 +797,7 @@ impl Bar {
         }
         for item in items {
             match item {
-                Item::Fill(..) | Item::Round(..) | Item::Text(..) => {
+                Item::Fill(..) | Item::Round(..) | Item::Panel(..) | Item::Text(..) => {
                     paint(&mut canvas, self.font.as_ref(), item, s)
                 }
                 Item::Icon(of, r, alpha) => {
@@ -822,14 +828,7 @@ impl Bar {
                         }
                     };
                     match px {
-                        Some(px) => {
-                            let paint = PixmapPaint {
-                                opacity: alpha,
-                                ..Default::default()
-                            };
-                            let t = Transform::identity();
-                            canvas.draw_pixmap(r.x, r.y, px.as_ref(), &paint, t, None);
-                        }
+                        Some(px) => draw_icon(&mut canvas, px, r, alpha, of.tint()),
                         None => placeholder(&mut canvas, r),
                     }
                 }
@@ -871,6 +870,7 @@ impl Bar {
         if self.session.open {
             self.session.close();
             self.draw_band();
+            self.resume_cards();
         }
     }
 
@@ -880,6 +880,7 @@ impl Bar {
         }
         self.close_menu();
         self.session.open = true;
+        self.session_since = self.now_ms();
         self.session.selected = 0;
         if !self.session.busy {
             self.session.busy = true;
@@ -899,6 +900,7 @@ impl Bar {
             });
         }
         self.draw_band();
+        self.show_cards();
     }
 
     fn session_click(&mut self, hit: session::Hit) {
@@ -970,10 +972,7 @@ impl Bar {
         let h = self.session.height();
         self.band.set_size(0, h as u32);
         if let Ok(region) = Region::new(&self.compositor) {
-            let r = session::BUTTON;
-            region.add(r.x, r.y, r.w, r.h);
-            if self.session.open {
-                let r = self.session.panel();
+            for r in self.session.input() {
                 region.add(r.x, r.y, r.w, r.h);
             }
             self.band
@@ -983,163 +982,46 @@ impl Bar {
         let Some(mut canvas) = Pixmap::new((self.band_w * s) as u32, (h * s) as u32) else {
             return;
         };
-        fill(
-            &mut canvas,
-            Rect {
-                x: 0,
-                y: 0,
-                w: self.band_w * s,
-                h: BAND_H * s,
-            },
-            theme::BAR_BG,
-            1.0,
+        let measured = |text: String| {
+            let w = self
+                .font
+                .as_ref()
+                .map_or(0.0, |f| text_w(f, &text, text_px()));
+            (text, w.ceil() as i32)
+        };
+        let now = jiff::Zoned::now();
+        let clock = measured(
+            now.strftime(if self.band_w < 520 {
+                "%H:%M"
+            } else {
+                "%a %d %b   %H:%M"
+            })
+            .to_string(),
         );
-        if self.session.open || self.band_hover {
-            paint(
-                &mut canvas,
-                self.font.as_ref(),
-                Item::Round(session::BUTTON, 8, theme::SELECTED),
-                s,
-            );
-        }
-        fill(
-            &mut canvas,
-            Rect {
-                x: 0,
-                y: (BAND_H - 1) * s,
-                w: self.band_w * s,
-                h: s,
-            },
-            theme::SHELL_EDGE,
-            1.0,
-        );
-        if let Some(icon) = self.icons.navi((16 * s) as u32) {
-            canvas.draw_pixmap(
-                12 * s,
-                8 * s,
-                icon.as_ref(),
-                &PixmapPaint::default(),
-                Transform::identity(),
-                None,
-            );
-        }
-        if let Some(font) = &self.font {
-            let now = jiff::Zoned::now();
-            let clock = now
-                .strftime(if self.band_w < 520 {
-                    "%H:%M"
-                } else {
-                    "%a %d %b   %H:%M"
-                })
-                .to_string();
-            let w = text_w(font, &clock, text_px()).ceil() as i32;
-            for item in [
-                Item::Text(
-                    "Navi".into(),
-                    Rect {
-                        x: 36,
-                        y: 0,
-                        w: 64,
-                        h: BAND_H,
-                    },
-                    INK,
-                ),
-                Item::Text(
-                    clock,
-                    Rect {
-                        x: (self.band_w - w) / 2,
-                        y: 0,
-                        w: w + 1,
-                        h: BAND_H,
-                    },
-                    INK,
-                ),
-            ] {
-                paint(&mut canvas, Some(font), item, s);
-            }
-            if let Some(b) = self.battery {
-                let text = format!(
-                    "{}{}%",
-                    if b.charging { "Charging  " } else { "" },
-                    b.percent
-                );
-                let w = text_w(font, &text, text_px()).ceil() as i32;
-                let x = self.band_w - 12 - w;
-                paint(
-                    &mut canvas,
-                    Some(font),
-                    Item::Text(
-                        text,
-                        Rect {
-                            x,
-                            y: 0,
-                            w: w + 1,
-                            h: BAND_H,
-                        },
-                        INK,
-                    ),
-                    s,
-                );
-                let r = Rect {
-                    x: x - 27,
-                    y: 11,
-                    w: 18,
-                    h: 10,
-                };
-                for edge in [
-                    Rect { h: 1, ..r },
-                    Rect {
-                        y: r.y + r.h - 1,
-                        h: 1,
-                        ..r
-                    },
-                    Rect { w: 1, ..r },
-                    Rect {
-                        x: r.x + r.w - 1,
-                        w: 1,
-                        ..r
-                    },
-                    Rect {
-                        x: r.x + r.w,
-                        y: r.y + 3,
-                        w: 2,
-                        h: 4,
-                    },
-                ] {
-                    fill(&mut canvas, scaled(edge, s), DIM, 1.0);
+        let battery = self.battery.map(|b| {
+            let (text, w) = measured(format!(
+                "{}{}%",
+                if b.charging { "Charging  " } else { "" },
+                b.percent
+            ));
+            (text, w, b)
+        });
+        let lit = self.session.open || self.band_hover;
+        let band = session::band(self.band_w, lit, clock, battery);
+        for item in band.into_iter().chain(self.session.draw()) {
+            if let Item::Icon(IconOf::Button, r, _) = item {
+                let r = scaled(r, s);
+                if let Some(icon) = self.icons.navi(r.w as u32) {
+                    let (paint, t) = (PixmapPaint::default(), Transform::identity());
+                    canvas.draw_pixmap(r.x, r.y, icon.as_ref(), &paint, t, None);
                 }
-                let charge = Rect {
-                    x: r.x + 2,
-                    y: r.y + 2,
-                    w: (14 * b.percent as i32 / 100).max(1),
-                    h: 6,
-                };
-                fill(
-                    &mut canvas,
-                    scaled(charge, s),
-                    if b.charging { theme::ACCENT } else { INK },
-                    1.0,
-                );
-            }
-        }
-        for item in self.session.draw(self.full_session) {
-            if let Item::Icon(IconOf::Session(name), r, alpha) = item {
+            } else if let Item::Icon(of @ IconOf::Session(name), r, alpha) = item {
                 let r = scaled(r, s);
                 if let Some(icon) =
                     self.icons
                         .get(name, &[name.into(), format!("{name}-symbolic")], r.w as u32)
                 {
-                    canvas.draw_pixmap(
-                        r.x,
-                        r.y,
-                        icon.as_ref(),
-                        &PixmapPaint {
-                            opacity: alpha,
-                            ..Default::default()
-                        },
-                        Transform::identity(),
-                        None,
-                    );
+                    draw_icon(&mut canvas, icon, r, alpha, of.tint());
                 } else {
                     placeholder(&mut canvas, r);
                 }
@@ -1268,19 +1150,7 @@ impl Bar {
                 }
                 self.emit(closed);
                 let at = self.notes.shown().iter().find(|n| n.id == id);
-                let wait = Duration::from_millis(at.map_or(0, |n| n.expires_ms - now));
-                let timer =
-                    self.loop_handle
-                        .insert_source(Timer::from_duration(wait), |_, _, bar| {
-                            let closed = bar.notes.expire(bar.now_ms());
-                            if !closed.is_empty() {
-                                bar.emit(closed);
-                            }
-                            TimeoutAction::Drop
-                        });
-                if let Err(e) = timer {
-                    warn!("notification timer: {e}");
-                }
+                self.expire_at(at.map_or(now, |n| n.expires_ms));
             }
             Call::Close(sender, id) => {
                 let closed = self.notes.close(&sender, id);
@@ -1299,6 +1169,37 @@ impl Bar {
         self.show_cards();
     }
 
+    /// Expires shown notes at `at` ms, or later while the session menu hides them.
+    fn expire_at(&mut self, at: u64) {
+        let wait = Duration::from_millis(at.saturating_sub(self.now_ms()));
+        let timer = self
+            .loop_handle
+            .insert_source(Timer::from_duration(wait), |_, _, bar| {
+                if bar.session.open {
+                    return TimeoutAction::ToDuration(Duration::from_millis(250));
+                }
+                let closed = bar.notes.expire(bar.now_ms());
+                if !closed.is_empty() {
+                    bar.emit(closed);
+                }
+                TimeoutAction::Drop
+            });
+        if let Err(e) = timer {
+            warn!("notification timer: {e}");
+        }
+    }
+
+    /// Shows the cards the session menu hid, giving back the time they were hidden.
+    fn resume_cards(&mut self) {
+        self.notes
+            .delay(self.now_ms().saturating_sub(self.session_since));
+        let expiries: Vec<u64> = self.notes.shown().iter().map(|n| n.expires_ms).collect();
+        for at in expiries {
+            self.expire_at(at);
+        }
+        self.show_cards();
+    }
+
     /// Lays out the shown notifications, creating, resizing or destroying their surface.
     fn show_cards(&mut self) {
         let font = self.font.as_ref();
@@ -1308,7 +1209,13 @@ impl Bar {
             }
             None => Some(text_px() / 2.0),
         };
-        let cards = cards::layout(self.notes.shown(), &advance);
+        // Cards share the session menu's corner; they wait while it's open.
+        let shown = if self.session.open {
+            &[][..]
+        } else {
+            self.notes.shown()
+        };
+        let cards = cards::layout(shown, &advance);
         if cards == self.cards && self.cards_layer.is_some() {
             return;
         }
@@ -1330,7 +1237,8 @@ impl Bar {
                     .layer_shell
                     .create_layer_surface(qh, surface, Layer::Top, ns, None);
                 l.set_anchor(Anchor::TOP | Anchor::LEFT);
-                l.set_margin(EDGE, 0, 0, EDGE);
+                let [top, right, bottom, left] = cards::MARGIN;
+                l.set_margin(top, right, bottom, left);
                 l.set_exclusive_zone(0);
                 l.set_keyboard_interactivity(KeyboardInteractivity::None);
                 self.cards_configured = false;
@@ -1385,6 +1293,9 @@ fn paint(canvas: &mut Pixmap, font: Option<&fontdue::Font>, item: Item, s: i32) 
     match item {
         Item::Fill(r, rgb) => fill(canvas, scaled(r, s), rgb, 1.0),
         Item::Round(r, radius, rgb) => rounded(canvas, scaled(r, s), radius * s, rgb),
+        Item::Panel(r, kind, edge, border) => {
+            panel(canvas, scaled(r, s), kind, edge, border * s, s)
+        }
         Item::Text(text, r, rgb) => {
             if let Some(font) = font {
                 draw_text(canvas, font, &text, scaled(r, s), text_px() * s as f32, rgb);
@@ -1429,11 +1340,48 @@ fn fill(canvas: &mut Pixmap, r: Rect, rgb: u32, alpha: f32) {
 
 /// Rounded shell surfaces, rendered with the rasterizer already used for icons.
 fn rounded(canvas: &mut Pixmap, r: Rect, radius: i32, rgb: u32) {
+    let mut path = tiny_skia::PathBuilder::new();
+    round_rect(&mut path, r, radius);
+    fill_path(canvas, path, rgb, 1.0);
+}
+
+/// A floating panel: translucent body, opaque `border` px rim, both following the corners.
+fn panel(canvas: &mut Pixmap, r: Rect, kind: theme::Panel, edge: u32, border: i32, s: i32) {
+    let radius = theme::RADIUS * s;
+    let mut body = tiny_skia::PathBuilder::new();
+    round_rect(&mut body, r, radius);
+    fill_path(canvas, body, theme::BAR_BG, theme::panel_alpha(kind));
+    let mut rim = tiny_skia::PathBuilder::new();
+    round_rect(&mut rim, r, radius);
+    let inner = Rect {
+        x: r.x + border,
+        y: r.y + border,
+        w: r.w - 2 * border,
+        h: r.h - 2 * border,
+    };
+    round_rect(&mut rim, inner, radius - border);
+    fill_path(canvas, rim, edge, 1.0);
+}
+
+/// Even-odd, so a second contour inside the first cuts it out.
+fn fill_path(canvas: &mut Pixmap, path: tiny_skia::PathBuilder, rgb: u32, alpha: f32) {
+    if let Some(path) = path.finish() {
+        let mut paint = Paint::default();
+        paint.set_color(color(rgb, alpha));
+        let rule = tiny_skia::FillRule::EvenOdd;
+        canvas.fill_path(&path, &paint, rule, Transform::identity(), None);
+    }
+}
+
+/// Adds `r` with rounded corners to `path` as one closed contour.
+fn round_rect(path: &mut tiny_skia::PathBuilder, r: Rect, radius: i32) {
     let (x, y, w, h) = (r.x as f32, r.y as f32, r.w as f32, r.h as f32);
+    if w <= 0.0 || h <= 0.0 {
+        return;
+    }
     let radius = (radius as f32).min(w / 2.0).min(h / 2.0).max(0.0);
     let k = radius * 0.5522848;
     let (right, bottom) = (x + w, y + h);
-    let mut path = tiny_skia::PathBuilder::new();
     path.move_to(x + radius, y);
     path.line_to(right - radius, y);
     path.cubic_to(
@@ -1465,17 +1413,36 @@ fn rounded(canvas: &mut Pixmap, r: Rect, radius: i32, rgb: u32) {
     path.line_to(x, y + radius);
     path.cubic_to(x, y + radius - k, x + radius - k, y, x + radius, y);
     path.close();
-    if let Some(path) = path.finish() {
-        let mut paint = Paint::default();
-        paint.set_color(color(rgb, 1.0));
-        canvas.fill_path(
-            &path,
-            &paint,
-            tiny_skia::FillRule::Winding,
-            Transform::identity(),
-            None,
-        );
+}
+
+/// `icon` at `r`, its colour replaced by `tint` (its shape kept) when given.
+fn draw_icon(canvas: &mut Pixmap, icon: &Pixmap, r: Rect, alpha: f32, tint: Option<u32>) {
+    let paint = PixmapPaint {
+        opacity: alpha,
+        ..Default::default()
+    };
+    let t = Transform::identity();
+    match tint {
+        Some(rgb) => {
+            let tinted = tinted(icon, rgb);
+            canvas.draw_pixmap(r.x, r.y, tinted.as_ref(), &paint, t, None)
+        }
+        None => canvas.draw_pixmap(r.x, r.y, icon.as_ref(), &paint, t, None),
     }
+}
+
+/// `icon`'s coverage in `rgb`.
+fn tinted(icon: &Pixmap, rgb: u32) -> Pixmap {
+    let mut out = icon.clone();
+    let [_, r, g, b] = theme::resolve(rgb).to_be_bytes();
+    for p in out.pixels_mut() {
+        let a = p.alpha();
+        let k = |c: u8| (u16::from(c) * u16::from(a) / 255) as u8;
+        if let Some(c) = PremultipliedColorU8::from_rgba(k(r), k(g), k(b), a) {
+            *p = c;
+        }
+    }
+    out
 }
 
 /// A dim outlined square where an icon couldn't be found.
@@ -1685,7 +1652,8 @@ impl LayerShellHandler for Bar {
             self.configured = false;
         } else if layer == &self.band {
             info!("status band closed by navi, making a new one");
-            self.session.close();
+            self.band_configured = false; // Nothing draws on the closed band.
+            self.close_session();
             match band_layer(&self.compositor, &self.layer_shell, &self.qh) {
                 Ok(b) => {
                     self.band = b;
@@ -2040,3 +2008,288 @@ delegate_pointer!(Bar);
 delegate_layer!(Bar);
 delegate_registry!(Bar);
 delegate_activation!(Bar, Launch);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use desktop::{Category, Entry};
+    use layout::Hit;
+    use theme::{ACCENT, INSET, ON_FILL, PANEL_EDGE, PANEL_TEXT, Panel};
+
+    fn note(id: u32) -> notify::Note {
+        notify::Note {
+            id,
+            sender: ":1.1".into(),
+            app: "App".into(),
+            summary: "Hi".into(),
+            body: "body".into(),
+            expires_ms: 0,
+            app_id: String::new(),
+            actions: Vec::new(),
+        }
+    }
+
+    /// Every panel in each state that changes its text: dock, launcher, session menu, band, cards.
+    fn every_state() -> Vec<Vec<Item>> {
+        let entries = [Entry {
+            id: "t.desktop".into(),
+            name: "Terminal".into(),
+            icon: None,
+            argv: vec!["t".into()],
+            wm_class: None,
+            category: Category::System,
+        }];
+        let slots = [
+            Slot {
+                focused: true,
+                running: 1,
+                ..Slot::default()
+            },
+            Slot {
+                pinned: true,
+                ..Slot::default()
+            },
+            Slot {
+                minimized: true,
+                running: 2,
+                ..Slot::default()
+            },
+        ];
+        let mut out = Vec::new();
+        for hover in [None, Some(Hit::Button), Some(Hit::Window(0))] {
+            out.push(Layout::new(3, false).draw(&slots, None, &entries, &[], hover, ""));
+        }
+        let open = Layout::new(3, true);
+        let pinned = ["t.desktop".to_string()];
+        let launch = |m: &Menu, hover, pins: &[String], message| {
+            open.draw(&slots, Some(m), &entries, pins, hover, message)
+        };
+        let hovers = [None, Some(Hit::Row(0)), Some(Hit::Pin(0)), Some(Hit::Back)];
+        let mut m = Menu::new(&entries);
+        for hover in hovers {
+            out.push(launch(&m, hover, &[], ""));
+        }
+        m.open(Category::System, &entries);
+        for pins in [&[][..], &pinned[..]] {
+            for hover in hovers {
+                out.push(launch(&m, hover, pins, "Pinned Terminal"));
+            }
+        }
+        m.set_query("zzz", &entries);
+        out.push(launch(&m, None, &[], ""));
+        out.push(open.draw(&slots, Some(&Menu::new(&[])), &[], &[], None, ""));
+
+        let mut s = session::Menu {
+            open: true,
+            ..Default::default()
+        };
+        for available in [[false; 6], [true; 6]] {
+            s.capabilities.available = available;
+            for selected in 0..6 {
+                s.selected = selected;
+                for full in [false, true] {
+                    s.full = full;
+                    out.push(s.draw());
+                }
+            }
+        }
+        s.busy = true;
+        out.push(s.draw());
+        s.busy = false;
+        s.activate(session::Hit::Row(5));
+        for selected in 0..2 {
+            s.selected = selected;
+            for full in [false, true] {
+                s.full = full;
+                out.push(s.draw());
+            }
+        }
+
+        for lit in [false, true] {
+            for charging in [None, Some(false), Some(true)] {
+                let battery = charging.map(|charging| {
+                    let b = status::Battery {
+                        percent: 50,
+                        charging,
+                    };
+                    ("50%".to_string(), 30, b)
+                });
+                out.push(session::band(800, lit, ("12:00".into(), 40), battery));
+            }
+        }
+
+        let cards = cards::layout(&[note(2), note(1)], &|_| Some(8.0));
+        out.extend([cards::draw(&cards, false), cards::draw(&cards, true)]);
+        out
+    }
+
+    #[test]
+    fn ac3_every_text_is_one_proven_on_its_backdrop() {
+        let mut seen = 0;
+        for items in every_state() {
+            for (k, item) in items.iter().enumerate() {
+                let (r, colors) = match item {
+                    Item::Text(_, r, c) => (*r, vec![*c]),
+                    // The query in INK, the placeholder in DIM.
+                    Item::Field(_, r) => (*r, vec![INK, DIM]),
+                    _ => continue,
+                };
+                let (x, y) = (r.x + r.w / 2, r.y + r.h / 2);
+                // The nearest item behind the text's centre: an opaque fill, or the panel.
+                let under = items[..k].iter().rev().find_map(|i| match i {
+                    Item::Round(f, _, c) | Item::Fill(f, c) if f.contains(x, y) => Some(Some(*c)),
+                    Item::Panel(f, ..) if f.contains(x, y) => Some(None),
+                    _ => None,
+                });
+                for c in colors {
+                    seen += 1;
+                    let ok = match under.expect("every text is on a panel") {
+                        None => PANEL_TEXT.contains(&c),
+                        Some(fill) => ON_FILL
+                            .iter()
+                            .any(|&(f, texts)| f == fill && texts.contains(&c)),
+                    };
+                    assert!(ok, "{item:?} on {under:x?}");
+                }
+            }
+        }
+        assert!(seen > 200, "{seen} texts");
+    }
+
+    #[test]
+    fn folder_and_session_glyphs_are_ink() {
+        let mut seen = 0;
+        for items in every_state() {
+            for item in &items {
+                if let Item::Icon(of @ (IconOf::Folder(_) | IconOf::Session(_)), ..) = item {
+                    seen += 1;
+                    // INK is proven 4.5:1 on panels and their fills, so well over 3:1.
+                    assert!(
+                        of.tint().is_some_and(|c| PANEL_TEXT.contains(&c)),
+                        "{item:?}"
+                    );
+                }
+            }
+        }
+        assert!(seen > 50, "{seen}");
+        // The tint keeps the shape and replaces the colour.
+        let mut icon = Pixmap::new(2, 1).unwrap();
+        icon.pixels_mut()[0] = PremultipliedColorU8::from_rgba(40, 0, 80, 128).unwrap();
+        let t = tinted(&icon, theme::INK);
+        let [_, r, g, b] = theme::resolve(theme::INK).to_be_bytes();
+        let k = |c: u8| (u16::from(c) * 128 / 255) as u8;
+        let p = t.pixels()[0];
+        assert_eq!(
+            (p.red(), p.green(), p.blue(), p.alpha()),
+            (k(r), k(g), k(b), 128)
+        );
+        assert_eq!(t.pixels()[1].alpha(), 0);
+    }
+
+    fn rendered(items: &[Item], w: i32, h: i32) -> Pixmap {
+        let mut canvas = Pixmap::new(w as u32, h as u32).unwrap();
+        for item in items {
+            paint(&mut canvas, None, item.clone(), 1);
+        }
+        canvas
+    }
+
+    /// Corner clear, body at the panel alpha, rim in `edge` at the middle of the top edge.
+    fn assert_panel(canvas: &Pixmap, r: Rect, body: (i32, i32), edge: u32, what: &str) {
+        let px = |(x, y): (i32, i32)| canvas.pixel(x as u32, y as u32).unwrap();
+        assert_eq!(px((r.x, r.y)).alpha(), 0, "{what}: corner");
+        let kind = match what {
+            "dock" | "band" => Panel::Bar,
+            _ => Panel::Popup,
+        };
+        let want = (255.0 * theme::panel_alpha(kind)).round() as i32;
+        let got = i32::from(px(body).alpha());
+        assert!(
+            (got - want).abs() <= 1,
+            "{what}: body alpha {got}, want {want}"
+        );
+        let top = px((r.x + r.w / 2, r.y));
+        let [_, er, eg, eb] = theme::resolve(edge).to_be_bytes();
+        assert_eq!(
+            (top.red(), top.green(), top.blue(), top.alpha()),
+            (er, eg, eb, 255),
+            "{what}: rim"
+        );
+    }
+
+    #[test]
+    fn ac6_panels_are_rounded_translucent_and_rimmed() {
+        let check = || {
+            let dock = Layout::new(1, false);
+            let items = dock.draw(&[Slot::default()], None, &[], &[], None, "");
+            let b = dock.bar();
+            let canvas = rendered(&items, dock.w, dock.h);
+            assert_panel(
+                &canvas,
+                b,
+                (b.x + b.w / 2, b.y + b.h / 2),
+                PANEL_EDGE,
+                "dock",
+            );
+            // Below the dock the surface is clear.
+            assert_eq!(canvas.pixel(0, (dock.h - 1) as u32).unwrap().alpha(), 0);
+
+            let open = Layout::new(1, true);
+            let items = open.draw(
+                &[Slot::default()],
+                Some(&Menu::new(&[])),
+                &[],
+                &[],
+                None,
+                "",
+            );
+            let p = open.panel().unwrap();
+            let canvas = rendered(&items, open.w, open.h);
+            assert_panel(
+                &canvas,
+                p,
+                (p.x + p.w / 2, p.y + p.h / 2),
+                PANEL_EDGE,
+                "launcher",
+            );
+
+            let items = session::band(400, false, ("12:00".into(), 40), None);
+            let r = Rect {
+                x: 0,
+                y: 0,
+                w: 400,
+                h: BAND_H,
+            };
+            let canvas = rendered(&items, 400, BAND_H);
+            assert_panel(&canvas, r, (300, BAND_H / 2), PANEL_EDGE, "band");
+
+            let cards = cards::layout(&[note(1)], &|_| Some(8.0));
+            let (w, h) = cards::size(&cards);
+            let canvas = rendered(&cards::draw(&cards, false), w, h);
+            let c = cards[0].rect;
+            assert_panel(&canvas, c, (c.x + c.w / 2, c.y + c.h / 2), ACCENT, "card");
+
+            let menu = session::Menu {
+                open: true,
+                ..Default::default()
+            };
+            let p = menu.panel();
+            let canvas = rendered(&menu.draw(), p.x + p.w, p.y + p.h);
+            assert_panel(
+                &canvas,
+                p,
+                (p.x + p.w - 20, p.y + 20),
+                PANEL_EDGE,
+                "session",
+            );
+        };
+        check();
+        theme::configure(&serde_json::json!({"high_contrast": true}));
+        assert_eq!(theme::panel_alpha(Panel::Popup), 1.0);
+        check();
+        theme::configure(&serde_json::json!({}));
+        assert_eq!(theme::panel_alpha(Panel::Bar), 0.85);
+        assert_eq!(theme::panel_alpha(Panel::Popup), 0.98);
+        assert_eq!(INSET, 12);
+    }
+}

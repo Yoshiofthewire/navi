@@ -3,9 +3,12 @@
 
 use crate::layout::{Item, Rect};
 use crate::notify::Note;
-use crate::theme::{ACCENT, BG, DIM, INK};
+use crate::theme::{ACCENT, DIM, INK, INSET, Panel};
 
 pub const CARD_W: i32 = 360;
+/// The cards layer's margins, top, right, bottom, left, from below the band's zone: twice the
+/// inset, so a card floats clear of the corner of the tile under it.
+pub const MARGIN: [i32; 4] = [2 * INSET, 0, 0, 2 * INSET];
 const GAP: i32 = 8;
 const PAD: i32 = 8;
 fn line_h() -> i32 {
@@ -70,16 +73,7 @@ pub fn draw(cards: &[Card], visual: bool) -> Vec<Item> {
     let mut out = Vec::new();
     for c in cards {
         let r = c.rect;
-        out.push(Item::Fill(r, ACCENT));
-        out.push(Item::Fill(
-            Rect {
-                x: r.x + border,
-                y: r.y + border,
-                w: r.w - 2 * border,
-                h: r.h - 2 * border,
-            },
-            BG,
-        ));
+        out.push(Item::Panel(r, Panel::Popup, ACCENT, border));
         let line = |k: i32| Rect {
             x: r.x + PAD,
             y: r.y + PAD + k * line_h(),
@@ -218,9 +212,11 @@ mod tests {
             DIM
         )));
         assert!(
-            items.contains(&Item::Fill(cards[0].rect, ACCENT)),
+            items.contains(&Item::Panel(cards[0].rect, Panel::Popup, ACCENT, 1)),
             "the outline"
         );
+        assert!(draw(&cards, true).contains(&Item::Panel(cards[0].rect, Panel::Popup, ACCENT, 3)));
+        assert_eq!(MARGIN, [24, 0, 0, 24]);
     }
 
     #[test]

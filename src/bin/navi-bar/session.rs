@@ -6,10 +6,13 @@ use zbus::blocking::{Connection, Proxy, connection::Builder};
 
 use crate::{
     layout::{IconOf, Item, Rect},
-    theme::{BAR_BG, BG, DIM, INK, SELECTED, SHELL_EDGE},
+    status::Battery,
+    theme::{ACCENT, BAR_BG, DIM, INK, INSET, PANEL_EDGE, Panel, SELECTED},
 };
 
 pub const BAND_H: i32 = 32;
+/// The band's layer margins, top, right, bottom, left: it floats `INSET` from the screen edges.
+pub const BAND_MARGIN: [i32; 4] = [INSET, INSET, 0, INSET];
 pub const BUTTON: Rect = Rect {
     x: 4,
     y: 0,
@@ -18,8 +21,12 @@ pub const BUTTON: Rect = Rect {
 };
 const WIDTH: i32 = 300;
 const ROW_H: i32 = 40;
-const TOP: i32 = BAND_H + 8;
-const LIST_Y: i32 = TOP + 44;
+const TOP: i32 = BAND_H + INSET;
+/// Inside the panel, as in the launcher.
+const PAD: i32 = 12;
+const HEADING_H: i32 = 32;
+const LINE_H: i32 = 24;
+const LIST_Y: i32 = TOP + PAD + HEADING_H + 4;
 const LOGIN: &str = "org.freedesktop.login1";
 const LOGIN_PATH: &str = "/org/freedesktop/login1";
 const MANAGER: &str = "org.freedesktop.login1.Manager";
@@ -108,6 +115,8 @@ pub struct Menu {
     pub busy: bool,
     pub message: String,
     pub capabilities: Capabilities,
+    /// A full session, not nested: decides which actions can be offered.
+    pub full: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -124,39 +133,63 @@ impl Menu {
         self.selected = 0;
         self.message.clear();
     }
+    /// Content plus `PAD` on every side; the hint below the list is one or two lines.
     pub fn panel(&self) -> Rect {
+        let lines = self.message().lines().take(2).count() as i32;
         Rect {
-            x: 8,
+            x: 0,
             y: TOP,
             w: WIDTH,
             h: if self.confirm.is_some() {
-                184
+                PAD + HEADING_H + 2 * HEADING_H + 8 + 36 + PAD
             } else {
-                44 + 6 * ROW_H + 64
+                LIST_Y - TOP + ACTIONS.len() as i32 * ROW_H + 4 + lines * LINE_H + PAD
             },
+        }
+    }
+    /// The hint under the list.
+    fn message(&self) -> &str {
+        if !self.message.is_empty() {
+            self.message.as_str()
+        } else if self.busy {
+            "Checking session services…"
+        } else if self.selected == 1 && !self.capabilities.available[1] {
+            "Install swaylock to enable\nscreen locking."
+        } else if !self.full && self.selected != 3 && self.selected != 1 {
+            "Available in a full Navi session."
+        } else if !self.capabilities.available[self.selected] {
+            "Not available from the\nsession services."
+        } else {
+            "Esc closes · Enter selects"
         }
     }
     pub fn height(&self) -> i32 {
         if self.open {
             let p = self.panel();
-            p.y + p.h + 8
+            p.y + p.h
         } else {
             BAND_H
         }
     }
+    /// The band's input region: the Navi button, and the menu while it's open.
+    pub fn input(&self) -> Vec<Rect> {
+        let mut r = vec![BUTTON];
+        r.extend(self.open.then(|| self.panel()));
+        r
+    }
     fn row(&self, i: usize) -> Rect {
         Rect {
-            x: 16,
+            x: PAD,
             y: LIST_Y + i as i32 * ROW_H,
-            w: WIDTH - 16,
+            w: WIDTH - 2 * PAD,
             h: ROW_H,
         }
     }
     fn cancel(&self) -> Rect {
         let p = self.panel();
         Rect {
-            x: p.x + 12,
-            y: p.y + p.h - 52,
+            x: p.x + PAD,
+            y: p.y + p.h - PAD - 36,
             w: 128,
             h: 36,
         }
@@ -222,51 +255,25 @@ impl Menu {
         }
         None
     }
-    pub fn draw(&self, full: bool) -> Vec<Item> {
+    pub fn draw(&self) -> Vec<Item> {
         if !self.open {
             return Vec::new();
         }
         let p = self.panel();
-        let mut out = vec![
-            Item::Round(p, 14, SHELL_EDGE),
-            Item::Round(
-                Rect {
-                    x: p.x + 1,
-                    y: p.y + 1,
-                    w: p.w - 2,
-                    h: p.h - 2,
-                },
-                13,
-                BG,
-            ),
-        ];
-        let text =
-            |label: &str, x, y, w, h, color| Item::Text(label.into(), Rect { x, y, w, h }, color);
+        let mut out = vec![Item::Panel(p, Panel::Popup, PANEL_EDGE, 1)];
+        let (x, w) = (p.x + PAD, WIDTH - 2 * PAD);
+        let text = |label: &str, y, h, color| Item::Text(label.into(), Rect { x, y, w, h }, color);
         if let Some(action) = self.confirm {
+            let y = p.y + PAD;
+            out.push(text(&format!("{}?", action.label()), y, HEADING_H, INK));
             out.push(text(
-                &format!("{}?", action.label()),
-                p.x + 16,
-                p.y + 8,
-                WIDTH - 32,
-                36,
+                action.warning(self.full),
+                y + HEADING_H,
+                HEADING_H,
                 INK,
             ));
-            out.push(text(
-                action.warning(full),
-                p.x + 16,
-                p.y + 44,
-                WIDTH - 32,
-                36,
-                INK,
-            ));
-            out.push(text(
-                "Cancel returns to the session menu.",
-                p.x + 16,
-                p.y + 80,
-                WIDTH - 32,
-                28,
-                DIM,
-            ));
+            let hint = "Cancel returns to the session menu.";
+            out.push(text(hint, y + 2 * HEADING_H, HEADING_H, DIM));
             for (i, (r, label)) in [(self.cancel(), "Cancel"), (self.accept(), action.label())]
                 .into_iter()
                 .enumerate()
@@ -276,10 +283,15 @@ impl Menu {
                     8,
                     if self.selected == i { SELECTED } else { BAR_BG },
                 ));
-                out.push(text(label, r.x + 12, r.y, r.w - 24, r.h, INK));
+                let at = Rect {
+                    x: r.x + 12,
+                    w: r.w - 24,
+                    ..r
+                };
+                out.push(Item::Text(label.into(), at, INK));
             }
         } else {
-            out.push(text("Session", p.x + 16, p.y + 4, WIDTH - 32, 36, INK));
+            out.push(text("Session", p.y + PAD, HEADING_H, INK));
             for (i, action) in ACTIONS.into_iter().enumerate() {
                 let r = self.row(i);
                 let enabled = self.capabilities.available[i] && !self.busy;
@@ -296,41 +308,118 @@ impl Menu {
                     },
                     if enabled { 1.0 } else { 0.45 },
                 ));
-                out.push(text(
-                    action.label(),
-                    r.x + 44,
-                    r.y,
-                    r.w - 52,
-                    r.h,
-                    if enabled { INK } else { DIM },
-                ));
+                let label = Rect {
+                    x: r.x + 44,
+                    w: r.w - 52,
+                    ..r
+                };
+                let color = if enabled { INK } else { DIM };
+                out.push(Item::Text(action.label().into(), label, color));
             }
-            let message = if !self.message.is_empty() {
-                self.message.as_str()
-            } else if self.busy {
-                "Checking session services…"
-            } else if self.selected == 1 && !self.capabilities.available[1] {
-                "Install swaylock to enable\nscreen locking."
-            } else if !full && self.selected != 3 && self.selected != 1 {
-                "Available in a full Navi session."
-            } else if !self.capabilities.available[self.selected] {
-                "Not available from the\nsession services."
-            } else {
-                "Esc closes · Enter selects"
-            };
-            for (i, line) in message.lines().take(2).enumerate() {
-                out.push(text(
-                    line,
-                    p.x + 16,
-                    p.y + p.h - 56 + i as i32 * 24,
-                    WIDTH - 32,
-                    24,
-                    DIM,
-                ));
+            let list_end = self.row(ACTIONS.len() - 1).y + ROW_H + 4;
+            for (i, line) in self.message().lines().take(2).enumerate() {
+                out.push(text(line, list_end + i as i32 * LINE_H, LINE_H, DIM));
             }
         }
         out
     }
+}
+
+/// The status band, `w` wide: the Navi button (`lit` when hovered or open), the clock and
+/// the battery, each text with its width in px.
+pub fn band(
+    w: i32,
+    lit: bool,
+    clock: (String, i32),
+    battery: Option<(String, i32, Battery)>,
+) -> Vec<Item> {
+    let text = |t, x, w| {
+        Item::Text(
+            t,
+            Rect {
+                x,
+                y: 0,
+                w,
+                h: BAND_H,
+            },
+            INK,
+        )
+    };
+    let mut out = vec![Item::Panel(
+        Rect {
+            x: 0,
+            y: 0,
+            w,
+            h: BAND_H,
+        },
+        Panel::Bar,
+        PANEL_EDGE,
+        1,
+    )];
+    if lit {
+        out.push(Item::Round(
+            Rect {
+                y: 4,
+                h: BAND_H - 8,
+                ..BUTTON
+            },
+            8,
+            SELECTED,
+        ));
+    }
+    out.push(Item::Icon(
+        IconOf::Button,
+        Rect {
+            x: 12,
+            y: 8,
+            w: 16,
+            h: 16,
+        },
+        1.0,
+    ));
+    out.push(text("Navi".into(), 36, 64));
+    let (clock, clock_w) = clock;
+    out.push(text(clock, (w - clock_w) / 2, clock_w + 1));
+    if let Some((label, label_w, b)) = battery {
+        let x = w - 12 - label_w;
+        out.push(text(label, x, label_w + 1));
+        let r = Rect {
+            x: x - 27,
+            y: 11,
+            w: 18,
+            h: 10,
+        };
+        for edge in [
+            Rect { h: 1, ..r },
+            Rect {
+                y: r.y + r.h - 1,
+                h: 1,
+                ..r
+            },
+            Rect { w: 1, ..r },
+            Rect {
+                x: r.x + r.w - 1,
+                w: 1,
+                ..r
+            },
+            Rect {
+                x: r.x + r.w,
+                y: r.y + 3,
+                w: 2,
+                h: 4,
+            },
+        ] {
+            out.push(Item::Fill(edge, DIM));
+        }
+        let charge = Rect {
+            x: r.x + 2,
+            y: r.y + 2,
+            w: (14 * b.percent as i32 / 100).max(1),
+            h: 6,
+        };
+        out.push(Item::Fill(charge, if b.charging { ACCENT } else { INK }));
+    }
+    out
 }
 
 pub enum Reply {
@@ -498,6 +587,53 @@ mod tests {
             [false, true, false, true, false, false]
         );
     }
+    #[test]
+    fn ac7_band_and_menu_float_inset() {
+        assert_eq!(BAND_MARGIN, [12, 12, 0, 12]);
+        let mut m = Menu::default();
+        assert_eq!(m.input(), [BUTTON]);
+        m.open = true;
+        let band = band(800, false, ("12:00".into(), 40), None);
+        let Some(&Item::Panel(b, ..)) = band.first() else {
+            panic!("the band is a panel")
+        };
+        for confirm in [None, Some(Action::Logout)] {
+            m.confirm = confirm;
+            let p = m.panel();
+            assert_eq!((p.x, p.y), (b.x, b.y + b.h + INSET));
+            assert_eq!(m.input(), [BUTTON, p]);
+            assert_eq!(m.height(), p.y + p.h);
+        }
+    }
+
+    #[test]
+    fn menu_padding_matches_the_launcher() {
+        let mut m = Menu {
+            open: true,
+            ..Default::default()
+        };
+        for message in ["", "Two\nlines"] {
+            m.message = message.into();
+            let p = m.panel();
+            let items = m.draw();
+            let texts: Vec<Rect> = items
+                .iter()
+                .filter_map(|i| match i {
+                    Item::Text(_, r, _) => Some(*r),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!((texts[0].x, texts[0].y), (p.x + PAD, p.y + PAD), "heading");
+            assert_eq!(m.row(0).x, p.x + PAD);
+            assert_eq!(m.row(0).x + m.row(0).w, p.x + p.w - PAD);
+            let last = texts.last().unwrap();
+            assert_eq!(last.y + last.h, p.y + p.h - PAD, "{message:?}");
+        }
+        m.activate(Hit::Row(3));
+        let p = m.panel();
+        assert_eq!(m.cancel().y + m.cancel().h, p.y + p.h - PAD);
+    }
+
     #[test]
     fn menu_geometry_keyboard_and_hit_targets_match() {
         let mut m = Menu::default();

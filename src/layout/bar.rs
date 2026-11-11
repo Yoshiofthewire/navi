@@ -1,11 +1,9 @@
 //! The bar above tabbed and server-decorated tiles: tabs, window buttons, and how they're drawn.
 
 use super::{BAR, Layout, Rect, WinId, drag::Hit};
-use crate::theme::{ACCENT, BAR_BG, INK, INK_ON_ACCENT, MINIMIZED, OUTLINE, TAB_BG, rgba};
+use crate::theme::{ACCENT, BAR_BG, MINIMIZED, OUTLINE, TAB_BG, rgba};
 
 const TAB_GAP: i32 = 2;
-/// The glyph box inside a button, in px.
-const GLYPH: i32 = 10;
 
 /// Who draws a toplevel's title bar and controls.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -23,7 +21,7 @@ pub fn decoration(has_parent: bool, requested: Decor) -> Decor {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Button {
     Minimize,
     Maximize,
@@ -32,7 +30,7 @@ pub enum Button {
 
 #[derive(Debug, PartialEq)]
 pub struct Bar {
-    /// The gap above the window, full window width.
+    /// Directly above the window, full window width, below the grab strip.
     pub rect: Rect,
     /// One per member of a tabbed group, by id.
     pub tabs: Vec<(WinId, Rect)>,
@@ -45,12 +43,11 @@ impl Layout {
         if !self.has_bar(id) {
             return None;
         }
-        let (c, r) = self.frame(id)?;
+        let (_, r) = self.frame(id)?;
         let rect = Rect {
-            x: r.x,
-            y: c.y,
-            w: r.w,
-            h: r.y - c.y,
+            y: r.y - BAR,
+            h: BAR,
+            ..r
         };
         let active = self.tile(self.active(id)?)?;
         let right = rect.x + rect.w;
@@ -97,30 +94,6 @@ fn partition(area: Rect, ids: &[WinId]) -> Vec<(WinId, Rect)> {
         .collect()
 }
 
-/// The rects of a button's glyph, centred in `r`.
-fn glyph(b: Button, r: Rect) -> Vec<Rect> {
-    let (x, y) = (r.x + (r.w - GLYPH) / 2, r.y + (r.h - GLYPH) / 2);
-    let at = |dx: i32, dy: i32, w: i32, h: i32| Rect {
-        x: x + dx,
-        y: y + dy,
-        w,
-        h,
-    };
-    match b {
-        Button::Minimize => vec![at(0, GLYPH - 2, GLYPH, 2)],
-        Button::Maximize => vec![
-            at(0, 0, GLYPH, 2),
-            at(0, 0, 1, GLYPH),
-            at(GLYPH - 1, 0, 1, GLYPH),
-            at(0, GLYPH - 1, GLYPH, 1),
-        ],
-        // Two diagonals of 2 px squares.
-        Button::Close => (0..GLYPH / 2)
-            .flat_map(|k| [at(2 * k, 2 * k, 2, 2), at(GLYPH - 2 - 2 * k, 2 * k, 2, 2)])
-            .collect(),
-    }
-}
-
 /// The 1 px border inside `r`.
 fn outline(r: Rect) -> [Rect; 4] {
     [
@@ -139,17 +112,9 @@ fn outline(r: Rect) -> [Rect; 4] {
     ]
 }
 
-/// Front to back: `bar` with `hover` (a tab or button id) lit.
+/// Front to back: `bar` with `hover` (a tab id) lit. Its buttons are drawn by `crate::glyph`.
 pub fn draw(l: &Layout, id: WinId, bar: &Bar, hover: Option<Hit>) -> Vec<(Rect, [f32; 4])> {
     let mut out = Vec::new();
-    for &(b, r) in &bar.buttons {
-        let lit = hover == Some(Hit::Button(id, b));
-        let ink = if lit { INK_ON_ACCENT } else { INK };
-        out.extend(glyph(b, r).into_iter().map(|g| (g, rgba(ink, 1.0))));
-        if lit {
-            out.push((r, rgba(ACCENT, 1.0)));
-        }
-    }
     let active = l.active(id);
     for &(t, r) in &bar.tabs {
         let minimized = l.tile(t).is_some_and(|t| t.minimized);
@@ -170,9 +135,9 @@ pub fn draw(l: &Layout, id: WinId, bar: &Bar, hover: Option<Hit>) -> Vec<(Rect, 
 #[cfg(test)]
 mod tests {
     use super::super::{
-        COLS, Cells, FULL, GAP, MIN_H, MIN_W, Output, ROWS, Tile,
+        COLS, Cells, FULL, MIN_H, MIN_W, Output, ROWS, STRIP, Tile,
         drag::{
-            Done, Drag,
+            Done, Drag, buttons,
             tests::{assert_valid, at, c, drag, uw, with, zones},
         },
     };
@@ -282,16 +247,25 @@ mod tests {
         let (cr, plain) = (o.cells_rect(HALF_L), o.tile_rect(HALF_L));
         let mut l = with(&[HALF_L]);
         assert_eq!(l.rect(0), Some(plain));
-        assert_eq!(plain.y, cr.y + GAP);
+        assert_eq!(plain.y, cr.y + STRIP);
         l.set_decorated(0, true);
         let r = l.rect(0).unwrap();
-        assert_eq!(r.y, cr.y + BAR);
-        assert_eq!(r.h, plain.h - (BAR - GAP));
+        // The bar sits between the strip and the window.
+        assert_eq!(r.y, cr.y + STRIP + BAR);
+        assert_eq!(r.h, plain.h - BAR);
+        assert_eq!(
+            l.bar(0).unwrap().rect,
+            Rect {
+                y: cr.y + STRIP,
+                h: BAR,
+                ..r
+            }
+        );
         assert_eq!((r.x, r.w), (plain.x, plain.w));
 
         let mut l = with(&[HALF_L, HALF_L]);
         assert_eq!(l.rect(0), l.rect(1));
-        assert_eq!(l.rect(0).unwrap().y, cr.y + BAR);
+        assert_eq!(l.rect(0).unwrap().y, cr.y + STRIP + BAR);
         l.remove(1);
         assert_eq!(l.rect(0), Some(plain));
     }
@@ -301,21 +275,22 @@ mod tests {
         let mut l = with(&[HALF_L]);
         l.set_decorated(0, true);
         let r = l.rect(0).unwrap();
-        let right = r.x + r.w;
+        let (right, top) = (r.x + r.w, r.y - BAR);
         for (k, b) in [
             (3, Button::Minimize),
             (2, Button::Maximize),
             (1, Button::Close),
         ] {
             let x = right - k * BAR;
-            for p in [(x, 0), (x + BAR - 1, BAR - 1), (x + 12, 12)] {
+            for p in [(x, top), (x + BAR - 1, top + BAR - 1), (x + 12, top + 12)] {
                 assert_eq!(l.hit(p), Some(Hit::Button(0, b)), "{p:?}");
             }
+            assert_eq!(l.hit((x, top - 1)), Some(Hit::Strip(0)), "the strip above");
         }
-        assert_eq!(l.hit((right - 3 * BAR - 1, 12)), Some(Hit::Strip(0)));
+        assert_eq!(l.hit((right - 3 * BAR - 1, top + 12)), Some(Hit::Strip(0)));
         assert_eq!(l.hit((r.x, 0)), Some(Hit::Strip(0)));
         assert_eq!(l.hit((500, 700)), None);
-        assert_eq!(l.hit((500, BAR)), None);
+        assert_eq!(l.hit((500, r.y)), None);
 
         // Tabs in id order with 2 px gaps; buttons only once the active tile is decorated.
         let mut l = with(&[HALF_L, HALF_L]);
@@ -334,7 +309,12 @@ mod tests {
                 _ if x < tb.x => None,
                 _ => Some(Hit::Tab(1)),
             };
-            assert_eq!(l.hit((x, 5)), want, "x {x}");
+            assert_eq!(l.hit((x, bar.rect.y + 5)), want, "x {x}");
+            assert_eq!(
+                l.hit((x, 5)),
+                Some(Hit::Strip(1)),
+                "the strip above the tabs"
+            );
         }
         l.set_decorated(0, true);
         assert!(
@@ -378,7 +358,7 @@ mod tests {
                         bar.tabs,
                         partition(
                             Rect {
-                                y: 0,
+                                y: STRIP,
                                 h: BAR,
                                 ..area
                             },
@@ -468,7 +448,7 @@ mod tests {
         let (rects, memory) = ([l.rect(0), l.rect(1)], l.memory.clone());
         let tiles = l.tiles.clone();
         assert_eq!(click_button(&mut l, 0, Button::Maximize), Some("maximized"));
-        assert_eq!(l.rect(0), Some(uw().window_rect(FULL, BAR)));
+        assert_eq!(l.rect(0), Some(uw().window_rect(FULL, STRIP + BAR)));
         assert!(!l.visible(1));
         assert_eq!(l.hit((1720, 700)), None, "b's left edge");
         assert_eq!(l.hit((2500, 1437)), None, "b's bottom edge");
@@ -552,7 +532,7 @@ mod tests {
         let mut l = with(&[HALF_L, HALF_R]);
         let before = (l.tiles.clone(), [l.rect(0), l.rect(1)]);
         assert!(l.maximize(0));
-        assert_eq!(l.rect(0), Some(uw().window_rect(FULL, GAP)));
+        assert_eq!(l.rect(0), Some(uw().window_rect(FULL, STRIP)));
         assert!(!l.visible(1));
         assert!(hits(&l).iter().all(|h| *h == Hit::Strip(0)));
         let maximized = l.tiles.clone();
@@ -648,14 +628,17 @@ mod tests {
         assert!(drawn.contains(&(tab(&l, 2), rgba(TAB_BG, 1.0))));
         assert!(!drawn.contains(&(tab(&l, 2), rgba(ACCENT, 1.0))));
 
+        // Buttons are glyph textures, lit under the pointer or an armed press, in no overlay rect.
         let close = button(&l, 1, Button::Close);
         let lit = zones(&l, None, mid(close), 0);
-        assert!(lit.contains(&(close, rgba(ACCENT, 1.0))));
-        let ink_on_accent = lit.iter().filter(|&&(_, k)| k == rgba(INK_ON_ACCENT, 1.0));
-        assert_eq!(ink_on_accent.count(), 10, "the X's squares");
-        // Glyphs sit in front of the button, which sits in front of the bar.
-        let pos = |want: (Rect, [f32; 4])| lit.iter().position(|&x| x == want).unwrap();
-        assert!(pos((close, rgba(ACCENT, 1.0))) < pos((l.bar(1).unwrap().rect, rgba(BAR_BG, 1.0))));
+        assert!(!lit.iter().any(|&(r, _)| r == close));
+        let glyphs = buttons(&l, None, mid(close));
+        assert_eq!(glyphs.len(), 3);
+        assert!(glyphs.contains(&(1, Button::Close, close, true)));
+        assert!(glyphs.iter().filter(|g| g.3).count() == 1);
+        assert!(buttons(&l, None, away).iter().all(|g| !g.3));
+        let d = Drag::press(&l, mid(close)).unwrap();
+        assert!(buttons(&l, Some(&d), away).contains(&(1, Button::Close, close, true)));
 
         // Inactive tabs are outlined; minimized ones are the same dimmed accent as a strip.
         for side in outline(tab(&l, 2)) {
@@ -698,10 +681,10 @@ mod tests {
         d.motion(&mut l, (3000, 700), 0);
         assert_eq!(
             preview(&l, &d, (3000, 700)),
-            Some(uw().window_rect(HALF_R, BAR))
+            Some(uw().window_rect(HALF_R, STRIP + BAR))
         );
         d.release(&mut l, (3000, 700), 10);
-        assert_eq!(l.rect(0), Some(uw().window_rect(HALF_R, BAR)));
+        assert_eq!(l.rect(0), Some(uw().window_rect(HALF_R, STRIP + BAR)));
 
         // A held tab-in will have a bar; an undecorated untab won't.
         let mut l = with(&[HALF_L, HALF_L, HALF_R]);
@@ -709,7 +692,7 @@ mod tests {
         d.motion(&mut l, (2500, 700), 0);
         assert_eq!(
             preview(&l, &d, (2500, 700)),
-            Some(uw().window_rect(HALF_R, BAR))
+            Some(uw().window_rect(HALF_R, STRIP + BAR))
         );
         let mut l = with(&[HALF_L, HALF_L]);
         let mut d = Drag::press(&l, mid(tab(&l, 1))).unwrap();
@@ -722,36 +705,11 @@ mod tests {
         let mut l = with(&[HALF_L, HALF_R]);
         assert!(l.maximize(0));
         let strip = l.zone(Hit::Strip(0)).unwrap();
-        assert_eq!((strip.w, strip.h), (uw().window_rect(FULL, GAP).w, GAP));
+        assert_eq!((strip.w, strip.h), (uw().window_rect(FULL, STRIP).w, STRIP));
         assert_eq!(
             zones(&l, None, (100, 2), 0),
             vec![(strip, rgba(ACCENT, 1.0))]
         );
-    }
-
-    #[test]
-    fn glyphs_fit_their_button() {
-        let r = Rect {
-            x: 100,
-            y: 0,
-            w: BAR,
-            h: BAR,
-        };
-        let inner = Rect {
-            x: 107,
-            y: 7,
-            w: GLYPH,
-            h: GLYPH,
-        };
-        for b in [Button::Minimize, Button::Maximize, Button::Close] {
-            for g in glyph(b, r) {
-                assert!(inner.contains((g.x, g.y)), "{b:?} {g:?}");
-                assert!(
-                    inner.contains((g.x + g.w - 1, g.y + g.h - 1)),
-                    "{b:?} {g:?}"
-                );
-            }
-        }
     }
 
     #[test]
