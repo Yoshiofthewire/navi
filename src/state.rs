@@ -73,7 +73,7 @@ use crate::CalloopData;
 use crate::activation::{self, may_issue, may_redeem};
 use crate::focus::{Focus, HandBack, Handoff, may_hand_back};
 use crate::layout::dialog::{self, Root};
-use crate::layout::{self, Decor, Drag, Fit, Layout, Rect, WinId, decoration};
+use crate::layout::{self, Decor, Drag, Fit, Layout, Rect, WinId, decoration, intersect};
 use crate::monitors::{BarHover, Hover};
 use crate::persist::{self, Store};
 use crate::toplevels::{self, Toplevels};
@@ -126,6 +126,16 @@ pub struct Managed {
     pub(crate) born: u64,
     /// The bounds a dialog's cap was last logged for.
     pub(crate) capped_for: Option<Rect>,
+    /// A shown X11 menu's owner (`layout::menu_owner`), which it stacks and is clipped with.
+    pub(crate) menu_owner: Option<Window>,
+}
+
+impl Managed {
+    /// An X11 override-redirect window: a menu, tooltip or drop-down.
+    pub(crate) fn is_menu(&self) -> bool {
+        let x = self.window.x11_surface();
+        self.tile.is_none() && x.is_some_and(|x| x.is_override_redirect())
+    }
 }
 
 pub struct Navi {
@@ -183,6 +193,8 @@ pub struct Navi {
     pub(crate) last_press: Option<(u32, WlSurface, Option<std::time::Duration>)>,
     /// When each shown layer surface came on screen (`activation::track_shown`), kept per frame.
     pub(crate) layers_shown: Vec<(WlSurface, std::time::Instant)>,
+    /// When an X11 menu past `layout::CLIENT_POPUPS` was last logged (`log_due`).
+    pub(crate) menus_capped: Option<std::time::Instant>,
     /// Counts left-button presses, delivered or not: a press token dies with the next one.
     pub(crate) presses: u64,
     /// The window that held the keyboard before the one holding it now, whether the user gave
@@ -304,6 +316,7 @@ impl Navi {
             focus_moves: 0,
             last_press: None,
             layers_shown: Vec::new(),
+            menus_capped: None,
             presses: 0,
             before_focus: None,
             before_layer: Default::default(),
@@ -400,9 +413,9 @@ impl Navi {
             .collect()
     }
 
-    /// Where `w`'s popups are kept: its clip rect (a tile's, a float's, a dialog's), else (an X11
-    /// menu, a window not placed) the output it's on.
-    fn popup_bounds(&self, w: &Window) -> Option<Rect> {
+    /// Where `w`'s popups (and X11 menus) are kept: its clip rect (a tile's, a float's, a
+    /// dialog's), else (a window not placed) the output it's on.
+    pub(crate) fn popup_bounds(&self, w: &Window) -> Option<Rect> {
         if let Some(clip) = self.stacking(w).1 {
             return Some(clip);
         }
@@ -423,8 +436,17 @@ impl Navi {
     /// The float `w` is, or whose dialog it is.
     pub fn float_owner(&self, w: &Window) -> Option<WinId> {
         let i = self.windows.iter().position(|m| &m.window == w)?;
-        self.owner(i)
+        self.stack_owner(i)
             .filter(|&id| self.layout.tile(id).is_some_and(|t| t.floating))
+    }
+
+    /// Window `i`'s tile as stacking sees it: `owner`, or a menu's owner's.
+    fn stack_owner(&self, i: usize) -> Option<WinId> {
+        let j = match &self.windows[i].menu_owner {
+            Some(w) => self.windows.iter().position(|m| &m.window == w)?,
+            None => i,
+        };
+        self.owner(j)
     }
 
     /// The windows that stack with the floats, top first: by their float's place in
@@ -449,13 +471,14 @@ impl Navi {
     }
 
     /// Whether `w` stacks with the floats (a float or a float's dialog), and the rect its own
-    /// surfaces are drawn and hit inside: its tile's clip or a dialog's rect. X11 menus have none.
+    /// surfaces are drawn and hit inside: its tile's clip, a dialog's rect, or an X11 menu's
+    /// geometry cut to its owner's popup bounds.
     pub fn stacking(&self, w: &Window) -> (bool, Option<Rect>) {
         let Some(i) = self.windows.iter().position(|m| &m.window == w) else {
             return (false, None);
         };
         let m = &self.windows[i];
-        let owner = self.owner(i).and_then(|id| self.layout.tile(id));
+        let owner = self.stack_owner(i).and_then(|id| self.layout.tile(id));
         let clip = match m.tile {
             Some(id) => self.layout.clip(id),
             None => m.placed,
@@ -467,7 +490,10 @@ impl Navi {
     /// every other window.
     pub fn dialog_rect(&self, w: &Window) -> Option<(Rect, bool)> {
         let m = self.windows.iter().find(|m| &m.window == w)?;
-        Some((m.placed.filter(|_| m.tile.is_none())?, m.waiting))
+        Some((
+            m.placed.filter(|_| m.tile.is_none() && !m.is_menu())?,
+            m.waiting,
+        ))
     }
 
     /// The topmost layer surface at `pos` on one of `layers`, and the surface under `pos` in it.
@@ -1525,11 +1551,7 @@ impl Navi {
         let (mut fresh, mut shown) = (Vec::new(), false);
         for i in 0..self.windows.len() {
             let m = &self.windows[i];
-            let menu = m
-                .window
-                .x11_surface()
-                .is_some_and(|x| x.is_override_redirect());
-            if m.tile.is_some() || menu {
+            if m.tile.is_some() || m.is_menu() {
                 continue;
             }
             let spot = self.dialog_spot(i);
@@ -2101,6 +2123,15 @@ fn want(m: &Managed) -> (i32, i32) {
     (g.w, g.h)
 }
 
+/// Whether a log paced like refits, one a second, may fire `now`; notes the time if so.
+pub(crate) fn log_due(last: &mut Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    let due = refit_wait(*last, now).is_none();
+    if due {
+        *last = Some(now);
+    }
+    due
+}
+
 /// A toplevel's committed min and max size, untrusted.
 fn size_hints(s: &WlSurface) -> ((i32, i32), (i32, i32)) {
     with_states(s, |states| {
@@ -2121,17 +2152,6 @@ fn refit_wait(
 ) -> Option<std::time::Duration> {
     let due = last? + REFIT_PACE;
     (due > now).then(|| due - now)
-}
-
-/// `r` cut to `bounds`; `None` if nothing is left. `r` is untrusted, so the sums are in i64.
-fn intersect(r: Rect, bounds: Rect) -> Option<Rect> {
-    let end = |a: i32, len: i32| i64::from(a) + i64::from(len);
-    let (x, y) = (r.x.max(bounds.x), r.y.max(bounds.y));
-    let w = end(r.x, r.w).min(end(bounds.x, bounds.w)) - i64::from(x);
-    let h = end(r.y, r.h).min(end(bounds.y, bounds.h)) - i64::from(y);
-    // Inside `bounds`, so these fit.
-    let (w, h) = (i32::try_from(w).ok()?, i32::try_from(h).ok()?);
-    (w > 0 && h > 0).then_some(Rect { x, y, w, h })
 }
 
 /// `p` with every client value bounded to `layout::POPUP_LIMIT`, so Smithay's placement can't
@@ -2364,6 +2384,7 @@ impl XdgShellHandler for Navi {
             placed: None,
             last_output: None,
             capped_for: None,
+            menu_owner: None,
         });
     }
 
@@ -3118,28 +3139,13 @@ mod tests {
     }
 
     #[test]
-    fn popups_are_cut_to_their_bounds() {
-        let full = Rect::new(0, 0, 1280, 800);
-        let r = Rect::new;
-        assert_eq!(
-            intersect(r(100, 100, 200, 50), full),
-            Some(r(100, 100, 200, 50))
-        );
-        assert_eq!(
-            intersect(r(-50, 700, 5000, 5000), full),
-            Some(r(0, 700, 1280, 100))
-        );
-        assert_eq!(intersect(r(1280, 0, 10, 10), full), None);
-        assert_eq!(intersect(r(10, 10, 0, 10), full), None);
-        // Client-sized extremes: no overflow.
-        let max = i32::MAX;
-        assert_eq!(
-            intersect(r(12, 0, max, max), full),
-            Some(r(12, 0, 1268, 800))
-        );
-        assert_eq!(intersect(r(max, max, max, max), full), None);
-        assert_eq!(intersect(r(i32::MIN, i32::MIN, max, max), full), None);
-        assert_eq!(intersect(r(-5, -5, max, max), full), Some(full));
-        assert_eq!(intersect(r(0, 0, 10, 10), r(max - 5, 0, max, max)), None);
+    fn paced_logs_fire_at_most_once_a_second() {
+        let (t, ms) = (std::time::Instant::now(), std::time::Duration::from_millis);
+        let mut last = None;
+        let fired: Vec<bool> = [0, 10, 999, 1000, 1500, 2000]
+            .into_iter()
+            .map(|n| log_due(&mut last, t + ms(n)))
+            .collect();
+        assert_eq!(fired, [true, false, false, true, false, true]);
     }
 }

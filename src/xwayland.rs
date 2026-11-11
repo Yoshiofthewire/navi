@@ -2,8 +2,8 @@
 
 use crate::{
     CalloopData,
-    layout::{Hints, Layout, Step, WinId},
-    state::{Managed, Navi, window_app},
+    layout::{CLIENT_POPUPS, Hints, Layout, Rect, Step, WinId, intersect, menu_owner, popups_full},
+    state::{Managed, Navi, log_due, window_app},
 };
 use smithay::wayland::selection::{
     SelectionTarget,
@@ -113,6 +113,13 @@ impl Navi {
         if x.is_override_redirect() && x11_parent.is_none() {
             return;
         }
+        // All X clients are one Wayland client: one cap bounds the menus any of them can map.
+        if x.is_override_redirect() && popups_full(self.windows.iter().filter(|m| m.is_menu())) {
+            if log_due(&mut self.menus_capped, std::time::Instant::now()) {
+                info!(cap = CLIENT_POPUPS, "X11 menu not shown: too many open");
+            }
+            return;
+        }
         let floating = x.is_override_redirect() || x11_parent.is_some();
         let mut tile = None;
         if !floating {
@@ -161,6 +168,7 @@ impl Navi {
             placed: None,
             last_output: None,
             capped_for: None,
+            menu_owner: None,
         });
         self.apply_layout();
         if !x.is_override_redirect() {
@@ -192,30 +200,37 @@ impl Navi {
         self.keep_focus_mapped(&[]);
     }
 
-    /// Override-redirect menus keep their X11 geometry and show only while their X11 parent is
-    /// shown; `recenter_dialogs` places transients.
+    /// Override-redirect menus keep their X11 geometry, drawn and hit only inside their owner's
+    /// popup bounds: shown while their owner is and that cut isn't empty. navi can't move them
+    /// (Smithay refuses to configure one). `recenter_dialogs` places transients.
     pub(crate) fn place_menus(&mut self) {
-        let menus: Vec<_> = self
-            .windows
-            .iter()
-            .filter(|m| m.tile.is_none())
-            .filter_map(|m| {
-                let x = m.window.x11_surface()?;
-                x.is_override_redirect()
-                    .then(|| (m.window.clone(), x.geometry().loc, m.x11_parent))
-            })
-            .collect();
         let mut new = false;
-        for (window, loc, parent) in menus {
-            let shown = parent.is_some_and(|id| {
-                self.windows.iter().any(|m| {
-                    m.window.x11_surface().is_some_and(|p| p.window_id() == id)
-                        && self.space.element_location(&m.window).is_some()
-                })
-            });
-            match shown {
-                true => new |= crate::state::put(&mut self.space, &window, (loc.x, loc.y)),
-                false => self.space.unmap_elem(&window),
+        for i in 0..self.windows.len() {
+            if !self.windows[i].is_menu() {
+                continue;
+            }
+            let window = self.windows[i].window.clone();
+            let g = window
+                .x11_surface()
+                .map(|x| x.geometry())
+                .unwrap_or_default();
+            let parent_of = |j: usize| {
+                let id = self.windows[j].x11_parent?;
+                let x11 = |p: &Managed| p.window.x11_surface().is_some_and(|x| x.window_id() == id);
+                self.windows.iter().position(x11)
+            };
+            let owner = menu_owner(i, parent_of, |j| self.windows[j].is_menu())
+                .map(|j| self.windows[j].window.clone())
+                .filter(|w| self.space.element_location(w).is_some());
+            let clip = owner
+                .as_ref()
+                .and_then(|w| self.popup_bounds(w))
+                .and_then(|b| intersect(Rect::new(g.loc.x, g.loc.y, g.size.w, g.size.h), b));
+            let m = &mut self.windows[i];
+            (m.placed, m.menu_owner) = (clip, owner.filter(|_| clip.is_some()));
+            match clip {
+                Some(_) => new |= crate::state::put(&mut self.space, &window, (g.loc.x, g.loc.y)),
+                None => self.space.unmap_elem(&window),
             }
         }
         // Only a newly shown menu changes the order; dialog commits come through here too.
@@ -467,13 +482,17 @@ pub(crate) mod tests {
             backend::WaylandError,
             delegate_noop, event_created_child,
             protocol::{
-                wl_compositor, wl_data_device, wl_data_device_manager, wl_data_offer, wl_registry,
-                wl_seat, wl_surface,
+                wl_buffer, wl_compositor, wl_data_device, wl_data_device_manager, wl_data_offer,
+                wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_surface,
             },
         },
         protocols_wlr::foreign_toplevel::v1::client::{
             zwlr_foreign_toplevel_handle_v1::{self as handle, ZwlrForeignToplevelHandleV1},
             zwlr_foreign_toplevel_manager_v1::{self as manager, ZwlrForeignToplevelManagerV1},
+        },
+        protocols_wlr::layer_shell::v1::client::{
+            zwlr_layer_shell_v1::{self, ZwlrLayerShellV1},
+            zwlr_layer_surface_v1::{self, ZwlrLayerSurfaceV1},
         },
     };
     use std::time::{Duration, Instant};
@@ -1411,14 +1430,15 @@ pub(crate) mod tests {
             conn.get_input_focus().unwrap().reply().unwrap().focus == hop
         });
         // Round 11: a menu of that dialog, which the user clicked (it takes the keyboard), hides
-        // with it and loses the keyboard too.
+        // with it and loses the keyboard too. It opens inside the dialog, which clips it.
+        let hop_rect = data.state.windows[2].placed.expect("dialog shown");
         let menu = conn.generate_id().unwrap();
         conn.create_window(
             smithay::reexports::x11rb::COPY_DEPTH_FROM_PARENT,
             menu,
             root,
-            40,
-            40,
+            (hop_rect.x + 10) as i16,
+            (hop_rect.y + 10) as i16,
             80,
             60,
             0,
@@ -2045,5 +2065,436 @@ pub(crate) mod tests {
             "the neighbour's hints were never touched"
         );
         destroy(&mut event_loop, &mut data, plain);
+    }
+
+    /// A layer-shell panel client: the surface navi-bar's panels are.
+    #[derive(Default)]
+    struct Panel {
+        compositor: Option<wl_compositor::WlCompositor>,
+        shm: Option<wl_shm::WlShm>,
+        layers: Option<ZwlrLayerShellV1>,
+        configured: Option<u32>,
+    }
+
+    impl ClientDispatch<wl_registry::WlRegistry, ()> for Panel {
+        fn event(
+            state: &mut Self,
+            registry: &wl_registry::WlRegistry,
+            event: wl_registry::Event,
+            _: &(),
+            _: &WaylandConnection,
+            qh: &QueueHandle<Self>,
+        ) {
+            if let wl_registry::Event::Global {
+                name, interface, ..
+            } = event
+            {
+                match interface.as_str() {
+                    "wl_compositor" => state.compositor = Some(registry.bind(name, 4, qh, ())),
+                    "wl_shm" => state.shm = Some(registry.bind(name, 1, qh, ())),
+                    "zwlr_layer_shell_v1" => state.layers = Some(registry.bind(name, 4, qh, ())),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    impl ClientDispatch<ZwlrLayerSurfaceV1, ()> for Panel {
+        fn event(
+            state: &mut Self,
+            _: &ZwlrLayerSurfaceV1,
+            event: zwlr_layer_surface_v1::Event,
+            _: &(),
+            _: &WaylandConnection,
+            _: &QueueHandle<Self>,
+        ) {
+            if let zwlr_layer_surface_v1::Event::Configure { serial, .. } = event {
+                state.configured = Some(serial);
+            }
+        }
+    }
+
+    delegate_noop!(Panel: ignore wl_compositor::WlCompositor);
+    delegate_noop!(Panel: ignore wl_surface::WlSurface);
+    delegate_noop!(Panel: ignore wl_shm::WlShm);
+    delegate_noop!(Panel: ignore wl_shm_pool::WlShmPool);
+    delegate_noop!(Panel: ignore wl_buffer::WlBuffer);
+    delegate_noop!(Panel: ignore ZwlrLayerShellV1);
+
+    impl Panel {
+        fn read(&mut self, queue: &mut EventQueue<Self>) {
+            if let Some(read) = queue.prepare_read() {
+                match read.read() {
+                    Ok(_) => {}
+                    Err(WaylandError::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(e) => panic!("panel client: {e}"),
+                }
+            }
+            queue.dispatch_pending(self).unwrap();
+            queue.flush().unwrap();
+        }
+    }
+
+    /// Job 026: override-redirect menus are drawn and hit only inside their owner's rect (a
+    /// tile's clip, a float's or a dialog's rect), stack with a float owner, show nothing while
+    /// locked or over a panel, and at most `CLIENT_POPUPS` are tracked. Named so CI's
+    /// `x11_lifecycle_and_input` filter runs it.
+    #[test]
+    #[ignore = "requires the Xwayland executable"]
+    fn x11_lifecycle_and_input_menu_containment() {
+        use crate::state::Raise;
+        let (mut event_loop, mut data) = harness();
+        let xdisplay = start(&event_loop.handle(), &data.state).expect("spawn Xwayland");
+        pump(&mut event_loop, &mut data, |d| d.state.xwm.is_some());
+        let (conn, screen) = smithay::reexports::x11rb::connect(Some(&xdisplay)).unwrap();
+        let root = conn.setup().roots[screen].root;
+        let create = |(x, y, w, h): (i32, i32, i32, i32),
+                      menu: bool,
+                      min: Option<(i32, i32)>,
+                      transient: Option<u32>| {
+            let win = conn.generate_id().unwrap();
+            conn.create_window(
+                smithay::reexports::x11rb::COPY_DEPTH_FROM_PARENT,
+                win,
+                root,
+                x as i16,
+                y as i16,
+                w as u16,
+                h as u16,
+                0,
+                WindowClass::INPUT_OUTPUT,
+                0,
+                &CreateWindowAux::new()
+                    .background_pixel(0x6688aa)
+                    .override_redirect(u32::from(menu)),
+            )
+            .unwrap();
+            if let Some(min) = min {
+                let hints = WmSizeHints {
+                    min_size: Some(min),
+                    ..WmSizeHints::new()
+                };
+                hints.set_normal_hints(&conn, win).unwrap();
+            }
+            if let Some(p) = transient {
+                conn.change_property32(
+                    PropMode::REPLACE,
+                    win,
+                    AtomEnum::WM_TRANSIENT_FOR,
+                    AtomEnum::WINDOW,
+                    &[p],
+                )
+                .unwrap();
+            }
+            conn.map_window(win).unwrap();
+            conn.flush().unwrap();
+            win
+        };
+        let managed = |d: &CalloopData, win: u32| {
+            d.state
+                .windows
+                .iter()
+                .position(|m| m.window.x11_surface().is_some_and(|x| x.window_id() == win))
+        };
+        let window =
+            |d: &CalloopData, win| d.state.windows[managed(d, win).unwrap()].window.clone();
+        let under = |d: &CalloopData, (x, y): (i32, i32)| {
+            let pos = (f64::from(x), f64::from(y)).into();
+            d.state.window_under(pos).map(|(w, _)| w.clone())
+        };
+        let moved = |win, (x, y): (i32, i32)| {
+            conn.configure_window(win, &ConfigureWindowAux::new().x(x).y(y))
+                .unwrap();
+            conn.flush().unwrap();
+        };
+        let destroy = |event_loop: &mut EventLoop<CalloopData>, data: &mut CalloopData, win| {
+            conn.destroy_window(win).unwrap();
+            conn.flush().unwrap();
+            pump(event_loop, data, |d| managed(d, win).is_none());
+        };
+        let menus = |d: &CalloopData| d.state.windows.iter().filter(|m| m.is_menu()).count();
+
+        // Two tiles side by side, both drawn.
+        let a = create((0, 0, 320, 240), false, None, None);
+        pump(&mut event_loop, &mut data, |d| managed(d, a).is_some());
+        let b = create((0, 0, 320, 240), false, None, None);
+        pump(&mut event_loop, &mut data, |d| managed(d, b).is_some());
+        let clip = |d: &CalloopData, win| {
+            let id = d.state.windows[managed(d, win).unwrap()].tile.unwrap();
+            d.state.layout.clip(id).unwrap()
+        };
+        let (mut left, mut right) = (a, b);
+        if clip(&data, a).x > clip(&data, b).x {
+            (left, right) = (b, a);
+        }
+        let (l, r) = (clip(&data, left), clip(&data, right));
+        assert!(
+            l.x + l.w <= r.x && l.y < r.y + r.h && r.y < l.y + l.h,
+            "{l:?} {r:?}"
+        );
+        let (lw, rw) = (window(&data, left), window(&data, right));
+        pump(&mut event_loop, &mut data, |d| {
+            under(d, (l.x + 10, l.y + 10)) == Some(lw.clone())
+                && under(d, (r.x + 10, r.y + 10)) == Some(rw.clone())
+        });
+
+        // AC3: a menu of the focused left tile overhangs its clip on the right, into the right
+        // tile: cut at the edge; a point past it reaches the right tile, one inside the menu.
+        data.state.focus_by(Some(lw.clone()), Raise::User);
+        let geo = Rect::new(l.x + l.w - 50, l.y + 20, 150, 80);
+        let menu = create((geo.x, geo.y, geo.w, geo.h), true, None, None);
+        pump(&mut event_loop, &mut data, |d| managed(d, menu).is_some());
+        let mw = window(&data, menu);
+        let m = &data.state.windows[managed(&data, menu).unwrap()];
+        assert_eq!(m.placed, intersect(geo, l));
+        assert_eq!(m.placed, Some(Rect::new(l.x + l.w - 50, l.y + 20, 50, 80)));
+        assert_eq!(m.menu_owner, Some(lw.clone()));
+        assert_eq!(data.state.stacking(&mw), (false, intersect(geo, l)));
+        let both = (l.x + l.w - 25, l.y + 40);
+        let past = (r.x + 10, l.y + 40);
+        assert!(past.0 < geo.x + geo.w, "inside the menu's X11 geometry");
+        pump(&mut event_loop, &mut data, |d| {
+            under(d, both) == Some(mw.clone())
+        });
+        assert_eq!(under(&data, past), Some(rw.clone()));
+        // A real click there focuses the right tile, not the menu.
+        data.state
+            .pointer_motion((f64::from(past.0), f64::from(past.1)).into(), 1);
+        data.state.pointer_button(0x110, true, true, 2);
+        data.state.pointer_button(0x110, true, false, 3);
+        assert_eq!(data.state.focused_window(), Some(rw.clone()));
+
+        // AC4: moved wholly into the right tile, it isn't shown and takes no input; moved back
+        // inside, it's shown again at its X11 position.
+        moved(menu, (r.x + 20, r.y + 20));
+        pump(&mut event_loop, &mut data, |d| {
+            d.state.space.element_location(&mw).is_none()
+        });
+        let m = &data.state.windows[managed(&data, menu).unwrap()];
+        assert_eq!((m.placed, m.menu_owner.clone()), (None, None));
+        assert_eq!(under(&data, (r.x + 30, r.y + 30)), Some(rw.clone()));
+        moved(menu, (l.x + 20, l.y + 20));
+        pump(&mut event_loop, &mut data, |d| {
+            d.state.space.element_location(&mw) == Some((l.x + 20, l.y + 20).into())
+        });
+        let inside = (l.x + 30, l.y + 30);
+        pump(&mut event_loop, &mut data, |d| {
+            under(d, inside) == Some(mw.clone())
+        });
+
+        // AC7: locked, the frame is only lock surfaces (none here) and nothing reaches the menu.
+        data.state.lock.active = true;
+        let output = data.state.space.outputs().next().unwrap().clone();
+        let frame = crate::render::elements(
+            &mut smithay::backend::renderer::test::DummyRenderer,
+            &data.state,
+            &output,
+            crate::render::Arrow::None,
+            &mut None,
+            &mut crate::render::Solids::default(),
+        );
+        assert!(frame.is_empty(), "{} elements while locked", frame.len());
+        let pos = (f64::from(inside.0), f64::from(inside.1)).into();
+        assert_eq!(data.state.pointer_focus(pos), None);
+        data.state.pointer_motion(pos, 4);
+        data.state.pointer_button(0x110, true, true, 5);
+        data.state.pointer_button(0x110, true, false, 6);
+        assert_eq!(data.state.focused_window(), Some(rw.clone()));
+        let pointer = data.state.seat.get_pointer().unwrap();
+        assert_eq!(pointer.current_focus(), None);
+        data.state.lock.active = false;
+
+        // AC8: a panel over the bottom of the tiles; a menu under it is hit only where the panel
+        // isn't. (Its draw order: `render::tests::panels_draw_above_window_bars`.)
+        let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
+        data.state
+            .display_handle
+            .insert_client(
+                server,
+                std::sync::Arc::new(crate::state::ClientState {
+                    privileged: true,
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        let wl = WaylandConnection::from_socket(client).unwrap();
+        let mut queue = wl.new_event_queue::<Panel>();
+        let _registry = wl.display().get_registry(&queue.handle(), ());
+        let mut panel = Panel::default();
+        queue.flush().unwrap();
+        pump(&mut event_loop, &mut data, |_| {
+            panel.read(&mut queue);
+            panel.compositor.is_some() && panel.shm.is_some() && panel.layers.is_some()
+        });
+        let qh = queue.handle();
+        let surface = panel.compositor.as_ref().unwrap().create_surface(&qh, ());
+        let layer = panel.layers.as_ref().unwrap().get_layer_surface(
+            &surface,
+            None,
+            zwlr_layer_shell_v1::Layer::Top,
+            "panel".into(),
+            &qh,
+            (),
+        );
+        let (pw, ph) = (1280, 60);
+        layer.set_size(pw as u32, ph as u32);
+        layer.set_anchor(zwlr_layer_surface_v1::Anchor::Bottom);
+        layer.set_keyboard_interactivity(zwlr_layer_surface_v1::KeyboardInteractivity::OnDemand);
+        surface.commit();
+        pump(&mut event_loop, &mut data, |_| {
+            panel.read(&mut queue);
+            panel.configured.is_some()
+        });
+        layer.ack_configure(panel.configured.unwrap());
+        let path = std::env::temp_dir().join(format!("navi-026-panel-{}", std::process::id()));
+        let file = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        std::fs::remove_file(&path).unwrap();
+        file.set_len((pw * ph * 4) as u64).unwrap();
+        let pool = panel.shm.as_ref().unwrap().create_pool(
+            std::os::fd::AsFd::as_fd(&file),
+            pw * ph * 4,
+            &qh,
+            (),
+        );
+        let buffer = pool.create_buffer(0, pw, ph, pw * 4, wl_shm::Format::Argb8888, &qh, ());
+        surface.attach(Some(&buffer), 0, 0);
+        surface.commit();
+        let panel_top = 720 - ph;
+        assert!(
+            l.y + l.h > panel_top + 20,
+            "the tile reaches under the panel"
+        );
+        let menu_at = (l.x + 20, panel_top - 20);
+        moved(menu, menu_at);
+        let on_panel = (l.x + 40, panel_top + 10);
+        let pos = (f64::from(on_panel.0), f64::from(on_panel.1)).into();
+        // navi's side of the panel: the layer surface a click there lands on.
+        let panel_surface = |d: &CalloopData| {
+            let layer = d.state.layer_at(pos)?;
+            (layer.namespace() == "panel").then(|| layer.wl_surface().clone())
+        };
+        pump(&mut event_loop, &mut data, |d| {
+            panel.read(&mut queue);
+            d.state.space.element_location(&mw) == Some(menu_at.into())
+                && panel_surface(d).is_some()
+        });
+        let ps = panel_surface(&data).unwrap();
+        assert_eq!(
+            under(&data, on_panel),
+            Some(mw.clone()),
+            "the menu is there"
+        );
+        assert_eq!(
+            data.state.pointer_focus(pos).map(|(s, _)| s),
+            Some(ps.clone())
+        );
+        let above = (l.x + 40, panel_top - 10);
+        pump(&mut event_loop, &mut data, |d| {
+            under(d, above) == Some(mw.clone())
+        });
+        data.state.pointer_motion(pos, 7);
+        data.state.pointer_button(0x110, true, true, 8);
+        data.state.pointer_button(0x110, true, false, 9);
+        let kb = data.state.seat.get_keyboard().unwrap();
+        let focus = kb.current_focus().and_then(|f| f.surface());
+        assert_eq!(focus, Some(ps), "the press reached the panel");
+        layer.destroy();
+        surface.destroy();
+        pump(&mut event_loop, &mut data, |d| {
+            panel.read(&mut queue);
+            panel_surface(d).is_none()
+        });
+        destroy(&mut event_loop, &mut data, menu);
+
+        // AC5: a float's menu stacks and is hit with the float, above it, cut to its rect.
+        let float = create((0, 0, 300, 700), false, Some((300, 700)), None);
+        pump(&mut event_loop, &mut data, |d| managed(d, float).is_some());
+        let fw = window(&data, float);
+        let fid = data.state.windows[managed(&data, float).unwrap()]
+            .tile
+            .unwrap();
+        assert!(data.state.layout.tile(fid).unwrap().floating);
+        let f = data.state.layout.clip(fid).unwrap();
+        pump(&mut event_loop, &mut data, |d| {
+            under(d, (f.x + 10, f.y + 10)) == Some(fw.clone())
+        });
+        data.state.focus_by(Some(fw.clone()), Raise::User);
+        let geo = Rect::new(f.x + f.w - 30, f.y + 40, 100, 60);
+        let menu = create((geo.x, geo.y, geo.w, geo.h), true, None, None);
+        pump(&mut event_loop, &mut data, |d| managed(d, menu).is_some());
+        let mw = window(&data, menu);
+        assert_eq!(data.state.stacking(&mw), (true, intersect(geo, f)));
+        assert_eq!(data.state.float_owner(&mw), Some(fid));
+        let floats = data.state.float_windows();
+        let at = |w: &smithay::desktop::Window| floats.iter().position(|&x| x == w);
+        assert!(at(&mw).unwrap() < at(&fw).unwrap(), "above its float");
+        let both = (f.x + f.w - 10, f.y + 50);
+        pump(&mut event_loop, &mut data, |d| {
+            under(d, both) == Some(mw.clone())
+        });
+        assert_ne!(under(&data, (f.x + f.w + 10, f.y + 50)), Some(mw.clone()));
+        destroy(&mut event_loop, &mut data, menu);
+        // And a menu of the float's X11 transient dialog is cut to the dialog's rect.
+        let dialog = create((0, 0, 200, 150), false, None, Some(float));
+        pump(&mut event_loop, &mut data, |d| {
+            managed(d, dialog).is_some_and(|i| d.state.windows[i].placed.is_some())
+        });
+        let dw = window(&data, dialog);
+        let p = data.state.windows[managed(&data, dialog).unwrap()]
+            .placed
+            .unwrap();
+        data.state.focus_by(Some(dw.clone()), Raise::User);
+        let geo = Rect::new(p.x + p.w - 20, p.y + 10, 100, 50);
+        let menu = create((geo.x, geo.y, geo.w, geo.h), true, None, None);
+        pump(&mut event_loop, &mut data, |d| managed(d, menu).is_some());
+        let mw = window(&data, menu);
+        assert_eq!(data.state.stacking(&mw), (true, intersect(geo, p)));
+        assert_eq!(
+            data.state.dialog_rect(&mw),
+            None,
+            "a menu isn't framed as a dialog"
+        );
+        destroy(&mut event_loop, &mut data, menu);
+        destroy(&mut event_loop, &mut data, dialog);
+        destroy(&mut event_loop, &mut data, float);
+
+        // AC6: of 65 menus, 64 are tracked; closing one lets the next in.
+        assert_eq!(menus(&data), 0);
+        data.state.focus_by(Some(lw.clone()), Raise::User);
+        let flood: Vec<u32> = (0..CLIENT_POPUPS as i32 + 1)
+            .map(|k| create((l.x + 10 + k, l.y + 10, 20, 20), true, None, None))
+            .collect();
+        pump(&mut event_loop, &mut data, |d| {
+            menus(d) == CLIENT_POPUPS && d.state.menus_capped.is_some()
+        });
+        let left_out: Vec<_> = flood
+            .iter()
+            .filter(|&&w| managed(&data, w).is_none())
+            .collect();
+        assert_eq!(left_out.len(), 1);
+        let gone = *flood
+            .iter()
+            .find(|&&w| managed(&data, w).is_some())
+            .unwrap();
+        conn.unmap_window(gone).unwrap();
+        conn.flush().unwrap();
+        pump(&mut event_loop, &mut data, |d| {
+            menus(d) == CLIENT_POPUPS - 1
+        });
+        let next = create((l.x + 100, l.y + 10, 20, 20), true, None, None);
+        pump(&mut event_loop, &mut data, |d| managed(d, next).is_some());
+        assert_eq!(menus(&data), CLIENT_POPUPS);
+        for w in flood.into_iter().chain([next]) {
+            conn.destroy_window(w).unwrap();
+        }
+        conn.flush().unwrap();
+        pump(&mut event_loop, &mut data, |d| menus(d) == 0);
+        destroy(&mut event_loop, &mut data, a);
+        destroy(&mut event_loop, &mut data, b);
     }
 }

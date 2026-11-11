@@ -41,6 +41,12 @@ features = [
     "xwayland",
 ]
 
+# Tests render frames with Smithay's dummy renderer.
+[dev-dependencies.smithay]
+version = "0.7.0"
+default-features = false
+features = ["renderer_test"]
+
 # Smithay places a new popup from the client's raw positioner before navi can bound it, so an
 # extreme one overflows there; debug navi wraps as release does, then navi bounds the result.
 [profile.dev.package.smithay]
