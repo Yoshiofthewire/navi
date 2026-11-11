@@ -63,6 +63,21 @@ impl Rect {
     }
 }
 
+/// How far a client's popup positioner may reach, in logical px: far past any output. With every
+/// coordinate within ±this and every size in 1..=this, Smithay's placement sums stay inside i32.
+pub const POPUP_LIMIT: i32 = 1 << 20;
+
+/// A client's positioner coordinate, bounded to `POPUP_LIMIT`.
+pub fn popup_coord(v: i32) -> i32 {
+    v.clamp(-POPUP_LIMIT, POPUP_LIMIT)
+}
+
+/// A client's positioner rect, bounded to `POPUP_LIMIT`; sizes stay at least 1.
+pub fn popup_rect(r: Rect) -> Rect {
+    let size = |v: i32| v.clamp(1, POPUP_LIMIT);
+    Rect::new(popup_coord(r.x), popup_coord(r.y), size(r.w), size(r.h))
+}
+
 /// A rectangle of whole grid cells.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Cells {
@@ -1137,6 +1152,39 @@ mod tests {
     use super::*;
     use crate::layout::{Action, Button, Done, float_overlay};
     use drag::Hit;
+
+    #[test]
+    fn popup_values_are_bounded() {
+        const L: i32 = POPUP_LIMIT;
+        for (v, want) in [
+            (i32::MAX, L),
+            (i32::MIN, -L),
+            (0, 0),
+            (L, L),
+            (L - 1, L - 1),
+            (L + 1, L),
+            (-L, -L),
+            (-L + 1, -L + 1),
+            (-L - 1, -L),
+        ] {
+            assert_eq!(popup_coord(v), want, "{v}");
+        }
+        let r = |x, y, w, h| Rect::new(x, y, w, h);
+        assert_eq!(
+            popup_rect(r(i32::MAX, i32::MIN, i32::MAX, i32::MAX)),
+            r(L, -L, L, L)
+        );
+        assert_eq!(
+            popup_rect(r(i32::MIN, i32::MAX, i32::MIN, 0)),
+            r(-L, L, 1, 1)
+        );
+        for v in [1, L - 1, L] {
+            assert_eq!(popup_rect(r(v, -v, v, v)), r(v, -v, v, v));
+        }
+        assert_eq!(popup_rect(r(L + 1, -L - 1, L + 1, L + 1)), r(L, -L, L, L));
+        let menu = r(40, 30, 200, 24);
+        assert_eq!(popup_rect(menu), menu);
+    }
 
     fn out(name: &str, x: i32, y: i32, w: i32, h: i32, priority: u32) -> Output {
         Output {

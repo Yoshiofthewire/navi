@@ -1916,8 +1916,9 @@ impl Navi {
             sub(b.x, up.x, window_geo.loc.x),
             sub(b.y, up.y, window_geo.loc.y),
         );
-        let target = Rectangle::new((x, y).into(), (b.w, b.h).into());
+        let target = bounded_rect(Rectangle::new((x, y).into(), (b.w, b.h).into()));
         popup.with_pending_state(|s| {
+            s.positioner = bounded(s.positioner);
             s.geometry = s.positioner.get_unconstrained_geometry(target);
         });
     }
@@ -2108,6 +2109,24 @@ fn intersect(r: Rect, bounds: Rect) -> Option<Rect> {
     // Inside `bounds`, so these fit.
     let (w, h) = (i32::try_from(w).ok()?, i32::try_from(h).ok()?);
     (w > 0 && h > 0).then_some(Rect { x, y, w, h })
+}
+
+/// `p` with every client value bounded to `layout::POPUP_LIMIT`, so Smithay's placement can't
+/// overflow.
+fn bounded(mut p: PositionerState) -> PositionerState {
+    p.anchor_rect = bounded_rect(p.anchor_rect);
+    p.rect_size = bounded_rect(Rectangle::new((0, 0).into(), p.rect_size)).size;
+    p.offset = (
+        layout::popup_coord(p.offset.x),
+        layout::popup_coord(p.offset.y),
+    )
+        .into();
+    p
+}
+
+fn bounded_rect(r: Rectangle<i32, Logical>) -> Rectangle<i32, Logical> {
+    let b = layout::popup_rect(Rect::new(r.loc.x, r.loc.y, r.size.w, r.size.h));
+    Rectangle::new((b.x, b.y).into(), (b.w, b.h).into())
 }
 
 /// The logical pixel containing `p`.
@@ -2345,6 +2364,7 @@ impl XdgShellHandler for Navi {
         positioner: PositionerState,
         token: u32,
     ) {
+        let positioner = bounded(positioner);
         surface.with_pending_state(|s| {
             s.geometry = positioner.get_geometry();
             s.positioner = positioner;
@@ -2686,6 +2706,98 @@ delegate_xdg_activation!(Navi);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_positioner::{
+        Anchor, ConstraintAdjustment, Gravity,
+    };
+
+    fn rect(x: i32, y: i32, w: i32, h: i32) -> Rectangle<i32, Logical> {
+        Rectangle::new((x, y).into(), (w, h).into())
+    }
+
+    fn positioner(
+        offset: (i32, i32),
+        anchor: Rectangle<i32, Logical>,
+        size: i32,
+    ) -> PositionerState {
+        PositionerState {
+            rect_size: (size, size).into(),
+            anchor_rect: anchor,
+            offset: offset.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn extreme_positioners_place_without_overflow() {
+        let (max, min) = (i32::MAX, i32::MIN);
+        let targets = [
+            rect(min, min, max, max),
+            rect(max, max, max, max),
+            rect(0, 0, 1, 1),
+        ]
+        .map(bounded_rect);
+        let mut raw = Vec::new();
+        for offset in [(max, max), (min, min), (max, min), (0, 0)] {
+            for (loc, len) in [(max, max), (min, max), (max, 1), (min, 1), (0, 1)] {
+                for size in [max, 1] {
+                    raw.push(positioner(offset, rect(loc, loc, len, len), size));
+                }
+            }
+        }
+        for p in raw {
+            let mut p = bounded(p);
+            for anchor in 0..=8 {
+                p.anchor_edges = Anchor::try_from(anchor).unwrap();
+                for gravity in 0..=8 {
+                    p.gravity = Gravity::try_from(gravity).unwrap();
+                    let _ = p.get_geometry();
+                    for adjust in 0..64 {
+                        p.constraint_adjustment = ConstraintAdjustment::from_bits_truncate(adjust);
+                        for t in targets {
+                            let _ = p.get_unconstrained_geometry(t);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn in_range_popups_place_as_before() {
+        let menu = PositionerState {
+            anchor_edges: Anchor::BottomLeft,
+            gravity: Gravity::BottomRight,
+            constraint_adjustment: ConstraintAdjustment::all(),
+            ..positioner((0, 4), rect(100, 20, 80, 24), 300)
+        };
+        for t in [
+            rect(-500, -300, 1280, 800),
+            rect(0, 0, 400, 300),
+            rect(-90, -10, 200, 200),
+        ] {
+            assert_eq!(bounded(menu), menu);
+            assert_eq!(
+                bounded(menu).get_unconstrained_geometry(bounded_rect(t)),
+                menu.get_unconstrained_geometry(t)
+            );
+        }
+    }
+
+    #[test]
+    fn reposition_to_extreme_offset_places_without_overflow() {
+        let p = PositionerState {
+            anchor_edges: Anchor::BottomRight,
+            gravity: Gravity::BottomRight,
+            ..positioner(
+                (i32::MAX, i32::MAX),
+                rect(i32::MAX, i32::MAX, 1, 1),
+                i32::MAX,
+            )
+        };
+        // As in `reposition_request`.
+        let g = bounded(p).get_geometry();
+        assert!(g.loc.x <= 3 * layout::POPUP_LIMIT + 1);
+    }
 
     #[test]
     fn ac1_only_navis_own_connection_is_privileged() {
