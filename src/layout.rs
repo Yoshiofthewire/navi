@@ -105,6 +105,34 @@ pub fn popup_too_deep<T>(popup: T, parent: impl Fn(&T) -> Option<T>) -> bool {
     true
 }
 
+/// An X11 menu's owner: the first window up its `parent_of` chain that `is_menu` says isn't a
+/// menu. `None` if the chain ends at no window, loops, or is longer than `POPUP_DEPTH` steps.
+pub fn menu_owner(
+    menu: usize,
+    parent_of: impl Fn(usize) -> Option<usize>,
+    is_menu: impl Fn(usize) -> bool,
+) -> Option<usize> {
+    let mut at = menu;
+    for _ in 0..POPUP_DEPTH {
+        at = parent_of(at)?;
+        if !is_menu(at) {
+            return Some(at);
+        }
+    }
+    None
+}
+
+/// `r` cut to `bounds`; `None` if nothing is left. `r` is untrusted, so the sums are in i64.
+pub fn intersect(r: Rect, bounds: Rect) -> Option<Rect> {
+    let end = |a: i32, len: i32| i64::from(a) + i64::from(len);
+    let (x, y) = (r.x.max(bounds.x), r.y.max(bounds.y));
+    let w = end(r.x, r.w).min(end(bounds.x, bounds.w)) - i64::from(x);
+    let h = end(r.y, r.h).min(end(bounds.y, bounds.h)) - i64::from(y);
+    // Inside `bounds`, so these fit.
+    let (w, h) = (i32::try_from(w).ok()?, i32::try_from(h).ok()?);
+    (w > 0 && h > 0).then_some(Rect { x, y, w, h })
+}
+
 /// A rectangle of whole grid cells.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Cells {
@@ -1198,6 +1226,100 @@ mod tests {
         assert!(!chain(POPUP_DEPTH));
         assert!(chain(POPUP_DEPTH + 1));
         assert!(chain(usize::MAX));
+    }
+
+    #[test]
+    fn popups_are_cut_to_their_bounds() {
+        let full = Rect::new(0, 0, 1280, 800);
+        let r = Rect::new;
+        assert_eq!(
+            intersect(r(100, 100, 200, 50), full),
+            Some(r(100, 100, 200, 50))
+        );
+        assert_eq!(
+            intersect(r(-50, 700, 5000, 5000), full),
+            Some(r(0, 700, 1280, 100))
+        );
+        assert_eq!(intersect(r(1280, 0, 10, 10), full), None);
+        assert_eq!(intersect(r(10, 10, 0, 10), full), None);
+        // Client-sized extremes: no overflow.
+        let max = i32::MAX;
+        assert_eq!(
+            intersect(r(12, 0, max, max), full),
+            Some(r(12, 0, 1268, 800))
+        );
+        assert_eq!(intersect(r(max, max, max, max), full), None);
+        assert_eq!(intersect(r(i32::MIN, i32::MIN, max, max), full), None);
+        assert_eq!(intersect(r(-5, -5, max, max), full), Some(full));
+        assert_eq!(intersect(r(0, 0, 10, 10), r(max - 5, 0, max, max)), None);
+    }
+
+    #[test]
+    fn menu_owners_are_found_within_the_depth_limit() {
+        // Live windows 0..parent.len(): `menus` are menus; `parent[i]` is i's X11 parent, which
+        // like navi's lookup finds only a live window.
+        let owner = |i: usize, parent: &[Option<usize>], menus: &[usize]| {
+            let live = |&p: &usize| p < parent.len();
+            menu_owner(
+                i,
+                |j| parent.get(j).copied().flatten().filter(live),
+                |j| menus.contains(&j),
+            )
+        };
+        // 0 is a tile; 1 its menu; 2 a menu of 1.
+        let parent = [None, Some(0), Some(1)];
+        assert_eq!(owner(1, &parent, &[1, 2]), Some(0));
+        assert_eq!(owner(2, &parent, &[1, 2]), Some(0));
+        // A chain of 16 menus over a tile resolves; of 17, it doesn't.
+        let chain = |n: usize| {
+            let parent: Vec<_> = (0..=n).map(|i| i.checked_sub(1)).collect();
+            let menus: Vec<_> = (1..=n).collect();
+            owner(n, &parent, &menus)
+        };
+        assert_eq!(chain(POPUP_DEPTH), Some(0));
+        assert_eq!(chain(POPUP_DEPTH + 1), None);
+        // A loop of menus, and a parent that's gone.
+        assert_eq!(owner(1, &[None, Some(2), Some(1)], &[1, 2]), None);
+        assert_eq!(owner(1, &[None, Some(7)], &[1]), None);
+        assert_eq!(owner(2, &[None, Some(7), Some(1)], &[1, 2]), None);
+    }
+
+    #[test]
+    fn menus_are_cut_to_their_owners_bounds() {
+        let tile = Rect::new(12, 20, 600, 400);
+        let r = Rect::new;
+        assert_eq!(
+            intersect(r(50, 60, 100, 80), tile),
+            Some(r(50, 60, 100, 80))
+        );
+        assert_eq!(
+            intersect(r(550, 60, 200, 80), tile),
+            Some(r(550, 60, 62, 80))
+        );
+        assert_eq!(
+            intersect(r(50, 380, 100, 80), tile),
+            Some(r(50, 380, 100, 40))
+        );
+        assert_eq!(intersect(r(612, 60, 100, 80), tile), None);
+        assert_eq!(intersect(r(700, 500, 10, 10), tile), None);
+        let inside = |c: Option<Rect>| {
+            c.is_none_or(|c| {
+                c.x >= tile.x
+                    && c.y >= tile.y
+                    && c.x + c.w <= tile.x + tile.w
+                    && c.y + c.h <= tile.y + tile.h
+            })
+        };
+        let extremes = [i32::MIN, i32::MIN + 1, -1, 0, 1, i32::MAX - 1, i32::MAX];
+        for x in extremes {
+            for y in extremes {
+                for w in extremes {
+                    for h in extremes {
+                        assert!(inside(intersect(r(x, y, w, h), tile)), "{x} {y} {w} {h}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

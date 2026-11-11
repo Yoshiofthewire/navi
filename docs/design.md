@@ -233,7 +233,12 @@ aspect, gravity, position) are ignored.
   shrinks it there when it's placed, and draws and hits it only there, whatever size the app asks
   for or attaches. So a popup, with or without a grab, can't cover or take input meant for a
   neighbouring tile. An app keeps at most 64 popups open and nests them at most 16 deep; navi
-  dismisses any more, and any popup without a parent except navi-bar's. A window that draws
+  dismisses any more, and any popup without a parent except navi-bar's. An X11 menu
+  (override-redirect: menu, tooltip, drop-down) gets the same rect as its *owner*'s popups, the
+  first window up its X11 parents that isn't a menu (at most 16 steps; none, a loop or a longer
+  chain and it isn't shown). navi can't move an X11 menu, so it's drawn and hit only where it
+  overlaps that rect, unmapped while that's empty, and stacks with its owner (with a float, above
+  it). At most 64 X11 menus are tracked across all X clients; a later one isn't shown. A window that draws
   larger, such as a CSD shadow or a buffer bigger than its configure, is cropped there, and a
   click just outside it reaches what's below. So no app draws over, or takes clicks meant for,
   another tile or navi's zones, except through a dialog, below.
@@ -288,6 +293,8 @@ aspect, gravity, position) are ignored.
   hints logs at most one refit a second. `dialog: capped to its monitor` (its size, the cap and
   its rect, once per dialog per bounds), `dialog: focus refused` (app and root) when a new dialog
   maps without the keyboard, and `dialog: re-resolved` (old and new root) when a parent closes.
+  `X11 menu not shown: too many open` (the cap) at most once a second while X11 menus are
+  refused at the cap.
 
 ### Tabs
 
@@ -698,7 +705,7 @@ session.
   window isn't refused: X11 clients on one Xwayland already see and inject each other's input,
   so it gains nothing navi could deny, and it can never name a Wayland window, so the focus rule
   still keeps it from taking keys from Wayland apps. Override-redirect menus keep their X11
-  geometry, unclipped, and show only while their X11 parent does. Clipboard transfers are bridged,
+  geometry and are cut to their owner's rect (*The clip*); they show only while their owner does. Clipboard transfers are bridged,
   with X11 access gated on keyboard focus. Clipboard MIME names containing NULs or exceeding
   2048 bytes are rejected; accepted names are preserved exactly. Primary selection, cross-protocol drag-and-drop,
   and automatic XWayland crash recovery remain unimplemented. Install the `Xwayland` executable
