@@ -591,8 +591,10 @@ impl Bar {
             // Closing again an app that ignored a close asks to force close it.
             context::Kind::ForceClose | context::Kind::Close(_) if c.overdue() => {
                 debug!(app_id = target.key, ?kind, "force-close confirmation");
+                let at = self.pointer_at;
+                let at = self.layout.anchor(at.0 as i32, at.1 as i32);
                 if let Some(c) = &mut self.context {
-                    c.ask_force(Instant::now());
+                    c.ask_force(Instant::now(), at);
                 }
             }
             context::Kind::Open | context::Kind::NewWindow | context::Kind::Action(_) => {
@@ -939,10 +941,11 @@ impl Bar {
             Keysym::Escape | Keysym::Menu => self.context = None,
             Keysym::F10 if self.shift => self.context = None,
             Keysym::Return | Keysym::KP_Enter => match (&c.confirm, c.selected) {
-                (Some(confirm), _) => {
-                    let hit = [context::Hit::Cancel, context::Hit::Confirm][confirm.selected];
-                    return self.confirm(hit);
-                }
+                // Swallowed until armed, never queued.
+                (Some(confirm), _) => match confirm.enter(Instant::now()) {
+                    Some(hit) => return self.confirm(hit),
+                    None => return,
+                },
                 (None, Some(i)) => return self.context_activate(i, serial, qh),
                 (None, None) => return,
             },
@@ -2300,7 +2303,7 @@ impl PointerHandler for Bar {
                     if let (PointerEventKind::Motion { .. }, Some(c)) =
                         (&e.kind, self.context.as_mut())
                     {
-                        c.moved();
+                        c.pointer(self.layout.anchor(x, y));
                     }
                     let in_menu = self.layout.context().zip(self.context.as_ref());
                     let on_item = in_menu.and_then(|(r, c)| c.hit(r, x, y));
@@ -2508,7 +2511,7 @@ mod tests {
             m.step(1);
             out.push(m.draw(r(&m)));
         }
-        m.ask_force(Instant::now());
+        m.ask_force(Instant::now(), (0, 0));
         for _ in 0..2 {
             m.step(1);
             out.push(m.draw(r(&m)));

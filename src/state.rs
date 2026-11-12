@@ -2515,9 +2515,7 @@ impl ClientState {
         use rustix::net::sockopt::socket_peercred;
         use rustix::process::{PidfdFlags, pidfd_open};
         let peer = socket_peercred(stream).ok().map(|c| c.pid);
-        // The pid read again once the pidfd is open: a mismatch drops the pidfd.
-        let still = |p| socket_peercred(stream).is_ok_and(|c| c.pid == p);
-        let pidfd = peer.and_then(|p| pidfd_open(p, PidfdFlags::empty()).ok().filter(|_| still(p)));
+        let pidfd = peer.and_then(|p| pidfd_open(p, PidfdFlags::empty()).ok());
         ClientState {
             pid: peer.map(|p| p.as_raw_nonzero().get() as u32),
             pidfd: pidfd.map(Arc::new),

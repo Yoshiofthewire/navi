@@ -20,8 +20,8 @@ const BUTTON_H: i32 = 36;
 /// Space around the confirmation's buttons.
 const GAP: i32 = 12;
 const MARK_W: i32 = 3;
-/// The confirmation's buttons take presses only this long after it appears, and after the
-/// pointer has moved: a double-click on the item that opened it never confirms.
+/// The confirmation acts on nothing for this long after it appears: a double-click or a double
+/// Enter on the item that opened it never confirms.
 pub const ARM: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Debug, PartialEq)]
@@ -144,7 +144,10 @@ pub struct Confirm {
     /// 0 Cancel, 1 Force close.
     pub selected: usize,
     pub opened: Instant,
-    /// The pointer moved since it opened.
+    /// Where the pointer was when it opened, relative to the surface's bottom centre
+    /// (`Layout::anchor`), so the motion navi sends when the surface resizes isn't a move.
+    pub at: (i32, i32),
+    /// The pointer really moved since it opened.
     pub moved: bool,
 }
 
@@ -161,9 +164,19 @@ impl Confirm {
         out
     }
 
-    /// Whether a press on a button counts (`ARM`); keys always do.
+    fn aged(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.opened) >= ARM
+    }
+
+    /// Whether a press on a button counts: `ARM` passed and the pointer really moved.
     pub fn armed(&self, now: Instant) -> bool {
-        self.moved && now.saturating_duration_since(self.opened) >= ARM
+        self.moved && self.aged(now)
+    }
+
+    /// Enter: the selected button once `ARM` has passed; before that the key is swallowed.
+    pub fn enter(&self, now: Instant) -> Option<Hit> {
+        let hit = [Hit::Cancel, Hit::Confirm][self.selected];
+        self.aged(now).then_some(hit)
     }
 }
 
@@ -265,8 +278,9 @@ impl Menu {
         self.lines.iter().any(force)
     }
 
-    /// Shows the force-close confirmation at `now`, Cancel selected.
-    pub fn ask_force(&mut self, now: Instant) {
+    /// Shows the force-close confirmation at `now`, Cancel selected, with the pointer at `at`
+    /// (anchored, `Layout::anchor`).
+    pub fn ask_force(&mut self, now: Instant, at: (i32, i32)) {
         let name = match self.lines.first() {
             Some(Line::Header(n)) => n.clone(),
             _ => String::new(),
@@ -280,14 +294,15 @@ impl Menu {
             windows: windows.unwrap_or(1),
             selected: 0,
             opened: now,
+            at,
             moved: false,
         });
     }
 
-    /// Pointer motion over the menu, for `Confirm::armed`.
-    pub fn moved(&mut self) {
+    /// Pointer motion to `at` (anchored), for `Confirm::armed`: the same spot isn't a move.
+    pub fn pointer(&mut self, at: (i32, i32)) {
         if let Some(c) = &mut self.confirm {
-            c.moved = true;
+            c.moved |= at != c.at;
         }
     }
 
@@ -347,16 +362,16 @@ impl Menu {
         matches!(self.lines[i], Line::Item(..)).then_some(Hit::Line(i))
     }
 
-    /// Hover selects what's under the pointer; returns whether anything changed.
+    /// Hover selects the item under the pointer; returns whether that changed. It never moves
+    /// the confirmation's selection: only keys do, so Enter acts on what the user chose.
     pub fn hover(&mut self, hit: Hit) -> bool {
-        let before = (self.selected, self.confirm.clone());
-        match (hit, &mut self.confirm) {
-            (Hit::Line(i), None) => self.selected = Some(i),
-            (Hit::Cancel, Some(c)) => c.selected = 0,
-            (Hit::Confirm, Some(c)) => c.selected = 1,
-            _ => {}
+        match (hit, &self.confirm) {
+            (Hit::Line(i), None) if self.selected != Some(i) => {
+                self.selected = Some(i);
+                true
+            }
+            _ => false,
         }
-        before != (self.selected, self.confirm.clone())
     }
 
     /// The menu at `r`, on top of everything else on the surface.
@@ -787,7 +802,7 @@ mod tests {
         assert!(mark.y > fill.y && mark.y + mark.h < fill.y + fill.h);
         assert!(matches!(items[0], Item::Panel(p, Panel::Popup, PANEL_EDGE, 1) if p == r));
         // The confirmation: Cancel selected first.
-        m.ask_force(Instant::now());
+        m.ask_force(Instant::now(), (0, 0));
         let items = m.draw(Rect { h: m.height(), ..r });
         assert_eq!(marks(&items), 1);
         assert!(
@@ -835,7 +850,7 @@ mod tests {
                 .collect();
             assert_eq!(rows.len(), 2);
             let t = Instant::now();
-            m.ask_force(t);
+            m.ask_force(t, (5, -50));
             let confirm = at(&m);
             assert_eq!(confirm.y + confirm.h, bottom);
             for r in &rows {
@@ -847,7 +862,10 @@ mod tests {
             }
             let c = m.confirm.clone().unwrap();
             assert!(!c.armed(t + ARM), "no motion yet");
-            m.moved();
+            // navi's motion for the resize, at the same spot, doesn't arm it.
+            m.pointer((5, -50));
+            assert!(!m.confirm.as_ref().unwrap().armed(t + ARM));
+            m.pointer((6, -50));
             let c = m.confirm.as_ref().unwrap();
             assert!(!c.armed(t + ARM - Duration::from_millis(1)));
             assert!(c.armed(t + ARM));
@@ -855,5 +873,36 @@ mod tests {
             let others = c.body().iter().any(|l| l.contains("other"));
             assert_eq!(others, windows > 1);
         }
+    }
+
+    /// Round 2: hover never selects a button, and Enter waits for `ARM`, then acts on the
+    /// default Cancel.
+    #[test]
+    fn hover_never_selects_and_enter_waits() {
+        let e = konsole();
+        let target = Target {
+            key: e.id.clone(),
+            dock: true,
+        };
+        let mut m = Menu::new(
+            target,
+            lines(&app(Some(&e), false, 1, 1), true),
+            (0, 0),
+            false,
+        );
+        let t = Instant::now();
+        m.ask_force(t, (0, 0));
+        assert!(!m.hover(Hit::Confirm));
+        assert!(!m.hover(Hit::Line(1)), "the items are gone");
+        let c = m.confirm.as_ref().unwrap();
+        assert_eq!(c.selected, 0, "hover leaves Cancel selected");
+        assert_eq!(c.enter(t), None);
+        assert_eq!(c.enter(t + ARM - Duration::from_millis(1)), None);
+        assert_eq!(c.enter(t + ARM), Some(Hit::Cancel));
+        m.step(1);
+        assert_eq!(
+            m.confirm.as_ref().unwrap().enter(t + ARM),
+            Some(Hit::Confirm)
+        );
     }
 }
