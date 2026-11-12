@@ -275,9 +275,6 @@ impl Navi {
                 self.pointer_button(event.button_code(), left, pressed, event.time_msec());
             }
             InputEvent::PointerAxis { event, .. } => {
-                let Some(pointer) = self.seat.get_pointer() else {
-                    return;
-                };
                 let source = event.source();
                 let mut frame = AxisFrame::new(event.time_msec()).source(source);
                 for axis in [Axis::Horizontal, Axis::Vertical] {
@@ -295,8 +292,7 @@ impl Navi {
                         frame = frame.stop(axis);
                     }
                 }
-                pointer.axis(self, frame);
-                pointer.frame(self);
+                self.pointer_axis(frame);
             }
             _ => {}
         }
@@ -532,6 +528,14 @@ impl Navi {
     }
 
     /// A pointer button, from winit or the debug replay.
+    /// A scroll, to what has the pointer.
+    pub fn pointer_axis(&mut self, frame: AxisFrame) {
+        if let Some(pointer) = self.seat.get_pointer() {
+            pointer.axis(self, frame);
+            pointer.frame(self);
+        }
+    }
+
     pub fn pointer_button(&mut self, button: u32, left: bool, pressed: bool, time: u32) {
         self.request_redraw();
         let Some(pointer) = self.seat.get_pointer() else {

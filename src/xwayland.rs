@@ -3081,4 +3081,127 @@ pub(crate) mod tests {
             "a new X client connects"
         );
     }
+
+    /// Job 038 AC5: Xwayland's stack follows navi's drawn order. A float stays above the tile
+    /// it covers whether the tile is refocused by navi or raised by the user, and a client's
+    /// own restack request changes nothing. Named so CI's `x11_lifecycle_and_input` filter runs it.
+    #[test]
+    #[ignore = "requires the Xwayland executable"]
+    fn x11_lifecycle_and_input_stacking() {
+        use crate::state::Raise;
+        let (mut event_loop, mut data) = harness();
+        let xdisplay = start(&event_loop.handle(), &data.state).expect("spawn Xwayland");
+        pump(&mut event_loop, &mut data, |d| d.state.xwm.is_some());
+        let (conn, screen) = smithay::reexports::x11rb::connect(Some(&xdisplay)).unwrap();
+        let root = conn.setup().roots[screen].root;
+        let create = |min: Option<(i32, i32)>| {
+            let win = conn.generate_id().unwrap();
+            conn.create_window(
+                smithay::reexports::x11rb::COPY_DEPTH_FROM_PARENT,
+                win,
+                root,
+                0,
+                0,
+                320,
+                240,
+                0,
+                WindowClass::INPUT_OUTPUT,
+                0,
+                &CreateWindowAux::new().background_pixel(0x224466),
+            )
+            .unwrap();
+            let hints = WmSizeHints {
+                min_size: min,
+                ..WmSizeHints::new()
+            };
+            hints.set_normal_hints(&conn, win).unwrap();
+            conn.map_window(win).unwrap();
+            conn.flush().unwrap();
+            win
+        };
+        let window = |d: &CalloopData, win: u32| {
+            d.state
+                .windows
+                .iter()
+                .find(|m| m.window.x11_surface().is_some_and(|x| x.window_id() == win))
+                .map(|m| (m.window.clone(), m.tile))
+        };
+        let tile = create(None);
+        pump(&mut event_loop, &mut data, |d| {
+            window(d, tile).is_some_and(|(_, t)| t.is_some())
+        });
+        let float = create(Some((2000, 1500)));
+        pump(&mut event_loop, &mut data, |d| {
+            window(d, float).is_some_and(|(_, t)| t.is_some())
+        });
+        let (tw, tid) = window(&data, tile).unwrap();
+        let (fw, fid) = window(&data, float).unwrap();
+        assert!(!data.state.layout.tile(tid.unwrap()).unwrap().floating);
+        assert!(data.state.layout.tile(fid.unwrap()).unwrap().floating);
+        let frame = |w: &smithay::desktop::Window| {
+            let x = w.x11_surface().unwrap();
+            x.mapped_window_id().unwrap_or(x.window_id())
+        };
+        let (tf, ff) = (frame(&tw), frame(&fw));
+        // Xwayland's order, bottom first, of the two; a round trip through the WM first, so
+        // every request it made before is done.
+        let mut syncs = 0;
+        let mut stack = |event_loop: &mut EventLoop<CalloopData>, data: &mut CalloopData| {
+            syncs += 1;
+            let title = format!("sync {syncs}");
+            conn.change_property8(
+                PropMode::REPLACE,
+                tile,
+                AtomEnum::WM_NAME,
+                AtomEnum::STRING,
+                title.as_bytes(),
+            )
+            .unwrap();
+            conn.flush().unwrap();
+            pump(event_loop, data, |d| {
+                crate::state::window_title(&window(d, tile).unwrap().0) == title
+            });
+            let tree = conn.query_tree(root).unwrap().reply().unwrap();
+            let at = |w| tree.children.iter().position(|&c| c == w).unwrap();
+            (at(tf), at(ff))
+        };
+        let float_above = |(t, f): (usize, usize)| f > t;
+        assert!(
+            float_above(stack(&mut event_loop, &mut data)),
+            "mapped last"
+        );
+
+        // navi's own refocus of the tile: no raise, in navi or in X.
+        data.state.focus_by(Some(tw.clone()), Raise::Not);
+        assert!(float_above(stack(&mut event_loop, &mut data)), "Raise::Not");
+        // A user's click on the tile: navi still draws the float above it.
+        data.state.focus_by(Some(tw.clone()), Raise::User);
+        assert!(
+            float_above(stack(&mut event_loop, &mut data)),
+            "Raise::User"
+        );
+        // The tile's client asks to go on top: ignored.
+        conn.configure_window(
+            tile,
+            &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
+        )
+        .unwrap();
+        conn.flush().unwrap();
+        assert!(
+            float_above(stack(&mut event_loop, &mut data)),
+            "client restack"
+        );
+        // Focusing the float and then the tile again keeps it so.
+        data.state.focus_by(Some(fw), Raise::User);
+        data.state.focus_by(Some(tw), Raise::Not);
+        assert!(
+            float_above(stack(&mut event_loop, &mut data)),
+            "refocus after the float"
+        );
+        for w in [tile, float] {
+            conn.destroy_window(w).unwrap();
+        }
+        conn.flush().unwrap();
+        pump(&mut event_loop, &mut data, |d| d.state.windows.is_empty());
+    }
 }

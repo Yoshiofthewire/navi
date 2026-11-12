@@ -1410,12 +1410,6 @@ impl Navi {
             None => window_surface(w).map(Focus::Wayland),
         });
         let surface = target.as_ref().and_then(Focus::surface);
-        if let Some(x) = window.as_ref().and_then(|w| w.x11_surface())
-            && let Some(wm) = self.xwm.as_mut()
-            && let Err(e) = wm.raise_window(x)
-        {
-            warn!("X11 raise: {e}");
-        }
         match &window {
             Some(w) => {
                 // Activates it; `restack` puts it back in the one order.
@@ -1439,8 +1433,9 @@ impl Navi {
                 // `restack` gives every float its family's rank, which leads that order.
                 if by != Raise::Not
                     && let Some(id) = self.float_owner(w)
+                    && self.layout.raise(id)
                 {
-                    self.layout.raise(id);
+                    self.sync_x11_stack();
                 }
             }
             None => self.space.elements().for_each(|w| {
@@ -1913,6 +1908,34 @@ impl Navi {
             })
             .collect();
         restack_space(&mut self.space, &shown, &dialog::stack_order(&shown_ranks));
+        self.sync_x11_stack();
+    }
+
+    /// Gives Xwayland navi's drawn order of its windows, so X11 pointer events where they
+    /// overlap go to the one in front. One way: a client's own restack stays ignored.
+    fn sync_x11_stack(&mut self) {
+        let floats = self.layout.floats();
+        let shown: Vec<&Window> = self.space.elements().collect();
+        let at: Vec<(Option<usize>, bool)> = shown
+            .iter()
+            .map(|w| {
+                let float = self.float_owner(w);
+                let x11 = w.x11_surface().is_some();
+                (
+                    float.and_then(|id| floats.iter().position(|&f| f == id)),
+                    x11,
+                )
+            })
+            .collect();
+        let order: Vec<_> = dialog::x11_stack(&at)
+            .into_iter()
+            .filter_map(|i| shown[i].x11_surface().cloned())
+            .collect();
+        if let Some(wm) = self.xwm.as_mut()
+            && let Err(e) = wm.update_stacking_order_upwards(order.iter())
+        {
+            warn!("X11 restack: {e}");
+        }
     }
 
     /// Window `i` as the stacking order sees it.
