@@ -4,8 +4,8 @@ use smithay::{
         utils::{RendererSurfaceStateUserData, on_commit_buffer_handler},
     },
     backend::session::libseat::LibSeatSession,
-    delegate_compositor, delegate_cursor_shape, delegate_data_device, delegate_layer_shell,
-    delegate_output, delegate_seat, delegate_shm, delegate_xdg_activation, delegate_xdg_decoration,
+    delegate_cursor_shape, delegate_data_device, delegate_layer_shell, delegate_output,
+    delegate_seat, delegate_shm, delegate_xdg_activation, delegate_xdg_decoration,
     delegate_xdg_shell,
     desktop::{
         LayerSurface, PopupKind, PopupManager, Space, Window, WindowSurfaceType,
@@ -33,17 +33,29 @@ use smithay::{
             zwlr_foreign_toplevel_manager_v1::ZwlrForeignToplevelManagerV1,
         },
         wayland_server::{
-            Client, DisplayHandle, Resource,
+            Client, DataInit, Dispatch, DisplayHandle, Resource,
             backend::{ClientData, ClientId, DisconnectReason, protocol::ProtocolError},
-            protocol::{wl_buffer, wl_output::WlOutput, wl_seat, wl_surface::WlSurface},
+            delegate_dispatch, delegate_global_dispatch,
+            protocol::{
+                wl_buffer,
+                wl_callback::WlCallback,
+                wl_compositor::WlCompositor,
+                wl_output::WlOutput,
+                wl_region::WlRegion,
+                wl_seat,
+                wl_subcompositor::WlSubcompositor,
+                wl_subsurface::WlSubsurface,
+                wl_surface::{self, WlSurface},
+            },
         },
     },
     utils::{Logical, Point, Rectangle, SERIAL_COUNTER, Serial, Size},
     wayland::{
         buffer::BufferHandler,
         compositor::{
-            CompositorClientState, CompositorHandler, CompositorState, SurfaceAttributes,
-            get_children, get_parent, is_sync_subsurface, with_states,
+            CompositorClientState, CompositorHandler, CompositorState, Damage, RegionUserData,
+            SubsurfaceUserData, SurfaceAttributes, SurfaceUserData, get_children, get_parent,
+            is_sync_subsurface, with_states,
         },
         output::OutputHandler,
         selection::{
@@ -2557,6 +2569,16 @@ impl CompositorHandler for Navi {
     fn commit(&mut self, surface: &WlSurface) {
         self.request_redraw();
         on_commit_buffer_handler::<Self>(surface);
+        // Bound what an undrawn or flooding surface accumulates across commits (job 036).
+        let now = self.now_ms() as u32;
+        with_states(surface, |s| {
+            let mut attrs = s.cached_state.get::<SurfaceAttributes>();
+            let current = attrs.current();
+            crate::flood::cap_damage(&mut current.damage, whole_buffer());
+            for callback in crate::flood::excess(&mut current.frame_callbacks) {
+                callback.done(now);
+            }
+        });
         // Smithay leaves a cursor surface's `wl_surface.offset` to the compositor.
         with_states(surface, |s| {
             let Some(cursor) = s.data_map.get::<CursorImageSurfaceData>() else {
@@ -3159,7 +3181,51 @@ impl ClientDndGrabHandler for Navi {}
 impl ServerDndGrabHandler for Navi {}
 impl OutputHandler for Navi {}
 
-delegate_compositor!(Navi);
+/// Damage covering any buffer: Smithay clips it to the buffer's size.
+fn whole_buffer() -> Damage {
+    Damage::Buffer(Rectangle::new((0, 0).into(), (i32::MAX, i32::MAX).into()))
+}
+
+// `delegate_compositor!` without `WlSurface`, which `Navi` dispatches itself to cap damage.
+delegate_global_dispatch!(Navi: [WlCompositor: ()] => CompositorState);
+delegate_global_dispatch!(Navi: [WlSubcompositor: ()] => CompositorState);
+delegate_dispatch!(Navi: [WlCompositor: ()] => CompositorState);
+delegate_dispatch!(Navi: [WlRegion: RegionUserData] => CompositorState);
+delegate_dispatch!(Navi: [WlCallback: ()] => CompositorState);
+delegate_dispatch!(Navi: [WlSubcompositor: ()] => CompositorState);
+delegate_dispatch!(Navi: [WlSubsurface: SubsurfaceUserData] => CompositorState);
+
+impl Dispatch<WlSurface, SurfaceUserData> for Navi {
+    fn request(
+        state: &mut Self,
+        client: &Client,
+        surface: &WlSurface,
+        request: wl_surface::Request,
+        data: &SurfaceUserData,
+        dh: &DisplayHandle,
+        init: &mut DataInit<'_, Self>,
+    ) {
+        if matches!(
+            request,
+            wl_surface::Request::Damage { .. } | wl_surface::Request::DamageBuffer { .. }
+        ) && !with_states(surface, |s| {
+            let mut attrs = s.cached_state.get::<SurfaceAttributes>();
+            crate::flood::admit(&mut attrs.pending().damage, whole_buffer())
+        }) {
+            return;
+        }
+        <CompositorState as Dispatch<WlSurface, SurfaceUserData, Self>>::request(
+            state, client, surface, request, data, dh, init,
+        );
+    }
+
+    fn destroyed(state: &mut Self, client: ClientId, surface: &WlSurface, data: &SurfaceUserData) {
+        <CompositorState as Dispatch<WlSurface, SurfaceUserData, Self>>::destroyed(
+            state, client, surface, data,
+        );
+    }
+}
+
 delegate_shm!(Navi);
 delegate_xdg_shell!(Navi);
 delegate_xdg_decoration!(Navi);

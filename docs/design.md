@@ -785,6 +785,16 @@ session.
   state off the rendering thread. Session-menu capability queries and confirmed power/switch-user requests
   run in navi-bar, off the UI thread. Nested mode refuses system actions before connecting.
   Navi never forces past inhibitors, runs a system command, or terminates a login1 session.
+- **Request floods (known, unfixed):** one client can still freeze navi (no frames, no input, no
+  lock screen) by writing requests faster than navi reads them, because pure-Rust
+  wayland-backend reads a client's socket until it is empty before serving anyone else. navi
+  keeps the Rust request parser over libwayland-server for memory safety (2026-11-12). What is
+  capped: a surface holds at most 64 damage rectangles (past that, one covering the whole
+  buffer) and 16 frame callbacks (older extras get `done` at once), so a flood or a never-drawn
+  surface can't grow memory through them, and navi recovers once the flood stops. Still
+  unbounded: the freeze itself, object-creation floods (`create_region`, `wl_surface.frame`
+  without a commit, any request that makes an object), `wl_region` rectangle lists, the cached
+  state of a sync subsurface whose parent never commits, and CPU.
 - **Config** is plain data. A config file can never run a command.
 - **Real hardware:** navi gets the GPU and input devices only through the seat session
   (libseat, so logind), never by opening `/dev` itself, and needs no root. On a VT switch the
