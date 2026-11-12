@@ -151,7 +151,7 @@ pub struct Confirm {
 impl Confirm {
     fn body(&self) -> Vec<String> {
         let mut out = vec![
-            "Close went unanswered for 90 s.".to_string(),
+            "It ignored Close for 90 s.".to_string(),
             "Force close ends it at once,".into(),
             "and unsaved work is lost.".into(),
         ];

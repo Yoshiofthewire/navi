@@ -590,6 +590,7 @@ impl Bar {
         match kind {
             // Closing again an app that ignored a close asks to force close it.
             context::Kind::ForceClose | context::Kind::Close(_) if c.overdue() => {
+                debug!(app_id = target.key, ?kind, "force-close confirmation");
                 if let Some(c) = &mut self.context {
                     c.ask_force(Instant::now());
                 }
