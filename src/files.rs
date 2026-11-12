@@ -46,12 +46,9 @@ pub fn xdg_dir(var: Option<&OsStr>, home: Option<&OsStr>, fallback: &str) -> Opt
 /// The file's bytes, at most `max`; `None` if there is no file. Judges the file it opened, not
 /// the path, and never blocks opening a FIFO swapped in by another process.
 pub fn read_bytes(path: &Path, max: u64) -> Result<Option<Vec<u8>>, String> {
-    let nonblock = rustix::fs::OFlags::NONBLOCK.bits() as i32;
-    let file = match OpenOptions::new()
-        .read(true)
-        .custom_flags(nonblock)
-        .open(path)
-    {
+    // Never wait for a FIFO's writer, and never take a tty as the controlling terminal.
+    let flags = (rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::NOCTTY).bits() as i32;
+    let file = match OpenOptions::new().read(true).custom_flags(flags).open(path) {
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.to_string()),
         Ok(f) => f,
@@ -107,6 +104,19 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!environ.is_empty());
+    }
+
+    #[test]
+    fn read_bytes_refuses_devices() {
+        for dev in [
+            "/dev/zero",
+            "/dev/null",
+            "/dev/urandom",
+            "/dev/full",
+            "/dev/tty",
+        ] {
+            assert!(read_bytes(Path::new(dev), 64).is_err(), "{dev}");
+        }
     }
 
     /// A FIFO swapped in for the file between any check and the open must not block the
