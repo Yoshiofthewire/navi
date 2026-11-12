@@ -494,6 +494,9 @@ impl Navi {
         let Some(pointer) = self.seat.get_pointer() else {
             return;
         };
+        if !pointer.is_grabbed() {
+            self.drop_x11();
+        }
         let inside = self
             .space
             .outputs()
@@ -660,9 +663,6 @@ impl Navi {
             },
         );
         pointer.frame(self);
-        if !pressed && !pointer.is_grabbed() {
-            self.drop_x11();
-        }
     }
 
     /// The window losing focus mid-drag may swallow the release: cancel the drag.

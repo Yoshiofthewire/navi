@@ -177,7 +177,7 @@ pub struct Navi {
     pub layout: Layout,
     pub memory: Store,
     pub xwm: Option<X11Wm>,
-    /// An X11 window is on top of Xwayland's stack for a held button (`lift_x11`).
+    /// An X11 window is on top of Xwayland's stack for a press (`lift_x11`).
     x11_lifted: bool,
     pub xwayland_shell: XWaylandShellState,
     pub windows: Vec<Managed>,
@@ -1914,8 +1914,9 @@ impl Navi {
         self.sync_x11_stack();
     }
 
-    /// Puts the X11 window whose `surface` gets a press on top of Xwayland's stack until the
-    /// release, so the press reaches it even inside a front X11 window's cut-off corner.
+    /// Puts the X11 window whose `surface` gets a press on top of Xwayland's stack, so the press
+    /// reaches it even inside a front X11 window's cut-off corner. It stays there until the
+    /// pointer moves with no button held: by then Xwayland has the press and release.
     pub(crate) fn lift_x11(&mut self, surface: &WlSurface) {
         let x = self
             .windows
