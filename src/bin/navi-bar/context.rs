@@ -144,9 +144,10 @@ pub struct Confirm {
     /// 0 Cancel, 1 Force close.
     pub selected: usize,
     pub opened: Instant,
-    /// Where the pointer was when it opened, relative to the surface's bottom centre
+    /// The pointer's reference spot, relative to the surface's bottom centre
     /// (`Layout::anchor`), so the motion navi sends when the surface resizes isn't a move.
-    pub at: (i32, i32),
+    /// `None` after the panel moved on screen: the next motion is the new reference.
+    pub at: Option<(i32, i32)>,
     /// The pointer really moved since it opened.
     pub moved: bool,
 }
@@ -294,7 +295,7 @@ impl Menu {
             windows: windows.unwrap_or(1),
             selected: 0,
             opened: now,
-            at,
+            at: Some(at),
             moved: false,
         });
     }
@@ -302,7 +303,25 @@ impl Menu {
     /// Pointer motion to `at` (anchored), for `Confirm::armed`: the same spot isn't a move.
     pub fn pointer(&mut self, at: (i32, i32)) {
         if let Some(c) = &mut self.confirm {
-            c.moved |= at != c.at;
+            c.moved |= c.at.is_some_and(|was| was != at);
+            c.at.get_or_insert(at);
+        }
+    }
+
+    /// The pointer entered the surface at `at`: a fresh reference, not a move.
+    pub fn entered(&mut self, at: (i32, i32)) {
+        if let Some(c) = &mut self.confirm {
+            c.at = Some(at);
+        }
+    }
+
+    /// The panel may have moved on screen (an output or scale change): the confirmation arms
+    /// again from `now`, and the pointer's next spot is the new reference.
+    pub fn moved_on_screen(&mut self, now: Instant) {
+        if let Some(c) = &mut self.confirm {
+            c.opened = now;
+            c.at = None;
+            c.moved = false;
         }
     }
 
@@ -904,5 +923,47 @@ mod tests {
             m.confirm.as_ref().unwrap().enter(t + ARM),
             Some(Hit::Confirm)
         );
+    }
+
+    /// Round 3: a panel move on screen (output resize, scale) restarts the arming; navi's
+    /// motion that follows is the new reference, not a move, and so is a pointer enter.
+    #[test]
+    fn a_panel_move_restarts_arming() {
+        let e = konsole();
+        let target = Target {
+            key: e.id.clone(),
+            dock: true,
+        };
+        let mut m = Menu::new(
+            target,
+            lines(&app(Some(&e), false, 1, 1), true),
+            (0, 0),
+            false,
+        );
+        let t = Instant::now();
+        m.ask_force(t, (5, -50));
+        let later = t + Duration::from_secs(2);
+        m.moved_on_screen(later);
+        // navi's motion at the still pointer, now at a new panel-relative spot.
+        m.pointer((5, -104));
+        let c = m.confirm.as_ref().unwrap();
+        assert!(
+            !c.armed(later + ARM),
+            "the motion after the move is only the reference"
+        );
+        assert_eq!(c.enter(later + ARM - Duration::from_millis(1)), None);
+        assert_eq!(c.enter(later + ARM), Some(Hit::Cancel));
+        m.pointer((5, -90));
+        let c = m.confirm.as_ref().unwrap();
+        assert!(
+            !c.armed(later + ARM - Duration::from_millis(1)),
+            "the timer restarted"
+        );
+        assert!(c.armed(later + ARM));
+        // A pointer coming back in sets the reference without arming.
+        m.moved_on_screen(later);
+        m.entered((40, -60));
+        m.pointer((40, -60));
+        assert!(!m.confirm.as_ref().unwrap().armed(later + ARM));
     }
 }

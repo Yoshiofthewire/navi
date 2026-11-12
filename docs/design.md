@@ -583,7 +583,8 @@ bundling a degoogled, resource-tested Chromium variant is reserved for a future 
   Its buttons sit under the heading, away from the rows that open it. For 500 ms after it
   appears it acts on nothing (Enter then is swallowed), and a button press counts only once
   the pointer has really moved, not for the motion navi sends when the panel resizes, so
-  neither a double-click nor a double Enter can confirm. Confirmed, navi checks the 90 s itself, then ends that window's client: a
+  neither a double-click nor a double Enter can confirm. An output, scale or configure change
+  while it's open restarts the 500 ms, and the pointer's next spot becomes its new reference. Confirmed, navi checks the 90 s itself, then ends that window's client: a
   Wayland app is sent SIGKILL through a pidfd taken when it connected and disconnected; an X11
   app's X connection is ended with XKillClient, never a signal. navi, navi-bar, the locker and
   Xwayland are never force closed. Nothing is automatic, and a refusal is only logged.

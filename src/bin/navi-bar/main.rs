@@ -1157,6 +1157,14 @@ impl Bar {
         present(&mut self.pool, &self.layer, &canvas, s);
     }
 
+    /// An output, scale or configure change may have moved the taskbar on screen: an open
+    /// force-close confirmation arms again from now.
+    fn panel_moved(&mut self) {
+        if let Some(c) = &mut self.context {
+            c.moved_on_screen(Instant::now());
+        }
+    }
+
     fn now_ms(&self) -> u64 {
         self.start.elapsed().as_millis() as u64
     }
@@ -2014,6 +2022,7 @@ impl LayerShellHandler for Bar {
     ) {
         if layer == &self.layer {
             self.configured = true;
+            self.panel_moved();
             self.draw();
         } else if layer == &self.band {
             self.band_configured = true;
@@ -2036,6 +2045,7 @@ impl CompositorHandler for Bar {
     ) {
         if factor != self.scale {
             self.scale = factor;
+            self.panel_moved();
             self.draw();
             self.draw_band();
             self.draw_cards();
@@ -2300,10 +2310,11 @@ impl PointerHandler for Bar {
                         self.layout.hit(e.position.0 as i32, e.position.1 as i32)
                     };
                     let (x, y) = (e.position.0 as i32, e.position.1 as i32);
-                    if let (PointerEventKind::Motion { .. }, Some(c)) =
-                        (&e.kind, self.context.as_mut())
-                    {
-                        c.pointer(self.layout.anchor(x, y));
+                    let at = self.layout.anchor(x, y);
+                    match (&e.kind, self.context.as_mut()) {
+                        (PointerEventKind::Motion { .. }, Some(c)) => c.pointer(at),
+                        (PointerEventKind::Enter { .. }, Some(c)) => c.entered(at),
+                        _ => {}
                     }
                     let in_menu = self.layout.context().zip(self.context.as_ref());
                     let on_item = in_menu.and_then(|(r, c)| c.hit(r, x, y));
@@ -2337,11 +2348,17 @@ impl OutputHandler for Bar {
         &mut self.output_state
     }
 
-    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {
+        self.panel_moved();
+    }
 
-    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+    fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {
+        self.panel_moved();
+    }
 
-    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+    fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {
+        self.panel_moved();
+    }
 }
 
 impl ShmHandler for Bar {
