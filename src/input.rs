@@ -647,6 +647,9 @@ impl Navi {
                 (u32::from(serial), s, shown)
             });
         }
+        if pressed && let Some(s) = pointer.current_focus() {
+            self.lift_x11(&s);
+        }
         pointer.button(
             self,
             &ButtonEvent {
@@ -657,6 +660,9 @@ impl Navi {
             },
         );
         pointer.frame(self);
+        if !pressed && !pointer.is_grabbed() {
+            self.drop_x11();
+        }
     }
 
     /// The window losing focus mid-drag may swallow the release: cancel the drag.

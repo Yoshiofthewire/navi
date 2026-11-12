@@ -177,6 +177,8 @@ pub struct Navi {
     pub layout: Layout,
     pub memory: Store,
     pub xwm: Option<X11Wm>,
+    /// An X11 window is on top of Xwayland's stack for a held button (`lift_x11`).
+    x11_lifted: bool,
     pub xwayland_shell: XWaylandShellState,
     pub windows: Vec<Managed>,
     /// A drag in navi's strip or edges, from press to release.
@@ -325,6 +327,7 @@ impl Navi {
             layout,
             memory,
             xwm: None,
+            x11_lifted: false,
             xwayland_shell: XWaylandShellState::new::<Self>(&dh),
             windows: Vec::new(),
             drag: None,
@@ -1909,6 +1912,32 @@ impl Navi {
             .collect();
         restack_space(&mut self.space, &shown, &dialog::stack_order(&shown_ranks));
         self.sync_x11_stack();
+    }
+
+    /// Puts the X11 window whose `surface` gets a press on top of Xwayland's stack until the
+    /// release, so the press reaches it even inside a front X11 window's cut-off corner.
+    pub(crate) fn lift_x11(&mut self, surface: &WlSurface) {
+        let x = self
+            .windows
+            .iter()
+            .filter_map(|m| m.window.x11_surface())
+            .find(|x| x.wl_surface().as_ref() == Some(surface))
+            .cloned();
+        if let Some(x) = x
+            && let Some(wm) = self.xwm.as_mut()
+        {
+            match wm.raise_window(&x) {
+                Ok(()) => self.x11_lifted = true,
+                Err(e) => warn!("X11 raise: {e}"),
+            }
+        }
+    }
+
+    /// Ends `lift_x11`: navi's order again.
+    pub(crate) fn drop_x11(&mut self) {
+        if std::mem::take(&mut self.x11_lifted) {
+            self.sync_x11_stack();
+        }
     }
 
     /// Gives Xwayland navi's drawn order of its windows, so X11 pointer events where they
