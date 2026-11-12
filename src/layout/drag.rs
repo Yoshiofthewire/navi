@@ -1194,8 +1194,9 @@ fn light(l: &Layout, hover: Option<Hit>, focused: Option<WinId>, out: &mut Vec<C
 }
 
 impl Layout {
-    /// What a lit corner's rects are cut to: the ring between `id`'s frame (`focused` or dim)
-    /// and an arc concentric with it, out to where the `lit` rects reach past the frame.
+    /// What a lit corner's rects are cut to: from `id`'s outline out to an arc concentric with
+    /// its frame (`focused` or dim), as far as the `lit` rects reach past the frame. Like a lit
+    /// straight run, it covers the frame.
     fn lit_corner(
         &self,
         id: WinId,
@@ -1228,7 +1229,7 @@ impl Layout {
         let outer = Rect::new(o.x - d, o.y - d, o.w + 2 * d, o.h + 2 * d);
         Some(Cut {
             shape: Shape::with_radii(outer, radii),
-            hole: Some(ring.shape),
+            hole: Some(self.shape(id)?),
         })
     }
 }
@@ -3338,8 +3339,8 @@ pub(super) mod tests {
     }
 
     /// Job 038 AC3: a hovered or pressed corner lights a quarter ring concentric with the frame,
-    /// out to where its zones reach; straight runs keep today's rects; edges and strips are as
-    /// they were.
+    /// from the outline (covering the frame, as a straight run does) out to where its zones
+    /// reach; straight runs keep today's rects; edges and strips are as they were.
     #[test]
     fn lit_corners_follow_the_arc() {
         let mut checked = 0;
@@ -3396,7 +3397,7 @@ pub(super) mod tests {
                         .filter(|(r, k, c)| {
                             *k == accent(1.0)
                                 && today.contains(r)
-                                && c.is_some_and(|c| c.hole == Some(ring.shape))
+                                && c.is_some_and(|c| c.hole == l.shape(id))
                         })
                         .collect();
                     assert_eq!(lit.len(), today.len(), "bar {bar} {want:?}");
@@ -3462,6 +3463,10 @@ pub(super) mod tests {
                                 assert!(lit_at(q), "between the arcs {q:?} bar {bar} {want:?}");
                                 let (ox, oy) = (q.0 - sq.x, q.1 - sq.y);
                                 diagonal += i32::from(ox == oy || ox == sq.w - 1 - oy);
+                            }
+                            // The frame under it is covered, as on a straight run.
+                            if bbox.contains(q) && !shape.contains(q) && ring.shape.contains(q) {
+                                assert!(lit_at(q), "on the frame {q:?} bar {bar} {want:?}");
                             }
                             if !bbox.contains(q) || d > f64::from(rad) + 0.75 {
                                 assert!(!lit_at(q), "past the zones or the outer arc {q:?}");
