@@ -903,11 +903,8 @@ impl Bar {
         }
     }
 
-    /// Menu or Shift+F10 in the launcher: the selected app row's menu, or closes it.
+    /// Menu or Shift+F10 in the launcher: the selected app row's menu (`context_key` closes it).
     fn menu_key(&mut self) {
-        if self.context.take().is_some() {
-            return self.relayout();
-        }
         let Some(menu) = &self.menu else {
             return;
         };
@@ -2144,6 +2141,10 @@ impl KeyboardHandler for Bar {
             self.close_session();
         }
         if surface == self.layer.wl_surface() {
+            debug!(
+                context = self.context.is_some(),
+                "taskbar lost the keyboard"
+            );
             self.close_menu();
         }
     }
