@@ -380,6 +380,8 @@ mod tests {
         assert_eq!(tb.x + tb.w, bar.rect.x + bar.rect.w);
         for x in bar.rect.x..bar.rect.x + bar.rect.w {
             let want = match x {
+                // The bar's rounded corners are no zone.
+                _ if l.cut_off(1, (x, bar.rect.y + 5)) => None,
                 _ if x < ta.x + ta.w => Some(Hit::Tab(0)),
                 _ if x < tb.x => None,
                 _ => Some(Hit::Tab(1)),

@@ -33,6 +33,24 @@ exceed 100% for multithreaded work. Small readings approach the sampler's tick r
 0.006% should be read as nearly idle, not as a precision guarantee. A recorded zero means no
 additional CPU ticks were observed in that sample, not a guarantee of zero CPU use.
 
+## Rounded tiles (2026-11-11)
+
+Same host and method, nested on X11 under Plasma, release builds of main (f7cbdda) and the
+rounded-tiles branch, three static Konsole windows each, run one after the other:
+
+| Scenario | Duration | Navi + bar CPU (% of one core) |
+| --- | ---: | ---: |
+| Before (main), three static windows | 302 s | 0.060 |
+| After (rounded), three static windows | 302 s | 0.030 |
+
+Both are at the sampler's resolution: rounding costs no idle CPU. PSS is not compared: during
+the main run the host swapped (core PSS fell from 105.7 to 64.4 MiB including swap), and the
+rounded run ended at 109.9 MiB including swap. A static nested desktop with two rounded tiles
+and a rounded float, and no screenshot instrumentation, drew one frame in the 60 s after it
+settled, at the minute change of navi-bar's clock, as main did: rounded chrome keeps stable
+element ids, so it adds no damage. Rounding draws only the corner squares of navi's chrome with
+a shader; a cut window surface loses direct scanout on DRM (fullscreen windows are never cut).
+
 ## What changed
 
 The nested backend no longer requests its next frame unconditionally. Input, surface commits,

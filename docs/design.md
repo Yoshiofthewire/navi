@@ -259,6 +259,32 @@ aspect, gravity, position) are ignored.
   bigger than its configure, is cropped there, and a click just outside it reaches what's below.
   So no app draws over, or takes clicks meant for, another tile or navi's zones, except through
   a dialog in front of that tile (below, and *Stacking order*).
+- **Rounded tiles.** Each shown tile and float has one outline: its bar and window (the window
+  alone without a bar), corner radius `RADIUS` (10 px, times the output scale), clamped to half
+  its shorter side. navi's chrome and the app's own pixels are cut to it, antialiased over one
+  px, so no square app corner pokes past the arc; under a bar the window's top corners are
+  square and the bar's round. The focus or idle frame is a ring just outside it, outer radius
+  `RADIUS` plus its width, so the app's cut doesn't change with focus. A maximized tile is
+  rounded; a minimized strip and the move preview are rounded by their own rect. Fullscreen
+  windows, dialogs and their frames, the lock surface and layer surfaces are never rounded.
+  The cut only removes px: a popup or X11 menu is bounded by its owner's outline instead of its
+  rect, so one flush with a corner loses the px past the arc and one inside is whole. A window
+  takes the pointer exactly where it's drawn: a cut-off corner (about 21 px² at scale 1) belongs
+  to what shows through it, the tile behind a float or nothing, and so does its cursor; the
+  bar's tabs, buttons and strip there are no zone. Where a float's frame is drawn over its
+  cut-off corner (out to the ring's outer arc, wider while focused), the px are that float's
+  resize corner, so a click on frame it can see never focuses the window behind. Otherwise
+  the resize corners, edges and strip keep their geometry in the gaps: the cut is too small for
+  a second corner rule, and letting the window keep its square hit rect would let a click on a
+  px showing the tile behind go to the float. Two GLES programs, compiled once per GL context, draw it in both backends: one fills
+  chrome in the corner squares (everything else stays a plain rect, so an idle desktop still
+  has no damage), one cuts app surfaces and window buttons that reach a corner. If they don't
+  compile, navi logs one warning and draws square. A cut surface can't be scanned out directly
+  on DRM; fullscreen windows aren't cut, so fullscreen video and games keep direct scanout.
+  X11 apps get navi's focus and clicks by the outline, but Xwayland gives X11 motion to the X11
+  window on top of its own stack, which follows the last focused X11 window rather than navi's
+  drawing, so where two X11 windows overlap (a cut corner included) the one behind can see
+  motion.
 - **Dialogs.** A dialog (an xdg toplevel with a parent, or an X11 `WM_TRANSIENT_FOR` window) has a
   *root*: the first tiled or floating window up its parents. The walk stops after 8 steps or on a
   loop; a chain that ends without a tiled window, is too deep or loops makes an *orphan*. Its
@@ -542,8 +568,8 @@ bundling a degoogled, resource-tested Chromium variant is reserved for a future 
   hold 3:1 in every scheme; app icons keep their own colours. The launcher's search field is
   the selected fill with a rim, so it has a shape even in high contrast. The band is 32 px (one
   line of text) and the dock 40 px (24 px icons in 32 px targets); they share radius and rim. Pixels outside a panel are clear and take no clicks. Hover and
-  selected fills inside a panel stay opaque. Windows stay solid and square, with no translucency
-  or shadows (rounded tiles are planned; see *Open questions*). No desktop widgets, dock
+  selected fills inside a panel stay opaque. Windows stay solid, with no translucency or shadows,
+  and share the panels' corners (*Rounded tiles*). No desktop widgets, dock
   magnification, reflection or bounce: it isn't Mac-like.
 - **App menu button:** the navi logo, under the icon name `navi` (in `assets/icons/hicolor`). It's
   installed into `hicolor`, so an icon theme can replace it. A hand-simplified version with
@@ -766,14 +792,6 @@ session.
 - More look references, beyond the logo.
 - Is this a daily driver? That decides whether laptop polish is in v1.
 - Planned look work, after the floating panels:
-  - **Rounded tiles.** A 10 px radius needs the client clipped too: the focus frame sits 2 px
-    outside the window, and a square window corner pokes outside any 10 px outer arc. GLES custom
-    elements in `render::Frame` for both backends: one antialiased rounded-rect shader for frames,
-    strips, tab bars and drag previews, one rounded-clip texture shader around each tiled window
-    (top corners only where no bar sits above). Dialogs, popups, fullscreen and the lock surface
-    are never clipped. It replaces the square crop each tiled and floating window already gets
-    (`Layout::clip`, *Client sizes*), with the same one rect per window. Clipping can disable
-    direct scanout for tiled windows.
   - **Frosted panels.** Blur behind navi-bar's panels via `ext-background-effect-v1`, advertised
     only to navi-bar like layer-shell, with each panel's region capped at 16 rectangles, clamped
     to the surface and rounded by `RADIUS`. Only the wallpaper is blurred, once per output and
