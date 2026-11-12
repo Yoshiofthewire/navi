@@ -26,7 +26,7 @@ use smithay::{
     },
     desktop::{LayerMap, Window, WindowSurface, layer_map_for_output},
     output::Output,
-    reexports::wayland_server::Resource,
+    reexports::wayland_server::{Resource, protocol::wl_surface::WlSurface},
     utils::{Buffer, Point, Rectangle, Scale, Size, Transform},
     wayland::shell::wlr_layer::Layer,
 };
@@ -38,7 +38,7 @@ use crate::{
     image::Image,
     layout::{self, Cut, Shape},
     monitors,
-    state::{Navi, identity},
+    state::{CursorSurface, Navi, identity},
     theme, wallpaper,
 };
 
@@ -601,7 +601,7 @@ pub struct Cursors {
     shapes: cursor::Shapes<Pointer>,
     scale: i32,
     /// The shape drawn last, to log changes.
-    last: Option<&'static str>,
+    last: &'static str,
 }
 
 impl Cursors {
@@ -611,7 +611,7 @@ impl Cursors {
         Some(Cursors {
             shapes,
             scale,
-            last: Some("default"),
+            last: "default",
         })
     }
 
@@ -619,16 +619,23 @@ impl Cursors {
         &self.shapes.theme
     }
 
-    /// How to draw `shape`; `None` draws nothing.
-    pub fn arrow(&mut self, shape: Option<&'static str>) -> Arrow<'_> {
-        if shape != self.last {
-            debug!(shape = shape.unwrap_or("hidden"), "cursor");
-            self.last = shape;
+    /// How to draw `shape`.
+    pub fn arrow(&mut self, shape: cursor::Shape<CursorSurface>) -> Arrow<'_> {
+        let name = match shape {
+            cursor::Shape::Named(n) => n,
+            cursor::Shape::Client(_) => "client surface",
+            cursor::Shape::Hidden => "hidden",
+        };
+        if name != self.last {
+            debug!(shape = name, "cursor");
+            self.last = name;
         }
         let scale = self.scale;
-        shape.map_or(Arrow::None, |s| {
-            Arrow::Image(self.shapes.get(s, |c| Pointer::new(c, scale)))
-        })
+        match shape {
+            cursor::Shape::Named(n) => Arrow::Image(self.shapes.get(n, |c| Pointer::new(c, scale))),
+            cursor::Shape::Client(s) => Arrow::Client(s),
+            cursor::Shape::Hidden => Arrow::None,
+        }
     }
 }
 
@@ -688,8 +695,20 @@ pub enum Arrow<'a> {
     /// The host draws it (nested, no theme).
     None,
     Image(&'a Pointer),
+    /// A client's cursor surface that passed `cursor::fits`.
+    Client(CursorSurface),
     /// No cursor theme on real hardware: a small accent square, so the pointer is never lost.
     Square,
+}
+
+impl Arrow<'_> {
+    /// The client cursor surface this draws, for `send_frames`.
+    pub fn surface(&self) -> Option<WlSurface> {
+        match self {
+            Arrow::Client((s, _)) => Some(s.clone()),
+            _ => None,
+        }
+    }
 }
 
 /// Everything `output` shows, top first. A wallpaper that fails to upload is dropped, so the
@@ -744,10 +763,7 @@ where
         w: geo.size.w,
         h: geo.size.h,
     };
-    let on_output = pointer.0 >= full.x
-        && pointer.0 < full.x + full.w
-        && pointer.1 >= full.y
-        && pointer.1 < full.y + full.h;
+    let on_output = has_pointer(state, output);
     match arrow {
         Arrow::Image(p) if on_output => {
             let loc = state.pointer_location() - geo.loc.to_f64() - Point::from(p.hotspot);
@@ -764,6 +780,17 @@ where
                 Ok(e) => out.push(Frame::from(e)),
                 Err(e) => warn!("cursor not drawn: {e:?}"),
             }
+        }
+        Arrow::Client((s, hotspot)) if on_output => {
+            let loc = state.pointer_location() - geo.loc.to_f64() - hotspot.to_f64();
+            out.extend(render_elements_from_surface_tree::<R, Frame<R>>(
+                renderer,
+                &s,
+                loc.to_physical(scale).to_i32_round(),
+                scale,
+                1.0,
+                Kind::Cursor,
+            ));
         }
         Arrow::Square if on_output => {
             above_panels = 1;
@@ -955,8 +982,18 @@ pub fn clear() -> [f32; 4] {
     theme::rgba(theme::BG, 1.0)
 }
 
-/// Frame callbacks for what `output` shows, after a frame.
-pub fn send_frames(state: &mut Navi, output: &Output) {
+/// Whether the pointer is on `output`.
+fn has_pointer(state: &Navi, output: &Output) -> bool {
+    let (x, y) = state.pointer_px();
+    state
+        .space
+        .output_geometry(output)
+        .is_some_and(|g| g.contains((x, y)))
+}
+
+/// Frame callbacks for what `output` shows, after a frame; `cursor` is the cursor surface the
+/// frame drew, if any.
+pub fn send_frames(state: &mut Navi, output: &Output, cursor: Option<&WlSurface>) {
     let time = state.start_time.elapsed();
     track_layers(state, output);
     if state.lock.active {
@@ -974,6 +1011,15 @@ pub fn send_frames(state: &mut Navi, output: &Output) {
         return;
     }
     let on_output = |_: &_, _: &_| Some(output.clone());
+    if let Some(s) = cursor.filter(|_| has_pointer(state, output)) {
+        smithay::desktop::utils::send_frames_surface_tree(
+            s,
+            output,
+            time,
+            Some(Duration::ZERO),
+            on_output,
+        );
+    }
     for window in state.space.elements_for_output(output) {
         window.send_frame(output, time, Some(Duration::ZERO), on_output);
     }

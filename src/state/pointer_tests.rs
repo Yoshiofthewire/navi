@@ -2,6 +2,7 @@
 //! `step` dispatches without `after_dispatch`, so each test first shows what main did (nothing
 //! moved), then that `after_dispatch`'s re-pick alone moves pointer focus.
 use super::*;
+use crate::cursor::Shape;
 use crate::layout::{Nudge, Side};
 use smithay::reexports::calloop::EventLoop;
 use smithay_client_toolkit::reexports::client::{
@@ -52,6 +53,8 @@ struct C {
     /// Redraws and commits this surface on every enter and motion (AC7).
     echo: Option<(wl_surface::WlSurface, wl_buffer::WlBuffer)>,
     synced: bool,
+    /// The tags of frame callbacks done (job 032).
+    done: Vec<usize>,
 }
 
 impl Dispatch<wl_registry::WlRegistry, ()> for C {
@@ -236,6 +239,19 @@ impl Dispatch<wl_callback::WlCallback, ()> for C {
         _: &QueueHandle<Self>,
     ) {
         c.synced = true;
+    }
+}
+
+impl Dispatch<wl_callback::WlCallback, usize> for C {
+    fn event(
+        c: &mut Self,
+        _: &wl_callback::WlCallback,
+        _: wl_callback::Event,
+        &tag: &usize,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        c.done.push(tag);
     }
 }
 
@@ -515,6 +531,33 @@ impl Conn {
     fn take(&mut self) -> Vec<Ev> {
         std::mem::take(&mut self.c.ev)
     }
+
+    /// A `w`×`h` cursor surface set at `hot` with enter `serial`, drawn and committed with a
+    /// frame callback tagged `frame`.
+    fn cursor(
+        &mut self,
+        serial: u32,
+        (w, h): (i32, i32),
+        hot: (i32, i32),
+        frame: usize,
+    ) -> wl_surface::WlSurface {
+        let s = self.surface();
+        let b = self.buffer(w, h);
+        let pointer = self.c.pointer.as_ref().unwrap();
+        pointer.set_cursor(serial, Some(&s), hot.0, hot.1);
+        s.attach(Some(&b), 0, 0);
+        s.damage_buffer(0, 0, w, h);
+        s.frame(&self.queue.handle(), frame);
+        s.commit();
+        s
+    }
+
+    /// navi's side of any of this client's surfaces.
+    fn server_of(&self, data: &CalloopData, s: &wl_surface::WlSurface) -> WlSurface {
+        let dh = &data.state.display_handle;
+        let id = s.id().protocol_id();
+        self.server.object_from_protocol_id(dh, id).unwrap()
+    }
 }
 
 fn pointer(data: &CalloopData) -> PointerHandle<Navi> {
@@ -631,7 +674,7 @@ fn a_float_and_a_dialog_over_a_still_pointer_take_and_give_it_back() {
     assert_eq!(focus(&data), Some(a_srv.clone()));
     // A asked for the I-beam.
     data.state.cursor.request = crate::cursor::Request::Named("text");
-    assert_eq!(data.state.cursor_shape(), Some("text"));
+    assert_eq!(data.state.cursor_shape(), Shape::Named("text"));
 
     // AC1: B floats centred, over the pointer, at its first buffer.
     let bi = b.toplevel("b", None, Some((900, 500)));
@@ -647,7 +690,7 @@ fn a_float_and_a_dialog_over_a_still_pointer_take_and_give_it_back() {
     assert_eq!((x, y), local(at, origin(&data, "b", 0)));
     assert_eq!(focus(&data), Some(b.server(&data, bi)));
     // AC8: A's I-beam doesn't carry over to B.
-    assert_eq!(data.state.cursor_shape(), Some("default"));
+    assert_eq!(data.state.cursor_shape(), Shape::Named("default"));
 
     // AC2: B's null buffer gives A the pointer back.
     b.unmap(bi);
@@ -902,7 +945,7 @@ fn the_lock_surface_takes_a_still_pointer_and_unlock_gives_it_back() {
     assert!(k.take().is_empty(), "its buffer changes nothing");
     assert_eq!(focus(&data), Some(k.server(&data, si)));
     // AC8: the lock's rule: its client's request, `default` until it makes one.
-    assert_eq!(data.state.cursor_shape(), Some("default"));
+    assert_eq!(data.state.cursor_shape(), Shape::Named("default"));
 
     // A window mapping and drawing while locked gets nothing.
     let mut b = Conn::new(&mut el, &mut data, ClientState::default());
@@ -1067,7 +1110,7 @@ fn a_repick_never_picks_what_the_dialog_covers() {
         Some(d_srv.clone()),
         "the dialog covers {hit:?}"
     );
-    assert_eq!(data.state.cursor_shape(), Some("default"));
+    assert_eq!(data.state.cursor_shape(), Shape::Named("default"));
 
     // C shrinks from the bottom and redraws; then grows back. Every re-pick keeps the dialog.
     let cid = data.state.windows[1].tile.unwrap();
@@ -1085,7 +1128,7 @@ fn a_repick_never_picks_what_the_dialog_covers() {
         a.sync(&mut el, &mut data);
         assert_eq!(focus(&data), Some(d_srv.clone()));
         assert!(data.state.zone_at(at.into()).is_none());
-        assert_eq!(data.state.cursor_shape(), Some("default"));
+        assert_eq!(data.state.cursor_shape(), Shape::Named("default"));
     }
     assert!(
         a.take().is_empty() && c.take().is_empty(),
@@ -1101,6 +1144,307 @@ fn a_repick_never_picks_what_the_dialog_covers() {
     assert!(c.take().is_empty());
     assert_eq!(focus(&data), None);
     let zone = data.state.zone_at(at.into()).expect("the zone");
-    assert_eq!(data.state.cursor_shape(), Some(zone.cursor()));
+    assert_eq!(data.state.cursor_shape(), Shape::Named(zone.cursor()));
     assert_ne!(zone.cursor(), "default");
+}
+
+// Job 032: client cursor surfaces.
+
+/// Moves the pointer to `at` and gives `c`'s enter serial on surface `i`; the others' events are
+/// dropped.
+fn enter(
+    el: &mut Loop,
+    data: &mut CalloopData,
+    at: (f64, f64),
+    c: &mut Conn,
+    i: usize,
+    others: &mut [&mut Conn],
+) -> u32 {
+    data.state.pointer_motion(at.into(), 0);
+    c.sync(el, data);
+    for o in others {
+        o.sync(el, data);
+        o.take();
+    }
+    entered(&c.take(), &c.id(i)).expect("entered").2
+}
+
+/// A point in navi's strip above window `app`.
+fn strip(data: &CalloopData, app: &str) -> (f64, f64) {
+    let (x, _) = centre(data, app);
+    let w = &data
+        .state
+        .windows
+        .iter()
+        .find(|m| window_app(&m.window) == app);
+    let top = data
+        .state
+        .space
+        .element_geometry(&w.unwrap().window)
+        .unwrap()
+        .loc
+        .y;
+    (top - 40..top)
+        .rev()
+        .map(|y| (x, f64::from(y)))
+        .find(|&p| data.state.zone_at(p.into()).is_some())
+        .expect("a zone above the window")
+}
+
+/// One frame on the test output as a backend without a theme draws it, then its frame
+/// callbacks, which `c` reads: the frame's cursor elements.
+fn frame(el: &mut Loop, data: &mut CalloopData, c: &mut Conn) -> usize {
+    use smithay::backend::renderer::element::{Element, Kind};
+    let output = data.state.space.outputs().next().unwrap().clone();
+    let arrow = match data.state.cursor_shape() {
+        Shape::Client(s) => crate::render::Arrow::Client(s),
+        _ => crate::render::Arrow::None,
+    };
+    let drawn = arrow.surface();
+    let cursors = crate::render::elements(
+        &mut smithay::backend::renderer::test::DummyRenderer,
+        &data.state,
+        &output,
+        arrow,
+        &mut None,
+        &mut crate::render::Solids::default(),
+    )
+    .iter()
+    .filter(|e| e.kind() == Kind::Cursor)
+    .count();
+    crate::render::send_frames(&mut data.state, &output, drawn.as_ref());
+    c.step(el, data);
+    cursors
+}
+
+fn client(s: &WlSurface, hot: (i32, i32)) -> Shape<crate::state::CursorSurface> {
+    Shape::Client((s.clone(), hot.into()))
+}
+
+/// AC3: a focused client's 24×24 cursor surface at (4, 4) is what navi draws; a pointer focus
+/// change forgets it; its offset moves the hotspot; destroyed, it is the arrow.
+#[test]
+fn client_ac3_cursor_surface_follows_pointer_focus() {
+    let (mut el, mut data) = crate::xwayland::tests::harness();
+    let mut a = Conn::new(&mut el, &mut data, ClientState::default());
+    let mut b = Conn::new(&mut el, &mut data, ClientState::default());
+    let ai = window(&mut el, &mut data, &mut a, "a");
+    let bi = window(&mut el, &mut data, &mut b, "b");
+    let (at, bt) = (centre(&data, "a"), centre(&data, "b"));
+    let serial = enter(&mut el, &mut data, at, &mut a, ai, &mut [&mut b]);
+    let cs = a.cursor(serial, (24, 24), (4, 4), 0);
+    a.sync(&mut el, &mut data);
+    let srv = a.server_of(&data, &cs);
+    assert_eq!(data.state.cursor_shape(), client(&srv, (4, 4)));
+
+    // Onto B: the arrow, and A's surface is no longer held.
+    enter(&mut el, &mut data, bt, &mut b, bi, &mut [&mut a]);
+    assert_eq!(data.state.cursor_shape(), Shape::Named("default"));
+    assert_eq!(data.state.cursor.request, crate::cursor::Request::default());
+
+    // Back on A, which sets it again, then moves its buffer by (1, 2): the hotspot follows.
+    let serial = enter(&mut el, &mut data, at, &mut a, ai, &mut [&mut b]);
+    a.c.pointer
+        .as_ref()
+        .unwrap()
+        .set_cursor(serial, Some(&cs), 4, 4);
+    let buf = a.buffer(24, 24);
+    cs.attach(Some(&buf), 1, 2);
+    cs.commit();
+    a.sync(&mut el, &mut data);
+    assert_eq!(data.state.cursor_shape(), client(&srv, (3, 2)));
+    // An offset that would overflow the hotspot saturates, and is outside: the arrow.
+    cs.attach(Some(&buf), i32::MIN, i32::MAX);
+    cs.commit();
+    a.sync(&mut el, &mut data);
+    assert_eq!(data.state.cursor_shape(), Shape::Named("default"));
+    cs.attach(Some(&buf), i32::MIN, i32::MAX);
+    cs.commit();
+    a.sync(&mut el, &mut data);
+    assert_eq!(data.state.cursor_shape(), Shape::Named("default"));
+
+    // Destroyed while set: no panic, the arrow, and a frame draws no cursor.
+    cs.destroy();
+    a.sync(&mut el, &mut data);
+    assert_eq!(data.state.cursor_shape(), Shape::Named("default"));
+    assert_eq!(frame(&mut el, &mut data, &mut a), 0);
+}
+
+/// AC4: requests from a client without the pointer or with a stale serial change nothing;
+/// a 512×512 surface and one with its hotspot outside are the arrow.
+#[test]
+fn client_ac4_unfocused_stale_and_oversized_cursors_are_refused() {
+    let (mut el, mut data) = crate::xwayland::tests::harness();
+    let mut a = Conn::new(&mut el, &mut data, ClientState::default());
+    let mut b = Conn::new(&mut el, &mut data, ClientState::default());
+    let ai = window(&mut el, &mut data, &mut a, "a");
+    let bi = window(&mut el, &mut data, &mut b, "b");
+    let (at, bt) = (centre(&data, "a"), centre(&data, "b"));
+    let stale = enter(&mut el, &mut data, at, &mut a, ai, &mut [&mut b]);
+    a.c.pointer.as_ref().unwrap().set_cursor(stale, None, 0, 0);
+    a.sync(&mut el, &mut data);
+    assert_eq!(data.state.cursor.request, crate::cursor::Request::Hidden);
+    // B never had the pointer.
+    b.cursor(stale, (24, 24), (4, 4), 0);
+    b.sync(&mut el, &mut data);
+    assert_eq!(data.state.cursor.request, crate::cursor::Request::Hidden);
+    // A, back after B, with its first serial.
+    enter(&mut el, &mut data, bt, &mut b, bi, &mut [&mut a]);
+    let serial = enter(&mut el, &mut data, at, &mut a, ai, &mut [&mut b]);
+    assert_ne!(serial, stale);
+    a.cursor(stale, (24, 24), (4, 4), 0);
+    a.sync(&mut el, &mut data);
+    assert_eq!(data.state.cursor.request, crate::cursor::Request::default());
+
+    for (size, hot) in [
+        ((512, 512), (0, 0)),
+        ((24, 24), (100, 100)),
+        ((24, 24), (-1, 0)),
+    ] {
+        let cs = a.cursor(serial, size, hot, 1);
+        a.sync(&mut el, &mut data);
+        let srv = a.server_of(&data, &cs);
+        assert_eq!(
+            data.state.cursor.request,
+            crate::cursor::Request::Surface(srv)
+        );
+        assert_eq!(
+            data.state.cursor_shape(),
+            Shape::Named("default"),
+            "{size:?} {hot:?}"
+        );
+        assert_eq!(frame(&mut el, &mut data, &mut a), 0);
+        cs.destroy();
+    }
+    // AC7: none of them was drawn, so none got a frame callback.
+    a.sync(&mut el, &mut data);
+    assert!(a.c.done.is_empty(), "{:?}", a.c.done);
+}
+
+/// AC5: over a zone, a Top layer, during a drag and locked, a stored client surface is never
+/// what is drawn, even if it outlived the focus change that clears it.
+#[test]
+fn client_ac5_never_over_navi_ui_drags_or_the_lock() {
+    let (mut el, mut data) = crate::xwayland::tests::harness();
+    let mut a = Conn::new(&mut el, &mut data, ClientState::default());
+    let privileged = ClientState {
+        privileged: true,
+        ..Default::default()
+    };
+    let mut l = Conn::new(&mut el, &mut data, privileged);
+    let ai = window(&mut el, &mut data, &mut a, "a");
+    let at = centre(&data, "a");
+    let serial = enter(&mut el, &mut data, at, &mut a, ai, &mut [&mut l]);
+    let cs = a.cursor(serial, (24, 24), (4, 4), 0);
+    a.sync(&mut el, &mut data);
+    let srv = a.server_of(&data, &cs);
+    assert_eq!(data.state.cursor_shape(), client(&srv, (4, 4)));
+    let stored = crate::cursor::Request::Surface(srv.clone());
+
+    // The strip: its own cursor, before and after forcing the request back.
+    let zone = strip(&data, "a");
+    put_pointer(&mut el, &mut data, zone, &mut [&mut a, &mut l]);
+    let grab = Shape::Named(data.state.zone_at(zone.into()).unwrap().cursor());
+    assert_eq!(data.state.cursor_shape(), grab);
+    data.state.cursor.request = stored.clone();
+    assert_eq!(data.state.cursor_shape(), grab);
+    assert_eq!(frame(&mut el, &mut data, &mut a), 0);
+
+    // A drag from the strip: its cursor.
+    data.state.pointer_button(0x110, true, true, 1);
+    assert!(data.state.drag.is_some(), "a drag from the strip");
+    data.state.cursor.request = stored.clone();
+    let drag = Shape::Named(data.state.drag.as_ref().unwrap().cursor());
+    assert_eq!(data.state.cursor_shape(), drag);
+    assert_eq!(frame(&mut el, &mut data, &mut a), 0);
+    data.state.pointer_button(0x110, true, false, 2);
+    assert!(data.state.drag.is_none());
+
+    // A Top layer over A: the layer client's cursor (`default`), never A's surface.
+    let li = l.layer((at.0 as i32 - 50, at.1 as i32 - 50), (100, 100));
+    l.sync(&mut el, &mut data);
+    l.draw(li, None);
+    l.sync(&mut el, &mut data);
+    put_pointer(&mut el, &mut data, at, &mut [&mut a, &mut l]);
+    assert_eq!(focus(&data), Some(l.server(&data, li)));
+    data.state.cursor.request = stored.clone();
+    assert_eq!(data.state.cursor_shape(), Shape::Named("default"));
+    assert_eq!(frame(&mut el, &mut data, &mut a), 0);
+
+    // Locked: job 025's rule (the lock client's request; a surface is `default`), and a lock
+    // frame has no cursor even when handed one.
+    data.state.lock.active = true;
+    data.state.cursor.request = stored;
+    assert_eq!(data.state.cursor_shape(), Shape::Named("default"));
+    let output = data.state.space.outputs().next().unwrap().clone();
+    let elements = crate::render::elements(
+        &mut smithay::backend::renderer::test::DummyRenderer,
+        &data.state,
+        &output,
+        crate::render::Arrow::Client((srv, (4, 4).into())),
+        &mut None,
+        &mut crate::render::Solids::default(),
+    );
+    assert!(
+        elements.is_empty(),
+        "{} elements while locked",
+        elements.len()
+    );
+    a.sync(&mut el, &mut data);
+    assert!(a.c.done.is_empty(), "{:?}", a.c.done);
+}
+
+/// AC6 (job 025's AC4 on the new `pick`): a null surface hides the pointer only over the client
+/// that asked.
+#[test]
+fn client_ac6_hidden_only_over_the_requesting_client() {
+    let (mut el, mut data) = crate::xwayland::tests::harness();
+    let mut a = Conn::new(&mut el, &mut data, ClientState::default());
+    let mut b = Conn::new(&mut el, &mut data, ClientState::default());
+    let ai = window(&mut el, &mut data, &mut a, "a");
+    let bi = window(&mut el, &mut data, &mut b, "b");
+    let (at, bt) = (centre(&data, "a"), centre(&data, "b"));
+    let hide = |a: &mut Conn, serial| a.c.pointer.as_ref().unwrap().set_cursor(serial, None, 0, 0);
+
+    let serial = enter(&mut el, &mut data, at, &mut a, ai, &mut [&mut b]);
+    hide(&mut a, serial);
+    a.sync(&mut el, &mut data);
+    assert_eq!(data.state.cursor_shape(), Shape::Hidden);
+    let zone = strip(&data, "a");
+    put_pointer(&mut el, &mut data, zone, &mut [&mut a, &mut b]);
+    let z = data.state.zone_at(zone.into()).unwrap().cursor();
+    assert_eq!(data.state.cursor_shape(), Shape::Named(z));
+    assert_ne!(z, "default");
+    let serial = enter(&mut el, &mut data, at, &mut a, ai, &mut [&mut b]);
+    assert_eq!(data.state.cursor_shape(), Shape::Named("default"));
+    hide(&mut a, serial);
+    a.sync(&mut el, &mut data);
+    assert_eq!(data.state.cursor_shape(), Shape::Hidden);
+    enter(&mut el, &mut data, bt, &mut b, bi, &mut [&mut a]);
+    assert_eq!(data.state.cursor_shape(), Shape::Named("default"));
+}
+
+/// AC7: a drawn cursor surface gets its frame callback after the frame; over a zone it gets
+/// none.
+#[test]
+fn client_ac7_frame_callbacks_only_when_drawn() {
+    let (mut el, mut data) = crate::xwayland::tests::harness();
+    let mut a = Conn::new(&mut el, &mut data, ClientState::default());
+    let ai = window(&mut el, &mut data, &mut a, "a");
+    let at = centre(&data, "a");
+    let serial = enter(&mut el, &mut data, at, &mut a, ai, &mut []);
+    let cs = a.cursor(serial, (24, 24), (4, 4), 7);
+    a.sync(&mut el, &mut data);
+    assert!(a.c.done.is_empty());
+    assert_eq!(frame(&mut el, &mut data, &mut a), 1);
+    assert_eq!(a.c.done, [7]);
+
+    // A new frame request; then the pointer goes to the strip before navi draws.
+    cs.frame(&a.queue.handle(), 8);
+    cs.commit();
+    a.sync(&mut el, &mut data);
+    let zone = strip(&data, "a");
+    put_pointer(&mut el, &mut data, zone, &mut [&mut a]);
+    assert_eq!(frame(&mut el, &mut data, &mut a), 0);
+    assert_eq!(a.c.done, [7]);
 }
