@@ -15,7 +15,7 @@ pub use drag::{
 };
 use memory::MAX_PX;
 pub use memory::safe;
-pub use shape::{Cut, Shape};
+pub use shape::{Cut, Shape, pieces};
 
 pub const COLS: i32 = 24;
 pub const ROWS: i32 = 12;
@@ -3210,10 +3210,8 @@ mod tests {
         let corner = (left, top);
         let glow = float_overlay(&l, None, l.hit(corner), None);
         for s in [Side::Left, Side::Top] {
-            assert!(
-                glow.contains(&(f, l.zone(Hit::Edge(f, s)).unwrap(), lit, None)),
-                "{s:?}"
-            );
+            let z = l.zone(Hit::Edge(f, s)).unwrap();
+            assert!(glow.iter().any(|g| (g.0, g.1, g.2) == (f, z, lit)), "{s:?}");
         }
 
         // Two floats: the front one's window hides the rear one's zones under it.

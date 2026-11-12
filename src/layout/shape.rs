@@ -131,6 +131,48 @@ impl Cut {
     }
 }
 
+/// Solid parts and cut corner parts of chrome, each with its rect's index.
+pub type Pieces<K> = (Vec<(usize, Rect, K)>, Vec<(usize, Rect, K, Cut)>);
+
+/// How chrome rects are drawn: by rect index, the px outside their cut's corner squares solid,
+/// and the parts inside cut. A cut with a hole (a ring, a lit corner) draws each corner once,
+/// for the first rect to reach it, over the box around every part its rects have there.
+pub fn pieces<K: Copy>(rects: &[(Rect, K, Option<Cut>)]) -> Pieces<K> {
+    let (mut plain, mut corners): Pieces<K> = (Vec::new(), Vec::new());
+    let mut drawn: Vec<(Cut, usize, usize)> = Vec::new();
+    for (i, &(r, k, cut)) in rects.iter().enumerate() {
+        let Some(c) = cut.filter(|c| c.shape.meets(r)) else {
+            plain.push((i, r, k));
+            continue;
+        };
+        plain.extend(c.shape.outside_corners(r).into_iter().map(|p| (i, p, k)));
+        for (at, sq) in c.shape.corners().into_iter().enumerate() {
+            let Some(part) = intersect(r, sq) else {
+                continue;
+            };
+            match drawn
+                .iter()
+                .find(|d| c.hole.is_some() && (d.0, d.1) == (c, at))
+            {
+                Some(&(.., j)) => corners[j].1 = bounding(corners[j].1, part),
+                None => {
+                    drawn.push((c, at, corners.len()));
+                    corners.push((i, part, k, c));
+                }
+            }
+        }
+    }
+    (plain, corners)
+}
+
+/// The smallest rect holding `a` and `b`.
+fn bounding(a: Rect, b: Rect) -> Rect {
+    let (x, y) = (a.x.min(b.x), a.y.min(b.y));
+    let right = (a.x + a.w).max(b.x + b.w);
+    let bottom = (a.y + a.h).max(b.y + b.h);
+    Rect::new(x, y, right - x, bottom - y)
+}
+
 /// `r` minus `hole`: up to four disjoint rects.
 fn subtract(r: Rect, hole: Rect) -> Vec<Rect> {
     let Some(i) = intersect(r, hole) else {
@@ -274,6 +316,48 @@ mod tests {
             assert_eq!(area, want);
         }
         assert_eq!(s.outside_corners(middle), vec![middle]);
+    }
+
+    /// A ring's four rects draw each corner square whole, once; rects of a cut with a hole
+    /// that reach only part of a square draw the box around those parts.
+    #[test]
+    fn pieces_draw_ring_corners_whole_and_lit_corners_to_their_rects() {
+        let inner = Rect::new(100, 100, 300, 200);
+        let c = Cut::ring(inner, RADIUS, 2);
+        let o = c.shape.rect;
+        let frame = [
+            Rect::new(o.x, o.y, o.w, 2),
+            Rect::new(o.x, inner.y + inner.h, o.w, 2),
+            Rect::new(o.x, inner.y, 2, inner.h),
+            Rect::new(inner.x + inner.w, inner.y, 2, inner.h),
+        ];
+        let rects: Vec<_> = frame.iter().map(|&r| (r, (), Some(c))).collect();
+        let (_, corners) = pieces(&rects);
+        let mut got: Vec<Rect> = corners.iter().map(|p| p.1).collect();
+        let mut want = c.shape.corners().to_vec();
+        got.sort_by_key(|r| (r.x, r.y));
+        want.sort_by_key(|r| (r.x, r.y));
+        assert_eq!(got, want);
+        // An L reaching 6 px left and 4 px below the corner square's inner part.
+        let sq = c.shape.corners()[3];
+        let left = Rect::new(sq.x, sq.y - 20, 6, sq.h + 16);
+        let below = Rect::new(sq.x, sq.y + sq.h - 4, sq.w + 20, 4);
+        let (plain, corners) = pieces(&[(left, (), Some(c)), (below, (), Some(c))]);
+        assert_eq!(corners.len(), 1);
+        assert_eq!(corners[0].1, Rect::new(sq.x, sq.y, sq.w, sq.h));
+        let narrow = Rect::new(sq.x, sq.y - 20, 3, sq.h + 16);
+        let (_, corners) = pieces(&[(narrow, (), Some(c))]);
+        assert_eq!(corners[0].1, Rect::new(sq.x, sq.y, 3, sq.h - 4));
+        assert!(plain.iter().all(|p| {
+            !c.shape
+                .corners()
+                .iter()
+                .any(|q| intersect(p.1, *q).is_some())
+        }));
+        // Without a hole each part is its own piece.
+        let solid = Cut::solid(c.shape);
+        let (_, corners) = pieces(&[(left, (), Some(solid)), (below, (), Some(solid))]);
+        assert_eq!(corners.len(), 2);
     }
 
     /// A frame's ring: outer radius `RADIUS + px`, its hole `RADIUS`, both clamped.

@@ -252,22 +252,7 @@ impl Layout {
             // A cut-off corner shows, and gives the pointer to, what is behind, but for the px
             // its frame is drawn over: those are a corner of the float's.
             if self.cut_off(f.id, p) {
-                let px = super::drag::frame_px(focused == Some(f.id));
-                let (_, ring) = self.frame_ring(f.id, px)?;
-                if !ring.shape.contains(p) {
-                    return None;
-                }
-                let x = if p.0 < o.x + o.w / 2 {
-                    Side::Left
-                } else {
-                    Side::Right
-                };
-                let y = if p.1 < o.y + o.h / 2 {
-                    Side::Top
-                } else {
-                    Side::Bottom
-                };
-                return Some(Some(Hit::Corner(f.id, x, y)));
+                return self.ring_corner(f.id, p, focused).map(Some);
             }
             if r.contains(p) {
                 return Some(None);
