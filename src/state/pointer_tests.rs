@@ -1448,3 +1448,119 @@ fn client_ac7_frame_callbacks_only_when_drawn() {
     assert_eq!(frame(&mut el, &mut data, &mut a), 0);
     assert_eq!(a.c.done, [7]);
 }
+
+/// navi's view of `s`'s damage: (entries, whether it is the collapsed whole buffer), pending
+/// or current.
+fn damage_of(s: &WlSurface, pending: bool) -> (usize, bool) {
+    with_states(s, |st| {
+        let mut attrs = st.cached_state.get::<SurfaceAttributes>();
+        let list = match pending {
+            true => &attrs.pending().damage,
+            false => &attrs.current().damage,
+        };
+        (list.len(), list.first() == Some(&whole_buffer()))
+    })
+}
+
+fn frames_of(s: &WlSurface) -> usize {
+    with_states(s, |st| {
+        let mut attrs = st.cached_state.get::<SurfaceAttributes>();
+        attrs.current().frame_callbacks.len()
+    })
+}
+
+/// Job 036 AC2: 10 000 damage requests on a role-less surface hold at most 64 before commit,
+/// and after it: the whole buffer.
+#[test]
+fn flood_ac2_damage_flood_is_capped() {
+    let (mut el, mut data) = crate::xwayland::tests::harness();
+    let mut a = Conn::new(&mut el, &mut data, ClientState::default());
+    let s = a.surface();
+    a.sync(&mut el, &mut data);
+    let srv = a.server_of(&data, &s);
+    for i in 0..64 {
+        s.damage(i, i, 1, 1);
+    }
+    a.sync(&mut el, &mut data);
+    assert_eq!(damage_of(&srv, true), (64, false));
+    for i in 64..10_000 {
+        if i % 2 == 0 {
+            s.damage(i, i, 1, 1);
+        } else {
+            s.damage_buffer(i, i, 1, 1);
+        }
+        if i % 500 == 0 {
+            a.sync(&mut el, &mut data);
+            assert_eq!(damage_of(&srv, true), (1, true), "{i}");
+        }
+    }
+    a.sync(&mut el, &mut data);
+    assert_eq!(damage_of(&srv, true), (1, true));
+    s.commit();
+    a.sync(&mut el, &mut data);
+    assert_eq!(damage_of(&srv, false), (1, true));
+
+    // Commits of 40 rectangles each, never drawn: current collapses once past 64.
+    let t = a.surface();
+    a.sync(&mut el, &mut data);
+    let srv = a.server_of(&data, &t);
+    for (n, want) in [(1, (40, false)), (2, (1, true)), (3, (41, true))] {
+        for i in 0..40 {
+            t.damage(i, n, 1, 1);
+        }
+        t.commit();
+        a.sync(&mut el, &mut data);
+        assert_eq!(damage_of(&srv, false), want, "commit {n}");
+    }
+}
+
+/// Job 036 AC2: 10 000 commits each with a frame callback on an undrawn surface leave 16
+/// pending; every other one was done, in request order.
+#[test]
+fn flood_ac2_frame_callbacks_are_capped() {
+    let (mut el, mut data) = crate::xwayland::tests::harness();
+    let mut a = Conn::new(&mut el, &mut data, ClientState::default());
+    let s = a.surface();
+    let qh = a.queue.handle();
+    for i in 0..10_000usize {
+        s.frame(&qh, i);
+        s.commit();
+        if i % 500 == 0 {
+            a.sync(&mut el, &mut data);
+        }
+    }
+    a.sync(&mut el, &mut data);
+    assert_eq!(a.c.done, (0..9_984).collect::<Vec<_>>());
+    assert_eq!(frames_of(&a.server_of(&data, &s)), 16);
+}
+
+/// Job 036: while locked, `send_frames` withholds a window's callbacks; the cap completes only
+/// the excess, and unlocked the frame sends the rest.
+#[test]
+fn flood_cap_sends_only_the_excess_while_locked() {
+    let (mut el, mut data) = crate::xwayland::tests::harness();
+    let mut a = Conn::new(&mut el, &mut data, ClientState::default());
+    let ai = window(&mut el, &mut data, &mut a, "a");
+    let s = a.s[ai].surface.clone();
+    let qh = a.queue.handle();
+    data.state.lock.active = true;
+    for i in 0..10usize {
+        s.frame(&qh, i);
+        s.commit();
+    }
+    a.sync(&mut el, &mut data);
+    frame(&mut el, &mut data, &mut a);
+    assert!(a.c.done.is_empty(), "{:?}", a.c.done);
+    for i in 10..20usize {
+        s.frame(&qh, i);
+        s.commit();
+    }
+    a.sync(&mut el, &mut data);
+    frame(&mut el, &mut data, &mut a);
+    assert_eq!(a.c.done, [0, 1, 2, 3]);
+    assert_eq!(frames_of(&a.server(&data, ai)), 16);
+
+    data.state.lock.active = false;
+    frame(&mut el, &mut data, &mut a);
+    assert_eq!(a.c.done, (0..20).collect::<Vec<_>>());
+}

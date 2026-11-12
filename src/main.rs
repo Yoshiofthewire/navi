@@ -7,6 +7,7 @@ mod control;
 mod cursor;
 mod desktop_config;
 mod files;
+mod flood;
 mod focus;
 mod force;
 mod glyph;
