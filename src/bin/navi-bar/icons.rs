@@ -3,8 +3,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
-use std::fs::File;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use resvg::{tiny_skia, usvg};
@@ -271,16 +269,9 @@ pub fn app_icon_names(app_id: &str, entries: &[Entry]) -> Vec<String> {
         .collect()
 }
 
-/// Reads at most `MAX_FILE` bytes.
+/// Reads at most `MAX_FILE` bytes of a regular file, never blocking on a FIFO swapped in.
 fn read_capped(path: &Path) -> Result<Vec<u8>, String> {
-    let mut bytes = Vec::new();
-    File::open(path)
-        .and_then(|f| f.take(MAX_FILE + 1).read_to_end(&mut bytes))
-        .map_err(|e| e.to_string())?;
-    match bytes.len() as u64 > MAX_FILE {
-        true => Err(format!("over {MAX_FILE} bytes")),
-        false => Ok(bytes),
-    }
+    read_bytes(path, MAX_FILE)?.ok_or_else(|| "no file".into())
 }
 
 /// An icon file drawn into a `size`×`size` pixmap, centred, keeping its aspect.
@@ -403,6 +394,55 @@ mod tests {
     use crate::testutil::Tmp;
 
     const SVG_RED: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><rect width="16" height="16" fill="#ff0000"/></svg>"##;
+
+    /// A Wayland client's app_id may be an absolute icon path. Swapping a FIFO in for that file
+    /// must not block navi-bar's main thread (job 035 review).
+    #[test]
+    fn a_fifo_swapped_in_for_an_icon_never_blocks() {
+        use std::os::unix::fs::symlink;
+        use std::sync::{Arc, atomic::AtomicBool, atomic::Ordering::Relaxed, mpsc};
+        let tmp = Tmp::new("icon-fifo");
+        let dir = tmp.0.clone();
+        fs::write(dir.join("reg.svg"), SVG_RED).unwrap();
+        let made = std::process::Command::new("mkfifo")
+            .arg(dir.join("fifo.svg"))
+            .status()
+            .unwrap();
+        assert!(made.success());
+        symlink("reg.svg", dir.join("x.svg")).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (stopped, d) = (stop.clone(), dir.clone());
+        // Atomically flips x.svg between the SVG and the FIFO.
+        let swapper = std::thread::spawn(move || {
+            for i in 0u64.. {
+                if stopped.load(Relaxed) {
+                    break;
+                }
+                let _ = fs::remove_file(d.join("n"));
+                symlink(if i % 2 == 0 { "fifo.svg" } else { "reg.svg" }, d.join("n")).unwrap();
+                fs::rename(d.join("n"), d.join("x.svg")).unwrap();
+            }
+        });
+        let (done, finished) = mpsc::channel();
+        let name = dir.join("x.svg").to_str().unwrap().to_string();
+        std::thread::spawn(move || {
+            let mut icons = Icons::new(Themes::new(vec![], None, PREFERRED));
+            for i in 0..20_000 {
+                let _ = icons.get(&format!("app:{i}"), std::slice::from_ref(&name), 32);
+            }
+            let _ = done.send(());
+        });
+        let result = finished.recv_timeout(std::time::Duration::from_secs(30));
+        if result.is_err() {
+            // Unblock the stuck open so the test process can end.
+            let _ = fs::OpenOptions::new()
+                .write(true)
+                .open(dir.join("fifo.svg"));
+        }
+        stop.store(true, Relaxed);
+        swapper.join().unwrap();
+        assert!(result.is_ok(), "Icons::get blocked opening a FIFO");
+    }
 
     #[test]
     fn kde_choice_and_category_icons_use_the_selected_theme() {

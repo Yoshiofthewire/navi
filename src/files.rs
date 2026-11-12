@@ -43,20 +43,129 @@ pub fn xdg_dir(var: Option<&OsStr>, home: Option<&OsStr>, fallback: &str) -> Opt
     }
 }
 
-/// The file's bytes, at most `max`; `None` if there is no file.
+/// The file's bytes, at most `max`; `None` if there is no file. Judges the file it opened, not
+/// the path, and never blocks opening a FIFO swapped in by another process.
 pub fn read_bytes(path: &Path, max: u64) -> Result<Option<Vec<u8>>, String> {
-    match fs::metadata(path) {
+    // Never wait for a FIFO's writer, and never take a tty as the controlling terminal.
+    let flags = (rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::NOCTTY).bits() as i32;
+    let file = match OpenOptions::new().read(true).custom_flags(flags).open(path) {
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.to_string()),
-        Ok(m) if !m.is_file() => return Err("not a regular file".into()),
-        Ok(_) => {}
+        Ok(f) => f,
+    };
+    if !file.metadata().map_err(|e| e.to_string())?.is_file() {
+        return Err("not a regular file".into());
     }
     let mut bytes = Vec::new();
-    File::open(path)
-        .and_then(|f| f.take(max + 1).read_to_end(&mut bytes))
+    file.take(max + 1)
+        .read_to_end(&mut bytes)
         .map_err(|e| e.to_string())?;
     if bytes.len() as u64 > max {
         return Err(format!("over {max} bytes"));
     }
     Ok(Some(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+    use std::sync::{Arc, atomic::AtomicBool, atomic::Ordering::Relaxed, mpsc};
+    use std::time::Duration;
+
+    /// A fresh empty dir, removed on drop.
+    struct Tmp(PathBuf);
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn read_bytes_caps_and_refuses_what_is_not_a_regular_file() {
+        let tmp = Tmp(std::env::temp_dir().join(format!("navi-files-{}-caps", std::process::id())));
+        let _ = fs::remove_dir_all(&tmp.0);
+        fs::create_dir(&tmp.0).unwrap();
+        let dir = &tmp.0;
+        fs::write(dir.join("f"), b"hello").unwrap();
+        assert_eq!(read_bytes(&dir.join("f"), 5), Ok(Some(b"hello".to_vec())));
+        assert!(read_bytes(&dir.join("f"), 4).is_err(), "over the cap");
+        assert_eq!(read_bytes(&dir.join("missing"), 5), Ok(None));
+        symlink("missing", dir.join("dangling")).unwrap();
+        assert_eq!(read_bytes(&dir.join("dangling"), 5), Ok(None));
+        symlink("f", dir.join("link")).unwrap();
+        assert_eq!(
+            read_bytes(&dir.join("link"), 5),
+            Ok(Some(b"hello".to_vec()))
+        );
+        assert!(read_bytes(dir, 5).is_err(), "a directory");
+        // navi-files reads another process's environ: procfs files are regular, size 0.
+        let environ = read_bytes(Path::new("/proc/self/environ"), 1 << 20)
+            .unwrap()
+            .unwrap();
+        assert!(!environ.is_empty());
+    }
+
+    #[test]
+    fn read_bytes_refuses_devices() {
+        for dev in [
+            "/dev/zero",
+            "/dev/null",
+            "/dev/urandom",
+            "/dev/full",
+            "/dev/tty",
+        ] {
+            assert!(read_bytes(Path::new(dev), 64).is_err(), "{dev}");
+        }
+    }
+
+    /// A FIFO swapped in for the file between any check and the open must not block the
+    /// caller (navi-bar's main thread reads icons, fonts and `.desktop` files this way).
+    #[test]
+    fn read_bytes_never_blocks_on_a_swapped_in_fifo() {
+        let tmp = Tmp(std::env::temp_dir().join(format!("navi-files-{}-fifo", std::process::id())));
+        let _ = fs::remove_dir_all(&tmp.0);
+        fs::create_dir(&tmp.0).unwrap();
+        let dir = tmp.0.clone();
+        fs::write(dir.join("reg"), b"bytes").unwrap();
+        let made = std::process::Command::new("mkfifo")
+            .arg(dir.join("fifo"))
+            .status()
+            .unwrap();
+        assert!(made.success());
+        assert!(
+            read_bytes(&dir.join("fifo"), 64).is_err(),
+            "a FIFO is refused"
+        );
+        symlink("reg", dir.join("x")).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (stopped, d) = (stop.clone(), dir.clone());
+        // Atomically flips x between the regular file and the FIFO.
+        let swapper = std::thread::spawn(move || {
+            for i in 0u64.. {
+                if stopped.load(Relaxed) {
+                    break;
+                }
+                let _ = fs::remove_file(d.join("n"));
+                symlink(if i % 2 == 0 { "fifo" } else { "reg" }, d.join("n")).unwrap();
+                fs::rename(d.join("n"), d.join("x")).unwrap();
+            }
+        });
+        let (done, finished) = mpsc::channel();
+        let d = dir.clone();
+        std::thread::spawn(move || {
+            for _ in 0..20_000 {
+                let _ = read_bytes(&d.join("x"), 64);
+            }
+            let _ = done.send(());
+        });
+        let result = finished.recv_timeout(Duration::from_secs(30));
+        if result.is_err() {
+            // Unblock the stuck open so the test process can end.
+            let _ = OpenOptions::new().write(true).open(dir.join("fifo"));
+        }
+        stop.store(true, Relaxed);
+        swapper.join().unwrap();
+        assert!(result.is_ok(), "read_bytes blocked opening a FIFO");
+    }
 }
