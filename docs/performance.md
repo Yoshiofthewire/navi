@@ -47,8 +47,11 @@ Both are at the sampler's resolution: rounding costs no idle CPU. PSS is not com
 the main run the host swapped (core PSS fell from 105.7 to 64.4 MiB including swap), and the
 rounded run ended at 109.9 MiB including swap. A static nested desktop with two rounded tiles
 and a rounded float, and no screenshot instrumentation, drew one frame in the 60 s after it
-settled, at the minute change of navi-bar's clock, as main did: rounded chrome keeps stable
-element ids, so it adds no damage. Rounding draws only the corner squares of navi's chrome with
+settled, at the minute change of navi-bar's clock: rounded chrome keeps stable element ids, so
+it adds no damage. A full-length comparison (2026-11-12, debug builds of main 3692a08 and the
+rounded-tile follow-ups, nested 1600×900, three static X11 tiles, no screenshot
+instrumentation, both 327 s side by side) drew the same frames: 16 while the clients mapped,
+then exactly one at each of the six minute changes and none between. Rounding draws only the corner squares of navi's chrome with
 a shader; a cut window surface loses direct scanout on DRM (fullscreen windows are never cut).
 
 ## What changed
