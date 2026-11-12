@@ -1,9 +1,10 @@
 //! Dock and launcher geometry in logical pixels; transparent margins stay outside input regions.
 
 use crate::{
+    context::MENU_W,
     desktop::{Category, Entry},
     menu::{Menu, ROWS, Row},
-    theme::{ACCENT, BAR_BG, DIM, INK, INK_ON_ACCENT, INSET, PANEL_EDGE, Panel, SELECTED},
+    theme::{ACCENT, BAR_BG, DIM, INK, INSET, PANEL_EDGE, Panel, SELECTED},
 };
 
 /// 40 px of dock, floating `INSET` above the screen edge.
@@ -24,6 +25,8 @@ pub const ROW_H: i32 = 36;
 pub const ROW_ICON: i32 = 24;
 pub const PANEL_H: i32 = 2 * PAD + HEADER_H + SEARCH_H + 8 + ROWS as i32 * ROW_H + FOOTER_H;
 const PANEL_GAP: i32 = INSET;
+/// The launcher's footer when it has no message.
+pub const HINT: &str = "Right-click or press Menu for app options.";
 pub const MINIMIZED_ALPHA: f32 = 0.45;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,8 +46,9 @@ pub enum Hit {
     Button,
     Window(usize),
     Row(usize),
-    Pin(usize),
     Back,
+    /// Anywhere in the open context menu, above whatever is under it.
+    Menu,
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Slot {
@@ -87,6 +91,8 @@ pub struct Layout {
     windows: usize,
     open: bool,
     rows: usize,
+    /// The open context menu's rect.
+    context: Option<Rect>,
 }
 
 impl Layout {
@@ -102,7 +108,63 @@ impl Layout {
             windows,
             open,
             rows: ROWS,
+            context: None,
         }
+    }
+
+    /// Surface point `(x, y)` relative to the surface's bottom centre, which stays put on screen
+    /// as the bottom-anchored, centred surface resizes.
+    pub fn anchor(&self, x: i32, y: i32) -> (i32, i32) {
+        (x - self.w / 2, y - self.h)
+    }
+
+    /// Opens a context menu `h` tall at `anchor`. A dock menu grows the surface and sits `INSET`
+    /// above the dock; a launcher menu stays inside the launcher, which grows to hold it.
+    pub fn with_context(mut self, anchor: (i32, i32), h: i32) -> Self {
+        let bounds = match self.panel() {
+            None => {
+                self.w = self.w.max(MENU_W);
+                self.h = BAR_H + PANEL_GAP + h;
+                Rect {
+                    x: 0,
+                    y: 0,
+                    w: self.w,
+                    h,
+                }
+            }
+            Some(p) => {
+                self.h += (h - p.h).max(0);
+                self.panel().unwrap_or(p)
+            }
+        };
+        let (x, y) = (anchor.0 + self.w / 2, anchor.1 + self.h);
+        let flip = |at: i32, len: i32, lo: i32, size: i32| {
+            let at = if at + len > lo + size { at - len } else { at };
+            at.clamp(lo, (lo + size - len).max(lo))
+        };
+        self.context = Some(Rect {
+            x: flip(x, MENU_W, bounds.x, bounds.w),
+            y: if self.open {
+                flip(y, h, bounds.y, bounds.h)
+            } else {
+                0
+            },
+            w: MENU_W,
+            h,
+        });
+        self
+    }
+
+    pub fn context(&self) -> Option<Rect> {
+        self.context
+    }
+
+    /// Where the input region takes clicks: the dock, the launcher and the context menu.
+    pub fn input(&self) -> Vec<Rect> {
+        [Some(self.bar()), self.panel(), self.context]
+            .into_iter()
+            .flatten()
+            .collect()
     }
 
     /// Short search results do not leave an empty, full-height launcher behind.
@@ -171,7 +233,8 @@ impl Layout {
             h: ROW_H,
         }
     }
-    fn pin(&self, k: usize) -> Rect {
+    /// A row's tail column: a folder's app count, or `Pinned`.
+    fn tail(&self, k: usize) -> Rect {
         let r = self.row(k);
         Rect {
             x: r.x + r.w - 60,
@@ -181,6 +244,9 @@ impl Layout {
         }
     }
     pub fn hit(&self, x: i32, y: i32) -> Option<Hit> {
+        if self.context.is_some_and(|c| c.contains(x, y)) {
+            return Some(Hit::Menu);
+        }
         if let Some(p) = self.panel() {
             if (Rect {
                 w: 52,
@@ -191,9 +257,6 @@ impl Layout {
                 return Some(Hit::Back);
             }
             for k in 0..self.rows {
-                if self.pin(k).contains(x, y) {
-                    return Some(Hit::Pin(k));
-                }
                 if self.row(k).contains(x, y) {
                     return Some(Hit::Row(k));
                 }
@@ -258,7 +321,8 @@ impl Layout {
             }
             for (k, (row, selected)) in m.rows().enumerate() {
                 let r = self.row(k);
-                if selected || matches!(hover, Some(Hit::Row(i) | Hit::Pin(i)) if i == k) {
+                let highlighted = selected || hover == Some(Hit::Row(k));
+                if highlighted {
                     out.push(Item::Round(r, 8, SELECTED));
                 }
                 let icon = square(r.x + 8, r, ROW_ICON);
@@ -271,46 +335,26 @@ impl Layout {
                             IconOf::Folder(c),
                         )
                     }
-                    Row::App(e) => (entries[e].name.as_str(), String::new(), IconOf::Entry(e)),
-                };
-                out.push(Item::Icon(of, icon, 1.0));
-                let text = Rect {
-                    x: icon.x + ROW_ICON + 12,
-                    w: r.w - ROW_ICON - 96,
-                    ..r
-                };
-                out.push(Item::Text(name.into(), text, INK));
-                let pin = self.pin(k);
-                match row {
-                    Row::Folder(_) => {
-                        let highlighted =
-                            selected || matches!(hover, Some(Hit::Row(i) | Hit::Pin(i)) if i == k);
-                        out.push(Item::Text(tail, pin, if highlighted { INK } else { DIM }));
-                    }
                     Row::App(e) => {
                         let pinned = pins.contains(&entries[e].id);
-                        out.push(Item::Round(
-                            pin,
-                            6,
-                            if hover == Some(Hit::Pin(k)) {
-                                ACCENT
-                            } else {
-                                BAR_BG
-                            },
-                        ));
-                        let ink = if hover == Some(Hit::Pin(k)) {
-                            INK_ON_ACCENT
-                        } else if pinned {
-                            ACCENT
-                        } else {
-                            INK
-                        };
-                        out.push(Item::Text(
-                            if pinned { "Unpin" } else { "Pin" }.into(),
-                            inset_x(pin, 8),
-                            ink,
-                        ));
+                        let tail = if pinned { "Pinned" } else { "" };
+                        (entries[e].name.as_str(), tail.into(), IconOf::Entry(e))
                     }
+                };
+                out.push(Item::Icon(of, icon, 1.0));
+                let x = icon.x + ROW_ICON + 12;
+                // The name runs to the row's end, or to its tail.
+                let end = if tail.is_empty() {
+                    r.x + r.w - PAD
+                } else {
+                    self.tail(k).x - 8
+                };
+                let text = Rect { x, w: end - x, ..r };
+                out.push(Item::Text(name.into(), text, INK));
+                if !tail.is_empty() {
+                    let folder = matches!(row, Row::Folder(_));
+                    let ink = if folder && highlighted { INK } else { DIM };
+                    out.push(Item::Text(tail, self.tail(k), ink));
                 }
             }
             let (top, total) = m.scroll_pos();
@@ -330,11 +374,7 @@ impl Layout {
                 w: p.w - 2 * PAD,
                 h: FOOTER_H,
             };
-            let hint = if message.is_empty() {
-                "Pin apps here, or press Insert on a selected app."
-            } else {
-                message
-            };
+            let hint = if message.is_empty() { HINT } else { message };
             out.push(Item::Text(hint.into(), footer, DIM));
         }
         let b = self.bar();
@@ -437,7 +477,8 @@ mod tests {
         let l = Layout::new(3, true);
         assert_eq!(l.w, PANEL_W);
         assert!(l.row(ROWS - 1).y + ROW_H <= PANEL_H - FOOTER_H - PAD);
-        assert_eq!(l.hit(l.pin(0).x + 2, l.pin(0).y + 2), Some(Hit::Pin(0)));
+        // The row's old Pin button column is now part of the row.
+        assert_eq!(l.hit(l.tail(0).x + 2, l.tail(0).y + 2), Some(Hit::Row(0)));
         assert_eq!(l.hit(l.row(0).x + 20, l.row(0).y + 10), Some(Hit::Row(0)));
         assert_eq!(l.hit(10, PANEL_H + 4), None);
         let short = Layout::new(3, true).with_rows(1);
@@ -481,51 +522,194 @@ mod tests {
         assert_eq!(dots.len(), 1);
     }
 
-    #[test]
-    fn launcher_draws_folders_and_explicit_pin_actions() {
-        let entries = [Entry {
+    fn terminal() -> Entry {
+        Entry {
             id: "terminal.desktop".into(),
             name: "Terminal".into(),
             icon: None,
             argv: vec!["terminal".into()],
             wm_class: None,
             category: Category::System,
-        }];
+            actions: Vec::new(),
+        }
+    }
+
+    fn texts(items: &[Item]) -> Vec<(&str, u32)> {
+        let mut out = Vec::new();
+        for i in items {
+            if let Item::Text(t, _, c) = i {
+                out.push((t.as_str(), *c));
+            }
+        }
+        out
+    }
+
+    /// AC5 (was `launcher_draws_folders_and_explicit_pin_actions`): rows have no Pin button; a
+    /// pinned app says `Pinned` in DIM, and the footer has the new hint.
+    #[test]
+    fn launcher_draws_folders_and_pinned_rows() {
+        let entries = [terminal()];
         let mut menu = Menu::new(&entries);
         let l = Layout::new(1, true);
-        let draw = |menu: &Menu| {
-            l.draw(
-                &[Slot {
-                    running: 1,
-                    ..Slot::default()
-                }],
-                Some(menu),
-                &entries,
-                &[],
-                None,
-                "",
-            )
+        let draw = |menu: &Menu, pins: &[String]| {
+            let slot = Slot {
+                running: 1,
+                ..Slot::default()
+            };
+            l.draw(&[slot], Some(menu), &entries, pins, None, "")
         };
-        let items = draw(&menu);
+        let items = draw(&menu, &[]);
         assert!(
             items
                 .iter()
                 .any(|i| matches!(i, Item::Icon(IconOf::Folder(Category::System), _, _)))
         );
-        assert!(
-            items
-                .iter()
-                .any(|i| matches!(i, Item::Text(t, ..) if t == "1 app"))
-        );
+        assert!(texts(&items).iter().any(|(t, _)| *t == "1 app"));
         menu.open(Category::System, &entries);
-        let items = draw(&menu);
-        for name in ["Back", "System", "Terminal", "Pin"] {
+        for pins in [vec![], vec!["terminal.desktop".to_string()]] {
+            let items = draw(&menu, &pins);
+            let t = texts(&items);
+            for name in ["Back", "System", "Terminal", HINT] {
+                assert!(t.iter().any(|(s, _)| *s == name), "{name}");
+            }
             assert!(
-                items
-                    .iter()
-                    .any(|i| matches!(i, Item::Text(t, ..) if t == name))
+                !t.iter().any(|(s, _)| *s == "Pin" || *s == "Unpin"),
+                "{t:?}"
+            );
+            assert_eq!(t.contains(&("Pinned", DIM)), !pins.is_empty());
+            assert!(items.iter().any(|i| matches!(i, Item::Panel(..))));
+            // An unpinned name runs to PAD from the row's end.
+            let name = items.iter().find_map(|i| match i {
+                Item::Text(s, r, _) if s == "Terminal" => Some(*r),
+                _ => None,
+            });
+            let (row, name) = (l.row(0), name.unwrap());
+            if pins.is_empty() {
+                assert_eq!(name.x + name.w, row.x + row.w - PAD);
+            } else {
+                assert!(name.x + name.w <= l.tail(0).x);
+            }
+        }
+        // No hit anywhere is a pin button.
+        for x in (0..l.w).step_by(4) {
+            for y in (0..l.h).step_by(4) {
+                assert!(matches!(
+                    l.hit(x, y),
+                    None | Some(Hit::Back | Hit::Row(_) | Hit::Button | Hit::Window(_))
+                ));
+            }
+        }
+    }
+
+    /// AC4: dock menus lie inside the surface, `INSET` above the dock, from either end.
+    #[test]
+    fn ac4_dock_menu_placement() {
+        let h = 300;
+        for windows in [1, 3, 12] {
+            let dock = Layout::new(windows, false);
+            let b = dock.bar();
+            for x in [b.x, b.x + b.w / 2, b.x + b.w - 1] {
+                let anchor = dock.anchor(x, b.y + 10);
+                let l = Layout::new(windows, false).with_context(anchor, h);
+                let r = l.context().unwrap();
+                assert!(
+                    r.x >= 0 && r.x + r.w <= l.w,
+                    "{windows} {x}: {r:?} in {}",
+                    l.w
+                );
+                assert_eq!(r.y + r.h + INSET, l.bar().y, "{windows} {x}");
+                assert_eq!((l.w, l.h), (dock.w.max(MENU_W), BAR_H + INSET + h));
+                assert_eq!(l.bar().w, b.w, "the dock stays put");
+                // Hits: the menu above, dock icons beside it.
+                assert_eq!(l.hit(r.x + 4, r.y + 4), Some(Hit::Menu));
+                assert_eq!(
+                    l.hit(l.target(0).x + 2, l.target(0).y + 2),
+                    Some(Hit::Button)
+                );
+                assert!(l.input().contains(&r));
+            }
+        }
+    }
+
+    /// AC4: a launcher menu flips at each corner and stays in the panel; the biggest one fits.
+    #[test]
+    fn ac4_launcher_menu_placement() {
+        let open = Layout::new(3, true);
+        let p = open.panel().unwrap();
+        let h = 200;
+        for (x, y) in [
+            (p.x + 1, p.y + 1),
+            (p.x + p.w - 2, p.y + 1),
+            (p.x + 1, p.y + p.h - 2),
+            (p.x + p.w - 2, p.y + p.h - 2),
+        ] {
+            let l = open.with_context(open.anchor(x, y), h);
+            let r = l.context().unwrap();
+            let p = l.panel().unwrap();
+            assert!(r.x >= p.x && r.x + r.w <= p.x + p.w, "{x},{y}: {r:?}");
+            assert!(r.y >= p.y && r.y + r.h <= p.y + p.h, "{x},{y}: {r:?}");
+            // Opened at the pointer, or flipped to end there.
+            assert!(r.x == x || r.x + r.w == x, "{x}: {r:?}");
+            assert!(r.y == y || r.y + r.h == y, "{y}: {r:?}");
+            let row = l.row(2);
+            if r.contains(row.x + 100, row.y + 4) {
+                assert_eq!(
+                    l.hit(row.x + 100, row.y + 4),
+                    Some(Hit::Menu),
+                    "above the rows"
+                );
+            }
+        }
+        // The biggest launcher menu: header, Open, six actions, a line and Pin.
+        let mut e = terminal();
+        e.actions = (0..crate::desktop::MAX_ACTIONS)
+            .map(|n| crate::desktop::Action {
+                id: n.to_string(),
+                name: "A".into(),
+                argv: vec!["a".into()],
+            })
+            .collect();
+        let app = crate::context::App {
+            entry: Some(&e),
+            app_id: "",
+            pinned: false,
+            windows: 0,
+            overdue: 0,
+        };
+        let target = crate::context::Target {
+            key: e.id.clone(),
+            dock: false,
+        };
+        let m = crate::context::Menu::new(target, crate::context::lines(&app, false), (0, 0), true);
+        assert!(m.height() <= PANEL_H, "{}", m.height());
+        // A short result list grows back to hold it.
+        let short = Layout::new(3, true).with_rows(1);
+        let l = short.with_context(short.anchor(p.x + 1, short.row(0).y), m.height());
+        assert!(l.panel().unwrap().h >= m.height());
+        let r = l.context().unwrap();
+        assert!(l.panel().unwrap().contains(r.x, r.y));
+    }
+
+    /// AC4: anchored at the bottom centre, a menu keeps its spot on screen as the surface grows.
+    #[test]
+    fn ac4_anchor_survives_a_resize() {
+        // Smithay centres a bottom-anchored layer at `W / 2 - w / 2`.
+        let origin = |l: &Layout, out_w: i32, out_h: i32| (out_w / 2 - l.w / 2, out_h - l.h);
+        for (out_w, windows) in [(3440, 1), (3441, 3), (1800, 12)] {
+            let dock = Layout::new(windows, false);
+            let (px, py) = (dock.target(1).x + 5, dock.target(1).y + 5);
+            let o = origin(&dock, out_w, 1440);
+            let on_screen = (o.0 + px, o.1 + py);
+            let anchor = dock.anchor(px, py);
+            let grown = Layout::new(windows, false).with_context(anchor, 250);
+            let g = origin(&grown, out_w, 1440);
+            let back = (anchor.0 + grown.w / 2 + g.0, anchor.1 + grown.h + g.1);
+            assert_eq!(back, on_screen, "{out_w} {windows}");
+            // The dock itself didn't move on screen.
+            assert_eq!(
+                (g.0 + grown.bar().x, g.1 + grown.bar().y),
+                (o.0 + dock.bar().x, o.1 + dock.bar().y)
             );
         }
-        assert!(items.iter().any(|i| matches!(i, Item::Panel(..))));
     }
 }

@@ -56,6 +56,7 @@ there, and Ctrl+Alt+Backspace brings the console back. Then pick "navi" on the l
 
 - **Super (tap):** open or close the app launcher. Type to search, arrows, PageUp/PageDown and
   Home/End to move, Enter to launch, Esc to close; the keyboard then returns to your window.
+  Right-click an app row, or press Menu or Shift+F10 on it, for its menu.
   Not while locked, and not over a fullscreen app on the taskbar's monitor (Super+Esc first).
   With sticky keys on, a lone Super tap latches Super instead.
 - **Super + 1…9:** focus or restore the Nth running app in the dock; **Super + Tab** /

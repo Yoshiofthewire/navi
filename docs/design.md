@@ -314,7 +314,8 @@ aspect, gravity, position) are ignored.
   the parent held the keyboard right before the dialog took it and the keyboard hasn't moved since
   (the parent gets back only what it held). Either way that window must still be visible (not
   hidden, minimized or wholly covered) on the same monitor, outside the lock; otherwise the
-  keyboard goes to nobody. Every hide (a dialog with its parent, a re-parent to a hidden window,
+  keyboard goes to nobody. That includes a force close: keys typed at a hung app never land in
+  another window the moment it dies. Every hide (a dialog with its parent, a re-parent to a hidden window,
   an X11 menu with its parent) takes the keyboard off the hidden window before the next key.
 - **Stacking order.** Windows stack by one rank: the last time they were raised, by the user (a
   click, the dock, Super+N, or an activation whose token came from the dock or from a window the
@@ -464,8 +465,9 @@ bundling a degoogled, resource-tested Chromium variant is reserved for a future 
   order, wrapping, and skip apps whose windows are all minimized. Both are navi's (apps never see
   them), work over fullscreen, and follow the activation rule: another window on a fullscreen
   monitor ends that fullscreen. The top-row digit keys count on any layout; the keypad doesn't.
-- **Pins:** use the **Pin / Unpin** button beside an app in the launcher, press Insert on a
-  selected app, or right-click an app's dock icon. Pins survive restarts in
+  Right-click an app's icon for its menu (*Context menus*).
+- **Pins:** pin or unpin an app from its right-click menu, in the dock or the launcher, or press
+  Insert on a selected app in the launcher. Pins survive restarts in
   `$XDG_CONFIG_HOME/navi/pins` (default `~/.config/navi/pins`): `navi-pins 1`, then one installed
   desktop file ID per line, at most 32. Uninstalled pins are retained in the file and hidden until
   the app is installed again. Saves are private and atomic; a damaged file is left intact and
@@ -489,8 +491,11 @@ bundling a degoogled, resource-tested Chromium variant is reserved for a future 
   keys on, a lone Super tap stays a latch. The mouse wheel and two-finger touchpad gestures
   scroll both folders and app lists; small continuous movements accumulate across frames, and
   gesture end, pointer leave or navigation clears any remainder. Short result lists shrink the
-  launcher to fit. The search, rows and pin buttons have distinct targets, and transparent space
-  around the dock and launcher takes no clicks.
+  launcher to fit. An app row is its icon and name, with `Pinned` in the secondary text colour
+  at its end when it's pinned; a folder row ends with its app count. Right-click an app row, or
+  press **Menu** or **Shift+F10** on the selected one, for its menu (*Context menus*). The search
+  and rows have distinct targets, and transparent space around the dock and launcher takes no
+  clicks.
   Folder rows use KDE's per-category icons (`applications-internet-symbolic`,
   `applications-development-symbolic`, `preferences-system-symbolic`, and the other matching
   category names), falling back to their non-symbolic name and then a generic folder.
@@ -545,6 +550,44 @@ bundling a degoogled, resource-tested Chromium variant is reserved for a future 
   the window cap. navi asks for it at most once a second, over the private control channel and
   with no app text. A repeat replaces the shown card silently, so a flood shows one card. No bus
   sender can close or replace it.
+- **Context menus:** a right-button press on a dock icon or a launcher app row opens that app's
+  menu next to the pointer; the release is ignored. No other part of the shell has one.
+
+  | Target | Items |
+  |---|---|
+  | Dock app with windows | header, **New window**, the app's desktop actions, **Pin to dock** / **Unpin from dock**, **Close window** / **Close all N windows** |
+  | Pinned dock app, no windows | header, **Open**, desktop actions, **Unpin from dock** |
+  | Dock app with no desktop entry | header, **Close window** / **Close all N windows** |
+  | Launcher app row | header, **Open**, desktop actions, **Pin to dock** / **Unpin from dock** |
+
+  The header (the app's name) and the lines between groups can't be selected. Desktop actions
+  come from the entry's `Actions=` (at most six, each with a name and an `Exec` the launcher
+  would run). A left press or Enter runs an item; Up/Down move (wrapping), Home/End go to the
+  ends, and every other key is swallowed. Hovering an item selects it. Esc closes only the menu;
+  a left press elsewhere on the shell closes it and does nothing else. A click into a window,
+  the lock, a window going fullscreen on the bar's monitor, the taskbar moving and the app
+  going away all close it. Opening it closes the session menu, and from the dock the launcher.
+  It holds the keyboard while open and returns it as the launcher does. A dock menu sits 12 px
+  above the dock, its left edge at the pointer, flipped left at the end of the dock, and centred
+  over a dock narrower than the menu (260 px); a launcher menu stays inside the launcher, and
+  its row stays highlighted. Only the launcher's menu opens from the keyboard (Menu,
+  Shift+F10); the dock's opens with the mouse, then takes the keyboard like the other.
+  **Close** is polite: the same request as a window's ✕ (`xdg_toplevel.close`, or
+  `WM_DELETE_WINDOW` for X11), for each of the app's windows; the app decides, and may ask
+  about unsaved work. **Force close:** if a window's first close (✕ or the dock) has gone
+  unanswered for 90 s, its dock menu offers **Force close…** below Close, and Close itself
+  now asks to force close. The 90 s count from the first close and never restart, so a window
+  kept open by cancelling a "Save changes?" prompt is offered it too. The confirmation names
+  the app, says unsaved work is lost and, for an app with more windows, that they close too.
+  Cancel is selected, and only the arrow keys and Tab move the selection; hovering doesn't.
+  Its buttons sit under the heading, away from the rows that open it. For 500 ms after it
+  appears it acts on nothing (Enter then is swallowed), and a button press counts only once
+  the pointer has really moved, not for the motion navi sends when the panel resizes, so
+  neither a double-click nor a double Enter can confirm. An output, scale or configure change
+  while it's open restarts the 500 ms, and the pointer's next spot becomes its new reference. Confirmed, navi checks the 90 s itself, then ends that window's client: a
+  Wayland app is sent SIGKILL through a pidfd taken when it connected and disconnected; an X11
+  app's X connection is ended with XKillClient, never a signal. navi, navi-bar, the locker and
+  Xwayland are never force closed. Nothing is automatic, and a refusal is only logged.
 - **Laptop alone:** the same layout with a slimmer taskbar.
 - **No virtual desktops.**
 - **Look:** cyberpunk, with no animations: every state change is instant. (The half-second hold
@@ -558,7 +601,8 @@ bundling a degoogled, resource-tested Chromium variant is reserved for a future 
   strips stay easy to find. A tile's lit strip or edge and its bar draw in front of its frame,
   a window stacked above the tile (a dialog) in front of all three, and the shell's panels in
   front of everything.
-  The shell's panels (dock, launcher, status band, session menu and notification cards) float:
+  The shell's panels (dock, launcher, status band, session menu, context menus and notification
+  cards) float:
   12 px (`INSET`) from the screen edges and from what they sit next to, with 10 px corners
   (`RADIUS`), the shell fill and a 1 px rim. The dock and band, which sit over the wallpaper,
   are 85 % opaque; the launcher, session menu and cards, which sit over windows, are 98 %, so
@@ -566,8 +610,11 @@ bundling a degoogled, resource-tested Chromium variant is reserved for a future 
   text 4.5:1 and marks 3:1 over any wallpaper, white or black; high contrast makes them opaque.
   Panels pad their content 12 px. Folder and session glyphs draw in the text colour, so they
   hold 3:1 in every scheme; app icons keep their own colours. The launcher's search field is
-  the selected fill with a rim, so it has a shape even in high contrast. The band is 32 px (one
-  line of text) and the dock 40 px (24 px icons in 32 px targets); they share radius and rim. Pixels outside a panel are clear and take no clicks. Hover and
+  the selected fill with a rim, so it has a shape even in high contrast. A context menu's
+  selected item has the selected fill and a 3 px accent mark at its left edge, which holds 3:1
+  where the fill alone doesn't; the force-close button has an accent rim. The band is 32 px
+  (one line of text) and the dock 40 px (24 px icons in 32 px targets); they share radius and
+  rim. Pixels outside a panel are clear and take no clicks. Hover and
   selected fills inside a panel stay opaque. Windows stay solid, with no translucency or shadows,
   and share the panels' corners (*Rounded tiles*). No desktop widgets, dock
   magnification, reflection or bounce: it isn't Mac-like.

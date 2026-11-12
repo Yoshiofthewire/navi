@@ -589,6 +589,7 @@ mod tests {
             argv: vec!["x".into()],
             wm_class: class.map(Into::into),
             category: crate::desktop::Category::Other,
+            actions: Vec::new(),
         };
         let entries = [
             e("org.kde.konsole.desktop", "utilities-terminal", None),

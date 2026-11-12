@@ -242,6 +242,7 @@ impl Navi {
             ours,
             Arc::new(ClientState {
                 locker: true,
+                child: Some(child.id()),
                 ..Default::default()
             }),
         ) {
@@ -252,6 +253,7 @@ impl Navi {
                 return Err(e.into());
             }
         };
+        self.protect(client.clone());
         self.lock.spawning = true;
         let timeout_client = client.clone();
         // A failed startup must not leave a menu action waiting forever.

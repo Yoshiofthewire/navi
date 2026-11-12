@@ -27,6 +27,8 @@ pub struct Info {
     pub states: Vec<handle::State>,
     /// A dialog of its family waits for the user; sent as `control::ATTENTION`.
     pub attention: bool,
+    /// A user's close went unanswered for `force::FORCE_AFTER`; sent as `control::CLOSE_OVERDUE`.
+    pub overdue: bool,
 }
 
 struct Sent {
@@ -47,6 +49,30 @@ impl Toplevels {
     #[cfg(test)]
     pub fn ids(&self) -> Vec<WinId> {
         self.windows.iter().map(|(id, _)| *id).collect()
+    }
+
+    /// The window whose handle has object ID `protocol_id` on `client`'s connection.
+    pub fn find(&self, client: &Client, protocol_id: u32) -> Option<WinId> {
+        let mine = |s: &Sent| {
+            s.handle.id().protocol_id() == protocol_id
+                && s.handle.client().as_ref() == Some(client)
+                && s.handle.is_alive()
+        };
+        let (id, _) = self
+            .windows
+            .iter()
+            .find(|(_, sent)| sent.iter().any(mine))?;
+        Some(*id)
+    }
+
+    /// The handle `client` holds for window `id`, by object ID.
+    #[cfg(test)]
+    pub fn handle_of(&self, client: &Client, id: WinId) -> Option<u32> {
+        let (_, sent) = self.windows.iter().find(|(w, _)| *w == id)?;
+        let s = sent
+            .iter()
+            .find(|s| s.handle.client().as_ref() == Some(client))?;
+        Some(s.handle.id().protocol_id())
     }
 
     /// Brings every manager up to date with `now`, the tiled windows in open order: announces
@@ -120,16 +146,19 @@ fn update(dh: &DisplayHandle, s: &mut Sent, info: &Info) {
             o.client_outputs(&client).for_each(|w| h.output_enter(&w));
         }
     }
-    if (&s.info.states, s.info.attention) != (&info.states, info.attention) {
+    let private = |i: &Info| (i.states.clone(), i.attention, i.overdue);
+    if private(&s.info) != private(info) {
         let fullscreen = h.version() >= 2;
-        // Only navi-bar sees these handles, so it alone reads the private attention state.
+        // Only navi-bar sees these handles, so it alone reads the private states.
         let attention = info.attention.then_some(crate::control::ATTENTION);
+        let overdue = info.overdue.then_some(crate::control::CLOSE_OVERDUE);
         let states: Vec<u8> = info
             .states
             .iter()
             .filter(|&&st| fullscreen || st != handle::State::Fullscreen)
             .map(|&st| u32::from(st))
             .chain(attention)
+            .chain(overdue)
             .flat_map(u32::to_ne_bytes)
             .collect();
         h.state(states);

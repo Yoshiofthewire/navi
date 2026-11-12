@@ -8,6 +8,7 @@ mod cursor;
 mod desktop_config;
 mod files;
 mod focus;
+mod force;
 mod glyph;
 mod image;
 mod input;
@@ -131,10 +132,11 @@ fn run(backend: Backend) -> Result<(), Box<dyn Error>> {
     );
     let handle = event_loop.handle();
     handle.insert_source(socket, |stream, _, data| {
+        let client = ClientState::accepted(&stream);
         if let Err(e) = data
             .state
             .display_handle
-            .insert_client(stream, Arc::new(ClientState::default()))
+            .insert_client(stream, Arc::new(client))
         {
             warn!("rejected client: {e}");
         }
@@ -175,9 +177,9 @@ fn run(backend: Backend) -> Result<(), Box<dyn Error>> {
     };
     // After the first output exists, so the bar lands on it.
     let xdisplay = xwayland::start(&handle, &data.state);
-    data.state.bar_control = shell::start_bar(
+    shell::start_bar(
         &handle,
-        &mut data.state.display_handle,
+        &mut data.state,
         &socket_name,
         theme,
         xdisplay,

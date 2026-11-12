@@ -57,6 +57,8 @@ pub fn start(handle: &LoopHandle<'static, CalloopData>, state: &Navi) -> Option<
         } => match X11Wm::start_wm(h.clone(), x11_socket, client.clone()) {
             Ok(wm) => {
                 data.state.xwm = Some(wm);
+                data.state.protect(client.clone());
+                data.state.xdisplay = Some(format!(":{display_number}"));
                 info!(display = format!(":{display_number}"), "XWayland ready");
             }
             Err(e) => warn!("XWayland window manager failed: {e}"),
@@ -94,7 +96,7 @@ pub(crate) const XWAYLAND_RESOURCE_ID_MASK: u32 = 0x001F_FFFF;
 
 /// The X client that created window `id`: its resource-ID base. The server rejects IDs outside a
 /// client's own range, so no client can name another's.
-fn x_client(id: u32) -> u32 {
+pub(crate) fn x_client(id: u32) -> u32 {
     id & !XWAYLAND_RESOURCE_ID_MASK
 }
 
@@ -209,6 +211,7 @@ impl Navi {
             last_output: None,
             capped_for: None,
             menu_owner: None,
+            close_sent: None,
         });
         self.apply_layout();
         if !x.is_override_redirect() {
@@ -2969,5 +2972,113 @@ pub(crate) mod tests {
         b.destroy_window(bw).unwrap();
         b.flush().unwrap();
         pump(&mut event_loop, &mut data, |d| d.state.windows.is_empty());
+    }
+
+    /// Job 034 AC13: a force close of an X window that ignores WM_DELETE_WINDOW ends its X
+    /// client only. Named so CI's `x11_lifecycle_and_input` filter runs it.
+    #[test]
+    #[ignore = "requires the Xwayland executable"]
+    fn x11_lifecycle_and_input_force_close() {
+        let (mut event_loop, mut data) = harness();
+        let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
+        let bar = data
+            .state
+            .display_handle
+            .insert_client(
+                server,
+                std::sync::Arc::new(crate::state::ClientState {
+                    privileged: true,
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        let shell = WaylandConnection::from_socket(client).unwrap();
+        let mut queue = shell.new_event_queue::<Metadata>();
+        let _registry = shell.display().get_registry(&queue.handle(), ());
+        let mut metadata = Metadata::default();
+        queue.flush().unwrap();
+        let xdisplay = start(&event_loop.handle(), &data.state).expect("spawn Xwayland");
+        pump(&mut event_loop, &mut data, |d| d.state.xwm.is_some());
+        let connect = || smithay::reexports::x11rb::connect(Some(&xdisplay)).unwrap();
+        let ((a, screen), (b, _)) = (connect(), connect());
+        let root = a.setup().roots[screen].root;
+        let atom = |name: &[u8]| a.intern_atom(false, name).unwrap().reply().unwrap().atom;
+        let (protocols, delete) = (atom(b"WM_PROTOCOLS"), atom(b"WM_DELETE_WINDOW"));
+        let create = |conn: &smithay::reexports::x11rb::rust_connection::RustConnection| {
+            let win = conn.generate_id().unwrap();
+            conn.create_window(
+                smithay::reexports::x11rb::COPY_DEPTH_FROM_PARENT,
+                win,
+                root,
+                0,
+                0,
+                64,
+                48,
+                0,
+                WindowClass::INPUT_OUTPUT,
+                0,
+                &CreateWindowAux::new().background_pixel(0x6688aa),
+            )
+            .unwrap();
+            conn.change_property32(PropMode::REPLACE, win, protocols, AtomEnum::ATOM, &[delete])
+                .unwrap();
+            conn.map_window(win).unwrap();
+            conn.flush().unwrap();
+            win
+        };
+        let (wa, wb) = (create(&a), create(&b));
+        let tile = |d: &CalloopData, win: u32| {
+            let mut ws = d.state.windows.iter();
+            let m = ws.find(|m| m.window.x11_surface().is_some_and(|x| x.window_id() == win));
+            m.and_then(|m| m.tile)
+        };
+        pump(&mut event_loop, &mut data, |d| {
+            tile(d, wa).is_some() && tile(d, wb).is_some()
+        });
+        let id = tile(&data, wa).unwrap();
+        pump(&mut event_loop, &mut data, |d| {
+            metadata.read(&mut queue);
+            d.state.toplevels.handle_of(&bar, id).is_some()
+        });
+        let handle = data.state.toplevels.handle_of(&bar, id).unwrap();
+        let force = |event_loop: &mut EventLoop<CalloopData>, data: &mut CalloopData| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            data.state.force_close(&bar, handle, tx);
+            let mut reply = None;
+            pump(event_loop, data, |_| {
+                reply = reply.or(rx.try_recv().ok());
+                reply.is_some()
+            });
+            reply.unwrap()
+        };
+
+        // The bar's close: A hears WM_DELETE_WINDOW and ignores it.
+        data.state.close_window(id);
+        let mut asked = false;
+        pump(&mut event_loop, &mut data, |_| {
+            while let Some(event) = a.poll_for_event().unwrap() {
+                if let Event::ClientMessage(e) = event {
+                    asked |= e.window == wa && e.data.as_data32()[0] == delete;
+                }
+            }
+            asked
+        });
+        assert!(!force(&mut event_loop, &mut data), "not overdue yet");
+        let m = data.state.windows.iter_mut().find(|m| m.tile == Some(id));
+        m.unwrap().close_sent = Some(Instant::now() - crate::force::FORCE_AFTER);
+        assert!(force(&mut event_loop, &mut data), "force closed at +90 s");
+
+        // A's connection is gone; B and Xwayland are not.
+        let dead = a.get_input_focus().map(|c| c.reply().is_err());
+        assert!(dead.unwrap_or(true), "A's connection closed");
+        assert!(b.get_input_focus().unwrap().reply().is_ok());
+        pump(&mut event_loop, &mut data, |d| tile(d, wa).is_none());
+        assert!(tile(&data, wb).is_some());
+        assert!(data.state.xwm.is_some(), "Xwayland alive");
+        let (c, _) = connect();
+        assert!(
+            c.get_input_focus().unwrap().reply().is_ok(),
+            "a new X client connects"
+        );
     }
 }
