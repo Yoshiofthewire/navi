@@ -450,7 +450,7 @@ fn swaylock_real_client_handshake() {
                     .state
                     .lock_presented(&output, h.data.state.lock.epoch);
             }
-            crate::render::send_frames(&mut h.data.state, &output);
+            crate::render::send_frames(&mut h.data.state, &output, None);
             h.data.display.flush_clients().unwrap();
             let mapped = h.data.state.lock.surfaces.first().is_some_and(|(_, s)| {
                 smithay::wayland::compositor::with_states(s.wl_surface(), |states| {

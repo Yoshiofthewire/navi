@@ -122,16 +122,15 @@ fn inherits(dirs: &[PathBuf], theme: &str) -> Vec<String> {
         .collect()
 }
 
-/// What a client asked the pointer to look like over its surface.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Request {
+/// What a client asked the pointer to look like over its surface, `S` its cursor surface.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Request<S> {
     Named(&'static str),
     Hidden,
-    /// A client cursor surface, which navi doesn't draw yet.
-    Surface,
+    Surface(S),
 }
 
-impl Default for Request {
+impl<S> Default for Request<S> {
     fn default() -> Self {
         Request::Named("default")
     }
@@ -140,7 +139,7 @@ impl Default for Request {
 /// The request of the client under the pointer, `F` its surface.
 pub struct Requested<F> {
     focus: Option<F>,
-    pub request: Request,
+    pub request: Request<F>,
 }
 
 impl<F> Default for Requested<F> {
@@ -162,29 +161,59 @@ impl<F: PartialEq> Requested<F> {
     }
 }
 
-/// The shape to draw, `None` for none, top rule first: while locked the lock client's request;
-/// a drag's cursor; over a Top or Overlay layer its client's; over a zone the zone's; else the
-/// client's under the pointer (`default` once the focus moved off it).
-pub fn pick(
+/// What to draw at the pointer.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Shape<S> {
+    Named(&'static str),
+    /// The client's cursor surface.
+    Client(S),
+    Hidden,
+}
+
+/// The shape to draw, top rule first: while locked the lock client's request; a drag's cursor;
+/// over a Top or Overlay layer its client's; over a zone the zone's; else the client's under the
+/// pointer (`default` once the focus moved off it). A cursor surface is drawn only in that last
+/// case; locked or over a layer it is `default`.
+pub fn pick<'a, S>(
     lock: bool,
     drag: Option<&'static str>,
     layer: bool,
     zone: Option<&'static str>,
-    request: Request,
-) -> Option<&'static str> {
-    let client = match request {
-        Request::Named(n) => Some(n),
-        Request::Hidden => None,
-        Request::Surface => Some("default"),
+    request: &'a Request<S>,
+) -> Shape<&'a S> {
+    let named = match request {
+        Request::Named(n) => Shape::Named(n),
+        Request::Hidden => Shape::Hidden,
+        Request::Surface(_) => Shape::Named("default"),
     };
     if lock {
-        return client;
+        return named;
     }
-    match (drag, layer, zone) {
-        (Some(d), ..) => Some(d),
-        (None, false, Some(z)) => Some(z),
-        _ => client,
+    match (drag, layer, zone, request) {
+        (Some(d), ..) => Shape::Named(d),
+        (None, true, ..) => named,
+        (None, false, Some(z), _) => Shape::Named(z),
+        (.., Request::Surface(s)) => Shape::Client(s),
+        _ => named,
     }
+}
+
+/// Largest buffer side of a client cursor surface, in px.
+const MAX_BUFFER: i32 = 1024;
+
+/// Whether navi draws a client's cursor surface: `size` (logical) at most `MAX_SIDE` and its
+/// `buffer` at most `MAX_BUFFER` px a side, both at least 1×1, the hotspot inside, no
+/// subsurfaces.
+pub fn fits(size: (i32, i32), buffer: (i32, i32), hotspot: (i32, i32), subsurfaces: bool) -> bool {
+    let side = |v: i32, max: i32| (1..=max).contains(&v);
+    let logical = MAX_SIDE as i32;
+    !subsurfaces
+        && side(size.0, logical)
+        && side(size.1, logical)
+        && side(buffer.0, MAX_BUFFER)
+        && side(buffer.1, MAX_BUFFER)
+        && (0..size.0).contains(&hotspot.0)
+        && (0..size.1).contains(&hotspot.1)
 }
 
 /// One theme's shapes at one size. Each shape's file is read at most once, hit or miss; a missing
@@ -564,49 +593,119 @@ mod tests {
     #[test]
     fn shapes_ac4_pick_precedence() {
         use Request::*;
-        let text = Named("text");
+        let (text, hidden): (Request<i32>, Request<i32>) = (Named("text"), Hidden);
+        let named = |n| Shape::Named(n);
         // Lock beats everything, even a drag left over.
         assert_eq!(
-            pick(true, Some("grabbing"), true, Some("n-resize"), text),
-            Some("text")
+            pick(true, Some("grabbing"), true, Some("n-resize"), &text),
+            named("text")
         );
-        assert_eq!(pick(true, Some("grabbing"), false, None, Hidden), None);
+        assert_eq!(
+            pick(true, Some("grabbing"), false, None, &hidden),
+            Shape::Hidden
+        );
         // A drag beats a layer, a zone and the client.
         assert_eq!(
-            pick(false, Some("se-resize"), true, Some("grab"), text),
-            Some("se-resize")
+            pick(false, Some("se-resize"), true, Some("grab"), &text),
+            named("se-resize")
         );
         assert_eq!(
-            pick(false, Some("grabbing"), false, None, Hidden),
-            Some("grabbing")
+            pick(false, Some("grabbing"), false, None, &hidden),
+            named("grabbing")
         );
         // A Top/Overlay layer beats a zone: its client's request counts.
         assert_eq!(
-            pick(false, None, true, Some("w-resize"), text),
-            Some("text")
+            pick(false, None, true, Some("w-resize"), &text),
+            named("text")
         );
-        assert_eq!(pick(false, None, true, Some("w-resize"), Hidden), None);
+        assert_eq!(
+            pick(false, None, true, Some("w-resize"), &hidden),
+            Shape::Hidden
+        );
         // A zone beats the client's request, Hidden included.
         assert_eq!(
-            pick(false, None, false, Some("w-resize"), text),
-            Some("w-resize")
+            pick(false, None, false, Some("w-resize"), &text),
+            named("w-resize")
         );
-        assert_eq!(pick(false, None, false, Some("grab"), Hidden), Some("grab"));
+        assert_eq!(
+            pick(false, None, false, Some("grab"), &hidden),
+            named("grab")
+        );
         // With none of those, the client's request.
-        assert_eq!(pick(false, None, false, None, text), Some("text"));
-        assert_eq!(pick(false, None, false, None, Hidden), None);
-        assert_eq!(pick(false, None, false, None, Surface), Some("default"));
+        assert_eq!(pick(false, None, false, None, &text), named("text"));
+        assert_eq!(pick(false, None, false, None, &hidden), Shape::Hidden);
         // A focus change resets the request; the old client's no longer applies.
         let mut r = Requested::default();
         r.focus(Some(1));
         r.request = Hidden;
         r.focus(Some(1));
-        assert_eq!(pick(false, None, false, None, r.request), None);
+        assert_eq!(pick(false, None, false, None, &r.request), Shape::Hidden);
         r.focus(Some(2));
-        assert_eq!(pick(false, None, false, None, r.request), Some("default"));
-        r.request = text;
+        assert_eq!(pick(false, None, false, None, &r.request), named("default"));
+        r.request = Surface(2);
         r.focus(None);
-        assert_eq!(pick(false, None, false, None, r.request), Some("default"));
+        assert_eq!(pick(false, None, false, None, &r.request), named("default"));
+    }
+
+    #[test]
+    fn client_ac1_pick_gives_the_surface_only_over_an_app() {
+        let s = Request::Surface(7);
+        let pick = |lock, drag, layer, zone| pick(lock, drag, layer, zone, &s);
+        assert_eq!(pick(false, None, false, None), Shape::Client(&7));
+        // Locked or over a panel, job 025 lets the client's request through, but not a surface.
+        assert_eq!(pick(true, None, false, None), Shape::Named("default"));
+        assert_eq!(
+            pick(true, Some("grabbing"), true, Some("grab")),
+            Shape::Named("default")
+        );
+        assert_eq!(pick(false, None, true, None), Shape::Named("default"));
+        assert_eq!(
+            pick(false, None, true, Some("grab")),
+            Shape::Named("default")
+        );
+        // A zone's or a drag's cursor wins, as over any request.
+        assert_eq!(
+            pick(false, None, false, Some("n-resize")),
+            Shape::Named("n-resize")
+        );
+        assert_eq!(
+            pick(false, Some("grabbing"), false, None),
+            Shape::Named("grabbing")
+        );
+        assert_eq!(
+            pick(false, Some("grabbing"), true, Some("grab")),
+            Shape::Named("grabbing")
+        );
+    }
+
+    #[test]
+    fn client_ac2_surface_caps() {
+        let ok = |size, buffer, hot| fits(size, buffer, hot, false);
+        assert!(ok((256, 256), (256, 256), (0, 0)));
+        assert!(ok((256, 256), (1024, 1024), (255, 255)));
+        assert!(ok((1, 1), (1, 1), (0, 0)));
+        assert!(ok((24, 24), (48, 48), (4, 4)));
+        assert!(!ok((257, 24), (257, 24), (0, 0)), "257 wide");
+        assert!(!ok((24, 257), (24, 257), (0, 0)), "257 tall");
+        assert!(!ok((0, 0), (0, 0), (0, 0)), "0×0");
+        assert!(!ok((0, 24), (0, 24), (0, 0)));
+        assert!(!ok((256, 256), (1025, 1024), (0, 0)), "1025 px buffer");
+        assert!(!ok((256, 256), (1024, 1025), (0, 0)), "1025 px buffer");
+        assert!(!ok((24, 24), (24, 24), (-1, 0)));
+        assert!(!ok((24, 24), (24, 24), (0, -1)));
+        assert!(!ok((24, 24), (24, 24), (24, 0)));
+        assert!(!ok((24, 24), (24, 24), (0, 24)));
+        assert!(!fits((24, 24), (24, 24), (4, 4), true), "a subsurface");
+        let ends = [i32::MIN, -1, 0, 1, i32::MAX];
+        for a in ends {
+            for b in ends {
+                for c in ends {
+                    // A hotspot at (w, h) is outside, whatever w and h are.
+                    assert!(!ok((a, b), (c, c), (a, b)));
+                    let _ = ok((24, 24), (a, b), (c, a));
+                }
+            }
+        }
     }
 
     #[test]

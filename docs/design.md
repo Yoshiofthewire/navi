@@ -619,19 +619,26 @@ don't affect navi's MIT licence.
   load, hit or miss, and only names from navi's fixed table and `cursor-shape-v1`'s list are ever
   looked up, never a client's string.
   Built now: navi's zone and drag cursors (see *Dragging*), apps' named cursors through
-  `cursor-shape-v1` (an I-beam over text and so on), and `XCURSOR_THEME` and `XCURSOR_SIZE`
+  `cursor-shape-v1` (an I-beam over text and so on), apps' own cursor surfaces
+  (`wl_pointer.set_cursor` with a buffer: every X11 app through Xwayland, and Wayland apps
+  without `cursor-shape-v1` such as GTK 3), and `XCURSOR_THEME` and `XCURSOR_SIZE`
   (24 × scale) set for navi-bar and the apps it launches. What shows, top rule first: while
   locked, the lock screen's request; during a drag, the drag's cursor; over a Top or Overlay
   panel, that panel's request; over a navi target, its cursor; else the request of the app under
-  the pointer. An app's request counts only while the pointer is over it: each new pointer focus
+  the pointer. A cursor surface draws only in that last case, at the pointer minus its hotspot
+  (`wl_surface.offset` moves it); locked or over a panel it is the arrow. It must be at most
+  256 × 256 logical px and 1024 px a side in its buffer, at least 1 × 1, with its hotspot inside
+  and no subsurfaces; one that breaks a cap, has no buffer or is destroyed draws the arrow, never
+  nothing. It gets frame callbacks only from frames that drew it, so an animated cursor runs no
+  faster than navi draws it. An app's request counts only while the pointer is over it: each new pointer focus
   starts from the arrow, and a request from an app without pointer focus or with a stale enter
   serial is dropped. Pointer focus follows the topmost surface under the pointer whenever the
   scene changes (a window, dialog, popup, panel or lock surface maps, unmaps, moves or is
   raised), not only on motion, except while a button or grab holds it; it never moves the
   keyboard. An app may hide the pointer only over its own surface, never over navi's
-  targets or during a drag. Still to come: cursor surfaces (`wl_pointer.set_cursor` with a buffer,
-  which every X11 app uses; navi draws its arrow instead), importing the cursor chosen in KDE,
-  animated cursors, and cursors for navi-bar's own UI. Nested, the pointer stays at the edge
+  targets or during a drag. Still to come: importing the cursor chosen in KDE, animated theme
+  cursors, and cursors for navi-bar's own UI. Nested without a cursor theme the host draws the
+  pointer, so apps' cursor surfaces don't show. Nested, the pointer stays at the edge
   where it left the window, since the winit backend doesn't report leaving.
 - **Planned theme imports:** sounds
   from `kdeglobals` `[Sounds]`, cursor from `kcminputrc` `[Mouse]`. This is a one-time copy into

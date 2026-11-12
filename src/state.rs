@@ -1,5 +1,8 @@
 use smithay::{
-    backend::renderer::utils::on_commit_buffer_handler,
+    backend::renderer::{
+        buffer_dimensions,
+        utils::{RendererSurfaceStateUserData, on_commit_buffer_handler},
+    },
     backend::session::libseat::LibSeatSession,
     delegate_compositor, delegate_cursor_shape, delegate_data_device, delegate_layer_shell,
     delegate_output, delegate_seat, delegate_shm, delegate_xdg_activation, delegate_xdg_decoration,
@@ -12,7 +15,7 @@ use smithay::{
     input::{
         Seat, SeatHandler, SeatState,
         keyboard::Keycode,
-        pointer::{CursorImageStatus, MotionEvent, PointerHandle},
+        pointer::{CursorImageStatus, CursorImageSurfaceData, MotionEvent, PointerHandle},
     },
     output::Output,
     reexports::{
@@ -39,8 +42,8 @@ use smithay::{
     wayland::{
         buffer::BufferHandler,
         compositor::{
-            CompositorClientState, CompositorHandler, CompositorState, get_parent,
-            is_sync_subsurface, with_states,
+            CompositorClientState, CompositorHandler, CompositorState, SurfaceAttributes,
+            get_children, get_parent, is_sync_subsurface, with_states,
         },
         output::OutputHandler,
         selection::{
@@ -71,6 +74,7 @@ use tracing::{info, warn};
 
 use crate::CalloopData;
 use crate::activation::{self, may_issue, may_redeem};
+use crate::cursor::Shape;
 use crate::focus::{Focus, HandBack, Handoff, may_hand_back};
 use crate::layout::dialog::{self, Root};
 use crate::layout::{self, Decor, Drag, Fit, Layout, Rect, WinId, decoration, intersect};
@@ -697,11 +701,12 @@ impl Navi {
         self.cursor.focus(focus);
     }
 
-    /// The cursor shape to draw at the pointer, `None` for hidden.
-    pub fn cursor_shape(&self) -> Option<&'static str> {
+    /// What to draw at the pointer. A client's cursor surface that is dead, unmapped or over
+    /// `cursor::fits`' caps is the `default` arrow.
+    pub fn cursor_shape(&self) -> Shape<CursorSurface> {
         let pos = self.pointer_location();
         let lock = self.lock.active;
-        crate::cursor::pick(
+        let shape = crate::cursor::pick(
             lock,
             self.drag.as_ref().map(Drag::cursor),
             !lock
@@ -709,8 +714,13 @@ impl Navi {
                     .layer_under(pos, [Layer::Overlay, Layer::Top])
                     .is_some(),
             self.zone_at(pos).map(layout::Hit::cursor),
-            self.cursor.request,
-        )
+            &self.cursor.request,
+        );
+        match shape {
+            Shape::Named(n) => Shape::Named(n),
+            Shape::Hidden => Shape::Hidden,
+            Shape::Client(s) => cursor_surface(s).map_or(Shape::Named("default"), Shape::Client),
+        }
     }
 
     /// What gets pointer focus at `pos`, top down: Overlay and Top layers, navi's zones (which
@@ -2049,6 +2059,39 @@ impl Navi {
     }
 }
 
+/// A client's cursor surface and its hotspot, in logical px.
+pub type CursorSurface = (WlSurface, Point<i32, Logical>);
+
+/// `s` and its hotspot, if it is alive, mapped and within `cursor::fits`' caps.
+fn cursor_surface(s: &WlSurface) -> Option<CursorSurface> {
+    if !s.is_alive() {
+        return None;
+    }
+    let subsurfaces = !get_children(s).is_empty();
+    with_states(s, |st| {
+        let hotspot = st
+            .data_map
+            .get::<CursorImageSurfaceData>()?
+            .lock()
+            .ok()?
+            .hotspot;
+        let r = st
+            .data_map
+            .get::<RendererSurfaceStateUserData>()?
+            .lock()
+            .ok()?;
+        let size = r.surface_size()?;
+        let buffer = buffer_dimensions(r.buffer()?)?;
+        crate::cursor::fits(
+            (size.w, size.h),
+            (buffer.w, buffer.h),
+            (hotspot.x, hotspot.y),
+            subsurfaces,
+        )
+        .then(|| (s.clone(), hotspot))
+    })
+}
+
 pub fn window_surface(w: &Window) -> Option<WlSurface> {
     w.wl_surface().map(std::borrow::Cow::into_owned)
 }
@@ -2349,6 +2392,22 @@ impl CompositorHandler for Navi {
     fn commit(&mut self, surface: &WlSurface) {
         self.request_redraw();
         on_commit_buffer_handler::<Self>(surface);
+        // Smithay leaves a cursor surface's `wl_surface.offset` to the compositor.
+        with_states(surface, |s| {
+            let Some(cursor) = s.data_map.get::<CursorImageSurfaceData>() else {
+                return;
+            };
+            let delta = s
+                .cached_state
+                .get::<SurfaceAttributes>()
+                .current()
+                .buffer_delta
+                .take();
+            if let (Some(d), Ok(mut c)) = (delta, cursor.lock()) {
+                let h = c.hotspot;
+                c.hotspot = (h.x.saturating_sub(d.x), h.y.saturating_sub(d.y)).into();
+            }
+        });
         if !is_sync_subsurface(surface) {
             let mut root = surface.clone();
             while let Some(parent) = get_parent(&root) {
@@ -2685,7 +2744,7 @@ impl SeatHandler for Navi {
         self.cursor.request = match image {
             CursorImageStatus::Named(icon) => crate::cursor::Request::Named(icon.name()),
             CursorImageStatus::Hidden => crate::cursor::Request::Hidden,
-            CursorImageStatus::Surface(_) => crate::cursor::Request::Surface,
+            CursorImageStatus::Surface(s) => crate::cursor::Request::Surface(s),
         };
         self.request_redraw();
     }

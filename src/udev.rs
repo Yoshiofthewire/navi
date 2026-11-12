@@ -41,7 +41,8 @@ use smithay::{
 use tracing::{error, info, warn};
 
 use crate::{
-    CalloopData, cursor,
+    CalloopData,
+    cursor::{self, Shape},
     files::xdg_dir,
     layout::Rect,
     monitors::{self, Arrangement, Mon},
@@ -731,11 +732,12 @@ fn render(data: &mut CalloopData, crtc: crtc::Handle) {
             return;
         }
     };
-    let shape = data.state.cursor_shape();
-    let arrow = udev
-        .pointer
-        .as_mut()
-        .map_or(Arrow::Square, |c| c.arrow(shape));
+    let arrow = match (udev.pointer.as_mut(), data.state.cursor_shape()) {
+        (Some(c), shape) => c.arrow(shape),
+        (None, Shape::Client(s)) => Arrow::Client(s),
+        (None, _) => Arrow::Square,
+    };
+    let cursor = arrow.surface();
     let mirror = crate::settings::output_preferences(&s.output).mirror;
     let source = if data.state.lock.active {
         s.output.clone()
@@ -809,7 +811,7 @@ fn render(data: &mut CalloopData, crtc: crtc::Handle) {
             warn!("frame timer: {e}");
         }
     }
-    render::send_frames(&mut data.state, &output);
+    render::send_frames(&mut data.state, &output, cursor.as_ref());
     data.state.space.refresh();
     data.state.popups.cleanup();
     data.state.refresh_toplevels();

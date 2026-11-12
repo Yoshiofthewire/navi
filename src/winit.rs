@@ -176,11 +176,13 @@ pub fn init(
                     let damage = Rectangle::from_size(size);
                     let mut copy = None;
                     let mut failed = false;
+                    let mut drawn = None;
                     match backend.bind() {
                         Ok((renderer, mut framebuffer)) => {
                             let arrow = cursor
                                 .as_mut()
                                 .map_or(Arrow::None, |c| c.arrow(state.cursor_shape()));
+                            drawn = arrow.surface();
                             let elements = render::elements(
                                 renderer,
                                 state,
@@ -236,7 +238,7 @@ pub fn init(
                     if !failed && state.lock.active {
                         state.lock_presented(&output, state.lock.epoch);
                     }
-                    render::send_frames(state, &output);
+                    render::send_frames(state, &output, drawn.as_ref());
                     let _ = data.display.flush_clients();
                     if failed || state.drag.is_some() {
                         state.request_redraw();
