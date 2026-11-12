@@ -13,6 +13,7 @@ mod theme;
 mod utility_theme;
 
 mod cards;
+mod context;
 #[path = "../../control.rs"]
 mod control;
 #[allow(dead_code)]
@@ -57,7 +58,7 @@ use smithay_client_toolkit::{
         },
         calloop_wayland_source::WaylandSource,
         client::{
-            Connection, Dispatch, QueueHandle, event_created_child,
+            Connection, Dispatch, Proxy, QueueHandle, event_created_child,
             globals::registry_queue_init,
             protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
         },
@@ -306,6 +307,8 @@ fn run() -> Result<(), String> {
         entries: desktop::scan(&data_dirs),
         data_dirs,
         menu: None,
+        context: None,
+        shift: false,
         pins: dock::Pins::load(),
         hover: None,
         pin_message: String::new(),
@@ -379,6 +382,8 @@ struct Win {
     activated: bool,
     /// A dialog of it waits for the user (navi's private state).
     attention: bool,
+    /// Its close went unanswered for 90 s (navi's private state).
+    overdue: bool,
     /// Shown after its first `done`.
     ready: bool,
 }
@@ -437,6 +442,9 @@ struct Bar {
     entries: Vec<Entry>,
     data_dirs: Vec<PathBuf>,
     menu: Option<Menu>,
+    /// The open right-click menu, over the dock or inside the launcher.
+    context: Option<context::Menu>,
+    shift: bool,
     pins: dock::Pins,
     hover: Option<layout::Hit>,
     pin_message: String,
@@ -450,7 +458,8 @@ struct Bar {
 
 /// What waits for a token.
 enum Pending {
-    Launch(Entry),
+    /// An entry, or one of its desktop actions by id.
+    Launch(Entry, Option<String>),
     /// A card's `default` action: the note's id and sender, and its `NotificationClosed`, sent
     /// after the action.
     Action(u32, String, Option<Closed>),
@@ -483,14 +492,19 @@ impl Bar {
 
     /// Resizes the surface to what it now holds, or redraws it at its size.
     fn relayout(&mut self) {
-        // navi gives the open launcher the keyboard, and hands it back when it closes. Closed,
-        // a click still focuses the taskbar, so a dock launch gets an activation token.
-        self.layer.set_keyboard_interactivity(match self.menu {
-            Some(_) => KeyboardInteractivity::Exclusive,
-            None => KeyboardInteractivity::OnDemand,
+        self.refresh_context();
+        // navi gives an open launcher or menu the keyboard, and hands it back when they close.
+        // Closed, a click still focuses the taskbar, so a dock launch gets an activation token.
+        let open = self.menu.is_some() || self.context.is_some();
+        self.layer.set_keyboard_interactivity(match open {
+            true => KeyboardInteractivity::Exclusive,
+            false => KeyboardInteractivity::OnDemand,
         });
         let rows = self.menu.as_ref().map_or(menu::ROWS, |m| m.rows().count());
-        let l = Layout::new(self.dock_apps().len(), self.menu.is_some()).with_rows(rows);
+        let mut l = Layout::new(self.dock_apps().len(), self.menu.is_some()).with_rows(rows);
+        if let Some(c) = &self.context {
+            l = l.with_context(c.anchor, c.height());
+        }
         if l == self.layout {
             return self.draw();
         }
@@ -507,6 +521,7 @@ impl Bar {
 
     fn toggle_menu(&mut self) {
         self.close_session();
+        self.context = None;
         self.pin_message.clear();
         self.menu = match self.menu {
             Some(_) => None,
@@ -519,19 +534,168 @@ impl Bar {
         self.relayout();
     }
 
+    /// Closes the launcher and any context menu.
     fn close_menu(&mut self) {
-        if self.menu.take().is_some() {
+        let context = self.context.take().is_some();
+        if self.menu.take().is_some() || context {
             self.relayout();
         }
     }
 
-    /// Asks for an activation token for the click or key with `serial`, then launches.
-    fn launch(&mut self, entry: usize, serial: u32, qh: &QueueHandle<Self>) {
+    /// Re-resolves the open context menu's target: new counts, or closed once it's gone.
+    fn refresh_context(&mut self) {
+        let Some(c) = &self.context else {
+            return;
+        };
+        let apps = self.dock_apps();
+        match context::resolve(&c.target, &apps, &self.entries, &self.pins.ids) {
+            Some(lines) => {
+                if let Some(c) = &mut self.context {
+                    c.update(lines);
+                }
+            }
+            None => {
+                debug!("context menu's app is gone");
+                self.context = None;
+            }
+        }
+    }
+
+    /// Opens `target`'s menu at surface point `at`; `keyboard` selects its first item.
+    fn open_context(&mut self, target: context::Target, at: (i32, i32), keyboard: bool) {
+        let apps = self.dock_apps();
+        let Some(lines) = context::resolve(&target, &apps, &self.entries, &self.pins.ids) else {
+            return;
+        };
+        self.close_session();
+        if target.dock {
+            self.menu = None;
+        }
+        let anchor = self.layout.anchor(at.0, at.1);
+        debug!(key = target.key, dock = target.dock, "context menu");
+        self.context = Some(context::Menu::new(target, lines, anchor, keyboard));
+        self.relayout();
+    }
+
+    /// Runs the context menu's item `i`, from a left press or a key with `serial`.
+    fn context_activate(&mut self, i: usize, serial: u32, qh: &QueueHandle<Self>) {
+        let Some(c) = &self.context else {
+            return;
+        };
+        let Some(context::Line::Item(kind, _)) = c.lines.get(i).cloned() else {
+            return;
+        };
+        let target = c.target.clone();
+        if kind == context::Kind::ForceClose {
+            if let Some(c) = &mut self.context {
+                c.ask_force();
+            }
+            return self.relayout();
+        }
+        self.context = None;
+        let entry = self.entries.iter().position(|e| e.id == target.key);
+        match kind {
+            context::Kind::Open | context::Kind::NewWindow => {
+                if let Some(e) = entry {
+                    self.launch(e, None, serial, qh);
+                }
+            }
+            context::Kind::Action(id) => {
+                if let Some(e) = entry {
+                    self.launch(e, Some(id), serial, qh);
+                }
+            }
+            context::Kind::Pin | context::Kind::Unpin => match entry {
+                Some(e) => self.toggle_pin(e),
+                None => self.relayout(),
+            },
+            context::Kind::Close(_) => {
+                let windows = self.app_windows(&target.key);
+                info!(app_id = target.key, windows = windows.len(), "dock close");
+                for w in &windows {
+                    w.handle.close();
+                }
+                self.relayout();
+            }
+            context::Kind::ForceClose => {}
+        }
+    }
+
+    /// The window list's windows of the dock app with menu key `key`.
+    fn app_windows(&self, key: &str) -> Vec<&Win> {
+        let apps = self.dock_apps();
+        let app = apps.iter().find(|a| context::key(a, &self.entries) == key);
+        let shown: Vec<&Win> = self.shown().collect();
+        app.map_or_else(Vec::new, |a| {
+            a.windows
+                .iter()
+                .filter_map(|&i| shown.get(i).copied())
+                .collect()
+        })
+    }
+
+    /// The confirmed force close: one request per overdue window, answered off the event loop.
+    fn force_close(&mut self) {
+        let Some(c) = self.context.take() else {
+            return;
+        };
+        let ids: Vec<u32> = self
+            .app_windows(&c.target.key)
+            .into_iter()
+            .filter(|w| w.overdue)
+            .map(|w| Proxy::id(&w.handle).protocol_id())
+            .collect();
+        info!(
+            app_id = c.target.key,
+            windows = ids.len(),
+            "force close requested"
+        );
+        let control = self.control.clone();
+        std::thread::spawn(move || {
+            for id in ids {
+                let reply = control
+                    .as_ref()
+                    .ok_or("no control channel".to_string())
+                    .and_then(|c| {
+                        let s = c
+                            .lock()
+                            .map_err(|_| "control channel poisoned".to_string())?;
+                        control::request(&s, control::Request::ForceClose(id))
+                    });
+                match reply {
+                    Ok(()) => info!(handle = id, "force close done"),
+                    Err(e) => warn!(handle = id, "force close: {e}"),
+                }
+            }
+        });
+        self.relayout();
+    }
+
+    /// A click or Enter on the confirmation's buttons.
+    fn confirm(&mut self, hit: context::Hit) {
+        match hit {
+            context::Hit::Confirm => self.force_close(),
+            _ => {
+                self.context = None;
+                self.relayout();
+            }
+        }
+    }
+
+    /// Asks for an activation token for the click or key with `serial`, then launches the
+    /// entry or its desktop action `action`.
+    fn launch(
+        &mut self,
+        entry: usize,
+        action: Option<String>,
+        serial: u32,
+        qh: &QueueHandle<Self>,
+    ) {
         let Some(e) = self.entries.get(entry).cloned() else {
             return;
         };
         let (app_id, surface) = (Some(e.id.clone()), self.layer.wl_surface().clone());
-        self.ask_token(Pending::Launch(e), app_id, serial, surface, qh);
+        self.ask_token(Pending::Launch(e, action), app_id, serial, surface, qh);
         self.close_menu();
     }
 
@@ -575,7 +739,7 @@ impl Bar {
 
     fn go_on(&mut self, p: Pending, token: Option<&str>) {
         match p {
-            Pending::Launch(e) => spawn(&e, token),
+            Pending::Launch(e, action) => spawn(&e, action.as_deref(), token),
             Pending::Action(id, sender, closed) => {
                 if let Some(conn) = &self.dbus {
                     dbus::action(conn, &sender, id, "default", token);
@@ -592,6 +756,7 @@ impl Bar {
             focused: w.activated,
             minimized: w.minimized,
             attention: w.attention,
+            overdue: w.overdue,
         });
         windows.collect()
     }
@@ -651,13 +816,26 @@ impl Bar {
                 }
                 self.relayout();
             }
-            Row::App(entry) => self.launch(entry, serial, qh),
+            Row::App(entry) => self.launch(entry, None, serial, qh),
         }
     }
 
     fn click(&mut self, serial: u32, qh: &QueueHandle<Self>) {
         let (x, y) = (self.pointer_at.0 as i32, self.pointer_at.1 as i32);
         debug!(x, y, hit = ?self.layout.hit(x, y), "dock click");
+        if let Some(c) = &self.context {
+            // A click outside the menu only closes it.
+            let hit = self.layout.context().and_then(|r| c.hit(r, x, y));
+            return match (hit, self.layout.hit(x, y)) {
+                (Some(context::Hit::Line(i)), _) => self.context_activate(i, serial, qh),
+                (Some(hit), _) => self.confirm(hit),
+                (None, Some(layout::Hit::Menu)) => {}
+                (None, _) => {
+                    self.context = None;
+                    self.relayout();
+                }
+            };
+        }
         match self.layout.hit(x, y) {
             Some(layout::Hit::Button) => self.toggle_menu(),
             Some(layout::Hit::Window(i)) => {
@@ -667,7 +845,7 @@ impl Bar {
                 };
                 if app.windows.is_empty() {
                     if let Some(e) = app.entry {
-                        self.launch(e, serial, qh);
+                        self.launch(e, None, serial, qh);
                     }
                 } else {
                     let focused = app
@@ -685,12 +863,9 @@ impl Bar {
                     self.close_menu();
                 }
             }
-            Some(layout::Hit::Row(k) | layout::Hit::Pin(k)) => {
+            Some(layout::Hit::Row(k)) => {
                 if let Some(row) = self.menu.as_ref().and_then(|m| m.at_row(k)) {
-                    match (self.layout.hit(x, y), row) {
-                        (Some(layout::Hit::Pin(_)), Row::App(e)) => self.toggle_pin(e),
-                        _ => self.open_row(row, serial, qh),
-                    }
+                    self.open_row(row, serial, qh);
                 }
             }
             Some(layout::Hit::Back) => {
@@ -699,25 +874,76 @@ impl Bar {
                 }
                 self.relayout();
             }
+            Some(layout::Hit::Menu) | None => {}
+        }
+    }
+
+    /// A right press: a dock icon's or launcher app row's menu; elsewhere it closes the menu.
+    fn right_click(&mut self) {
+        let (x, y) = (self.pointer_at.0 as i32, self.pointer_at.1 as i32);
+        let target = match self.layout.hit(x, y) {
+            Some(layout::Hit::Window(i)) => self.dock_apps().get(i).map(|app| context::Target {
+                key: context::key(app, &self.entries),
+                dock: true,
+            }),
+            Some(layout::Hit::Row(k)) => {
+                let row = self.menu.as_ref().and_then(|m| m.at_row(k));
+                row.and_then(|r| context::row_target(r, &self.entries))
+            }
+            Some(layout::Hit::Menu) => return,
+            _ => None,
+        };
+        match target {
+            Some(t) => self.open_context(t, (x, y), false),
+            None if self.context.is_some() => {
+                self.context = None;
+                self.relayout();
+            }
             None => {}
         }
     }
 
-    fn right_click(&mut self) {
-        let (x, y) = (self.pointer_at.0 as i32, self.pointer_at.1 as i32);
-        let entry = match self.layout.hit(x, y) {
-            Some(layout::Hit::Window(i)) => self.dock_apps().get(i).and_then(|app| app.entry),
-            Some(layout::Hit::Row(k) | layout::Hit::Pin(k)) => {
-                self.menu.as_ref().and_then(|m| match m.at_row(k) {
-                    Some(Row::App(e)) => Some(e),
-                    _ => None,
-                })
-            }
-            _ => None,
-        };
-        if let Some(e) = entry {
-            self.toggle_pin(e);
+    /// Menu or Shift+F10 in the launcher: the selected app row's menu, or closes it.
+    fn menu_key(&mut self) {
+        if self.context.take().is_some() {
+            return self.relayout();
         }
+        let Some(menu) = &self.menu else {
+            return;
+        };
+        let at = menu.rows().position(|(_, selected)| selected);
+        let target = menu
+            .selected()
+            .and_then(|r| context::row_target(r, &self.entries));
+        if let (Some(k), Some(t)) = (at, target) {
+            let row = self.layout.row(k);
+            let text = row.x + 8 + layout::ROW_ICON + 12;
+            self.open_context(t, (text, row.y + row.h), true);
+        }
+    }
+
+    /// Keys while a context menu is open; every other key is swallowed.
+    fn context_key(&mut self, event: KeyEvent, serial: u32, qh: &QueueHandle<Self>) {
+        let Some(c) = self.context.as_mut() else {
+            return;
+        };
+        match event.keysym {
+            Keysym::Escape => self.context = None,
+            Keysym::Menu => self.context = None,
+            Keysym::F10 if self.shift => self.context = None,
+            Keysym::Return | Keysym::KP_Enter => match (&c.confirm, c.selected) {
+                (Some(confirm), _) => {
+                    let hit = [context::Hit::Cancel, context::Hit::Confirm][confirm.selected];
+                    return self.confirm(hit);
+                }
+                (None, Some(i)) => return self.context_activate(i, serial, qh),
+                (None, None) => return,
+            },
+            Keysym::Home | Keysym::KP_Home if c.confirm.is_none() => c.home(),
+            Keysym::End | Keysym::KP_End if c.confirm.is_none() => c.end(),
+            _ => return self.edit(event),
+        }
+        self.relayout();
     }
 
     fn key(&mut self, event: KeyEvent, serial: u32, qh: &QueueHandle<Self>) {
@@ -738,10 +964,15 @@ impl Bar {
             }
             return;
         }
+        if self.context.is_some() {
+            return self.context_key(event, serial, qh);
+        }
         let Some(menu) = self.menu.as_ref() else {
             return;
         };
         match event.keysym {
+            Keysym::Menu => self.menu_key(),
+            Keysym::F10 if self.shift => self.menu_key(),
             Keysym::Escape => {
                 if !self.menu.as_mut().is_some_and(|m| m.back(&self.entries)) {
                     self.close_menu();
@@ -773,6 +1004,16 @@ impl Bar {
             }
             self.draw_band();
             return;
+        }
+        if let Some(c) = self.context.as_mut() {
+            let confirm = c.confirm.is_some();
+            match event.keysym {
+                Keysym::Up => c.step(-1),
+                Keysym::Down => c.step(1),
+                Keysym::Left | Keysym::Right | Keysym::Tab if confirm => c.step(1),
+                _ => return,
+            }
+            return self.draw();
         }
         let Some(menu) = self.menu.as_mut() else {
             return;
@@ -827,15 +1068,19 @@ impl Bar {
             self.hover,
             &self.pin_message,
         );
+        let context = match (&self.context, l.context()) {
+            (Some(c), Some(r)) => c.draw(r),
+            _ => Vec::new(),
+        };
         if let Ok(region) = Region::new(&self.compositor) {
-            for r in [Some(l.bar()), l.panel()].into_iter().flatten() {
+            for r in l.input() {
                 region.add(r.x, r.y, r.w, r.h);
             }
             self.layer
                 .wl_surface()
                 .set_input_region(Some(region.wl_region()));
         }
-        for item in items {
+        for item in items.into_iter().chain(context) {
             match item {
                 Item::Fill(..) | Item::Round(..) | Item::Panel(..) | Item::Text(..) => {
                     paint(&mut canvas, self.font.as_ref(), item, s)
@@ -931,9 +1176,10 @@ impl Bar {
             );
             let control = self.control.clone();
             std::thread::spawn(move || {
-                let can_lock = control
-                    .as_ref()
-                    .is_some_and(|c| c.lock().is_ok_and(|s| control::request(&s, false).is_ok()));
+                let can_lock = control.as_ref().is_some_and(|c| {
+                    c.lock()
+                        .is_ok_and(|s| control::request(&s, control::Request::CanLock).is_ok())
+                });
                 let _ = tx.send(session::Reply::Capabilities(session::capabilities(
                     full, seat, can_lock,
                 )));
@@ -962,7 +1208,7 @@ impl Bar {
                 let result = session::perform_locked(action, full, &caps, || {
                     let c = control.as_ref().ok_or("Lock channel unavailable")?;
                     let s = c.lock().map_err(|_| "Lock channel unavailable")?;
-                    control::request(&s, true)
+                    control::request(&s, control::Request::Lock)
                 });
                 let _ = tx.send(session::Reply::Done(result));
             });
@@ -1323,6 +1569,24 @@ impl Bar {
     }
 }
 
+/// A window-list handle's states: minimized, activated, and navi's private attention and
+/// close-overdue.
+fn states(bytes: &[u8]) -> [bool; 4] {
+    let states: Vec<u32> = bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|&b| u32::from_ne_bytes(b))
+        .collect();
+    [
+        handle::State::Minimized as u32,
+        handle::State::Activated as u32,
+        control::ATTENTION,
+        control::CLOSE_OVERDUE,
+    ]
+    .map(|s| states.contains(&s))
+}
+
 /// Draws `canvas` on `layer`'s surface at buffer scale `s`.
 fn present(pool: &mut SlotPool, layer: &LayerSurface, canvas: &Pixmap, s: i32) {
     let (w, h) = (canvas.width() as i32, canvas.height() as i32);
@@ -1563,10 +1827,18 @@ fn draw_text(
     pen.round() as i32
 }
 
-/// Runs `e`'s argv with no shell, detached in its own process group, with nothing of navi-bar's
-/// but its environment minus `WAYLAND_SOCKET`. A thread reaps it.
-fn spawn(e: &Entry, token: Option<&str>) {
-    let Some((program, args)) = e.argv.split_first() else {
+/// Runs `e`'s argv, or its desktop action `action`'s, with no shell, detached in its own process
+/// group, with nothing of navi-bar's but its environment minus `WAYLAND_SOCKET`. A thread reaps
+/// it. Logs carry IDs, never argv.
+fn spawn(e: &Entry, action: Option<&str>, token: Option<&str>) {
+    let argv = match action {
+        Some(id) => match e.actions.iter().find(|a| a.id == id) {
+            Some(a) => &a.argv,
+            None => return,
+        },
+        None => &e.argv,
+    };
+    let Some((program, args)) = argv.split_first() else {
         return;
     };
     let mut cmd = Command::new(program);
@@ -1609,10 +1881,10 @@ fn spawn(e: &Entry, token: Option<&str>) {
     match cmd.spawn() {
         Ok(mut child) => {
             let pid = child.id();
-            info!(id = e.id, argv = ?e.argv, pid, token = token.is_some(), "launch");
+            info!(id = e.id, action, pid, token = token.is_some(), "launch");
             std::thread::spawn(move || child.wait());
         }
-        Err(err) => warn!(id = e.id, argv = ?e.argv, "launch failed: {err}"),
+        Err(err) => warn!(id = e.id, action, "launch failed: {err}"),
     }
 }
 
@@ -1642,6 +1914,7 @@ impl Dispatch<ZwlrForeignToplevelManagerV1, ()> for Bar {
                 minimized: false,
                 activated: false,
                 attention: false,
+                overdue: false,
                 ready: false,
             }),
             manager::Event::Finished => warn!("window list finished"),
@@ -1670,15 +1943,7 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for Bar {
         match event {
             handle::Event::AppId { app_id } => w.app_id = app_id,
             handle::Event::State { state } => {
-                let states: Vec<u32> = state
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|&b| u32::from_ne_bytes(b))
-                    .collect();
-                w.minimized = states.contains(&(handle::State::Minimized as u32));
-                w.activated = states.contains(&(handle::State::Activated as u32));
-                w.attention = states.contains(&control::ATTENTION);
+                [w.minimized, w.activated, w.attention, w.overdue] = states(&state);
             }
             handle::Event::Done => {
                 w.ready = true;
@@ -1705,6 +1970,7 @@ impl LayerShellHandler for Bar {
         } else if layer == &self.layer {
             // Moved to another output, or its output went away: navi places the new one.
             info!("taskbar closed by navi, making a new one");
+            self.context = None;
             self.layer = bar_layer(&self.compositor, &self.layer_shell, &self.qh, &self.layout);
             self.configured = false;
         } else if layer == &self.band {
@@ -1909,9 +2175,10 @@ impl KeyboardHandler for Bar {
         _: &QueueHandle<Self>,
         _: &wl_keyboard::WlKeyboard,
         _: u32,
-        _: Modifiers,
+        modifiers: Modifiers,
         _: u32,
     ) {
+        self.shift = modifiers.shift;
     }
 }
 
@@ -2018,10 +2285,14 @@ impl PointerHandler for Bar {
                     } else {
                         self.layout.hit(e.position.0 as i32, e.position.1 as i32)
                     };
-                    let selected = match (self.menu.as_mut(), hover) {
-                        (Some(menu), Some(layout::Hit::Row(k) | layout::Hit::Pin(k))) => {
-                            menu.select_row(k)
+                    let (x, y) = (e.position.0 as i32, e.position.1 as i32);
+                    let in_menu = self.layout.context().zip(self.context.as_ref());
+                    let on_item = in_menu.and_then(|(r, c)| c.hit(r, x, y));
+                    let selected = match (self.menu.as_mut(), self.context.as_mut(), hover) {
+                        (_, Some(c), Some(layout::Hit::Menu)) => {
+                            on_item.is_some_and(|h| c.hover(h))
                         }
+                        (Some(menu), None, Some(layout::Hit::Row(k))) => menu.select_row(k),
                         _ => false,
                     };
                     if hover != self.hover || selected {
@@ -2107,6 +2378,7 @@ mod tests {
             argv: vec!["t".into()],
             wm_class: None,
             category: Category::System,
+            actions: Vec::new(),
         }];
         let slots = [
             Slot {
@@ -2133,7 +2405,7 @@ mod tests {
         let launch = |m: &Menu, hover, pins: &[String], message| {
             open.draw(&slots, Some(m), &entries, pins, hover, message)
         };
-        let hovers = [None, Some(Hit::Row(0)), Some(Hit::Pin(0)), Some(Hit::Back)];
+        let hovers = [None, Some(Hit::Row(0)), Some(Hit::Back)];
         let mut m = Menu::new(&entries);
         for hover in hovers {
             out.push(launch(&m, hover, &[], ""));
@@ -2189,7 +2461,67 @@ mod tests {
 
         let cards = cards::layout(&[note(2), note(1)], &|_| Some(8.0));
         out.extend([cards::draw(&cards, false), cards::draw(&cards, true)]);
+
+        // Context menus: every item selected in turn, and the force-close confirmation.
+        let mut konsole = entries[0].clone();
+        konsole.actions = vec![desktop::Action {
+            id: "t".into(),
+            name: "New Tab".into(),
+            argv: vec!["t".into()],
+        }];
+        let app = context::App {
+            entry: Some(&konsole),
+            app_id: "t",
+            pinned: true,
+            windows: 2,
+            overdue: 1,
+        };
+        let target = context::Target {
+            key: "t.desktop".into(),
+            dock: true,
+        };
+        let mut m = context::Menu::new(target, context::lines(&app, true), (0, 0), false);
+        let r = |m: &context::Menu| Rect {
+            x: 0,
+            y: 0,
+            w: context::MENU_W,
+            h: m.height(),
+        };
+        out.push(m.draw(r(&m)));
+        for _ in 0..m.lines.len() {
+            m.step(1);
+            out.push(m.draw(r(&m)));
+        }
+        m.ask_force();
+        for _ in 0..2 {
+            m.step(1);
+            out.push(m.draw(r(&m)));
+        }
         out
+    }
+
+    /// AC11: navi-bar reads navi's private states from a handle's state array.
+    #[test]
+    fn ac11_handle_states_decode_close_overdue() {
+        let bytes =
+            |states: &[u32]| -> Vec<u8> { states.iter().flat_map(|s| s.to_ne_bytes()).collect() };
+        let min = handle::State::Minimized as u32;
+        assert_eq!(states(&bytes(&[])), [false; 4]);
+        assert_eq!(
+            states(&bytes(&[control::CLOSE_OVERDUE])),
+            [false, false, false, true]
+        );
+        let all = [
+            min,
+            handle::State::Activated as u32,
+            control::ATTENTION,
+            control::CLOSE_OVERDUE,
+        ];
+        assert_eq!(states(&bytes(&all)), [true; 4]);
+        // A trailing partial value is ignored.
+        let mut odd = bytes(&[min]);
+        odd.extend([2, 0]);
+        assert_eq!(states(&odd), [true, false, false, false]);
     }
 
     #[test]

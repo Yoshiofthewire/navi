@@ -1,5 +1,7 @@
 //! Private navi-bar ↔ compositor channel. Never inherited by launched apps. Every message is one
-//! byte, so requests, replies and toggles can share the stream without framing.
+//! byte, so requests, replies and toggles can share the stream without framing. The one
+//! exception is `FORCE_CLOSE`, bar → navi: the byte, then a window-list handle's protocol object
+//! ID as a little-endian `u32`.
 
 use std::{
     io::{Read, Write},
@@ -11,6 +13,7 @@ use std::{
 /// navi-bar → navi requests.
 pub const CAN_LOCK: u8 = 0;
 pub const LOCK: u8 = 1;
+pub const FORCE_CLOSE: u8 = 2;
 /// navi → navi-bar replies.
 pub const NO: u8 = 0;
 pub const YES: u8 = 1;
@@ -22,6 +25,10 @@ pub const CYCLE_PREV: u8 = 4;
 /// Outside the protocol's values, as only navi-bar sees the window list.
 #[allow(dead_code)]
 pub const ATTENTION: u32 = 0x6e61_7601;
+/// navi → navi-bar, in a window-list handle's states: a user close went unanswered for
+/// `FORCE_AFTER`, so the window may be force closed.
+#[allow(dead_code)]
+pub const CLOSE_OVERDUE: u32 = 0x6e61_7602;
 /// Slot n (1..=9) is `SLOT_1 + n - 1`.
 pub const SLOT_1: u8 = 5;
 const SLOT_9: u8 = SLOT_1 + 8;
@@ -70,6 +77,43 @@ impl Command {
     }
 }
 
+/// A navi-bar → navi request.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Request {
+    CanLock,
+    Lock,
+    /// End the window whose window-list handle has this object ID on navi-bar's connection.
+    ForceClose(u32),
+}
+
+impl Request {
+    pub fn bytes(self) -> Vec<u8> {
+        match self {
+            Request::CanLock => vec![CAN_LOCK],
+            Request::Lock => vec![LOCK],
+            Request::ForceClose(id) => [&[FORCE_CLOSE][..], &id.to_le_bytes()].concat(),
+        }
+    }
+
+    /// navi's side: the next request, or `None` on EOF, a short read or an unknown byte.
+    // navi-bar only writes requests.
+    #[allow(dead_code)]
+    pub fn read(r: &mut impl Read) -> Option<Self> {
+        let mut byte = [0];
+        r.read_exact(&mut byte).ok()?;
+        Some(match byte[0] {
+            CAN_LOCK => Request::CanLock,
+            LOCK => Request::Lock,
+            FORCE_CLOSE => {
+                let mut id = [0; 4];
+                r.read_exact(&mut id).ok()?;
+                Request::ForceClose(u32::from_le_bytes(id))
+            }
+            _ => return None,
+        })
+    }
+}
+
 /// navi-bar's end: requests go out on `stream`, replies come back from the reader thread.
 pub struct Control {
     stream: UnixStream,
@@ -102,16 +146,17 @@ pub fn reader(
     Ok(Control { stream, replies })
 }
 
-/// Asks navi whether it can lock (`lock` false), or to lock now.
-pub fn request(control: &Control, lock: bool) -> Result<(), String> {
+/// Sends `request` and waits for navi's answer: `Ok` for `YES`.
+pub fn request(control: &Control, request: Request) -> Result<(), String> {
     // A reply that came after an earlier request timed out isn't this one's.
     while control.replies.try_recv().is_ok() {}
     let mut stream = &control.stream;
     stream
-        .write_all(&[if lock { LOCK } else { CAN_LOCK }])
+        .write_all(&request.bytes())
         .map_err(|e| e.to_string())?;
     match control.replies.recv_timeout(Duration::from_secs(15)) {
         Ok(YES) => Ok(()),
+        Ok(_) if matches!(request, Request::ForceClose(_)) => Err("refused by navi".into()),
         Ok(_) => Err("Screen lock unavailable. Install swaylock and check the Navi log.".into()),
         Err(e) => Err(e.to_string()),
     }
@@ -142,13 +187,13 @@ mod tests {
         })
         .unwrap();
         // A toggle and an unknown byte arrive while a request waits for its reply.
-        let waiting = std::thread::spawn(move || (request(&control, true), control));
+        let waiting = std::thread::spawn(move || (request(&control, Request::Lock), control));
         assert_eq!(answer(&mut navi, &[TOGGLE_MENU, 9], YES), LOCK);
         let (result, control) = waiting.join().unwrap();
         assert_eq!(result, Ok(()));
         toggles.recv_timeout(Duration::from_secs(5)).unwrap();
         // The reader survived the unknown byte: replies and toggles still flow.
-        let waiting = std::thread::spawn(move || request(&control, false));
+        let waiting = std::thread::spawn(move || request(&control, Request::CanLock));
         assert_eq!(answer(&mut navi, &[], NO), CAN_LOCK);
         assert!(waiting.join().unwrap().is_err());
         navi.write_all(&[TOGGLE_MENU]).unwrap();
@@ -164,7 +209,7 @@ mod tests {
         let mut sent: Vec<u8> = (SLOT_1..=SLOT_1 + 8).collect();
         sent.extend([CYCLE_NEXT, CYCLE_PREV, WINDOW_LIMIT, 15, 255, TOGGLE_MENU]);
         // They all arrive before the reply, and the request still gets it.
-        let waiting = std::thread::spawn(move || request(&control, false));
+        let waiting = std::thread::spawn(move || request(&control, Request::CanLock));
         assert_eq!(answer(&mut navi, &sent, YES), CAN_LOCK);
         assert_eq!(waiting.join().unwrap(), Ok(()));
         let mut want: Vec<_> = (1..=9).map(|n| Command::Dock(DockKey::Slot(n))).collect();
@@ -185,5 +230,42 @@ mod tests {
         for b in [NO, YES, 15, 255] {
             assert_eq!(Command::from_byte(b), None);
         }
+    }
+
+    /// AC11: the one framed request, both ways.
+    #[test]
+    fn ac11_force_close_is_five_bytes() {
+        let req = Request::ForceClose(0xFF00_0001);
+        assert_eq!(req.bytes(), [FORCE_CLOSE, 1, 0, 0, 0xFF]);
+        assert_eq!(Request::read(&mut &req.bytes()[..]), Some(req));
+        for r in [Request::CanLock, Request::Lock] {
+            assert_eq!(Request::read(&mut &r.bytes()[..]), Some(r));
+        }
+        // A short read, EOF and an unknown byte all end the reader.
+        for bad in [&[FORCE_CLOSE, 1, 0][..], &[], &[3], &[255, 0, 0, 0, 0]] {
+            assert_eq!(Request::read(&mut &bad[..]), None, "{bad:?}");
+        }
+    }
+
+    /// AC11: navi-bar's side of a force close: five bytes out, `YES` or `NO` back.
+    #[test]
+    fn ac11_force_close_request_gets_its_reply() {
+        let (bar, mut navi) = UnixStream::pair().unwrap();
+        let control = reader(bar, |_| {}).unwrap();
+        let waiting = std::thread::spawn(move || {
+            let r = request(&control, Request::ForceClose(0xFF00_0001));
+            (r, control)
+        });
+        assert_eq!(
+            Request::read(&mut navi),
+            Some(Request::ForceClose(0xFF00_0001))
+        );
+        navi.write_all(&[NO]).unwrap();
+        let (result, control) = waiting.join().unwrap();
+        assert!(result.is_err());
+        let waiting = std::thread::spawn(move || request(&control, Request::Lock));
+        assert_eq!(Request::read(&mut navi), Some(Request::Lock));
+        navi.write_all(&[YES]).unwrap();
+        assert_eq!(waiting.join().unwrap(), Ok(()));
     }
 }

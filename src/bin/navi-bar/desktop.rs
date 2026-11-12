@@ -12,6 +12,8 @@ use crate::files::{read_bytes, xdg_dir};
 const MAX_FILE: u64 = 64 << 10;
 const MAX_FILES: usize = 2048;
 const MAX_DEPTH: usize = 4;
+/// Desktop actions kept per entry; extras are dropped.
+pub const MAX_ACTIONS: usize = 6;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Entry {
@@ -22,6 +24,16 @@ pub struct Entry {
     pub argv: Vec<String>,
     pub wm_class: Option<String>,
     pub category: Category,
+    /// `Actions=`, in order: each one's own `[Desktop Action <id>]` group.
+    pub actions: Vec<Action>,
+}
+
+/// A desktop action, such as "New Private Window".
+#[derive(Clone, Debug, PartialEq)]
+pub struct Action {
+    pub id: String,
+    pub name: String,
+    pub argv: Vec<String>,
 }
 
 /// Desktop Entry Spec main categories. Each app appears in one folder.
@@ -170,6 +182,7 @@ pub fn scan(data_dirs: &[PathBuf]) -> Vec<Entry> {
                 argv: vec![files.to_string_lossy().into_owned()],
                 wm_class: Some("thunar".into()),
                 category: Category::System,
+                actions: Vec::new(),
             });
         }
         let settings = exe.with_file_name("navi-settings");
@@ -182,6 +195,7 @@ pub fn scan(data_dirs: &[PathBuf]) -> Vec<Entry> {
                 argv: vec![settings.to_string_lossy().into_owned()],
                 wm_class: Some("io.github.Yoshiofthewire.Navi.Settings".into()),
                 category: Category::Settings,
+                actions: Vec::new(),
             });
         }
     }
@@ -239,23 +253,25 @@ pub fn unescape(v: &str) -> String {
     out
 }
 
-/// The entry, if it's an app to show: `[Desktop Entry]` keys only, the first of each key wins.
+/// The entry, if it's an app to show: `[Desktop Entry]` keys, and its actions' groups. The
+/// first of each key in a group wins.
 fn parse(id: String, text: &str) -> Option<Entry> {
-    let mut in_entry = false;
-    let mut keys: Vec<(&str, &str)> = Vec::new();
+    let mut group = "";
+    let mut keys: Vec<(&str, &str, &str)> = Vec::new();
     for line in text.lines() {
         let line = line.trim();
-        if line.starts_with('[') {
-            in_entry = line == "[Desktop Entry]";
-        } else if in_entry && let Some((k, v)) = line.split_once('=') {
-            keys.push((k.trim(), v.trim()));
+        if let Some(g) = line.strip_prefix('[') {
+            group = g.strip_suffix(']').unwrap_or("");
+        } else if let Some((k, v)) = line.split_once('=') {
+            keys.push((group, k.trim(), v.trim()));
         }
     }
-    let get = |key: &str| {
+    let get_in = |group: &str, key: &str| {
         keys.iter()
-            .find(|(k, _)| *k == key)
-            .map(|(_, v)| unescape(v))
+            .find(|(g, k, _)| *g == group && *k == key)
+            .map(|(_, _, v)| unescape(v))
     };
+    let get = |key: &str| get_in("Desktop Entry", key);
     let yes = |key: &str| get(key).as_deref() == Some("true");
     let has_navi = |key: &str| get(key).is_some_and(|v| v.split(';').any(|d| d == "navi"));
     let shown = get("Type").as_deref() == Some("Application")
@@ -267,6 +283,28 @@ fn parse(id: String, text: &str) -> Option<Entry> {
     if !shown {
         return None;
     }
+    let mut actions: Vec<Action> = Vec::new();
+    for id in get("Actions").unwrap_or_default().split(';') {
+        let ok_id = (1..=64).contains(&id.chars().count())
+            && !id.chars().any(|c| c.is_control() || c == '[' || c == ']');
+        if actions.len() == MAX_ACTIONS || !ok_id || actions.iter().any(|a| a.id == id) {
+            continue;
+        }
+        let group = format!("Desktop Action {id}");
+        let name: String = get_in(&group, "Name")
+            .unwrap_or_default()
+            .chars()
+            .filter(|c| !c.is_control())
+            .collect();
+        let argv = get_in(&group, "Exec").and_then(|e| exec::split(&e).ok());
+        if let (false, Some(argv)) = (name.trim().is_empty(), argv) {
+            actions.push(Action {
+                id: id.into(),
+                name,
+                argv,
+            });
+        }
+    }
     Some(Entry {
         id,
         name: get("Name").filter(|n| !n.is_empty())?,
@@ -274,6 +312,7 @@ fn parse(id: String, text: &str) -> Option<Entry> {
         argv: exec::split(&get("Exec")?).ok()?,
         wm_class: get("StartupWMClass").filter(|c| !c.is_empty()),
         category: Category::parse(&get("Categories").unwrap_or_default()),
+        actions,
     })
 }
 
@@ -422,5 +461,69 @@ mod tests {
             }
             assert_eq!(entry_for("", &[entry]), None);
         }
+    }
+
+    fn action(id: &str, name: &str, exec: &str) -> String {
+        format!("[Desktop Action {id}]\nName={name}\nExec={exec}\n")
+    }
+
+    /// AC3: `Actions=` in order, each bad one skipped, six at most, the entry kept.
+    #[test]
+    fn ac3_desktop_actions() {
+        let parsed = |actions: &str, groups: &[String]| {
+            let text = app("A", &format!("Actions={actions}\n")) + &groups.concat();
+            let e = parse("a.desktop".into(), &text).expect("the entry stays");
+            e.actions
+                .into_iter()
+                .map(|a| (a.id, a.name, a.argv))
+                .collect::<Vec<_>>()
+        };
+        let ab = [
+            action("a", "Alpha", "run --a"),
+            action("b", "Beta", "run \"b c\""),
+        ];
+        assert_eq!(
+            parsed("a;b;missing;", &ab),
+            [
+                (
+                    "a".into(),
+                    "Alpha".into(),
+                    vec!["run".to_string(), "--a".into()]
+                ),
+                (
+                    "b".into(),
+                    "Beta".into(),
+                    vec!["run".to_string(), "b c".into()]
+                ),
+            ]
+        );
+        let long = "x".repeat(65);
+        for (actions, group) in [
+            ("bad", action("bad", "Bad", "a;b")),
+            ("bad", action("bad", "Bad", "run $x")),
+            ("bad", action("bad", "Bad", "run \"open")),
+            ("bad", action("bad", "", "run")),
+            ("bad", "[Desktop Action bad]\nExec=run\n".to_string()),
+            (long.as_str(), action(&long, "Long", "run")),
+            ("x]y", action("x]y", "Bracket", "run")),
+        ] {
+            assert_eq!(parsed(actions, &[group]), [], "{actions}");
+        }
+        // A duplicate keeps the first; control characters leave the name.
+        let dup = [action("a", "First\u{7}", "run")];
+        assert_eq!(
+            parsed("a;a;", &dup),
+            [("a".into(), "First".into(), vec!["run".into()])]
+        );
+        let groups: Vec<String> = (0..8).map(|n| action(&n.to_string(), "N", "run")).collect();
+        let ids: Vec<String> = parsed("0;1;2;3;4;5;6;7", &groups)
+            .into_iter()
+            .map(|a| a.0)
+            .collect();
+        assert_eq!(ids, ["0", "1", "2", "3", "4", "5"]);
+        // Without `Actions=`, groups are ignored and the entry is as before.
+        let plain = parse("p.desktop".into(), &(app("P", "") + &ab.concat())).unwrap();
+        assert!(plain.actions.is_empty());
+        assert_eq!(plain.argv, ["run"]);
     }
 }

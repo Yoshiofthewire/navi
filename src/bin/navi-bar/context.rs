@@ -1,0 +1,730 @@
+//! Right-click menus on dock icons and launcher app rows: what they hold, keyboard moves, and
+//! the force-close confirmation, drawn in one panel. main.rs runs the actions.
+
+use crate::{
+    desktop::Entry,
+    layout::{Item, Rect},
+    menu::Row,
+    theme::{ACCENT, BAR_BG, DIM, INK, PANEL_EDGE, Panel, SELECTED},
+};
+
+pub const MENU_W: i32 = 260;
+const PAD: i32 = 12;
+const ROW_H: i32 = 32;
+/// A 1 px line with 4 px above and below.
+const SEP_H: i32 = 9;
+const LINE_H: i32 = 24;
+const BUTTON_H: i32 = 36;
+const MARK_W: i32 = 3;
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Kind {
+    Open,
+    NewWindow,
+    /// A desktop action, by id.
+    Action(String),
+    Pin,
+    Unpin,
+    /// Close the app's windows, this many.
+    Close(usize),
+    ForceClose,
+}
+
+impl Kind {
+    /// The same item across a re-resolve: Pin and Unpin are one toggle, Close any count.
+    fn same(&self, other: &Kind) -> bool {
+        use Kind::*;
+        match (self, other) {
+            (Pin | Unpin, Pin | Unpin) | (Close(_), Close(_)) => true,
+            (a, b) => a == b,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Line {
+    Header(String),
+    Item(Kind, String),
+    Sep,
+}
+
+impl Line {
+    fn h(&self) -> i32 {
+        match self {
+            Line::Sep => SEP_H,
+            _ => ROW_H,
+        }
+    }
+}
+
+/// The app a menu acts on: its desktop ID, else its app ID, and whether it's a dock icon's.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Target {
+    pub key: String,
+    pub dock: bool,
+}
+
+/// What the target is now.
+pub struct App<'a> {
+    pub entry: Option<&'a Entry>,
+    pub app_id: &'a str,
+    pub pinned: bool,
+    pub windows: usize,
+    /// Its windows whose close went unanswered for 90 s.
+    pub overdue: usize,
+}
+
+/// The menu's target for a launcher row: apps only.
+pub fn row_target(row: Row, entries: &[Entry]) -> Option<Target> {
+    match row {
+        Row::App(e) => Some(Target {
+            key: entries.get(e)?.id.clone(),
+            dock: false,
+        }),
+        Row::Folder(_) => None,
+    }
+}
+
+/// The menu for `app`, from the dock or the launcher.
+pub fn lines(app: &App, dock: bool) -> Vec<Line> {
+    let name = match app.entry {
+        Some(e) => e.name.as_str(),
+        None if !app.app_id.is_empty() => app.app_id,
+        None => "Unknown app",
+    };
+    let mut out = vec![Line::Header(name.into())];
+    let item = |kind: Kind| {
+        let label = match &kind {
+            Kind::Open => "Open".into(),
+            Kind::NewWindow => "New window".into(),
+            Kind::Action(id) => app
+                .entry
+                .and_then(|e| e.actions.iter().find(|a| &a.id == id))
+                .map_or_else(String::new, |a| a.name.clone()),
+            Kind::Pin => "Pin to dock".into(),
+            Kind::Unpin => "Unpin from dock".into(),
+            Kind::Close(1) => "Close window".into(),
+            Kind::Close(n) => format!("Close all {n} windows"),
+            Kind::ForceClose => "Force close…".into(),
+        };
+        Line::Item(kind, label)
+    };
+    let running = dock && app.windows > 0;
+    if let Some(e) = app.entry {
+        out.push(item(if running { Kind::NewWindow } else { Kind::Open }));
+        out.extend(e.actions.iter().map(|a| item(Kind::Action(a.id.clone()))));
+        out.push(Line::Sep);
+        out.push(item(if app.pinned { Kind::Unpin } else { Kind::Pin }));
+    }
+    if running {
+        if app.entry.is_some() {
+            out.push(Line::Sep);
+        }
+        out.push(item(Kind::Close(app.windows)));
+        if app.overdue > 0 {
+            out.push(item(Kind::ForceClose));
+        }
+    }
+    out
+}
+
+/// The force-close confirmation, in place of the items.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Confirm {
+    pub name: String,
+    /// 0 Cancel, 1 Force close.
+    pub selected: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Hit {
+    Line(usize),
+    Cancel,
+    Confirm,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Menu {
+    pub target: Target,
+    pub lines: Vec<Line>,
+    /// An item's index in `lines`.
+    pub selected: Option<usize>,
+    pub confirm: Option<Confirm>,
+    /// Where it opened, relative to the surface's bottom centre (`Layout::anchor`).
+    pub anchor: (i32, i32),
+}
+
+impl Menu {
+    /// Opened by keyboard, its first item is selected.
+    pub fn new(target: Target, lines: Vec<Line>, anchor: (i32, i32), keyboard: bool) -> Self {
+        let mut m = Menu {
+            target,
+            lines,
+            selected: None,
+            confirm: None,
+            anchor,
+        };
+        if keyboard {
+            m.home();
+        }
+        m
+    }
+
+    fn items(&self) -> Vec<usize> {
+        let items = self.lines.iter().enumerate();
+        items
+            .filter(|(_, l)| matches!(l, Line::Item(..)))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    pub fn selected_kind(&self) -> Option<&Kind> {
+        match self.lines.get(self.selected?) {
+            Some(Line::Item(k, _)) => Some(k),
+            _ => None,
+        }
+    }
+
+    /// Up (-1) or Down (1) through the items, wrapping; from none, the first or last.
+    pub fn step(&mut self, by: i32) {
+        if let Some(c) = &mut self.confirm {
+            c.selected = 1 - c.selected;
+            return;
+        }
+        let items = self.items();
+        if items.is_empty() {
+            return;
+        }
+        let n = items.len() as i32;
+        let at = self
+            .selected
+            .and_then(|s| items.iter().position(|&i| i == s));
+        let next = match at {
+            Some(at) => (at as i32 + by).rem_euclid(n),
+            None if by > 0 => 0,
+            None => n - 1,
+        };
+        self.selected = Some(items[next as usize]);
+    }
+
+    pub fn home(&mut self) {
+        self.selected = self.items().first().copied();
+    }
+
+    pub fn end(&mut self) {
+        self.selected = self.items().last().copied();
+    }
+
+    /// New contents for the same target; the selection follows its kind.
+    pub fn update(&mut self, lines: Vec<Line>) {
+        let kind = self.selected_kind().cloned();
+        self.lines = lines;
+        self.selected = kind.and_then(|k| {
+            let found = self.lines.iter().enumerate().find(|(_, l)| match l {
+                Line::Item(other, _) => k.same(other),
+                _ => false,
+            });
+            found.map(|(i, _)| i)
+        });
+    }
+
+    /// Shows the force-close confirmation, Cancel selected.
+    pub fn ask_force(&mut self) {
+        let name = match self.lines.first() {
+            Some(Line::Header(n)) => n.clone(),
+            _ => String::new(),
+        };
+        self.confirm = Some(Confirm { name, selected: 0 });
+    }
+
+    pub fn height(&self) -> i32 {
+        match self.confirm {
+            Some(_) => PAD + ROW_H + 3 * LINE_H + 8 + BUTTON_H + PAD,
+            None => PAD + self.lines.iter().map(Line::h).sum::<i32>() + PAD,
+        }
+    }
+
+    /// Each line's rect in the menu at `r`.
+    fn rects(&self, r: Rect) -> impl Iterator<Item = (usize, Rect)> + '_ {
+        let mut y = r.y + PAD;
+        self.lines.iter().enumerate().map(move |(i, l)| {
+            let at = Rect {
+                x: r.x + PAD,
+                y,
+                w: r.w - 2 * PAD,
+                h: l.h(),
+            };
+            y += l.h();
+            (i, at)
+        })
+    }
+
+    fn buttons(&self, r: Rect) -> [Rect; 2] {
+        let w = (r.w - 3 * PAD) / 2;
+        let cancel = Rect {
+            x: r.x + PAD,
+            y: r.y + r.h - PAD - BUTTON_H,
+            w,
+            h: BUTTON_H,
+        };
+        [
+            cancel,
+            Rect {
+                x: cancel.x + w + PAD,
+                ..cancel
+            },
+        ]
+    }
+
+    /// What's at `(x, y)` in the menu at `r`: an item or a button.
+    pub fn hit(&self, r: Rect, x: i32, y: i32) -> Option<Hit> {
+        if self.confirm.is_some() {
+            let [cancel, force] = self.buttons(r);
+            return match (cancel.contains(x, y), force.contains(x, y)) {
+                (true, _) => Some(Hit::Cancel),
+                (_, true) => Some(Hit::Confirm),
+                _ => None,
+            };
+        }
+        let mut lines = self.rects(r);
+        let (i, _) = lines.find(|(_, at)| at.contains(x, y))?;
+        matches!(self.lines[i], Line::Item(..)).then_some(Hit::Line(i))
+    }
+
+    /// Hover selects what's under the pointer; returns whether anything changed.
+    pub fn hover(&mut self, hit: Hit) -> bool {
+        let before = (self.selected, self.confirm.clone());
+        match (hit, &mut self.confirm) {
+            (Hit::Line(i), None) => self.selected = Some(i),
+            (Hit::Cancel, Some(c)) => c.selected = 0,
+            (Hit::Confirm, Some(c)) => c.selected = 1,
+            _ => {}
+        }
+        before != (self.selected, self.confirm.clone())
+    }
+
+    /// The menu at `r`, on top of everything else on the surface.
+    pub fn draw(&self, r: Rect) -> Vec<Item> {
+        let mut out = vec![Item::Panel(r, Panel::Popup, PANEL_EDGE, 1)];
+        let row = |y, h| Rect {
+            x: r.x + PAD,
+            y,
+            w: r.w - 2 * PAD,
+            h,
+        };
+        if let Some(c) = &self.confirm {
+            let y = r.y + PAD;
+            out.push(Item::Text(
+                format!("Force close {}?", c.name),
+                row(y, ROW_H),
+                INK,
+            ));
+            let body = [
+                "It hasn't closed for 90 seconds.",
+                "Unsaved work is lost.",
+                "All of its windows close too.",
+            ];
+            for (i, line) in body.into_iter().enumerate() {
+                let at = row(y + ROW_H + i as i32 * LINE_H, LINE_H);
+                out.push(Item::Text(line.into(), at, DIM));
+            }
+            for (i, (b, label)) in self
+                .buttons(r)
+                .into_iter()
+                .zip(["Cancel", "Force close"])
+                .enumerate()
+            {
+                let fill = if c.selected == i { SELECTED } else { BAR_BG };
+                out.push(Item::Round(b, 8, fill));
+                if c.selected == i {
+                    out.push(Item::Fill(mark(b), ACCENT));
+                }
+                out.push(Item::Text(label.into(), inset_x(b, 12), INK));
+            }
+            return out;
+        }
+        for (i, at) in self.rects(r) {
+            match &self.lines[i] {
+                Line::Header(name) => out.push(Item::Text(name.clone(), inset_x(at, 8), DIM)),
+                Line::Sep => out.push(Item::Fill(
+                    Rect {
+                        y: at.y + 4,
+                        h: 1,
+                        ..at
+                    },
+                    PANEL_EDGE,
+                )),
+                Line::Item(_, label) => {
+                    if self.selected == Some(i) {
+                        out.push(Item::Round(at, 7, SELECTED));
+                        out.push(Item::Fill(mark(at), ACCENT));
+                    }
+                    out.push(Item::Text(label.clone(), inset_x(at, 12), INK));
+                }
+            }
+        }
+        out
+    }
+}
+
+/// The selection's accent mark at `r`'s left edge, inside its rounded corners.
+fn mark(r: Rect) -> Rect {
+    Rect {
+        x: r.x,
+        y: r.y + 7,
+        w: MARK_W,
+        h: r.h - 14,
+    }
+}
+
+fn inset_x(r: Rect, by: i32) -> Rect {
+    Rect {
+        x: r.x + by,
+        w: r.w - 2 * by,
+        ..r
+    }
+}
+
+/// The target's menu now, or `None` once it's gone: no dock app with its key, or (launcher) no
+/// entry.
+pub fn resolve(
+    target: &Target,
+    apps: &[crate::dock::App],
+    entries: &[Entry],
+    pins: &[String],
+) -> Option<Vec<Line>> {
+    if !target.dock {
+        let entry = entries.iter().find(|e| e.id == target.key)?;
+        let app = App {
+            entry: Some(entry),
+            app_id: &entry.id,
+            pinned: pins.contains(&entry.id),
+            windows: 0,
+            overdue: 0,
+        };
+        return Some(lines(&app, false));
+    }
+    let a = apps.iter().find(|a| key(a, entries) == target.key)?;
+    let app = App {
+        entry: a.entry.and_then(|e| entries.get(e)),
+        app_id: &a.app_id,
+        pinned: a.pinned,
+        windows: a.windows.len(),
+        overdue: a.overdue,
+    };
+    Some(lines(&app, true))
+}
+
+/// A dock app's menu key: its desktop ID, else its app ID.
+pub fn key(app: &crate::dock::App, entries: &[Entry]) -> String {
+    match app.entry.and_then(|e| entries.get(e)) {
+        Some(e) => e.id.clone(),
+        None => app.app_id.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::desktop::{Action, Category};
+
+    fn konsole() -> Entry {
+        Entry {
+            id: "org.kde.konsole.desktop".into(),
+            name: "Konsole".into(),
+            icon: None,
+            argv: vec!["konsole".into()],
+            wm_class: None,
+            category: Category::System,
+            actions: vec![Action {
+                id: "NewTab".into(),
+                name: "Open a New Tab".into(),
+                argv: vec!["konsole".into(), "--new-tab".into()],
+            }],
+        }
+    }
+
+    fn app(entry: Option<&Entry>, pinned: bool, windows: usize, overdue: usize) -> App<'_> {
+        App {
+            entry,
+            app_id: "org.kde.konsole",
+            pinned,
+            windows,
+            overdue,
+        }
+    }
+
+    fn labels(lines: &[Line]) -> Vec<String> {
+        let label = |l: &Line| match l {
+            Line::Header(h) => format!("[{h}]"),
+            Line::Item(_, t) => t.clone(),
+            Line::Sep => "-".into(),
+        };
+        lines.iter().map(label).collect()
+    }
+
+    /// AC1: one test per row of the contents table.
+    #[test]
+    fn ac1_dock_app_with_windows() {
+        let e = konsole();
+        let one = lines(&app(Some(&e), false, 1, 0), true);
+        let want = [
+            "[Konsole]",
+            "New window",
+            "Open a New Tab",
+            "-",
+            "Pin to dock",
+            "-",
+            "Close window",
+        ];
+        assert_eq!(labels(&one), want);
+        let three = lines(&app(Some(&e), true, 3, 0), true);
+        let want = [
+            "[Konsole]",
+            "New window",
+            "Open a New Tab",
+            "-",
+            "Unpin from dock",
+            "-",
+            "Close all 3 windows",
+        ];
+        assert_eq!(labels(&three), want);
+        // An overdue window adds Force close right below Close.
+        let overdue = lines(&app(Some(&e), true, 3, 1), true);
+        assert_eq!(
+            labels(&overdue)[6..],
+            ["Close all 3 windows", "Force close…"]
+        );
+        assert_eq!(
+            overdue[7],
+            Line::Item(Kind::ForceClose, "Force close…".into())
+        );
+    }
+
+    #[test]
+    fn ac1_dock_pin_without_windows() {
+        let e = konsole();
+        let got = lines(&app(Some(&e), true, 0, 0), true);
+        assert_eq!(
+            labels(&got),
+            [
+                "[Konsole]",
+                "Open",
+                "Open a New Tab",
+                "-",
+                "Unpin from dock"
+            ]
+        );
+    }
+
+    #[test]
+    fn ac1_dock_app_without_an_entry() {
+        let got = lines(&app(None, false, 1, 0), true);
+        assert_eq!(labels(&got), ["[org.kde.konsole]", "Close window"]);
+        let got = lines(&app(None, false, 2, 2), true);
+        assert_eq!(
+            labels(&got),
+            ["[org.kde.konsole]", "Close all 2 windows", "Force close…"]
+        );
+        let nameless = App {
+            app_id: "",
+            ..app(None, false, 1, 0)
+        };
+        assert_eq!(labels(&lines(&nameless, true))[0], "[Unknown app]");
+    }
+
+    #[test]
+    fn ac1_launcher_rows() {
+        let e = konsole();
+        // Windows never show in the launcher's menu.
+        let got = lines(&app(Some(&e), false, 2, 1), false);
+        assert_eq!(
+            labels(&got),
+            ["[Konsole]", "Open", "Open a New Tab", "-", "Pin to dock"]
+        );
+        let got = lines(&app(Some(&e), true, 0, 0), false);
+        assert_eq!(labels(&got)[4], "Unpin from dock");
+        let entries = [e];
+        assert_eq!(row_target(Row::Folder(Category::System), &entries), None);
+        assert_eq!(
+            row_target(Row::App(0), &entries),
+            Some(Target {
+                key: "org.kde.konsole.desktop".into(),
+                dock: false
+            })
+        );
+        assert_eq!(row_target(Row::App(1), &entries), None);
+    }
+
+    #[test]
+    fn ac1_header_and_separators_never_selectable() {
+        let e = konsole();
+        let target = Target {
+            key: e.id.clone(),
+            dock: true,
+        };
+        let mut m = Menu::new(
+            target,
+            lines(&app(Some(&e), false, 2, 1), true),
+            (0, 0),
+            false,
+        );
+        let r = Rect {
+            x: 0,
+            y: 0,
+            w: MENU_W,
+            h: m.height(),
+        };
+        for _ in 0..20 {
+            m.step(1);
+            assert!(m.selected_kind().is_some());
+        }
+        for (i, at) in m.rects(r).collect::<Vec<_>>() {
+            let hit = m.hit(r, at.x + 4, at.y + at.h / 2);
+            let item = matches!(m.lines[i], Line::Item(..));
+            assert_eq!(hit.is_some(), item, "{:?}", m.lines[i]);
+        }
+    }
+
+    fn menu(windows: usize) -> Menu {
+        let e = konsole();
+        let target = Target {
+            key: e.id.clone(),
+            dock: true,
+        };
+        Menu::new(
+            target,
+            lines(&app(Some(&e), false, windows, 0), true),
+            (0, 0),
+            false,
+        )
+    }
+
+    /// AC2: keyboard moves.
+    #[test]
+    fn ac2_keyboard_navigation() {
+        let mut m = menu(2);
+        assert_eq!(m.selected, None);
+        m.step(1);
+        assert_eq!(m.selected_kind(), Some(&Kind::NewWindow));
+        m.step(-1);
+        assert_eq!(
+            m.selected_kind(),
+            Some(&Kind::Close(2)),
+            "Up wraps to the last"
+        );
+        m.step(1);
+        assert_eq!(m.selected_kind(), Some(&Kind::NewWindow), "and Down back");
+        let mut up = menu(2);
+        up.step(-1);
+        assert_eq!(up.selected_kind(), Some(&Kind::Close(2)));
+        m.end();
+        assert_eq!(m.selected_kind(), Some(&Kind::Close(2)));
+        m.home();
+        assert_eq!(m.selected_kind(), Some(&Kind::NewWindow));
+        // Opened by keyboard: the first item.
+        let k = Menu::new(m.target.clone(), m.lines.clone(), (0, 0), true);
+        assert_eq!(k.selected_kind(), Some(&Kind::NewWindow));
+
+        let mut one = Menu::new(
+            m.target.clone(),
+            lines(&app(None, false, 1, 0), true),
+            (0, 0),
+            true,
+        );
+        for by in [1, -1, 1] {
+            one.step(by);
+            assert_eq!(one.selected_kind(), Some(&Kind::Close(1)));
+        }
+
+        // A window closes: the selection stays on Close, now "Close window".
+        m.end();
+        m.update(lines(&app(Some(&konsole()), false, 1, 0), true));
+        assert_eq!(m.selected_kind(), Some(&Kind::Close(1)));
+        assert_eq!(
+            m.lines[m.selected.unwrap()],
+            Line::Item(Kind::Close(1), "Close window".into())
+        );
+        // Pin becomes Unpin and stays selected.
+        let at = m
+            .lines
+            .iter()
+            .position(|l| matches!(l, Line::Item(Kind::Pin, _)))
+            .unwrap();
+        m.selected = Some(at);
+        m.update(lines(&app(Some(&konsole()), true, 1, 0), true));
+        assert_eq!(m.selected_kind(), Some(&Kind::Unpin));
+    }
+
+    /// AC2: a gone target closes the menu; `main.rs` closes it when `resolve` finds nothing.
+    #[test]
+    fn ac2_gone_target_closes() {
+        let entries = [konsole()];
+        let pins: [String; 0] = [];
+        let target = Target {
+            key: entries[0].id.clone(),
+            dock: true,
+        };
+        let apps = crate::dock::apps(&pins, &entries, &[]);
+        assert!(resolve(&target, &apps, &entries, &pins).is_none());
+        let pinned = [entries[0].id.clone()];
+        let apps = crate::dock::apps(&pinned, &entries, &[]);
+        let got = resolve(&target, &apps, &entries, &pinned).unwrap();
+        assert_eq!(labels(&got)[1], "Open");
+        // The launcher's target is gone once its entry is uninstalled.
+        let row = Target {
+            dock: false,
+            ..target
+        };
+        assert!(resolve(&row, &apps, &entries, &pinned).is_some());
+        assert!(resolve(&row, &[], &[], &pinned).is_none());
+    }
+
+    /// AC6: the selection is a `SELECTED` fill and a 3 px `ACCENT` mark.
+    #[test]
+    fn ac6_selection_look() {
+        let mut m = menu(1);
+        let r = Rect {
+            x: 0,
+            y: 0,
+            w: MENU_W,
+            h: m.height(),
+        };
+        let marks = |items: &[Item]| {
+            let n = items
+                .iter()
+                .filter(|i| matches!(i, Item::Fill(f, ACCENT) if f.w == MARK_W));
+            n.count()
+        };
+        assert_eq!(marks(&m.draw(r)), 0);
+        m.home();
+        let items = m.draw(r);
+        assert_eq!(marks(&items), 1);
+        let fill = items.iter().find_map(|i| match i {
+            Item::Round(f, 7, SELECTED) => Some(*f),
+            _ => None,
+        });
+        let mark = items.iter().find_map(|i| match i {
+            Item::Fill(f, ACCENT) => Some(*f),
+            _ => None,
+        });
+        let (fill, mark) = (fill.expect("a SELECTED fill"), mark.unwrap());
+        assert_eq!((mark.x, mark.w), (fill.x, 3));
+        assert!(mark.y > fill.y && mark.y + mark.h < fill.y + fill.h);
+        assert!(matches!(items[0], Item::Panel(p, Panel::Popup, PANEL_EDGE, 1) if p == r));
+        // The confirmation: Cancel selected first.
+        m.ask_force();
+        let items = m.draw(Rect { h: m.height(), ..r });
+        assert_eq!(marks(&items), 1);
+        assert!(
+            items
+                .iter()
+                .any(|i| matches!(i, Item::Text(t, _, INK) if t == "Force close Konsole?"))
+        );
+        assert_eq!(m.confirm.as_ref().unwrap().selected, 0);
+        m.step(1);
+        assert_eq!(m.confirm.as_ref().unwrap().selected, 1);
+        m.step(1);
+        assert_eq!(m.confirm.as_ref().unwrap().selected, 0);
+    }
+}

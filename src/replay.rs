@@ -3,7 +3,7 @@
 //! input-injection tool.
 //!
 //! One step per line, in global logical px: `wait <ms>`, `move <x> <y>`, `press`, `release`
-//! (the left button), `key <evdev keycode>` (press and release), and `down <code>` / `up <code>`
+//! (the left button), `press right`, `release right`, `key <evdev keycode>` (press and release), and `down <code>` / `up <code>`
 //! to hold a key, such as a modifier. Blank lines and `#` comments are skipped. Any other line is
 //! an error, and then nothing is replayed.
 
@@ -21,6 +21,7 @@ use tracing::{error, info};
 use crate::CalloopData;
 
 const BTN_LEFT: u32 = 0x110;
+const BTN_RIGHT: u32 = 0x111;
 const MAX_BYTES: u64 = 1 << 20;
 /// evdev's KEY_MAX.
 const KEY_MAX: u32 = 0x2ff;
@@ -29,8 +30,9 @@ const KEY_MAX: u32 = 0x2ff;
 enum Step {
     Wait(u64),
     Move(i32, i32),
-    Press,
-    Release,
+    /// A button down or up, by evdev code.
+    Press(u32),
+    Release(u32),
     Key(u32),
     Down(u32),
     Up(u32),
@@ -49,8 +51,10 @@ fn parse(script: &str) -> Result<Vec<Step>, String> {
                 .ok()
                 .zip(y.parse().ok())
                 .map(|(x, y)| Step::Move(x, y)),
-            ["press"] => Some(Step::Press),
-            ["release"] => Some(Step::Release),
+            ["press"] => Some(Step::Press(BTN_LEFT)),
+            ["release"] => Some(Step::Release(BTN_LEFT)),
+            ["press", "right"] => Some(Step::Press(BTN_RIGHT)),
+            ["release", "right"] => Some(Step::Release(BTN_RIGHT)),
             ["key", code] => keycode(code).map(Step::Key),
             ["down", code] => keycode(code).map(Step::Down),
             ["up", code] => keycode(code).map(Step::Up),
@@ -99,8 +103,8 @@ pub fn start(handle: &LoopHandle<'static, CalloopData>) {
             match step {
                 Step::Wait(ms) => return TimeoutAction::ToDuration(Duration::from_millis(ms)),
                 Step::Move(x, y) => state.pointer_motion((f64::from(x), f64::from(y)).into(), time),
-                Step::Press => state.pointer_button(BTN_LEFT, true, true, time),
-                Step::Release => state.pointer_button(BTN_LEFT, true, false, time),
+                Step::Press(button) => state.pointer_button(button, true, true, time),
+                Step::Release(button) => state.pointer_button(button, true, false, time),
                 // xkb keycodes are evdev's plus 8.
                 Step::Key(code) => {
                     for key in [KeyState::Pressed, KeyState::Released] {
@@ -126,18 +130,20 @@ mod tests {
     #[test]
     fn parses_the_four_steps() {
         let script = "# drag a\nwait 500\n\nmove 100 2\npress\nmove -5 1439\nrelease\nkey 46\n\
-                      down 29\nup 29\n";
+                      down 29\nup 29\npress right\nrelease right\n";
         assert_eq!(
             parse(script),
             Ok(vec![
                 Step::Wait(500),
                 Step::Move(100, 2),
-                Step::Press,
+                Step::Press(BTN_LEFT),
                 Step::Move(-5, 1439),
-                Step::Release,
+                Step::Release(BTN_LEFT),
                 Step::Key(46),
                 Step::Down(29),
                 Step::Up(29),
+                Step::Press(BTN_RIGHT),
+                Step::Release(BTN_RIGHT),
             ])
         );
     }
@@ -152,6 +158,10 @@ mod tests {
             "move 1 2 3",
             "move x 2",
             "press 1",
+            "press middle",
+            "release middle",
+            "press right 1",
+            "press left",
             "click",
             "key",
             "key x",

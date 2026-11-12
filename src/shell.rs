@@ -5,7 +5,7 @@ use std::{
     cell::RefCell,
     collections::VecDeque,
     ffi::{OsStr, OsString},
-    io::{self, Read, Write},
+    io::{self, Write},
     os::{fd::OwnedFd, unix::net::UnixStream},
     path::PathBuf,
     process::{Command, Stdio},
@@ -14,20 +14,17 @@ use std::{
     time::{Duration, Instant},
 };
 
-use smithay::reexports::{
-    calloop::{
-        LoopHandle,
-        channel::{self, Event},
-        timer::{TimeoutAction, Timer},
-    },
-    wayland_server::DisplayHandle,
+use smithay::reexports::calloop::{
+    LoopHandle,
+    channel::{self, Event},
+    timer::{TimeoutAction, Timer},
 };
 use tracing::{info, warn};
 
 use crate::{
     CalloopData,
-    control::{self, LOCK, NO, YES},
-    state::ClientState,
+    control::{self, NO, Request, YES},
+    state::{ClientState, Navi},
 };
 
 const MAX_STARTS: usize = 5;
@@ -91,21 +88,21 @@ pub fn send_command(control: &UnixStream, command: control::Command) -> bool {
 }
 
 /// Spawns `navi-bar` next to navi's own executable, with no shell and no `PATH` search, and
-/// restarts it when it exits. Without it, navi runs without a bar. Returns the first bar's
-/// control stream for `send_command`; `Navi::bar_control` follows each restart.
+/// restarts it when it exits. Without it, navi runs without a bar. `Navi::bar_control` follows
+/// each start, for `send_command`.
 pub fn start_bar(
     handle: &LoopHandle<'static, CalloopData>,
-    dh: &mut DisplayHandle,
+    state: &mut Navi,
     wayland_display: &OsStr,
     cursor: Option<(String, u32)>,
     xdisplay: Option<String>,
     session: bool,
-) -> Option<UnixStream> {
+) {
     let path = match std::env::current_exe() {
         Ok(exe) => exe.with_file_name("navi-bar"),
         Err(e) => {
             warn!("navi-bar not started, navi's own path is unknown: {e}");
-            return None;
+            return;
         }
     };
     // Only a successful exit from our own shell means the user confirmed Log Out.
@@ -119,7 +116,7 @@ pub fn start_bar(
         respawn: Respawn::default(),
         clock: Instant::now(),
     }));
-    let control = bar.borrow_mut().start(dh, &tx, handle);
+    state.bar_control = bar.borrow_mut().start(state, &tx, handle);
     let h = handle.clone();
     let restart = handle.insert_source(rx, move |event, _, data| {
         let Event::Msg(logout) = event else {
@@ -134,11 +131,8 @@ pub fn start_bar(
         let (bar, tx) = (bar.clone(), tx.clone());
         let timer = Timer::from_duration(RESTART_DELAY);
         let queued = h.insert_source(timer, move |_, _, data| {
-            data.state.bar_control = bar.borrow_mut().start(
-                &mut data.state.display_handle,
-                &tx,
-                &data.state.loop_handle,
-            );
+            let h = data.state.loop_handle.clone();
+            data.state.bar_control = bar.borrow_mut().start(&mut data.state, &tx, &h);
             TimeoutAction::Drop
         });
         if let Err(e) = queued {
@@ -148,7 +142,6 @@ pub fn start_bar(
     if let Err(e) = restart {
         warn!("navi-bar won't be restarted: {e}");
     }
-    control
 }
 
 impl Bar {
@@ -156,7 +149,7 @@ impl Bar {
     /// writer for its control stream.
     fn start(
         &mut self,
-        dh: &mut DisplayHandle,
+        state: &mut Navi,
         exited: &channel::Sender<bool>,
         handle: &LoopHandle<'static, CalloopData>,
     ) -> Option<UnixStream> {
@@ -164,7 +157,7 @@ impl Bar {
             warn!("navi-bar keeps crashing, running without a bar");
             return None;
         }
-        self.spawn(dh, exited.clone(), handle)
+        self.spawn(state, exited.clone(), handle)
             .inspect_err(|e| {
                 warn!(path = %self.path.display(), "navi-bar not started, running without a bar: {e}");
             })
@@ -173,37 +166,20 @@ impl Bar {
 
     fn spawn(
         &self,
-        dh: &mut DisplayHandle,
+        state: &mut Navi,
         exited: channel::Sender<bool>,
         handle: &LoopHandle<'static, CalloopData>,
     ) -> io::Result<UnixStream> {
         let (ours, theirs) = UnixStream::pair()?;
-        let (mut control, child_control) = UnixStream::pair()?;
+        let (control, child_control) = UnixStream::pair()?;
         let toggles = control.try_clone()?;
-        let (requests, events) = channel::channel::<(bool, std::sync::mpsc::Sender<bool>)>();
-        handle
-            .insert_source(events, |event, _, data| {
-                if let Event::Msg((lock, reply)) = event {
-                    if lock {
-                        data.state.request_lock(Some(reply));
-                    } else {
-                        let _ = reply.send(crate::locking::executable().is_file());
-                    }
-                }
-            })
-            .map_err(|e| io::Error::other(e.to_string()))?;
+        let (requests, events) = channel::channel::<(Request, std::sync::mpsc::Sender<bool>)>();
         std::thread::spawn(move || {
-            let mut request = [0];
-            while control.read_exact(&mut request).is_ok() {
+            serve(control, |request| {
                 let (tx, rx) = std::sync::mpsc::channel();
-                if request[0] > LOCK || requests.send((request[0] == LOCK, tx)).is_err() {
-                    break;
-                }
-                let ok = rx.recv_timeout(Duration::from_secs(12)).unwrap_or(false);
-                if control.write_all(&[if ok { YES } else { NO }]).is_err() {
-                    break;
-                }
-            }
+                requests.send((request, tx)).ok()?;
+                Some(rx.recv_timeout(Duration::from_secs(12)).unwrap_or(false))
+            })
         });
         let mut cmd = Command::new(&self.path);
         // Without a theme navi drew nothing either, so apps keep their own default.
@@ -231,13 +207,40 @@ impl Bar {
         let pid = child.id();
         let bar = ClientState {
             privileged: true,
+            child: Some(pid),
             ..Default::default()
         };
         // On failure navi-bar sees its socket close and exits.
-        match dh.insert_client(ours, Arc::new(bar)) {
-            Ok(_) => info!(pid, "navi-bar started"),
-            Err(e) => warn!(pid, "navi-bar's connection refused: {e}"),
-        }
+        let client = match state.display_handle.insert_client(ours, Arc::new(bar)) {
+            Ok(c) => {
+                info!(pid, "navi-bar started");
+                state.protect(c.clone());
+                Some(c)
+            }
+            Err(e) => {
+                warn!(pid, "navi-bar's connection refused: {e}");
+                None
+            }
+        };
+        handle
+            .insert_source(events, move |event, _, data| {
+                let Event::Msg((request, reply)) = event else {
+                    return;
+                };
+                match (request, &client) {
+                    (Request::Lock, _) => data.state.request_lock(Some(reply)),
+                    (Request::CanLock, _) => {
+                        let _ = reply.send(crate::locking::executable().is_file());
+                    }
+                    (Request::ForceClose(handle), Some(bar)) => {
+                        data.state.force_close(bar, handle, reply);
+                    }
+                    (Request::ForceClose(_), None) => {
+                        let _ = reply.send(false);
+                    }
+                }
+            })
+            .map_err(|e| io::Error::other(e.to_string()))?;
         std::thread::spawn(move || {
             let logout = match child.wait() {
                 Ok(status) => {
@@ -253,6 +256,17 @@ impl Bar {
             let _ = exited.send(logout);
         });
         Ok(toggles)
+    }
+}
+
+/// navi's end of the control stream: answers each request with `answer`'s `YES` or `NO` until
+/// EOF, a short or unknown request, or `answer` returning `None`.
+fn serve(mut control: UnixStream, mut answer: impl FnMut(Request) -> Option<bool>) {
+    while let Some(request) = Request::read(&mut control) {
+        let Some(ok) = answer(request) else { break };
+        if control.write_all(&[if ok { YES } else { NO }]).is_err() {
+            break;
+        }
     }
 }
 
@@ -273,6 +287,7 @@ fn session_env(cmd: &mut Command, session: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
 
     #[test]
     fn ac10_respawn_allows_five_a_minute() {
@@ -305,6 +320,34 @@ mod tests {
         assert!(
             !send_command(&navi, control::Command::ToggleMenu),
             "broken socket"
+        );
+    }
+
+    /// AC11: navi's reader decodes a force close and answers it, around lock requests; a short
+    /// force close then EOF ends it.
+    #[test]
+    fn ac11_serve_answers_force_close_and_ends_on_a_short_one() {
+        let (bar, navi) = UnixStream::pair().unwrap();
+        let (seen, asked) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            serve(navi, |r| {
+                seen.send(r).unwrap();
+                Some(r != Request::CanLock)
+            })
+        });
+        let control = control::reader(bar.try_clone().unwrap(), |_| {}).unwrap();
+        assert_eq!(control::request(&control, Request::Lock), Ok(()));
+        let force = Request::ForceClose(0xFF00_0001);
+        assert_eq!(control::request(&control, force), Ok(()));
+        assert!(control::request(&control, Request::CanLock).is_err());
+        let got: Vec<_> = asked.try_iter().collect();
+        assert_eq!(got, [Request::Lock, force, Request::CanLock]);
+        (&bar).write_all(&[control::FORCE_CLOSE, 1, 0]).unwrap();
+        bar.shutdown(std::net::Shutdown::Write).unwrap();
+        server.join().unwrap();
+        assert!(
+            asked.try_recv().is_err(),
+            "the short request was never answered"
         );
     }
 

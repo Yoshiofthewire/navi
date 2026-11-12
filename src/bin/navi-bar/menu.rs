@@ -206,6 +206,7 @@ mod tests {
                 argv: vec!["x".into()],
                 wm_class: None,
                 category: Category::Other,
+                actions: Vec::new(),
             })
             .collect()
     }

@@ -104,6 +104,8 @@ pub struct Running<'a> {
     pub focused: bool,
     pub minimized: bool,
     pub attention: bool,
+    /// A user's close of it went unanswered for 90 s.
+    pub overdue: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -116,6 +118,8 @@ pub struct App {
     /// One of its windows has a dialog waiting for the user.
     pub attention: bool,
     pub pinned: bool,
+    /// How many of its windows may be force closed.
+    pub overdue: usize,
 }
 
 pub fn apps(pins: &[String], entries: &[Entry], windows: &[Running<'_>]) -> Vec<App> {
@@ -131,6 +135,7 @@ pub fn apps(pins: &[String], entries: &[Entry], windows: &[Running<'_>]) -> Vec<
                 minimized: false,
                 attention: false,
                 pinned: true,
+                overdue: 0,
             })
         })
         .collect();
@@ -149,6 +154,7 @@ pub fn apps(pins: &[String], entries: &[Entry], windows: &[Running<'_>]) -> Vec<
                 minimized: true,
                 attention: false,
                 pinned: false,
+                overdue: 0,
             });
             apps.len() - 1
         });
@@ -159,6 +165,7 @@ pub fn apps(pins: &[String], entries: &[Entry], windows: &[Running<'_>]) -> Vec<
         app.windows.push(i);
         app.focused |= win.focused;
         app.attention |= win.attention;
+        app.overdue += usize::from(win.overdue);
         app.minimized &= win.minimized;
     }
     apps
@@ -260,6 +267,7 @@ mod tests {
             argv: vec!["terminal".into()],
             wm_class: Some("Term".into()),
             category: Category::System,
+            actions: Vec::new(),
         }];
         let windows = [
             Running {
@@ -267,18 +275,21 @@ mod tests {
                 focused: false,
                 minimized: true,
                 attention: false,
+                overdue: false,
             },
             Running {
                 app_id: "terminal",
                 focused: true,
                 minimized: false,
                 attention: false,
+                overdue: false,
             },
             Running {
                 app_id: "unknown",
                 focused: false,
                 minimized: false,
                 attention: false,
+                overdue: false,
             },
         ];
         let apps = apps(
@@ -306,6 +317,7 @@ mod tests {
             argv: vec![id.into()],
             wm_class: None,
             category: Category::System,
+            actions: Vec::new(),
         }
     }
 
@@ -315,6 +327,7 @@ mod tests {
             focused,
             minimized,
             attention: false,
+            overdue: false,
         }
     }
 
@@ -423,5 +436,55 @@ mod tests {
             key(&d, &w, DockKey::Cycle { forward: true }),
             Err("no other app to cycle to")
         );
+    }
+
+    /// AC7: Pin and Unpin from the context menu's items go through `Pins::toggle` unchanged.
+    #[test]
+    fn ac7_pin_from_the_context_menu() {
+        use crate::context::{self, Kind, Line, Target};
+        let tmp = Tmp::new("context-pins");
+        let path = tmp.0.join("navi/pins");
+        let entries = [entry("kwrite.desktop")];
+        let target = Target {
+            key: "kwrite.desktop".into(),
+            dock: false,
+        };
+        let mut pins = Pins::open(Some(path.clone()));
+        // The menu's pin item, run as main.rs does: `toggle` on the target's desktop ID.
+        let run = |pins: &mut Pins, want: Kind| {
+            let lines = context::resolve(&target, &[], &entries, &pins.ids).unwrap();
+            let item = lines.iter().find_map(|l| match l {
+                Line::Item(k @ (Kind::Pin | Kind::Unpin), _) => Some(k.clone()),
+                _ => None,
+            });
+            assert_eq!(item, Some(want));
+            pins.toggle(&target.key)
+        };
+        assert_eq!(run(&mut pins, Kind::Pin), Ok(true));
+        assert_eq!(run(&mut pins, Kind::Unpin), Ok(false));
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(Pins::open(Some(path.clone())).ids, pins.ids);
+        assert_eq!(run(&mut pins, Kind::Pin), Ok(true));
+        assert_eq!(Pins::open(Some(path.clone())).ids, ["kwrite.desktop"]);
+
+        // Full: the MAX_PINS error, file unchanged.
+        let full: Vec<String> = (0..MAX_PINS).map(|n| format!("a{n}.desktop")).collect();
+        let text = format!("{HEADER}\n{}\n", full.join("\n"));
+        std::fs::write(&path, &text).unwrap();
+        let mut pins = Pins::open(Some(path.clone()));
+        assert_eq!(
+            run(&mut pins, Kind::Pin),
+            Err("The dock holds up to 32 pinned apps".into())
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+
+        // Damaged: an error, file intact.
+        std::fs::write(&path, "navi-pins 9\n").unwrap();
+        let mut pins = Pins::open(Some(path.clone()));
+        assert!(run(&mut pins, Kind::Pin).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "navi-pins 9\n");
     }
 }

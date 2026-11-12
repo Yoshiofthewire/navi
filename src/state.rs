@@ -34,7 +34,7 @@ use smithay::{
         },
         wayland_server::{
             Client, DisplayHandle, Resource,
-            backend::{ClientData, ClientId, DisconnectReason},
+            backend::{ClientData, ClientId, DisconnectReason, protocol::ProtocolError},
             protocol::{wl_buffer, wl_output::WlOutput, wl_seat, wl_surface::WlSurface},
         },
     },
@@ -70,6 +70,7 @@ use smithay::{
         },
     },
 };
+use std::{os::fd::OwnedFd, sync::Arc};
 use tracing::{info, warn};
 
 use crate::CalloopData;
@@ -132,6 +133,8 @@ pub struct Managed {
     pub(crate) capped_for: Option<Rect>,
     /// A shown X11 menu's owner (`layout::menu_owner`), which it stacks and is clipped with.
     pub(crate) menu_owner: Option<Window>,
+    /// The user's first close of it (✕ or the bar), never refreshed: `force::overdue`.
+    pub(crate) close_sent: Option<std::time::Instant>,
 }
 
 impl Managed {
@@ -186,6 +189,10 @@ pub struct Navi {
     bar_output: Option<String>,
     /// The running navi-bar's control stream, for app menu toggles.
     pub bar_control: Option<std::os::unix::net::UnixStream>,
+    /// navi-bar's, the locker's and Xwayland's connections, while alive: never force closed.
+    pub(crate) protected: Vec<Client>,
+    /// navi's own Xwayland display, `:N`, once ready.
+    pub(crate) xdisplay: Option<String>,
     pub super_tap: crate::input::SuperTap,
     /// Layers whose last commit asked for `Exclusive` keyboard focus.
     pub(crate) exclusive: crate::focus::Exclusive<WlSurface, Window>,
@@ -324,6 +331,8 @@ impl Navi {
             hover_timer: None,
             bar_output: persist::load_bar(),
             bar_control: None,
+            protected: Vec::new(),
+            xdisplay: None,
             super_tap: Default::default(),
             exclusive: Default::default(),
             handback: None,
@@ -1185,7 +1194,8 @@ impl Navi {
             .get_keyboard()
             .and_then(|kb| kb.current_focus())
             .and_then(|f| f.surface());
-        let now = self
+        let now = std::time::Instant::now();
+        let list = self
             .windows
             .iter()
             .filter_map(|m| {
@@ -1200,6 +1210,7 @@ impl Navi {
                 ];
                 let info = toplevels::Info {
                     attention: tile.attention,
+                    overdue: crate::force::overdue(m.close_sent, now),
                     title: window_title(&m.window),
                     app_id: window_app(&m.window),
                     output: self
@@ -1212,7 +1223,7 @@ impl Navi {
                 Some((id, info))
             })
             .collect();
-        self.toplevels.refresh(&self.display_handle, now);
+        self.toplevels.refresh(&self.display_handle, list);
     }
 
     fn managed_mut(&mut self, s: &WlSurface) -> Option<&mut Managed> {
@@ -1226,14 +1237,144 @@ impl Navi {
         Some(m.window.clone())
     }
 
-    pub fn close_window(&self, id: WinId) {
-        if let Some(w) = self.window_of(id) {
-            if let Some(t) = w.toplevel() {
-                t.send_close();
-            } else if let Some(x) = w.x11_surface()
-                && let Err(e) = x.close()
-            {
-                warn!("X11 close: {e}");
+    /// A user's close (✕ or the bar): polite, and the first one starts the force-close clock.
+    pub fn close_window(&mut self, id: WinId) {
+        let Some(m) = self.windows.iter_mut().find(|m| m.tile == Some(id)) else {
+            return;
+        };
+        if m.close_sent.is_none() {
+            m.close_sent = Some(std::time::Instant::now());
+            // Wakes the window list when the window becomes overdue; one per stamped window.
+            let after = crate::force::FORCE_AFTER + std::time::Duration::from_millis(10);
+            let timer = self
+                .loop_handle
+                .insert_source(Timer::from_duration(after), |_, _, d| {
+                    d.state.refresh_toplevels();
+                    TimeoutAction::Drop
+                });
+            if let Err(e) = timer {
+                warn!("force-close timer: {e}");
+            }
+        }
+        if let Some(t) = m.window.toplevel() {
+            t.send_close();
+        } else if let Some(x) = m.window.x11_surface()
+            && let Err(e) = x.close()
+        {
+            warn!("X11 close: {e}");
+        }
+    }
+
+    /// Keeps `client` from ever being force closed, with its pid.
+    pub fn protect(&mut self, client: Client) {
+        let dh = self.display_handle.backend_handle();
+        self.protected
+            .retain(|c| dh.get_client_data(c.id()).is_ok());
+        self.protected.push(client);
+    }
+
+    /// navi-bar's confirmed force close of the window whose handle has object ID `handle` on
+    /// `bar`'s connection. `reply` hears whether it was done; X11 answers from a worker.
+    /// Returns whether a process was signalled.
+    pub fn force_close(
+        &mut self,
+        bar: &Client,
+        handle: u32,
+        reply: std::sync::mpsc::Sender<bool>,
+    ) -> bool {
+        use crate::force::{Owner, Plan, Target};
+        let now = std::time::Instant::now();
+        let id = self.toplevels.find(bar, handle);
+        let managed = id.and_then(|id| self.windows.iter().find(|m| m.tile == Some(id)));
+        let client = managed
+            .and_then(|m| window_surface(&m.window))
+            .and_then(|s| s.client());
+        let target = managed.map(|m| Target {
+            close_sent: m.close_sent,
+            owner: match (m.window.x11_surface(), &client) {
+                (Some(x), _) => Owner::X11 {
+                    window: x.window_id(),
+                },
+                (None, c) => {
+                    let data = c.as_ref().and_then(|c| c.get_data::<ClientState>());
+                    Owner::Wayland {
+                        protected: data.is_none_or(|d| d.privileged || d.locker)
+                            || c.as_ref().is_some_and(|c| self.protected.contains(c)),
+                        pid: data.and_then(|d| d.pid),
+                        pidfd: data.and_then(|d| d.pidfd.clone()),
+                    }
+                }
+            },
+        });
+        let dh = &self.display_handle;
+        let facts = crate::force::Facts {
+            locked: self.lock.active,
+            own_pid: std::process::id(),
+            protected_pids: self
+                .protected
+                .iter()
+                .flat_map(|c| {
+                    let peer = c.get_credentials(dh).ok().map(|c| c.pid as u32);
+                    let child = c.get_data::<ClientState>().and_then(|d| d.child);
+                    [peer, child]
+                })
+                .flatten()
+                .collect(),
+        };
+        let id = id.unwrap_or_default();
+        match crate::force::plan(target, now, &facts) {
+            Err(why) => {
+                info!(id, handle, ?why, by = "bar", "force close refused");
+                let _ = reply.send(false);
+                false
+            }
+            Ok(Plan::Wayland { signal }) => {
+                let pid = client
+                    .as_ref()
+                    .and_then(|c| c.get_data::<ClientState>())
+                    .and_then(|d| d.pid);
+                let signalled = signal.is_some_and(|fd| {
+                    rustix::process::pidfd_send_signal(&*fd, rustix::process::Signal::KILL)
+                        .inspect_err(|e| warn!(id, ?pid, "force close signal: {e}"))
+                        .is_ok()
+                });
+                if let Some(c) = &client {
+                    c.kill(
+                        dh,
+                        ProtocolError {
+                            code: 0,
+                            object_id: 1,
+                            object_interface: "wl_display".into(),
+                            message: "force closed by the user".into(),
+                        },
+                    );
+                }
+                info!(id, ?pid, signalled, by = "bar", "force close");
+                let _ = reply.send(true);
+                signalled
+            }
+            Ok(Plan::X11 { window, client }) => {
+                let Some(display) = self.xdisplay.clone() else {
+                    let _ = reply.send(false);
+                    return false;
+                };
+                // Its own connection, so a stuck Xwayland never blocks the event loop.
+                std::thread::spawn(move || {
+                    use smithay::reexports::x11rb::{self, protocol::xproto::ConnectionExt};
+                    let done = x11rb::connect(Some(&display))
+                        .map_err(|e| e.to_string())
+                        .and_then(|(conn, _)| {
+                            // `check` waits for the server's answer.
+                            let cookie = conn.kill_client(window).map_err(|e| e.to_string())?;
+                            cookie.check().map_err(|e| e.to_string())
+                        });
+                    match &done {
+                        Ok(()) => info!(id, x11_client = client, by = "bar", "force close"),
+                        Err(e) => warn!(id, x11_client = client, "force close failed: {e}"),
+                    }
+                    let _ = reply.send(done.is_ok());
+                });
+                false
             }
         }
     }
@@ -2357,6 +2498,28 @@ pub struct ClientState {
     pub privileged: bool,
     /// Only the dedicated connection passed to the swaylock child.
     pub locker: bool,
+    /// The peer's pid and a pidfd for it, from SO_PEERCRED at accept.
+    pub pid: Option<u32>,
+    pub pidfd: Option<Arc<OwnedFd>>,
+    /// navi-bar's or the locker's process, on the connection navi made for it.
+    pub child: Option<u32>,
+}
+
+impl ClientState {
+    /// A client of the listening socket, with its peer's pid and a pidfd captured now, at
+    /// accept, so a later pid reuse can't redirect a force close's signal.
+    pub fn accepted(stream: &std::os::unix::net::UnixStream) -> Self {
+        use rustix::process::{PidfdFlags, pidfd_open};
+        let peer = rustix::net::sockopt::socket_peercred(stream)
+            .ok()
+            .map(|c| c.pid);
+        let pidfd = peer.and_then(|p| pidfd_open(p, PidfdFlags::empty()).ok());
+        ClientState {
+            pid: peer.map(|p| p.as_raw_nonzero().get() as u32),
+            pidfd: pidfd.map(Arc::new),
+            ..Default::default()
+        }
+    }
 }
 
 /// The filter on privileged globals: layer shell and the window list.
@@ -2566,6 +2729,7 @@ impl XdgShellHandler for Navi {
             last_output: None,
             capped_for: None,
             menu_owner: None,
+            close_sent: None,
         });
     }
 
@@ -3636,5 +3800,7 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod force_tests;
 #[cfg(test)]
 mod pointer_tests;

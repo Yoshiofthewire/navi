@@ -241,6 +241,16 @@ mod tests {
         }
     }
 
+    /// Job 034 AC6: a context menu's selection mark holds 3:1 on its `SELECTED` fill too.
+    #[test]
+    fn selection_mark_is_3_to_1_on_its_fill() {
+        for flags in all_flags() {
+            let r = |c| resolve_flags(c, flags);
+            let c = contrast(r(ACCENT), r(SELECTED));
+            assert!(c >= 3.0, "flags {flags}: {c}");
+        }
+    }
+
     #[test]
     fn rgba_premultiplies() {
         assert_eq!(rgba(0xFF0000, 0.5), [0.5, 0.0, 0.0, 0.5]);
