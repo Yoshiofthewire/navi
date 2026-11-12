@@ -586,39 +586,40 @@ impl Bar {
             return;
         };
         let target = c.target.clone();
-        if kind == context::Kind::ForceClose {
-            if let Some(c) = &mut self.context {
-                c.ask_force();
-            }
-            return self.relayout();
-        }
-        self.context = None;
         let entry = self.entries.iter().position(|e| e.id == target.key);
         match kind {
-            context::Kind::Open | context::Kind::NewWindow => {
-                if let Some(e) = entry {
-                    self.launch(e, None, serial, qh);
+            // Closing again an app that ignored a close asks to force close it.
+            context::Kind::ForceClose | context::Kind::Close(_) if c.overdue() => {
+                if let Some(c) = &mut self.context {
+                    c.ask_force(Instant::now());
                 }
             }
-            context::Kind::Action(id) => {
+            context::Kind::Open | context::Kind::NewWindow | context::Kind::Action(_) => {
+                self.context = None;
+                let action = match kind {
+                    context::Kind::Action(id) => Some(id),
+                    _ => None,
+                };
                 if let Some(e) = entry {
-                    self.launch(e, Some(id), serial, qh);
+                    return self.launch(e, action, serial, qh);
                 }
             }
-            context::Kind::Pin | context::Kind::Unpin => match entry {
-                Some(e) => self.toggle_pin(e),
-                None => self.relayout(),
-            },
-            context::Kind::Close(_) => {
+            context::Kind::Pin | context::Kind::Unpin => {
+                self.context = None;
+                if let Some(e) = entry {
+                    return self.toggle_pin(e);
+                }
+            }
+            context::Kind::Close(_) | context::Kind::ForceClose => {
+                self.context = None;
                 let windows = self.app_windows(&target.key);
                 info!(app_id = target.key, windows = windows.len(), "dock close");
                 for w in &windows {
                     w.handle.close();
                 }
-                self.relayout();
             }
-            context::Kind::ForceClose => {}
         }
+        self.relayout();
     }
 
     /// The window list's windows of the dock app with menu key `key`.
@@ -828,7 +829,12 @@ impl Bar {
             let hit = self.layout.context().and_then(|r| c.hit(r, x, y));
             return match (hit, self.layout.hit(x, y)) {
                 (Some(context::Hit::Line(i)), _) => self.context_activate(i, serial, qh),
-                (Some(hit), _) => self.confirm(hit),
+                // Buttons count only once armed: a double-click can't confirm unseen.
+                (Some(hit), _) => {
+                    if c.confirm.as_ref().is_some_and(|f| f.armed(Instant::now())) {
+                        self.confirm(hit);
+                    }
+                }
                 (None, Some(layout::Hit::Menu)) => {}
                 (None, _) => {
                     self.context = None;
@@ -887,7 +893,11 @@ impl Bar {
                 dock: true,
             }),
             Some(layout::Hit::Row(k)) => {
-                let row = self.menu.as_ref().and_then(|m| m.at_row(k));
+                let row = self.menu.as_mut().and_then(|m| {
+                    // The row stays highlighted while its menu is open.
+                    m.select_row(k);
+                    m.at_row(k)
+                });
                 row.and_then(|r| context::row_target(r, &self.entries))
             }
             Some(layout::Hit::Menu) => return,
@@ -925,8 +935,7 @@ impl Bar {
             return;
         };
         match event.keysym {
-            Keysym::Escape => self.context = None,
-            Keysym::Menu => self.context = None,
+            Keysym::Escape | Keysym::Menu => self.context = None,
             Keysym::F10 if self.shift => self.context = None,
             Keysym::Return | Keysym::KP_Enter => match (&c.confirm, c.selected) {
                 (Some(confirm), _) => {
@@ -2287,6 +2296,11 @@ impl PointerHandler for Bar {
                         self.layout.hit(e.position.0 as i32, e.position.1 as i32)
                     };
                     let (x, y) = (e.position.0 as i32, e.position.1 as i32);
+                    if let (PointerEventKind::Motion { .. }, Some(c)) =
+                        (&e.kind, self.context.as_mut())
+                    {
+                        c.moved();
+                    }
                     let in_menu = self.layout.context().zip(self.context.as_ref());
                     let on_item = in_menu.and_then(|(r, c)| c.hit(r, x, y));
                     let selected = match (self.menu.as_mut(), self.context.as_mut(), hover) {
@@ -2493,7 +2507,7 @@ mod tests {
             m.step(1);
             out.push(m.draw(r(&m)));
         }
-        m.ask_force();
+        m.ask_force(Instant::now());
         for _ in 0..2 {
             m.step(1);
             out.push(m.draw(r(&m)));

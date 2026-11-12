@@ -314,7 +314,8 @@ aspect, gravity, position) are ignored.
   the parent held the keyboard right before the dialog took it and the keyboard hasn't moved since
   (the parent gets back only what it held). Either way that window must still be visible (not
   hidden, minimized or wholly covered) on the same monitor, outside the lock; otherwise the
-  keyboard goes to nobody. Every hide (a dialog with its parent, a re-parent to a hidden window,
+  keyboard goes to nobody. That includes a force close: keys typed at a hung app never land in
+  another window the moment it dies. Every hide (a dialog with its parent, a re-parent to a hidden window,
   an X11 menu with its parent) takes the keyboard off the hidden window before the next key.
 - **Stacking order.** Windows stack by one rank: the last time they were raised, by the user (a
   click, the dock, Super+N, or an activation whose token came from the dock or from a window the
@@ -567,15 +568,23 @@ bundling a degoogled, resource-tested Chromium variant is reserved for a future 
   the lock, a window going fullscreen on the bar's monitor, the taskbar moving and the app
   going away all close it. Opening it closes the session menu, and from the dock the launcher.
   It holds the keyboard while open and returns it as the launcher does. A dock menu sits 12 px
-  above the dock, flipped left at the screen edge; a launcher menu stays inside the launcher.
+  above the dock, its left edge at the pointer, flipped left at the end of the dock, and centred
+  over a dock narrower than the menu (260 px); a launcher menu stays inside the launcher, and
+  its row stays highlighted. Only the launcher's menu opens from the keyboard (Menu,
+  Shift+F10); the dock's, and so Force close, are mouse-only.
   **Close** is polite: the same request as a window's ✕ (`xdg_toplevel.close`, or
   `WM_DELETE_WINDOW` for X11), for each of the app's windows; the app decides, and may ask
   about unsaved work. **Force close:** if a window's first close (✕ or the dock) has gone
-  unanswered for 90 s, its dock menu also offers **Force close…** below Close. It asks first,
-  with Cancel selected. Confirmed, navi checks the 90 s itself, then ends that window's client:
-  a Wayland app is sent SIGKILL through a pidfd taken when it connected and disconnected; an X11
+  unanswered for 90 s, its dock menu offers **Force close…** below Close, and Close itself
+  now asks to force close. The 90 s count from the first close and never restart, so a window
+  kept open by cancelling a "Save changes?" prompt is offered it too. The confirmation names
+  the app, says unsaved work is lost and, for an app with more windows, that they close too.
+  Cancel is selected; its buttons sit under the heading, away from the rows that open it, and
+  take a press only 500 ms after it appears and once the pointer has moved, so a double-click
+  can't confirm. Confirmed, navi checks the 90 s itself, then ends that window's client: a
+  Wayland app is sent SIGKILL through a pidfd taken when it connected and disconnected; an X11
   app's X connection is ended with XKillClient, never a signal. navi, navi-bar, the locker and
-  Xwayland are never force closed. Nothing is automatic.
+  Xwayland are never force closed. Nothing is automatic, and a refusal is only logged.
 - **Laptop alone:** the same layout with a slimmer taskbar.
 - **No virtual desktops.**
 - **Look:** cyberpunk, with no animations: every state change is instant. (The half-second hold
@@ -600,8 +609,9 @@ bundling a degoogled, resource-tested Chromium variant is reserved for a future 
   hold 3:1 in every scheme; app icons keep their own colours. The launcher's search field is
   the selected fill with a rim, so it has a shape even in high contrast. A context menu's
   selected item has the selected fill and a 3 px accent mark at its left edge, which holds 3:1
-  where the fill alone doesn't. The band is 32 px (one
-  line of text) and the dock 40 px (24 px icons in 32 px targets); they share radius and rim. Pixels outside a panel are clear and take no clicks. Hover and
+  where the fill alone doesn't; the force-close button has an accent rim. The band is 32 px
+  (one line of text) and the dock 40 px (24 px icons in 32 px targets); they share radius and
+  rim. Pixels outside a panel are clear and take no clicks. Hover and
   selected fills inside a panel stay opaque. Windows stay solid, with no translucency or shadows,
   and share the panels' corners (*Rounded tiles*). No desktop widgets, dock
   magnification, reflection or bounce: it isn't Mac-like.

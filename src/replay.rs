@@ -3,9 +3,9 @@
 //! input-injection tool.
 //!
 //! One step per line, in global logical px: `wait <ms>`, `move <x> <y>`, `press`, `release`
-//! (the left button), `press right`, `release right`, `key <evdev keycode>` (press and release), and `down <code>` / `up <code>`
-//! to hold a key, such as a modifier. Blank lines and `#` comments are skipped. Any other line is
-//! an error, and then nothing is replayed.
+//! (the left button), `press right`, `release right`, `key <evdev keycode>` (press and
+//! release), and `down <code>` / `up <code>` to hold a key, such as a modifier. Blank lines and
+//! `#` comments are skipped. Any other line is an error, and then nothing is replayed.
 
 use std::time::Duration;
 

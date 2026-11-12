@@ -1,6 +1,8 @@
 //! Right-click menus on dock icons and launcher app rows: what they hold, keyboard moves, and
 //! the force-close confirmation, drawn in one panel. main.rs runs the actions.
 
+use std::time::{Duration, Instant};
+
 use crate::{
     desktop::Entry,
     layout::{Item, Rect},
@@ -15,7 +17,12 @@ const ROW_H: i32 = 32;
 const SEP_H: i32 = 9;
 const LINE_H: i32 = 24;
 const BUTTON_H: i32 = 36;
+/// Space around the confirmation's buttons.
+const GAP: i32 = 12;
 const MARK_W: i32 = 3;
+/// The confirmation's buttons take presses only this long after it appears, and after the
+/// pointer has moved: a double-click on the item that opened it never confirms.
+pub const ARM: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Kind {
@@ -132,8 +139,32 @@ pub fn lines(app: &App, dock: bool) -> Vec<Line> {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Confirm {
     pub name: String,
+    /// The app's windows, as the Close item counted them.
+    pub windows: usize,
     /// 0 Cancel, 1 Force close.
     pub selected: usize,
+    pub opened: Instant,
+    /// The pointer moved since it opened.
+    pub moved: bool,
+}
+
+impl Confirm {
+    fn body(&self) -> Vec<String> {
+        let mut out = vec![
+            "Close went unanswered for 90 s.".to_string(),
+            "Force close ends it at once,".into(),
+            "and unsaved work is lost.".into(),
+        ];
+        if self.windows > 1 {
+            out.push(format!("Its other {} windows close too.", self.windows - 1));
+        }
+        out
+    }
+
+    /// Whether a press on a button counts (`ARM`); keys always do.
+    pub fn armed(&self, now: Instant) -> bool {
+        self.moved && now.saturating_duration_since(self.opened) >= ARM
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -228,18 +259,41 @@ impl Menu {
         });
     }
 
-    /// Shows the force-close confirmation, Cancel selected.
-    pub fn ask_force(&mut self) {
+    /// Whether the app has a window that may be force closed.
+    pub fn overdue(&self) -> bool {
+        let force = |l: &Line| matches!(l, Line::Item(Kind::ForceClose, _));
+        self.lines.iter().any(force)
+    }
+
+    /// Shows the force-close confirmation at `now`, Cancel selected.
+    pub fn ask_force(&mut self, now: Instant) {
         let name = match self.lines.first() {
             Some(Line::Header(n)) => n.clone(),
             _ => String::new(),
         };
-        self.confirm = Some(Confirm { name, selected: 0 });
+        let windows = self.lines.iter().find_map(|l| match l {
+            Line::Item(Kind::Close(n), _) => Some(*n),
+            _ => None,
+        });
+        self.confirm = Some(Confirm {
+            name,
+            windows: windows.unwrap_or(1),
+            selected: 0,
+            opened: now,
+            moved: false,
+        });
+    }
+
+    /// Pointer motion over the menu, for `Confirm::armed`.
+    pub fn moved(&mut self) {
+        if let Some(c) = &mut self.confirm {
+            c.moved = true;
+        }
     }
 
     pub fn height(&self) -> i32 {
-        match self.confirm {
-            Some(_) => PAD + ROW_H + 3 * LINE_H + 8 + BUTTON_H + PAD,
+        match &self.confirm {
+            Some(c) => PAD + ROW_H + GAP + BUTTON_H + GAP + c.body().len() as i32 * LINE_H + PAD,
             None => PAD + self.lines.iter().map(Line::h).sum::<i32>() + PAD,
         }
     }
@@ -259,11 +313,13 @@ impl Menu {
         })
     }
 
+    /// Cancel and Force close, right under the heading: far above the bottom rows (Close,
+    /// Force close…) that open the confirmation, whose bottom edge stays put.
     fn buttons(&self, r: Rect) -> [Rect; 2] {
         let w = (r.w - 3 * PAD) / 2;
         let cancel = Rect {
             x: r.x + PAD,
-            y: r.y + r.h - PAD - BUTTON_H,
+            y: r.y + PAD + ROW_H + GAP,
             w,
             h: BUTTON_H,
         };
@@ -313,39 +369,48 @@ impl Menu {
             h,
         };
         if let Some(c) = &self.confirm {
-            let y = r.y + PAD;
+            let heading = row(r.y + PAD, ROW_H);
             out.push(Item::Text(
                 format!("Force close {}?", c.name),
-                row(y, ROW_H),
+                inset_x(heading, 12),
                 INK,
             ));
-            let body = [
-                "It hasn't closed for 90 seconds.",
-                "Unsaved work is lost.",
-                "All of its windows close too.",
-            ];
-            for (i, line) in body.into_iter().enumerate() {
-                let at = row(y + ROW_H + i as i32 * LINE_H, LINE_H);
-                out.push(Item::Text(line.into(), at, DIM));
-            }
-            for (i, (b, label)) in self
-                .buttons(r)
+            let line = Rect {
+                y: heading.y + ROW_H + GAP / 2,
+                h: 1,
+                ..heading
+            };
+            out.push(Item::Fill(line, PANEL_EDGE));
+            let buttons = self.buttons(r);
+            for (i, (b, label)) in buttons
                 .into_iter()
                 .zip(["Cancel", "Force close"])
                 .enumerate()
             {
                 let fill = if c.selected == i { SELECTED } else { BAR_BG };
-                out.push(Item::Round(b, 8, fill));
+                // Force close, the destructive one, always has an accent rim.
+                let inner = if i == 1 {
+                    out.push(Item::Round(b, 8, ACCENT));
+                    inset(b, 2)
+                } else {
+                    b
+                };
+                out.push(Item::Round(inner, 8, fill));
                 if c.selected == i {
-                    out.push(Item::Fill(mark(b), ACCENT));
+                    out.push(Item::Fill(mark(inner), ACCENT));
                 }
                 out.push(Item::Text(label.into(), inset_x(b, 12), INK));
+            }
+            let top = buttons[0].y + BUTTON_H + GAP;
+            for (i, text) in c.body().into_iter().enumerate() {
+                let at = row(top + i as i32 * LINE_H, LINE_H);
+                out.push(Item::Text(text, inset_x(at, 12), DIM));
             }
             return out;
         }
         for (i, at) in self.rects(r) {
             match &self.lines[i] {
-                Line::Header(name) => out.push(Item::Text(name.clone(), inset_x(at, 8), DIM)),
+                Line::Header(name) => out.push(Item::Text(name.clone(), inset_x(at, 12), DIM)),
                 Line::Sep => out.push(Item::Fill(
                     Rect {
                         y: at.y + 4,
@@ -374,6 +439,15 @@ fn mark(r: Rect) -> Rect {
         y: r.y + 7,
         w: MARK_W,
         h: r.h - 14,
+    }
+}
+
+fn inset(r: Rect, by: i32) -> Rect {
+    Rect {
+        x: r.x + by,
+        y: r.y + by,
+        w: r.w - 2 * by,
+        h: r.h - 2 * by,
     }
 }
 
@@ -713,7 +787,7 @@ mod tests {
         assert!(mark.y > fill.y && mark.y + mark.h < fill.y + fill.h);
         assert!(matches!(items[0], Item::Panel(p, Panel::Popup, PANEL_EDGE, 1) if p == r));
         // The confirmation: Cancel selected first.
-        m.ask_force();
+        m.ask_force(Instant::now());
         let items = m.draw(Rect { h: m.height(), ..r });
         assert_eq!(marks(&items), 1);
         assert!(
@@ -726,5 +800,60 @@ mod tests {
         assert_eq!(m.confirm.as_ref().unwrap().selected, 1);
         m.step(1);
         assert_eq!(m.confirm.as_ref().unwrap().selected, 0);
+    }
+
+    /// Round 1: a double press on the row that opens the confirmation (Close or Force close…)
+    /// never lands on a button, and the buttons wait for `ARM` and fresh motion.
+    #[test]
+    fn a_double_press_never_confirms() {
+        let e = konsole();
+        let target = Target {
+            key: e.id.clone(),
+            dock: true,
+        };
+        for windows in [1, 3] {
+            let lines = lines(&app(Some(&e), false, windows, 1), true);
+            let mut m = Menu::new(target.clone(), lines, (0, 0), false);
+            // Bottom-anchored like the dock menu: both panels share their bottom edge.
+            let bottom = 800;
+            let at = |m: &Menu| Rect {
+                x: 100,
+                y: bottom - m.height(),
+                w: MENU_W,
+                h: m.height(),
+            };
+            let menu = at(&m);
+            let rows: Vec<Rect> = m
+                .rects(menu)
+                .filter(|(i, _)| {
+                    matches!(
+                        m.lines[*i],
+                        Line::Item(Kind::Close(_) | Kind::ForceClose, _)
+                    )
+                })
+                .map(|(_, r)| r)
+                .collect();
+            assert_eq!(rows.len(), 2);
+            let t = Instant::now();
+            m.ask_force(t);
+            let confirm = at(&m);
+            assert_eq!(confirm.y + confirm.h, bottom);
+            for r in &rows {
+                for x in r.x..r.x + r.w {
+                    for y in r.y..r.y + r.h {
+                        assert_eq!(m.hit(confirm, x, y), None, "{windows}: ({x}, {y})");
+                    }
+                }
+            }
+            let c = m.confirm.clone().unwrap();
+            assert!(!c.armed(t + ARM), "no motion yet");
+            m.moved();
+            let c = m.confirm.as_ref().unwrap();
+            assert!(!c.armed(t + ARM - Duration::from_millis(1)));
+            assert!(c.armed(t + ARM));
+            // The window count is honest: a line only when there are others.
+            let others = c.body().iter().any(|l| l.contains("other"));
+            assert_eq!(others, windows > 1);
+        }
     }
 }

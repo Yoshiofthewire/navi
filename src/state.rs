@@ -1321,10 +1321,9 @@ impl Navi {
                 .flatten()
                 .collect(),
         };
-        let id = id.unwrap_or_default();
         match crate::force::plan(target, now, &facts) {
             Err(why) => {
-                info!(id, handle, ?why, by = "bar", "force close refused");
+                info!(?id, handle, ?why, by = "bar", "force close refused");
                 let _ = reply.send(false);
                 false
             }
@@ -2508,12 +2507,17 @@ pub struct ClientState {
 impl ClientState {
     /// A client of the listening socket, with its peer's pid and a pidfd captured now, at
     /// accept, so a later pid reuse can't redirect a force close's signal.
+    ///
+    /// A peer outside navi's pid namespace has pid 0 in SO_PEERCRED. rustix 1.1.6 reads that
+    /// into a `NonZero` pid unchecked; as compiled it comes back as an error, so no pid: the
+    /// client can then only be disconnected, never signalled. Revisit with SO_PEERPIDFD.
     pub fn accepted(stream: &std::os::unix::net::UnixStream) -> Self {
+        use rustix::net::sockopt::socket_peercred;
         use rustix::process::{PidfdFlags, pidfd_open};
-        let peer = rustix::net::sockopt::socket_peercred(stream)
-            .ok()
-            .map(|c| c.pid);
-        let pidfd = peer.and_then(|p| pidfd_open(p, PidfdFlags::empty()).ok());
+        let peer = socket_peercred(stream).ok().map(|c| c.pid);
+        // The pid read again once the pidfd is open: a mismatch drops the pidfd.
+        let still = |p| socket_peercred(stream).is_ok_and(|c| c.pid == p);
+        let pidfd = peer.and_then(|p| pidfd_open(p, PidfdFlags::empty()).ok().filter(|_| still(p)));
         ClientState {
             pid: peer.map(|p| p.as_raw_nonzero().get() as u32),
             pidfd: pidfd.map(Arc::new),

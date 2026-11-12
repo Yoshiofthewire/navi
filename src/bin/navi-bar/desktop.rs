@@ -1,7 +1,7 @@
 //! Installed apps from `.desktop` files (Desktop Entry Spec, the parts the menu needs). The files
 //! are untrusted: sizes, counts and depth are capped and a bad file is skipped.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -14,6 +14,8 @@ const MAX_FILES: usize = 2048;
 const MAX_DEPTH: usize = 4;
 /// Desktop actions kept per entry; extras are dropped.
 pub const MAX_ACTIONS: usize = 6;
+/// `Actions=` ids looked at per entry, kept or not.
+const MAX_LISTED: usize = 16;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Entry {
@@ -256,21 +258,18 @@ pub fn unescape(v: &str) -> String {
 /// The entry, if it's an app to show: `[Desktop Entry]` keys, and its actions' groups. The
 /// first of each key in a group wins.
 fn parse(id: String, text: &str) -> Option<Entry> {
+    // One pass into a map, so lookups cost the same however long the file is.
     let mut group = "";
-    let mut keys: Vec<(&str, &str, &str)> = Vec::new();
+    let mut keys: HashMap<(&str, &str), &str> = HashMap::new();
     for line in text.lines() {
         let line = line.trim();
         if let Some(g) = line.strip_prefix('[') {
             group = g.strip_suffix(']').unwrap_or("");
         } else if let Some((k, v)) = line.split_once('=') {
-            keys.push((group, k.trim(), v.trim()));
+            keys.entry((group, k.trim())).or_insert(v.trim());
         }
     }
-    let get_in = |group: &str, key: &str| {
-        keys.iter()
-            .find(|(g, k, _)| *g == group && *k == key)
-            .map(|(_, _, v)| unescape(v))
-    };
+    let get_in = |group: &str, key: &str| keys.get(&(group, key)).map(|v| unescape(v));
     let get = |key: &str| get_in("Desktop Entry", key);
     let yes = |key: &str| get(key).as_deref() == Some("true");
     let has_navi = |key: &str| get(key).is_some_and(|v| v.split(';').any(|d| d == "navi"));
@@ -284,12 +283,15 @@ fn parse(id: String, text: &str) -> Option<Entry> {
         return None;
     }
     let mut actions: Vec<Action> = Vec::new();
-    for id in get("Actions").unwrap_or_default().split(';') {
+    let listed = get("Actions").unwrap_or_default();
+    let mut tried: Vec<&str> = Vec::new();
+    for id in listed.split(';').take(MAX_LISTED) {
         let ok_id = (1..=64).contains(&id.chars().count())
             && !id.chars().any(|c| c.is_control() || c == '[' || c == ']');
-        if actions.len() == MAX_ACTIONS || !ok_id || actions.iter().any(|a| a.id == id) {
+        if actions.len() == MAX_ACTIONS || !ok_id || tried.contains(&id) {
             continue;
         }
+        tried.push(id);
         let group = format!("Desktop Action {id}");
         let name: String = get_in(&group, "Name")
             .unwrap_or_default()
@@ -525,5 +527,43 @@ mod tests {
         let plain = parse("p.desktop".into(), &(app("P", "") + &ab.concat())).unwrap();
         assert!(plain.actions.is_empty());
         assert_eq!(plain.argv, ["run"]);
+    }
+
+    /// Round 1 security: a 64 KiB file listing one missing id 16 000 times, padded with keys,
+    /// parses as fast as a plain one (it took ~125 ms in release before the fix).
+    #[test]
+    fn hostile_actions_parse_in_linear_time() {
+        let head = format!(
+            "[Desktop Entry]\nType=Application\nName=Evil\nExec=true\nActions={}\n",
+            "a;".repeat(16000)
+        );
+        let text = head.clone() + &"k=\n".repeat((65000 - head.len()) / 3);
+        assert!(text.len() < MAX_FILE as usize);
+        let start = std::time::Instant::now();
+        for _ in 0..10 {
+            let e = parse("evil.desktop".into(), &text).unwrap();
+            assert!(e.actions.is_empty());
+        }
+        let took = start.elapsed();
+        assert!(
+            took < std::time::Duration::from_millis(500),
+            "{took:?} for 10 parses"
+        );
+        // Only the first 16 listed ids are looked at.
+        let mut groups = String::new();
+        let mut list = String::new();
+        for n in 0..20 {
+            list += &format!("x{n};");
+            if n >= 15 {
+                groups += &action(&format!("x{n}"), "Late", "run");
+            }
+        }
+        let e = parse(
+            "l.desktop".into(),
+            &(app("L", &format!("Actions={list}\n")) + &groups),
+        )
+        .unwrap();
+        let ids: Vec<&str> = e.actions.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, ["x15"]);
     }
 }
