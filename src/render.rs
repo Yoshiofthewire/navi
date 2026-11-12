@@ -457,7 +457,7 @@ impl Default for CornerBuffer {
 
 /// A window button's glyph texture: whose, which, lit, its px size and the colours it was
 /// drawn in. One buffer per button keeps element ids unique and stable.
-type GlyphKey = (layout::WinId, layout::Button, bool, u32, (u32, u32));
+type GlyphKey = (layout::WinId, layout::Button, bool, (i32, i32), (u32, u32));
 type Physical = Rectangle<i32, smithay::utils::Physical>;
 
 /// Stable decoration identities let the damage tracker recognize an unchanged desktop.
@@ -545,11 +545,14 @@ impl Solids {
         out
     }
 
-    /// The window buttons' glyphs, by window; textures of buttons no longer shown are dropped.
+    /// The window buttons' glyphs, by window, each `rect` (logical) drawn 1:1 over its px on
+    /// an output at `origin` and `scale`; textures of buttons no longer shown are dropped.
     fn glyphs<R>(
         &mut self,
         renderer: &mut R,
-        buttons: Vec<(layout::WinId, layout::Button, bool, Physical)>,
+        buttons: Vec<(layout::WinId, layout::Button, bool, layout::Rect)>,
+        origin: (i32, i32),
+        scale: f64,
     ) -> Vec<(layout::WinId, Physical, MemoryRenderBufferRenderElement<R>)>
     where
         R: Renderer + ImportMem,
@@ -558,33 +561,40 @@ impl Solids {
         let colours = (theme::resolve(theme::INK), theme::resolve(theme::SELECTED));
         let mut used = std::collections::HashSet::new();
         let mut out = Vec::new();
-        for (id, b, lit, r) in buttons {
-            let size = r.size.w.max(1) as u32;
+        for (id, b, lit, rect) in buttons {
+            let r = physical(monitors::to_local(rect, origin, scale));
+            let size = (r.size.w.max(1), r.size.h.max(1));
             let key = (id, b, lit, size, colours);
             used.insert(key);
             let buffer = match self.glyphs.entry(key) {
                 std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
                 std::collections::hash_map::Entry::Vacant(e) => {
-                    let Some(px) = crate::glyph::button(b, lit, size) else {
+                    let Some(px) = crate::glyph::button(b, lit, size.0 as u32, size.1 as u32)
+                    else {
                         continue;
                     };
                     e.insert(MemoryRenderBuffer::from_slice(
                         px.data(),
                         Fourcc::Abgr8888,
-                        (size as i32, size as i32),
+                        size,
                         1,
                         Transform::Normal,
                         None,
                     ))
                 }
             };
+            // Smithay rounds the element's edges from its logical size; offset by half the
+            // rounding error so both land on `r`'s.
+            let error = |px: i32, logical: i32| (f64::from(px) - f64::from(logical) * scale) / 2.0;
+            let at =
+                r.loc.to_f64() + Point::from((error(r.size.w, rect.w), error(r.size.h, rect.h)));
             match MemoryRenderBufferRenderElement::from_buffer(
                 renderer,
-                r.loc.to_f64(),
+                at,
                 buffer,
                 None,
-                None,
-                None,
+                Some(Rectangle::from_size(Size::from(size).to_f64())),
+                Some(Size::from((rect.w, rect.h))),
                 Kind::Unspecified,
             ) {
                 Ok(e) => out.push((id, r, e)),
@@ -835,7 +845,7 @@ where
     let buttons = layout::buttons(&state.layout, state.drag.as_ref(), under)
         .into_iter()
         .filter(|&(.., r, _)| overlaps(r, full))
-        .map(|(id, b, r, lit)| (id, b, lit, rect(r)))
+        .map(|(id, b, r, lit)| (id, b, lit, r))
         .collect();
     let floating = |id| state.layout.tile(id).is_some_and(|t| t.floating);
     // A button in its bar's corner is cut as the bar is.
@@ -848,7 +858,7 @@ where
         (Some(id), f)
     };
     let (float_glyphs, glyphs): (Vec<_>, Vec<_>) = solids
-        .glyphs(renderer, buttons)
+        .glyphs(renderer, buttons, origin, scale)
         .into_iter()
         .partition(|(id, ..)| floating(*id));
     // `Solids::chrome` keeps order, and the square pointer is the first decoration.
@@ -1337,6 +1347,217 @@ mod tests {
             .map(|s| s.w * s.h)
             .sum();
         assert_eq!(area, bar.w * bar.h);
+    }
+
+    /// A renderer that only imports memory, so `Solids::glyphs` runs without a GPU.
+    mod mem {
+        use smithay::backend::allocator::Fourcc;
+        use smithay::backend::renderer::{
+            Color32F, ContextId, DebugFlags, Frame, ImportMem, Renderer, RendererSuper, Texture,
+            TextureFilter,
+            sync::SyncPoint,
+            test::{DummyError, DummyFramebuffer},
+        };
+        use smithay::utils::{Buffer, Physical, Rectangle, Size, Transform};
+
+        #[derive(Clone, Debug)]
+        pub struct Tex(pub Size<i32, Buffer>);
+        impl Texture for Tex {
+            fn width(&self) -> u32 {
+                self.0.w as u32
+            }
+            fn height(&self) -> u32 {
+                self.0.h as u32
+            }
+            fn format(&self) -> Option<Fourcc> {
+                None
+            }
+        }
+
+        static ID: std::sync::LazyLock<ContextId<Tex>> = std::sync::LazyLock::new(ContextId::new);
+
+        #[derive(Debug)]
+        pub struct Mem;
+        #[derive(Debug)]
+        pub struct MemFrame;
+        impl Frame for MemFrame {
+            type Error = DummyError;
+            type TextureId = Tex;
+            fn context_id(&self) -> ContextId<Tex> {
+                ID.clone()
+            }
+            fn clear(
+                &mut self,
+                _: Color32F,
+                _: &[Rectangle<i32, Physical>],
+            ) -> Result<(), DummyError> {
+                Ok(())
+            }
+            fn draw_solid(
+                &mut self,
+                _: Rectangle<i32, Physical>,
+                _: &[Rectangle<i32, Physical>],
+                _: Color32F,
+            ) -> Result<(), DummyError> {
+                Ok(())
+            }
+            fn render_texture_from_to(
+                &mut self,
+                _: &Tex,
+                _: Rectangle<f64, Buffer>,
+                _: Rectangle<i32, Physical>,
+                _: &[Rectangle<i32, Physical>],
+                _: &[Rectangle<i32, Physical>],
+                _: Transform,
+                _: f32,
+            ) -> Result<(), DummyError> {
+                Ok(())
+            }
+            fn transformation(&self) -> Transform {
+                Transform::Normal
+            }
+            fn wait(&mut self, _: &SyncPoint) -> Result<(), DummyError> {
+                Ok(())
+            }
+            fn finish(self) -> Result<SyncPoint, DummyError> {
+                Ok(SyncPoint::default())
+            }
+        }
+        impl RendererSuper for Mem {
+            type Error = DummyError;
+            type TextureId = Tex;
+            type Framebuffer<'buffer> = DummyFramebuffer;
+            type Frame<'frame, 'buffer>
+                = MemFrame
+            where
+                'buffer: 'frame,
+                Self: 'frame;
+        }
+        impl Renderer for Mem {
+            fn context_id(&self) -> ContextId<Tex> {
+                ID.clone()
+            }
+            fn downscale_filter(&mut self, _: TextureFilter) -> Result<(), DummyError> {
+                Ok(())
+            }
+            fn upscale_filter(&mut self, _: TextureFilter) -> Result<(), DummyError> {
+                Ok(())
+            }
+            fn set_debug_flags(&mut self, _: DebugFlags) {}
+            fn debug_flags(&self) -> DebugFlags {
+                DebugFlags::empty()
+            }
+            fn render<'frame, 'buffer>(
+                &'frame mut self,
+                _: &'frame mut DummyFramebuffer,
+                _: Size<i32, Physical>,
+                _: Transform,
+            ) -> Result<MemFrame, DummyError>
+            where
+                'buffer: 'frame,
+            {
+                Ok(MemFrame)
+            }
+            fn wait(&mut self, _: &SyncPoint) -> Result<(), DummyError> {
+                Ok(())
+            }
+        }
+        impl ImportMem for Mem {
+            fn import_memory(
+                &mut self,
+                data: &[u8],
+                _: Fourcc,
+                size: Size<i32, Buffer>,
+                _: bool,
+            ) -> Result<Tex, DummyError> {
+                assert_eq!(data.len(), (size.w * size.h * 4) as usize);
+                Ok(Tex(size))
+            }
+            fn update_memory(
+                &mut self,
+                _: &Tex,
+                _: &[u8],
+                _: Rectangle<i32, Buffer>,
+            ) -> Result<(), DummyError> {
+                Ok(())
+            }
+            fn mem_formats(&self) -> Box<dyn Iterator<Item = Fourcc>> {
+                Box::new([Fourcc::Abgr8888].into_iter())
+            }
+        }
+    }
+
+    /// AC1, AC2: a 24 px button's glyph covers exactly its physical rect at any scale, sampling
+    /// its whole texture, which has the rect's px size.
+    #[test]
+    fn window_button_glyph_covers_its_physical_rect() {
+        let check = |logical: layout::Rect, origin: (i32, i32), s: f64| {
+            let r = physical(monitors::to_local(logical, origin, s));
+            let mut solids = Solids::default();
+            let e = solids.glyphs(
+                &mut mem::Mem,
+                vec![(1, layout::Button::Close, false, logical)],
+                origin,
+                s,
+            );
+            assert_eq!(e.len(), 1);
+            let (_, at, e) = &e[0];
+            assert_eq!(*at, r);
+            let scale = Scale::from(s);
+            assert_eq!(Element::geometry(e, scale), r, "{logical:?} at {s}");
+            let texture = Rectangle::from_size((r.size.w, r.size.h).into()).to_f64();
+            assert_eq!(Element::src(e), texture, "{logical:?} at {s}: 1:1");
+            r
+        };
+        // At 1.6 this button's edges round to 39 px across and 38 px down.
+        let logical = layout::Rect::new(2, 1, 24, 24);
+        for (s, size) in [(1.0, (24, 24)), (1.6, (39, 38)), (2.0, (48, 48))] {
+            assert_eq!(check(logical, (0, 0), s).size, size.into());
+        }
+        // No drift anywhere on an output, at any scale Settings or KWin can give.
+        for k in 10..=80 {
+            let s = f64::from(k) * 0.05;
+            for x in (-7..3000).step_by(13) {
+                let logical = layout::Rect::new(x, x / 3 + 1, 24, 24);
+                check(logical, (-1000, 700), s);
+            }
+        }
+    }
+
+    /// AC3: unchanged buttons at 1.6 have no damage; a button lit or unlit has.
+    #[test]
+    fn window_button_glyphs_are_stable_at_fractional_scale() {
+        let s = 1.6;
+        let mut solids = Solids::default();
+        let mut tracker = OutputDamageTracker::new((1800, 1125), s, Transform::Normal);
+        let bar = |x| layout::Rect::new(x, 300, 24, 24);
+        let mut glyphs = |lit| -> Vec<_> {
+            let buttons = vec![
+                (1, layout::Button::Minimize, false, bar(101)),
+                (1, layout::Button::Maximize, false, bar(125)),
+                (1, layout::Button::Close, lit, bar(149)),
+            ];
+            let e = solids.glyphs(&mut mem::Mem, buttons, (0, 0), s);
+            e.into_iter().map(|(.., e)| e).collect()
+        };
+        let e = glyphs(false);
+        assert!(tracker.damage_output(1, &e).unwrap().0.is_some());
+        let e = glyphs(false);
+        assert!(
+            tracker.damage_output(1, &e).unwrap().0.is_none(),
+            "unchanged"
+        );
+        let e = glyphs(true);
+        let damage = tracker.damage_output(1, &e).unwrap().0.unwrap().clone();
+        let close = physical(monitors::to_local(bar(149), (0, 0), s));
+        assert_eq!(damage, vec![close], "lit: only ✕");
+        let e = glyphs(true);
+        assert!(
+            tracker.damage_output(1, &e).unwrap().0.is_none(),
+            "still lit"
+        );
+        let e = glyphs(false);
+        assert!(tracker.damage_output(1, &e).unwrap().0.is_some(), "unlit");
     }
 
     /// `gl_FragCoord` maps back to the output px it was drawn from, for every output transform,
