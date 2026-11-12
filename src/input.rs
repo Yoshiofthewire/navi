@@ -530,15 +530,18 @@ impl Navi {
         }
     }
 
-    /// A pointer button, from winit or the debug replay.
-    /// A scroll, to what has the pointer.
+    /// A scroll, to what has the pointer; an X11 window there is lifted as for a press.
     pub fn pointer_axis(&mut self, frame: AxisFrame) {
         if let Some(pointer) = self.seat.get_pointer() {
+            if let Some(s) = pointer.current_focus() {
+                self.lift_x11(&s);
+            }
             pointer.axis(self, frame);
             pointer.frame(self);
         }
     }
 
+    /// A pointer button, from winit or the debug replay.
     pub fn pointer_button(&mut self, button: u32, left: bool, pressed: bool, time: u32) {
         self.request_redraw();
         let Some(pointer) = self.seat.get_pointer() else {

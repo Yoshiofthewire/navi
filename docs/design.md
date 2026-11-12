@@ -286,14 +286,15 @@ aspect, gravity, position) are ignored.
   idle desktop still has no damage), one cuts app surfaces and window buttons that reach a
   corner. If they don't compile, navi logs one warning and draws square. A cut surface can't be
   scanned out directly on DRM; fullscreen windows aren't cut, so fullscreen video and games
-  keep direct scanout. X11 apps get navi's keyboard focus by the outline. Xwayland sends X11
-  pointer events to the top window at the pointer in its own stack of square windows, so navi
-  pushes its drawn order there after every restack (the tiles, then the floats, back to
-  front); a client's own restack request stays ignored. Where X11 windows overlap, the one
-  drawn in front gets the motion and wheel. A press lifts the X11 window navi gives it to the
-  top of that stack until the pointer next moves with no button held, so clicks follow the
-  outline too. Only inside a front X11 window's cut-off corner over another X11 window does
-  Xwayland still give motion and wheel to the front one; X input shapes would close that.
+  keep direct scanout.
+- **X11 stacking.** X11 apps get navi's focus by the outline, but Xwayland sends X11 pointer
+  events to the top window at the pointer in its own stack of square windows. So navi pushes
+  its drawn order there after every restack (the tiles, then the floats, back to front), and a
+  client's own restack request stays ignored: where X11 windows overlap, the one drawn in front
+  gets the motion. A press or scroll lifts the X11 window navi gives it to the top of that
+  stack until the pointer next moves with no button held, so clicks and the wheel follow the
+  outline too. Only inside a front X11 window's cut-off corner (about 21 px²) over another X11
+  window does Xwayland still give motion to the front one; X input shapes would close that.
 - **Dialogs.** A dialog (an xdg toplevel with a parent, or an X11 `WM_TRANSIENT_FOR` window) has a
   *root*: the first tiled or floating window up its parents. The walk stops after 8 steps or on a
   loop; a chain that ends without a tiled window, is too deep or loops makes an *orphan*. Its
@@ -831,8 +832,9 @@ session.
 - **Input replay for testing (debug builds only):** `NAVI_INPUT_REPLAY=<file>` plays a pointer
   and keyboard script through the same handlers as real input: one step per line, `wait <ms>`,
   `move <x> <y>` (global logical px), `press`, `release` (left button), `key <evdev keycode>`
-  (press and release), `down <code>` and `up <code>` (to hold a modifier), `#` comments. A bad line logs one error and nothing is replayed. Release
-  builds don't contain it.
+  (press and release), `down <code>` and `up <code>` (to hold a modifier), `wheel up` and
+  `wheel down` (one notch), `#` comments. A bad line logs one error and nothing is replayed.
+  Release builds don't contain it.
 - The shell (taskbar, corners, launcher) runs as separate `layer-shell` clients, so a taskbar
   crash can't take your windows down.
 

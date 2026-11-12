@@ -83,7 +83,7 @@ use smithay::{
     },
 };
 use std::{os::fd::OwnedFd, sync::Arc};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::CalloopData;
 use crate::activation::{self, may_issue, may_redeem};
@@ -179,6 +179,8 @@ pub struct Navi {
     pub xwm: Option<X11Wm>,
     /// An X11 window is on top of Xwayland's stack for a press (`lift_x11`).
     x11_lifted: bool,
+    /// The last X11 restack failed; logged once until one succeeds.
+    x11_restack_failed: bool,
     pub xwayland_shell: XWaylandShellState,
     pub windows: Vec<Managed>,
     /// A drag in navi's strip or edges, from press to release.
@@ -328,6 +330,7 @@ impl Navi {
             memory,
             xwm: None,
             x11_lifted: false,
+            x11_restack_failed: false,
             xwayland_shell: XWaylandShellState::new::<Self>(&dh),
             windows: Vec::new(),
             drag: None,
@@ -1914,9 +1917,9 @@ impl Navi {
         self.sync_x11_stack();
     }
 
-    /// Puts the X11 window whose `surface` gets a press on top of Xwayland's stack, so the press
-    /// reaches it even inside a front X11 window's cut-off corner. It stays there until the
-    /// pointer moves with no button held: by then Xwayland has the press and release.
+    /// Puts the X11 window whose `surface` gets a press or scroll on top of Xwayland's stack, so
+    /// it reaches that window even inside a front X11 window's cut-off corner. It stays there
+    /// until the pointer moves with no button held: by then Xwayland has the event.
     pub(crate) fn lift_x11(&mut self, surface: &WlSurface) {
         let x = self
             .windows
@@ -1961,10 +1964,16 @@ impl Navi {
             .into_iter()
             .filter_map(|i| shown[i].x11_surface().cloned())
             .collect();
-        if let Some(wm) = self.xwm.as_mut()
-            && let Err(e) = wm.update_stacking_order_upwards(order.iter())
-        {
-            warn!("X11 restack: {e}");
+        let Some(wm) = self.xwm.as_mut() else {
+            return;
+        };
+        // Once per run of failures: a dead Xwayland would fail every layout pass.
+        match wm.update_stacking_order_upwards(order.iter()) {
+            Ok(()) => self.x11_restack_failed = false,
+            Err(e) if !std::mem::replace(&mut self.x11_restack_failed, true) => {
+                warn!("X11 restack: {e}")
+            }
+            Err(e) => debug!("X11 restack: {e}"),
         }
     }
 
