@@ -598,14 +598,15 @@ impl Bar {
                 }
             }
             context::Kind::Open | context::Kind::NewWindow | context::Kind::Action(_) => {
-                self.context = None;
                 let action = match kind {
                     context::Kind::Action(id) => Some(id),
                     _ => None,
                 };
+                // launch's close_menu takes the context menu and relayouts.
                 if let Some(e) = entry {
                     return self.launch(e, action, serial, qh);
                 }
+                self.context = None;
             }
             context::Kind::Pin | context::Kind::Unpin => {
                 self.context = None;
