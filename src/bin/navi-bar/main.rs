@@ -223,7 +223,7 @@ fn run() -> Result<(), String> {
             channel::Event::Msg(control::Command::ToggleMenu) => bar.toggle_menu(),
             channel::Event::Msg(control::Command::Dock(key)) => bar.dock_key(key),
             channel::Event::Msg(control::Command::WindowLimit) => bar.window_limit(),
-            channel::Event::Msg(control::Command::Frost) => bar.load_frost(),
+            channel::Event::Msg(control::Command::Frost) => bar.refresh_frost(true),
             channel::Event::Closed => {}
         })
         .map_err(|e| e.to_string())?;
@@ -321,8 +321,7 @@ fn run() -> Result<(), String> {
             .map(PathBuf::from)
             .filter(|p| p.is_absolute()),
         output: None,
-        output_size: (0, 0),
-        frost: None,
+        frost: frost::Frost::default(),
     };
     bar.refresh_status();
     bar.relayout();
@@ -457,10 +456,9 @@ struct Bar {
     closed: bool,
     /// navi's frost files, if it writes them.
     frost_dir: Option<PathBuf>,
-    /// The output the surfaces are on, its logical size, and its frost.
+    /// The output the surfaces are on, and its frost.
     output: Option<wl_output::WlOutput>,
-    output_size: (i32, i32),
-    frost: Option<Pixmap>,
+    frost: frost::Frost,
 }
 
 /// What waits for a token.
@@ -851,11 +849,7 @@ impl Bar {
                 .wl_surface()
                 .set_input_region(Some(region.wl_region()));
         }
-        let under = Backdrop {
-            frost: self.frost.as_ref(),
-            output: self.output_size,
-            at: self.origins().dock,
-        };
+        let under = self.frost.backdrop(self.output_size(), self.origins().dock);
         for item in items {
             match item {
                 Item::Fill(..) | Item::Round(..) | Item::Panel(..) | Item::Text(..) => {
@@ -922,7 +916,7 @@ impl Bar {
         }
         present(&mut self.pool, &self.layer, &canvas, s);
         let us = started.elapsed().as_micros() as u64;
-        debug!(us, frost = self.frost.is_some(), "dock drawn");
+        debug!(us, frost = under.frosted(), "dock drawn");
     }
 
     fn now_ms(&self) -> u64 {
@@ -1072,11 +1066,7 @@ impl Bar {
         });
         let lit = self.session.open || self.band_hover;
         let band = session::band(self.band_w, lit, clock, battery);
-        let under = Backdrop {
-            frost: self.frost.as_ref(),
-            output: self.output_size,
-            at: self.origins().band,
-        };
+        let under = self.frost.backdrop(self.output_size(), self.origins().band);
         for item in band.into_iter().chain(self.session.draw()) {
             if let Item::Icon(IconOf::Button, r, _) = item {
                 let r = scaled(r, s);
@@ -1100,7 +1090,7 @@ impl Bar {
         }
         present(&mut self.pool, &self.band, &canvas, s);
         let us = started.elapsed().as_micros() as u64;
-        debug!(us, frost = self.frost.is_some(), "band drawn");
+        debug!(us, frost = under.frosted(), "band drawn");
     }
 
     fn call(&mut self, call: Call) {
@@ -1213,19 +1203,25 @@ impl Bar {
     /// Where the surfaces sit on their output.
     fn origins(&self) -> layout::Origins {
         let dock = (self.layout.w, self.layout.h);
-        layout::origins(self.output_size, dock, self.band_configured)
+        let size = self.output_size().unwrap_or((0, 0));
+        layout::origins(size, dock, self.band_configured)
     }
 
-    /// Reloads the frost of the output the surfaces are on, and redraws them.
-    fn load_frost(&mut self) {
+    /// The logical size of the output the surfaces are on, once xdg-output has told it.
+    fn output_size(&self) -> Option<(i32, i32)> {
+        let info = self.output_state.info(self.output.as_ref()?)?;
+        info.logical_size
+    }
+
+    /// Follows the output the surfaces are on: reloads its frost when its name changed or
+    /// `reload` (navi wrote new files), then redraws, so a size that arrived late shows too.
+    fn refresh_frost(&mut self, reload: bool) {
         let info = self.output.as_ref().and_then(|o| self.output_state.info(o));
-        let info = info.as_ref();
-        self.output_size = info.and_then(|i| i.logical_size).unwrap_or((0, 0));
-        let name = info.and_then(|i| i.name.as_deref());
-        self.frost = match (&self.frost_dir, name) {
-            (Some(dir), Some(name)) => frost::load(dir, name),
-            _ => None,
-        };
+        let name = info.as_ref().and_then(|i| i.name.as_deref());
+        let dir = self.frost_dir.as_deref();
+        self.frost
+            .update(name, reload, |name| dir.and_then(|d| frost::load(d, name)));
+        debug!(?name, size = ?self.output_size(), "frost output");
         self.draw();
         self.draw_band();
         self.draw_cards();
@@ -1368,11 +1364,9 @@ impl Bar {
         let Some(mut canvas) = Pixmap::new((w * s) as u32, (h * s) as u32) else {
             return;
         };
-        let under = Backdrop {
-            frost: self.frost.as_ref(),
-            output: self.output_size,
-            at: self.origins().cards,
-        };
+        let under = self
+            .frost
+            .backdrop(self.output_size(), self.origins().cards);
         for item in cards::draw(&self.cards, self.desktop_settings["visual_alerts"] == true) {
             paint(&mut canvas, self.font.as_ref(), item, s, under);
         }
@@ -1853,7 +1847,7 @@ impl CompositorHandler for Bar {
     ) {
         if self.output.as_ref() != Some(output) {
             self.output = Some(output.clone());
-            self.load_frost();
+            self.refresh_frost(false);
         }
     }
 
@@ -2118,11 +2112,15 @@ impl OutputHandler for Bar {
         &mut self.output_state
     }
 
-    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+    fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, o: wl_output::WlOutput) {
+        if self.output.as_ref() == Some(&o) {
+            self.refresh_frost(false);
+        }
+    }
 
     fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, o: wl_output::WlOutput) {
         if self.output.as_ref() == Some(&o) {
-            self.load_frost();
+            self.refresh_frost(false);
         }
     }
 

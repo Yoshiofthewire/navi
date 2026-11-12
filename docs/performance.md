@@ -99,12 +99,13 @@ clock's minute tick, with frost as without. A frost batch (decode and blur, on i
 change and once per wallpaper change; never while idle.
 
 navi-bar's draw time (`navi_bar=debug`, the `dock drawn` and `band drawn` lines, after the
-first draw, which loads fonts and icons), 3440 × 1440 at scale 1:
+first draw, which loads fonts and icons; `frost=true` only once the body really shows frost),
+2040 × 1275 at scale 1, no resize:
 
 | Surface | Solid body | Frosted body |
 | --- | ---: | ---: |
-| Dock | 0.06–0.26 ms | 0.14–0.16 ms |
-| Status band (3416 px wide) | 0.34–0.69 ms | 1.0–1.8 ms |
+| Dock | 0.03–0.10 ms | 0.13 ms |
+| Status band (2016 px wide) | 0.22–0.52 ms | 0.8–1.6 ms |
 
 The bilinear pattern fill costs about 1 ms on the widest panel, only when navi-bar redraws
 (the clock's minute, hover, a menu), never per compositor frame.

@@ -7,6 +7,7 @@ use std::{
     io::{self, ErrorKind},
     os::unix::fs::{DirBuilderExt, OpenOptionsExt},
     path::{Path, PathBuf},
+    rc::Rc,
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -34,6 +35,9 @@ impl Dir {
             .duration_since(UNIX_EPOCH)
             .ok()?
             .as_nanos();
+        sweep(runtime, |pid| {
+            Path::new("/proc").join(pid.to_string()).exists()
+        });
         let path = runtime.join(format!("navi-frost-{}-{nanos}", std::process::id()));
         Dir::make(path)
             .inspect_err(|e| warn!("frost off: {e}"))
@@ -57,11 +61,46 @@ impl Drop for Dir {
     }
 }
 
-/// Writes each output's frost into `dir`, each file replaced atomically. A solid or failed
-/// wallpaper, or a failed write, removes the output's file, so navi-bar falls back to solid.
-pub fn write(dir: &Path, outputs: &Outputs, images: &[Option<std::rc::Rc<Image>>]) -> usize {
+/// Removes frost dirs that a navi which died uncleanly left in `runtime`: our own real
+/// directories (never symlinks) named for a pid that `alive` says is gone.
+fn sweep(runtime: &Path, alive: impl Fn(u32) -> bool) {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(entries) = fs::read_dir(runtime) else {
+        return;
+    };
+    let uid = rustix::process::getuid().as_raw();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let pid = name
+            .to_str()
+            .and_then(|n| n.strip_prefix("navi-frost-"))
+            .and_then(|rest| rest.split_once('-'))
+            .and_then(|(pid, _)| pid.parse::<u32>().ok());
+        let Some(pid) = pid.filter(|&p| !alive(p)) else {
+            continue;
+        };
+        // `file_type` and `symlink_metadata` don't follow a symlink.
+        let ours = entry
+            .path()
+            .symlink_metadata()
+            .is_ok_and(|m| m.file_type().is_dir() && m.uid() == uid);
+        if ours && fs::remove_dir_all(entry.path()).is_ok() {
+            info!(pid, "stale frost dir removed");
+        }
+    }
+}
+
+/// Writes each output's frost into `dir`, each file replaced atomically, decoding one wallpaper
+/// at a time with `image(i)`. A solid or failed wallpaper, or a failed write, removes the
+/// output's file, so navi-bar falls back to solid; so does an output no longer in `outputs`.
+pub fn write(
+    dir: &Path,
+    outputs: &Outputs,
+    mut image: impl FnMut(usize) -> Option<Rc<Image>>,
+) -> usize {
     let mut written = 0;
-    for ((name, _, w, h), image) in outputs.iter().zip(images) {
+    let mut keep = Vec::new();
+    for (i, (name, _, w, h)) in outputs.iter().enumerate() {
         let Some(path) = files::frost_file(dir, name) else {
             warn!(
                 output = name,
@@ -69,22 +108,33 @@ pub fn write(dir: &Path, outputs: &Outputs, images: &[Option<std::rc::Rc<Image>>
             );
             continue;
         };
-        match image.as_deref().map(|image| save(&path, image, *w, *h)) {
+        match image(i).map(|image| save(&path, &image, *w, *h)) {
             Some(Ok(())) => {
                 written += 1;
+                keep.push(path);
                 continue;
             }
             Some(Err(e)) => warn!(output = name, "frost not written: {e}"),
             None => {}
         }
-        match fs::remove_file(&path) {
-            Err(e) if e.kind() != ErrorKind::NotFound => {
-                warn!(output = name, "stale frost not removed: {e}")
-            }
-            _ => {}
+        remove(&path);
+    }
+    for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "png") && !keep.contains(&path) {
+            remove(&path);
         }
     }
     written
+}
+
+fn remove(path: &Path) {
+    match fs::remove_file(path) {
+        Err(e) if e.kind() != ErrorKind::NotFound => {
+            warn!(path = %path.display(), "stale frost not removed: {e}")
+        }
+        _ => {}
+    }
 }
 
 /// The blurred, cover-cropped thumbnail, undarkened: navi-bar's tint darkens it.
@@ -174,7 +224,21 @@ impl Frost {
             .spawn(move || {
                 let start = Instant::now();
                 let names: Vec<_> = outputs.iter().map(|(n, p, ..)| (n.as_str(), *p)).collect();
-                let written = write(&dir, &outputs, &wallpaper::open(&names));
+                let paths = wallpaper::paths(&names);
+                // One decoded wallpaper at a time; outputs sharing a file reuse it.
+                let mut last: Option<(&Path, Option<Rc<Image>>)> = None;
+                let written = write(&dir, &outputs, |i| {
+                    let path = paths[i].as_deref();
+                    match &last {
+                        Some((p, img)) if path == Some(*p) => img.clone(),
+                        _ => {
+                            last = None;
+                            let img = wallpaper::decode(names[i].0, path).map(Rc::new);
+                            last = path.map(|p| (p, img.clone()));
+                            img
+                        }
+                    }
+                });
                 let thread = std::thread::current().name().map(str::to_string);
                 let ms = start.elapsed().as_millis() as u64;
                 info!(thread, outputs = outputs.len(), written, ms, "frost batch");
@@ -248,7 +312,6 @@ impl Navi {
 mod tests {
     use super::*;
     use crate::persist::tests::{Tmp, mode};
-    use std::rc::Rc;
 
     fn solid(w: u32, h: u32, rgb: [u8; 3]) -> Image {
         Image {
@@ -325,9 +388,9 @@ mod tests {
             l.sort();
             l
         };
-        assert_eq!(write(dir.path(), &outputs, &images), 2);
+        assert_eq!(write(dir.path(), &outputs, |i| images[i].clone()), 2);
         let first = fs::read(dir.path().join("DP-1.png")).unwrap();
-        assert_eq!(write(dir.path(), &outputs, &images), 2);
+        assert_eq!(write(dir.path(), &outputs, |i| images[i].clone()), 2);
         assert_eq!(fs::read(dir.path().join("DP-1.png")).unwrap(), first);
         let want = vec!["DP-1.png".to_string(), format!("{}.png", "b".repeat(64))];
         assert_eq!(
@@ -342,7 +405,7 @@ mod tests {
         // DP-1 becomes solid: its stale file goes.
         let mut images = images;
         images[0] = None;
-        write(dir.path(), &outputs, &images);
+        write(dir.path(), &outputs, |i| images[i].clone());
         assert_eq!(listing(dir.path()), want[1..]);
         let path = dir.path().to_path_buf();
         drop(dir);
@@ -391,7 +454,7 @@ mod tests {
             .iter()
             .map(|&c| Some(Rc::new(solid(160, 90, c))))
             .collect();
-        assert_eq!(write(&tmp.0, &outputs, &images), 3);
+        assert_eq!(write(&tmp.0, &outputs, |i| images[i].clone()), 3);
         for ((name, _, w, h), c) in outputs.iter().zip(colours) {
             let img = read(&tmp.0.join(format!("{name}.png")));
             assert!(img.w.max(img.h) <= 960);
@@ -411,5 +474,57 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn ux4_a_removed_output_loses_its_frost() {
+        let tmp = Tmp::new("frost-gone");
+        let img = Some(Rc::new(solid(16, 9, [1, 2, 3])));
+        let both: Outputs = vec![("A".into(), 0, 160, 90), ("B".into(), 1, 160, 90)];
+        assert_eq!(write(&tmp.0, &both, |_| img.clone()), 2);
+        let only_a: Outputs = vec![("A".into(), 0, 160, 90)];
+        assert_eq!(write(&tmp.0, &only_a, |_| img.clone()), 1);
+        assert!(tmp.0.join("A.png").exists());
+        assert!(!tmp.0.join("B.png").exists(), "B's output is gone");
+    }
+
+    #[test]
+    fn sec3_only_our_dead_navis_frost_dirs_are_swept() {
+        let tmp = Tmp::new("frost-sweep");
+        let rt = &tmp.0;
+        let elsewhere = Tmp::new("frost-sweep-target");
+        fs::write(elsewhere.0.join("keep"), "x").unwrap();
+        let me = std::process::id();
+        for d in [
+            "navi-frost-111-1",
+            &format!("navi-frost-{me}-1"),
+            "navi-frost-x-1",
+            "other",
+        ] {
+            fs::create_dir(rt.join(d)).unwrap();
+            fs::write(rt.join(d).join("DP-1.png"), "x").unwrap();
+        }
+        fs::write(rt.join("navi-frost-112-1"), "a file").unwrap();
+        std::os::unix::fs::symlink(&elsewhere.0, rt.join("navi-frost-113-1")).unwrap();
+        // 111..=113 are dead; we are alive.
+        sweep(rt, |pid| pid == me);
+        let mut left: Vec<_> = fs::read_dir(rt)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        let mut want = vec![
+            format!("navi-frost-{me}-1"),
+            "navi-frost-112-1".into(),
+            "navi-frost-113-1".into(),
+            "navi-frost-x-1".into(),
+            "other".into(),
+        ];
+        want.sort();
+        assert_eq!(left, want);
+        assert!(
+            elsewhere.0.join("keep").exists(),
+            "a symlink is never followed"
+        );
     }
 }

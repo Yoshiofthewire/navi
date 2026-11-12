@@ -544,7 +544,8 @@ bundling a degoogled, resource-tested Chromium variant is reserved for a future 
   darkened), and writes it as a PNG into a private 0700 directory under `XDG_RUNTIME_DIR`,
   `NAVI_FROST_DIR`; a `FROST` control byte tells navi-bar to reload. navi-bar stretches it over
   the output and offsets it by where navi's layer map puts each of its surfaces, so the frost
-  lines up with the wallpaper. Without an absolute `XDG_RUNTIME_DIR` frost is off.
+  lines up with the wallpaper. Without an absolute `XDG_RUNTIME_DIR` frost is off. A removed
+  output's file goes with the next batch, and a start removes frost dirs left by a navi that died.
   Panels pad their content 12 px. Folder and session glyphs draw in the text colour, so they
   hold 3:1 in every scheme; app icons keep their own colours. The launcher's search field is
   the selected fill with a rim, so it has a shape even in high contrast. The band is 32 px (one

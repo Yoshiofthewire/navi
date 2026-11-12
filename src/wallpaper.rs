@@ -265,9 +265,8 @@ fn open_image(path: &Path) -> Result<Image, String> {
     }
 }
 
-/// The wallpaper of each output, given as (name, priority); `None` means the solid colour. Each
-/// distinct path is decoded once.
-pub fn open(outputs: &[(&str, u32)]) -> Vec<Option<Rc<Image>>> {
+/// Each output's wallpaper file, given as (name, priority); `None` means the solid colour.
+pub fn paths(outputs: &[(&str, u32)]) -> Vec<Option<PathBuf>> {
     let var = std::env::var_os;
     let Some(dir) = files::xdg_dir(
         var("XDG_CONFIG_HOME").as_deref(),
@@ -277,35 +276,45 @@ pub fn open(outputs: &[(&str, u32)]) -> Vec<Option<Rc<Image>>> {
         warn!("no absolute XDG_CONFIG_HOME or HOME: no wallpaper");
         return vec![None; outputs.len()];
     };
-    let file = dir.join("navi/wallpaper");
-    let entries = load_or_import(&file, &dir.join(PLASMA));
-    let mut decoded: HashMap<&Path, Option<Rc<Image>>> = HashMap::new();
+    let entries = load_or_import(&dir.join("navi/wallpaper"), &dir.join(PLASMA));
     let priorities: Vec<u32> = outputs.iter().map(|o| o.1).collect();
-    let paths = for_outputs(&entries, &priorities);
+    for_outputs(&entries, &priorities)
+        .into_iter()
+        .map(|p| p.map(Path::to_path_buf))
+        .collect()
+}
+
+/// Output `name`'s wallpaper at `path`, decoded; `None`, logged, means the solid colour.
+pub fn decode(name: &str, path: Option<&Path>) -> Option<Image> {
+    let img = path.and_then(|p| match open_image(p) {
+        Ok(img) => Some(img),
+        Err(e) => {
+            warn!(path = %p.display(), "wallpaper not shown: {e}; edit navi's wallpaper file");
+            None
+        }
+    });
+    match (&img, path) {
+        (Some(i), Some(p)) => {
+            info!(output = name, path = %p.display(), w = i.w, h = i.h, "wallpaper")
+        }
+        _ => info!(output = name, path = "solid", "wallpaper"),
+    }
+    img
+}
+
+/// The wallpaper of each output, given as (name, priority); `None` means the solid colour. Each
+/// distinct path is decoded once.
+pub fn open(outputs: &[(&str, u32)]) -> Vec<Option<Rc<Image>>> {
+    let mut decoded: HashMap<PathBuf, Option<Rc<Image>>> = HashMap::new();
     outputs
         .iter()
-        .zip(paths)
-        .map(|(&(name, _), path)| {
-            let img = path.and_then(|p| {
-                decoded
-                    .entry(p)
-                    .or_insert_with(|| match open_image(p) {
-                        Ok(img) => Some(Rc::new(img)),
-                        Err(e) => {
-                            let hint = format!("edit {} and restart", file.display());
-                            warn!(path = %p.display(), "wallpaper not shown: {e}; {hint}");
-                            None
-                        }
-                    })
-                    .clone()
-            });
-            match (&img, path) {
-                (Some(i), Some(p)) => {
-                    info!(output = name, path = %p.display(), w = i.w, h = i.h, "wallpaper")
-                }
-                _ => info!(output = name, path = "solid", "wallpaper"),
-            }
-            img
+        .zip(paths(outputs))
+        .map(|(&(name, _), path)| match path {
+            Some(path) => decoded
+                .entry(path.clone())
+                .or_insert_with(|| decode(name, Some(&path)).map(Rc::new))
+                .clone(),
+            None => decode(name, None).map(Rc::new),
         })
         .collect()
 }

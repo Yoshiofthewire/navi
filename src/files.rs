@@ -43,17 +43,25 @@ pub fn xdg_dir(var: Option<&OsStr>, home: Option<&OsStr>, fallback: &str) -> Opt
     }
 }
 
-/// The file's bytes, at most `max`; `None` if there is no file.
+/// The file's bytes, at most `max`; `None` if there is no file. Judges the file it opened, not
+/// the path, and never blocks opening a FIFO swapped in by another process.
 pub fn read_bytes(path: &Path, max: u64) -> Result<Option<Vec<u8>>, String> {
-    match fs::metadata(path) {
+    let nonblock = rustix::fs::OFlags::NONBLOCK.bits() as i32;
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(nonblock)
+        .open(path)
+    {
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.to_string()),
-        Ok(m) if !m.is_file() => return Err("not a regular file".into()),
-        Ok(_) => {}
+        Ok(f) => f,
+    };
+    if !file.metadata().map_err(|e| e.to_string())?.is_file() {
+        return Err("not a regular file".into());
     }
     let mut bytes = Vec::new();
-    File::open(path)
-        .and_then(|f| f.take(max + 1).read_to_end(&mut bytes))
+    file.take(max + 1)
+        .read_to_end(&mut bytes)
         .map_err(|e| e.to_string())?;
     if bytes.len() as u64 > max {
         return Err(format!("over {max} bytes"));
