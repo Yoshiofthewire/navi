@@ -222,16 +222,17 @@ fn run() -> Result<(), String> {
             channel::Event::Msg(control::Command::ToggleMenu) => bar.toggle_menu(),
             channel::Event::Msg(control::Command::Dock(key)) => bar.dock_key(key),
             channel::Event::Msg(control::Command::WindowLimit) => bar.window_limit(),
+            channel::Event::Msg(control::Command::ForceOffer(id)) => bar.force_offer(id),
             channel::Event::Closed => {}
         })
         .map_err(|e| e.to_string())?;
     let control = match control {
-        Some(stream) => Some(std::sync::Arc::new(std::sync::Mutex::new(
+        Some(stream) => Some(std::sync::Arc::new(
             control::reader(stream, move |c| {
                 let _ = command_tx.send(c);
             })
             .map_err(|e| e.to_string())?,
-        ))),
+        )),
         None => None,
     };
     let (session_tx, session_rx) = channel::channel();
@@ -240,6 +241,15 @@ fn run() -> Result<(), String> {
         .insert_source(session_rx, |event, _, bar| {
             if let channel::Event::Msg(reply) = event {
                 bar.session_reply(reply);
+            }
+        })
+        .map_err(|e| e.to_string())?;
+    let (force_tx, force_rx) = channel::channel();
+    event_loop
+        .handle()
+        .insert_source(force_rx, |event, _, bar| {
+            if let channel::Event::Msg((app, replies)) = event {
+                bar.force_replies(app, replies);
             }
         })
         .map_err(|e| e.to_string())?;
@@ -278,6 +288,7 @@ fn run() -> Result<(), String> {
         control,
         band_hover: false,
         session_tx,
+        force_tx,
         full_session: dbus::wants_export(var("NAVI_EXPORT_ENV").as_deref()),
         logout: false,
         cards_layer: None,
@@ -403,9 +414,11 @@ struct Bar {
     session: session::Menu,
     /// When the session menu opened, in `now_ms`: cards hidden behind it don't expire meanwhile.
     session_since: u64,
-    control: Option<std::sync::Arc<std::sync::Mutex<control::Control>>>,
+    control: Option<std::sync::Arc<control::Control>>,
     band_hover: bool,
     session_tx: channel::Sender<session::Reply>,
+    /// A confirmed force close's app name and its replies, by handle ID.
+    force_tx: channel::Sender<(String, Vec<(u32, bool)>)>,
     full_session: bool,
     logout: bool,
     /// The notification cards' surface, while any are shown.
@@ -655,24 +668,56 @@ impl Bar {
             windows = ids.len(),
             "force close requested"
         );
-        let control = self.control.clone();
+        let name = c.confirm.map_or(c.target.key, |c| c.name);
+        let (control, tx) = (self.control.clone(), self.force_tx.clone());
         std::thread::spawn(move || {
-            for id in ids {
-                let reply = control
-                    .as_ref()
-                    .ok_or("no control channel".to_string())
-                    .and_then(|c| {
-                        let s = c
-                            .lock()
-                            .map_err(|_| "control channel poisoned".to_string())?;
-                        control::request(&s, control::Request::ForceClose(id))
-                    });
-                match reply {
-                    Ok(()) => info!(handle = id, "force close done"),
-                    Err(e) => warn!(handle = id, "force close: {e}"),
-                }
-            }
+            let _ = tx.send((name, force_requests(control.as_deref(), &ids)));
         });
+        self.relayout();
+    }
+
+    /// A confirmation's replies are in: one card if a window still listed wasn't force closed.
+    fn force_replies(&mut self, app: String, replies: Vec<(u32, bool)>) {
+        let listed: Vec<u32> = self
+            .windows
+            .iter()
+            .map(|w| Proxy::id(&w.handle).protocol_id())
+            .collect();
+        let now = self.now_ms();
+        let repeat = self.notes.shown().iter().any(|n| n.sender == notify::LOCAL);
+        let Some((id, closed)) = force_card(&mut self.notes, now, &app, &replies, &listed) else {
+            return;
+        };
+        info!(id, app, "force close refused card");
+        self.posted(now, id, closed, "", !repeat);
+    }
+
+    /// navi's offer, after a ✕ on an overdue window: its app's dock menu, in the confirmation.
+    fn force_offer(&mut self, id: u32) {
+        let handles: Vec<(u32, bool)> = self
+            .shown()
+            .map(|w| (Proxy::id(&w.handle).protocol_id(), w.overdue))
+            .collect();
+        let apps = self.dock_apps();
+        let (entries, pins) = (&self.entries, &self.pins.ids);
+        let now = Instant::now();
+        let Some(app) = context::offer(&mut self.context, id, &handles, &apps, entries, pins, now)
+        else {
+            debug!(
+                handle = id,
+                "force-offer ignored: not a listed overdue window"
+            );
+            return;
+        };
+        // Over the app's slot, as its right-click menu opens (slot 0 is the launcher button).
+        let t = self.layout.target(app + 1);
+        let anchor = self.layout.anchor(t.x + t.w / 2, t.y);
+        if let Some(c) = &mut self.context {
+            c.anchor = anchor;
+        }
+        info!(handle = id, app_id = apps[app].app_id, "force-offer");
+        self.close_session();
+        self.menu = None;
         self.relayout();
     }
 
@@ -1195,10 +1240,9 @@ impl Bar {
             );
             let control = self.control.clone();
             std::thread::spawn(move || {
-                let can_lock = control.as_ref().is_some_and(|c| {
-                    c.lock()
-                        .is_ok_and(|s| control::request(&s, control::Request::CanLock).is_ok())
-                });
+                let can_lock = control
+                    .as_ref()
+                    .is_some_and(|c| control::request(c, control::Request::CanLock).is_ok());
                 let _ = tx.send(session::Reply::Capabilities(session::capabilities(
                     full, seat, can_lock,
                 )));
@@ -1225,9 +1269,7 @@ impl Bar {
             let control = self.control.clone();
             std::thread::spawn(move || {
                 let result = session::perform_locked(action, full, &caps, || {
-                    let c = control.as_ref().ok_or("Lock channel unavailable")?;
-                    let s = c.lock().map_err(|_| "Lock channel unavailable")?;
-                    control::request(&s, control::Request::Lock)
+                    lock_request(control.as_deref())
                 });
                 let _ = tx.send(session::Reply::Done(result));
             });
@@ -1456,19 +1498,7 @@ impl Bar {
 
     /// Applies the notification settings to note `id`, just posted, then shows it.
     fn posted(&mut self, now: u64, id: u32, mut closed: Vec<Closed>, app_id: &str, sound: bool) {
-        let blocked = self.desktop_settings["blocked_apps"]
-            .as_array()
-            .is_some_and(|a| a.iter().any(|v| v == app_id));
-        let suppressed = blocked
-            || self.desktop_settings["dnd"] == true
-            || self.desktop_settings["notifications"] != true;
-        if suppressed {
-            self.notes.hide(id);
-        }
-        if blocked || self.desktop_settings["history"] != true {
-            self.notes.history.retain(|n| n.id != id);
-        }
-        if suppressed {
+        if settle(&mut self.notes, &self.desktop_settings, id, app_id) {
             closed.push((id, notify::EXPIRED));
         } else if sound {
             runtime::play(&self.desktop_settings, "notification");
@@ -1641,6 +1671,61 @@ fn paint(canvas: &mut Pixmap, font: Option<&fontdue::Font>, item: Item, s: i32) 
         }
         _ => {}
     }
+}
+
+/// Applies the notification settings (DND, notifications, history, blocked apps) to note `id`,
+/// just posted by `app_id`. Returns whether it is hidden.
+fn settle(notes: &mut Notes, settings: &serde_json::Value, id: u32, app_id: &str) -> bool {
+    let blocked = settings["blocked_apps"]
+        .as_array()
+        .is_some_and(|a| a.iter().any(|v| v == app_id));
+    let suppressed = blocked || settings["dnd"] == true || settings["notifications"] != true;
+    if suppressed {
+        notes.hide(id);
+    }
+    if blocked || settings["history"] != true {
+        notes.history.retain(|n| n.id != id);
+    }
+    suppressed
+}
+
+/// One request per window in `ids`, in order, each `YES` or not (refused, timed out, failed).
+/// A lock request waits for at most the one in flight (`control::request`).
+fn force_requests(control: Option<&control::Control>, ids: &[u32]) -> Vec<(u32, bool)> {
+    let ask = |id| {
+        let c = control.ok_or_else(|| "no control channel".to_string())?;
+        control::request(c, control::Request::ForceClose(id))
+    };
+    let replies = ids.iter().map(|&id| match ask(id) {
+        Ok(()) => {
+            info!(handle = id, "force close done");
+            (id, true)
+        }
+        Err(e) => {
+            warn!(handle = id, "force close: {e}");
+            (id, false)
+        }
+    });
+    replies.collect()
+}
+
+/// The session menu's Lock.
+fn lock_request(control: Option<&control::Control>) -> Result<(), String> {
+    let c = control.ok_or("Lock channel unavailable")?;
+    control::request(c, control::Request::Lock)
+}
+
+/// A confirmation's `replies` for `app`: one local card if a request for a window still in
+/// `listed` wasn't done. One that closed on its own meanwhile is no refusal.
+fn force_card(
+    notes: &mut Notes,
+    now: u64,
+    app: &str,
+    replies: &[(u32, bool)],
+    listed: &[u32],
+) -> Option<(u32, Vec<Closed>)> {
+    let refused = replies.iter().any(|(id, ok)| !ok && listed.contains(id));
+    refused.then(|| notes.force_refused(now, app))
 }
 
 fn text_w(font: &fontdue::Font, text: &str, px: f32) -> f32 {
@@ -2729,5 +2814,101 @@ mod tests {
         assert_eq!(theme::panel_alpha(Panel::Bar), 0.85);
         assert_eq!(theme::panel_alpha(Panel::Popup), 0.98);
         assert_eq!(INSET, 12);
+    }
+
+    /// Job 040 AC5: one confirmation's refusals post one local card naming the app, under the
+    /// window-limit card's rules; all done, or refused windows gone meanwhile, post none.
+    #[test]
+    fn ac5_a_refused_force_close_posts_one_card() {
+        let on = serde_json::json!({"notifications": true, "history": true, "dnd": false});
+        // Refused, done, timed out.
+        let mixed = [(1, false), (2, true), (3, false)];
+        let mut n = Notes::default();
+        let (id, closed) = force_card(&mut n, 0, "Konsole", &mixed, &[1, 2, 3]).expect("a card");
+        assert!(closed.is_empty());
+        assert!(!settle(&mut n, &on, id, ""));
+        let [card] = n.shown() else {
+            panic!("one card: {:?}", n.shown());
+        };
+        assert_eq!(card.sender, notify::LOCAL);
+        assert_eq!(card.summary, "Force close didn't happen");
+        assert_eq!(
+            card.body,
+            "Konsole wasn't force closed. The Navi log says why."
+        );
+        assert_eq!(n.history.len(), 1);
+        // A second confirmation's card replaces it.
+        let (again, _) = force_card(&mut n, 10, "Konsole", &mixed, &[1]).unwrap();
+        assert_eq!((again, n.shown().len()), (id, 1));
+
+        let mut n = Notes::default();
+        let done = [(1, true), (2, true)];
+        assert!(force_card(&mut n, 0, "Konsole", &done, &[1, 2]).is_none());
+        // 1 and 3 closed on their own before the replies came.
+        assert!(force_card(&mut n, 0, "Konsole", &mixed, &[2, 9]).is_none());
+        assert!(n.shown().is_empty() && n.history.is_empty());
+
+        // DND, notifications off, history off: as the window-limit card is treated.
+        let settings = [
+            serde_json::json!({"notifications": true, "history": true, "dnd": true}),
+            serde_json::json!({"notifications": false, "history": true, "dnd": false}),
+            serde_json::json!({"notifications": true, "history": false, "dnd": false}),
+            on,
+        ];
+        let want = [(0, 1), (0, 1), (1, 0), (1, 1)];
+        for (s, want) in settings.iter().zip(want) {
+            let mut limit = Notes::default();
+            let (id, _) = limit.window_limit(0);
+            let limit_hidden = settle(&mut limit, s, id, "");
+            let mut force = Notes::default();
+            let (id, _) = force_card(&mut force, 0, "Konsole", &mixed, &[1]).unwrap();
+            assert_eq!(settle(&mut force, s, id, ""), limit_hidden, "{s}");
+            let got = (force.shown().len(), force.history.len());
+            assert_eq!(got, (limit.shown().len(), limit.history.len()), "{s}");
+            assert_eq!(got, want, "{s}");
+        }
+    }
+
+    /// Job 040 AC8: a Lock clicked while a force close of 3 windows is in flight goes out
+    /// right after the one in flight, whatever navi's delay.
+    #[test]
+    fn ac8_lock_waits_for_at_most_one_force_close() {
+        use std::os::unix::net::UnixStream;
+        let (bar, mut navi) = UnixStream::pair().unwrap();
+        let ctl = std::sync::Arc::new(control::reader(bar, |_| {}).unwrap());
+        let (seen_tx, seen) = std::sync::mpsc::channel();
+        let stub = std::thread::spawn(move || {
+            let mut order = Vec::new();
+            for _ in 0..4 {
+                let r = control::Request::read(&mut navi).unwrap();
+                seen_tx.send(r).unwrap();
+                order.push(r);
+                let reply = match r {
+                    // A stuck X11 worker; navi's own reader answers within 12 s.
+                    control::Request::ForceClose(_) => {
+                        std::thread::sleep(Duration::from_millis(800));
+                        control::NO
+                    }
+                    _ => control::YES,
+                };
+                std::io::Write::write_all(&mut navi, &[reply]).unwrap();
+            }
+            order
+        });
+        let c = ctl.clone();
+        let forcing = std::thread::spawn(move || force_requests(Some(&c), &[1, 2, 3]));
+        let first = seen.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(first, control::Request::ForceClose(1));
+        // The click, while the first is in flight.
+        let c = ctl.clone();
+        let locking = std::thread::spawn(move || lock_request(Some(&c)));
+        assert_eq!(locking.join().unwrap(), Ok(()));
+        let replies = forcing.join().unwrap();
+        assert_eq!(replies, [(1, false), (2, false), (3, false)]);
+        use control::Request::{ForceClose, Lock};
+        assert_eq!(
+            stub.join().unwrap(),
+            [ForceClose(1), Lock, ForceClose(2), ForceClose(3)]
+        );
     }
 }

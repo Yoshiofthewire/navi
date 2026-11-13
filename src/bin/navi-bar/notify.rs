@@ -93,15 +93,28 @@ impl Notes {
     /// (navi paces it). A repeat replaces the one shown. Bus senders start with `:`, so none can
     /// replace or close it.
     pub fn window_limit(&mut self, now: u64) -> (u32, Vec<Closed>) {
+        let body = format!(
+            "An app tried to open more than {} windows. Close some of its windows to open more.",
+            crate::control::CLIENT_TOPLEVELS
+        );
+        self.local(now, "Window limit reached", body)
+    }
+
+    /// A confirmed force close of `app` didn't happen: navi refused, failed or didn't answer.
+    /// The same `LOCAL` card as `window_limit`.
+    pub fn force_refused(&mut self, now: u64, app: &str) -> (u32, Vec<Closed>) {
+        let body = format!("{app} wasn't force closed. The Navi log says why.");
+        self.local(now, "Force close didn't happen", body)
+    }
+
+    /// navi-bar's own card; it replaces the one shown.
+    fn local(&mut self, now: u64, summary: &str, body: String) -> (u32, Vec<Closed>) {
         let shown = self.shown.iter().find(|n| n.sender == LOCAL);
         let r = Request {
             app_name: "Navi".into(),
             replaces_id: shown.map_or(0, |n| n.id),
-            summary: "Window limit reached".into(),
-            body: format!(
-                "An app tried to open more than {} windows. Close some of its windows to open more.",
-                crate::control::CLIENT_TOPLEVELS
-            ),
+            summary: summary.into(),
+            body,
             expire_timeout: -1,
             ..Request::default()
         };

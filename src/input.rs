@@ -587,9 +587,9 @@ impl Navi {
                 // Also hands the pointer back to whatever is under it now.
                 self.apply_layout();
                 match done {
-                    // The app decides; navi never kills it.
+                    // The app decides; an overdue one gets navi-bar's force-close offer.
                     Some(Done::Click(Action::Close, id)) => {
-                        self.close_window(id);
+                        self.close_button(id, std::time::Instant::now());
                     }
                     Some(Done::Click(Action::Activate | Action::Restore, id)) => {
                         let shown = self.window_of(id).filter(|_| self.layout.visible(id));

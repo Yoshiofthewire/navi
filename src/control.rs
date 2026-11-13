@@ -1,12 +1,12 @@
 //! Private navi-bar ↔ compositor channel. Never inherited by launched apps. Every message is one
-//! byte, so requests, replies and toggles can share the stream without framing. The one
-//! exception is `FORCE_CLOSE`, bar → navi: the byte, then a window-list handle's protocol object
-//! ID as a little-endian `u32`.
+//! byte, so requests, replies and toggles can share the stream without framing. The two
+//! exceptions, `FORCE_CLOSE` (bar → navi) and `FORCE_OFFER` (navi → bar), are the byte, then a
+//! window-list handle's protocol object ID as a little-endian `u32`.
 
 use std::{
     io::{Read, Write},
     os::unix::net::UnixStream,
-    sync::mpsc,
+    sync::{Condvar, Mutex, MutexGuard, PoisonError, mpsc},
     time::Duration,
 };
 
@@ -34,6 +34,8 @@ pub const SLOT_1: u8 = 5;
 const SLOT_9: u8 = SLOT_1 + 8;
 /// navi → navi-bar, unsolicited: navi closed a client's toplevel past `CLIENT_TOPLEVELS`.
 pub const WINDOW_LIMIT: u8 = SLOT_9 + 1;
+/// navi → navi-bar, unsolicited, then a handle ID: a ✕ on an overdue window; offer force close.
+pub const FORCE_OFFER: u8 = WINDOW_LIMIT + 1;
 /// How many toplevels (dialogs included) one client may have open at once; more are closed.
 pub const CLIENT_TOPLEVELS: usize = 256;
 
@@ -50,10 +52,21 @@ pub enum Command {
     ToggleMenu,
     Dock(DockKey),
     WindowLimit,
+    /// The window whose window-list handle has this object ID on navi-bar's connection.
+    ForceOffer(u32),
 }
 
 impl Command {
     // navi's side; navi-bar only decodes.
+    #[allow(dead_code)]
+    pub fn bytes(self) -> Vec<u8> {
+        match self {
+            Command::ForceOffer(id) => [&[FORCE_OFFER][..], &id.to_le_bytes()].concat(),
+            c => vec![c.byte()],
+        }
+    }
+
+    /// The first (for every command but `ForceOffer`, the only) byte.
     #[allow(dead_code)]
     pub fn byte(self) -> u8 {
         match self {
@@ -62,9 +75,11 @@ impl Command {
             Command::Dock(DockKey::Cycle { forward: false }) => CYCLE_PREV,
             Command::Dock(DockKey::Slot(n)) => SLOT_1 + n.clamp(1, 9) - 1,
             Command::WindowLimit => WINDOW_LIMIT,
+            Command::ForceOffer(_) => FORCE_OFFER,
         }
     }
 
+    /// A one-byte command; `FORCE_OFFER` needs its ID, so `reader` decodes it.
     pub fn from_byte(byte: u8) -> Option<Self> {
         Some(match byte {
             TOGGLE_MENU => Command::ToggleMenu,
@@ -114,10 +129,47 @@ impl Request {
     }
 }
 
-/// navi-bar's end: requests go out on `stream`, replies come back from the reader thread.
+/// navi-bar's end: requests go out on `stream`, replies come back from the reader thread. One
+/// request at a time, and a lock request takes the next turn ahead of waiting force closes.
 pub struct Control {
     stream: UnixStream,
-    replies: mpsc::Receiver<u8>,
+    replies: Mutex<mpsc::Receiver<u8>>,
+    turn: Mutex<Turn>,
+    next: Condvar,
+}
+
+#[derive(Default)]
+struct Turn {
+    busy: bool,
+    /// Lock requests waiting for the stream.
+    urgent: usize,
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The stream is the holder's until dropped.
+struct Held<'a>(&'a Control);
+
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        lock(&self.0.turn).busy = false;
+        self.0.next.notify_all();
+    }
+}
+
+impl Control {
+    fn take(&self, urgent: bool) -> Held<'_> {
+        let mut t = lock(&self.turn);
+        t.urgent += usize::from(urgent);
+        while t.busy || (!urgent && t.urgent > 0) {
+            t = self.next.wait(t).unwrap_or_else(PoisonError::into_inner);
+        }
+        t.urgent -= usize::from(urgent);
+        t.busy = true;
+        Held(self)
+    }
 }
 
 /// Starts the one reader of navi-bar's end: commands go to `command`, replies to `request`.
@@ -136,6 +188,13 @@ pub fn reader(
                         break;
                     }
                 }
+                FORCE_OFFER => {
+                    let mut id = [0; 4];
+                    if read.read_exact(&mut id).is_err() {
+                        break;
+                    }
+                    command(Command::ForceOffer(u32::from_le_bytes(id)));
+                }
                 other => match Command::from_byte(other) {
                     Some(c) => command(c),
                     None => tracing::warn!(byte = other, "unknown control byte ignored"),
@@ -143,18 +202,26 @@ pub fn reader(
             }
         }
     });
-    Ok(Control { stream, replies })
+    Ok(Control {
+        stream,
+        replies: Mutex::new(replies),
+        turn: Mutex::default(),
+        next: Condvar::new(),
+    })
 }
 
-/// Sends `request` and waits for navi's answer: `Ok` for `YES`.
+/// Sends `request` and waits for navi's answer: `Ok` for `YES`. Waits for its turn first: a
+/// lock or lock check goes ahead of force closes not yet sent.
 pub fn request(control: &Control, request: Request) -> Result<(), String> {
+    let _held = control.take(!matches!(request, Request::ForceClose(_)));
+    let replies = lock(&control.replies);
     // A reply that came after an earlier request timed out isn't this one's.
-    while control.replies.try_recv().is_ok() {}
+    while replies.try_recv().is_ok() {}
     let mut stream = &control.stream;
     stream
         .write_all(&request.bytes())
         .map_err(|e| e.to_string())?;
-    match control.replies.recv_timeout(Duration::from_secs(15)) {
+    match replies.recv_timeout(Duration::from_secs(15)) {
         Ok(YES) => Ok(()),
         Ok(_) if matches!(request, Request::ForceClose(_)) => Err("refused by navi".into()),
         Ok(_) => Err("Screen lock unavailable. Install swaylock and check the Navi log.".into()),
@@ -207,7 +274,7 @@ mod tests {
         let (tx, commands) = mpsc::channel();
         let control = reader(bar, move |c| tx.send(c).unwrap()).unwrap();
         let mut sent: Vec<u8> = (SLOT_1..=SLOT_1 + 8).collect();
-        sent.extend([CYCLE_NEXT, CYCLE_PREV, WINDOW_LIMIT, 15, 255, TOGGLE_MENU]);
+        sent.extend([CYCLE_NEXT, CYCLE_PREV, WINDOW_LIMIT, 16, 255, TOGGLE_MENU]);
         // They all arrive before the reply, and the request still gets it.
         let waiting = std::thread::spawn(move || request(&control, Request::CanLock));
         assert_eq!(answer(&mut navi, &sent, YES), CAN_LOCK);
@@ -222,12 +289,12 @@ mod tests {
         for w in &want {
             assert_eq!(commands.recv_timeout(Duration::from_secs(5)).unwrap(), *w);
         }
-        assert!(commands.try_recv().is_err(), "15 and 255 ignored");
+        assert!(commands.try_recv().is_err(), "16 and 255 ignored");
         // navi's encoding is the reader's decoding.
         for c in want {
             assert_eq!(Command::from_byte(c.byte()), Some(c));
         }
-        for b in [NO, YES, 15, 255] {
+        for b in [NO, YES, FORCE_OFFER, 16, 255] {
             assert_eq!(Command::from_byte(b), None);
         }
     }
@@ -267,5 +334,83 @@ mod tests {
         assert_eq!(Request::read(&mut navi), Some(Request::Lock));
         navi.write_all(&[YES]).unwrap();
         assert_eq!(waiting.join().unwrap(), Ok(()));
+    }
+
+    /// Job 040 AC1: `FORCE_OFFER` and its ID, between one-byte commands and a pending
+    /// request's reply.
+    #[test]
+    fn ac1_force_offer_round_trips_between_commands_and_replies() {
+        let (bar, mut navi) = UnixStream::pair().unwrap();
+        let (tx, commands) = mpsc::channel();
+        let control = reader(bar, move |c| tx.send(c).unwrap()).unwrap();
+        let sent = [
+            Command::ToggleMenu,
+            Command::ForceOffer(0xFF00_0001),
+            Command::Dock(DockKey::Slot(3)),
+            Command::ForceOffer(7),
+            Command::WindowLimit,
+        ];
+        let before: Vec<u8> = sent.iter().flat_map(|c| c.bytes()).collect();
+        assert_eq!(before.len(), 3 + 2 * 5);
+        let waiting = std::thread::spawn(move || (request(&control, Request::Lock), control));
+        assert_eq!(answer(&mut navi, &before, YES), LOCK);
+        let (result, control) = waiting.join().unwrap();
+        assert_eq!(result, Ok(()));
+        // A NO between two offers is the next request's reply, not part of an ID.
+        let waiting = std::thread::spawn(move || request(&control, Request::ForceClose(9)));
+        assert_eq!(Request::read(&mut navi), Some(Request::ForceClose(9)));
+        let mut after = Command::ForceOffer(0x0102_0304).bytes();
+        after.push(NO);
+        after.extend(Command::ForceOffer(NO.into()).bytes());
+        navi.write_all(&after).unwrap();
+        assert!(waiting.join().unwrap().is_err(), "NO");
+        let want = sent
+            .into_iter()
+            .chain([Command::ForceOffer(0x0102_0304), Command::ForceOffer(0)]);
+        for w in want {
+            assert_eq!(commands.recv_timeout(Duration::from_secs(5)).unwrap(), w);
+        }
+        assert!(commands.try_recv().is_err());
+        assert_eq!(
+            Command::ForceOffer(0xFF00_0001).bytes(),
+            [FORCE_OFFER, 1, 0, 0, 0xFF]
+        );
+    }
+
+    /// Job 040 AC1: a truncated offer then EOF delivers nothing.
+    #[test]
+    fn ac1_a_truncated_force_offer_delivers_nothing() {
+        for cut in 1..5 {
+            let (bar, mut navi) = UnixStream::pair().unwrap();
+            let (tx, commands) = mpsc::channel();
+            let _control = reader(bar, move |c| tx.send(c).unwrap()).unwrap();
+            let frame = Command::ForceOffer(0xFF00_0001).bytes();
+            navi.write_all(&frame[..cut]).unwrap();
+            drop(navi);
+            // The reader ends at EOF and drops its sender.
+            assert_eq!(
+                commands.recv_timeout(Duration::from_secs(5)),
+                Err(mpsc::RecvTimeoutError::Disconnected),
+                "{cut} bytes"
+            );
+        }
+    }
+
+    /// Job 040 AC1: every other command is still the one byte it was.
+    #[test]
+    fn ac1_one_byte_commands_are_unchanged() {
+        let mut all: Vec<_> = (1..=9).map(|n| Command::Dock(DockKey::Slot(n))).collect();
+        all.extend([
+            Command::ToggleMenu,
+            Command::Dock(DockKey::Cycle { forward: true }),
+            Command::Dock(DockKey::Cycle { forward: false }),
+            Command::WindowLimit,
+        ]);
+        let bytes: Vec<u8> = all.iter().map(|c| c.byte()).collect();
+        assert_eq!(bytes, [5, 6, 7, 8, 9, 10, 11, 12, 13, 2, 3, 4, 14]);
+        for c in all {
+            assert_eq!(c.bytes(), [c.byte()]);
+            assert_eq!(Command::from_byte(c.byte()), Some(c));
+        }
     }
 }

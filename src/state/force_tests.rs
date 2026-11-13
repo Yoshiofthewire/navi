@@ -363,3 +363,55 @@ fn ac12_force_close_ends_only_the_overdue_client() {
     assert!(handle(&data, ib).is_some());
     assert_eq!(b.c.closes, 0);
 }
+
+/// Job 040 AC2: a ✕ on navi's title bar is always the polite close; once the first close is
+/// 90 s old it also sends navi-bar one `FORCE_OFFER` with the bar's handle for the window.
+#[test]
+fn ac2_close_button_offers_force_close_at_90_s() {
+    let (mut el, mut data) = crate::xwayland::tests::harness();
+    let mut bar = Conn::new(&mut el, &mut data, true);
+    data.state.protect(bar.server.clone());
+    let (bar_end, navi_end) = std::os::unix::net::UnixStream::pair().unwrap();
+    bar_end.set_nonblocking(true).unwrap();
+    data.state.bar_control = Some(navi_end);
+    let offers = || {
+        let mut buf = [0; 64];
+        let n = std::io::Read::read(&mut &bar_end, &mut buf).unwrap_or(0);
+        buf[..n].to_vec()
+    };
+    let mut a = Conn::new(&mut el, &mut data, false);
+    let mut b = Conn::new(&mut el, &mut data, false);
+    let (_ta, _tb) = (a.window("a"), b.window("b"));
+    a.sync(&mut el, &mut data);
+    b.sync(&mut el, &mut data);
+    bar.sync(&mut el, &mut data);
+    let (ia, ib) = (tile(&mut data, "a"), tile(&mut data, "b"));
+    let handle = data.state.toplevels.handle_of(&bar.server, ia).unwrap();
+
+    // The first ✕ starts the clock, however late it is.
+    data.state
+        .close_button(ia, Instant::now() + Duration::from_secs(1000));
+    a.sync(&mut el, &mut data);
+    assert_eq!((a.c.closes, offers()), (1, vec![]), "first ✕");
+    let sent = managed(&mut data, "a").unwrap().close_sent.unwrap();
+
+    data.state
+        .close_button(ia, sent + FORCE_AFTER - Duration::from_millis(1));
+    a.sync(&mut el, &mut data);
+    assert_eq!((a.c.closes, offers()), (2, vec![]), "at 89.999 s");
+
+    data.state.close_button(ia, sent + FORCE_AFTER);
+    a.sync(&mut el, &mut data);
+    let mut want = vec![crate::control::FORCE_OFFER];
+    want.extend(handle.to_le_bytes());
+    assert_eq!((a.c.closes, offers()), (3, want), "at 90 s");
+    assert_eq!(managed(&mut data, "a").unwrap().close_sent, Some(sent));
+
+    // Locked: no offer. Another window's first ✕: none either.
+    data.state.lock.active = true;
+    data.state.close_button(ia, sent + FORCE_AFTER);
+    data.state.lock.active = false;
+    data.state.close_button(ib, sent + FORCE_AFTER);
+    b.sync(&mut el, &mut data);
+    assert_eq!((b.c.closes, offers()), (1, vec![]));
+}
