@@ -119,6 +119,52 @@ mod tests {
         }
     }
 
+    /// A tty swapped in for a path must never become the reader's controlling terminal
+    /// (`O_NOCTTY`). Runs itself again as a session leader with no ctty, aimed at a pty slave.
+    #[test]
+    fn read_bytes_never_takes_a_controlling_terminal() {
+        const SLAVE: &str = "NAVI_TEST_NOCTTY_SLAVE";
+        const MARKER: &str = "noctty child checked";
+        let no_ctty = || File::open("/dev/tty").is_err();
+        if let Some(slave) = std::env::var_os(SLAVE) {
+            rustix::process::setsid().expect("setsid");
+            assert!(no_ctty(), "child has a ctty before read_bytes");
+            assert!(
+                read_bytes(Path::new(&slave), 64).is_err(),
+                "a tty is refused"
+            );
+            assert!(
+                no_ctty(),
+                "read_bytes made the tty our controlling terminal"
+            );
+            println!("{MARKER}");
+            return;
+        }
+        use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
+        let master =
+            openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC).expect("openpt");
+        grantpt(&master).expect("grantpt");
+        unlockpt(&master).expect("unlockpt");
+        let slave = ptsname(&master, Vec::new()).expect("ptsname");
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "files::tests::read_bytes_never_takes_a_controlling_terminal",
+            ])
+            .args(["--nocapture", "--test-threads=1"])
+            .env(SLAVE, slave.to_str().unwrap())
+            .output()
+            .expect("spawn the test binary");
+        drop(master);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let report = format!("{stdout}{}", String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success(), "child failed:\n{report}");
+        assert!(
+            stdout.contains(MARKER),
+            "child skipped the check:\n{report}"
+        );
+    }
+
     /// A FIFO swapped in for the file between any check and the open must not block the
     /// caller (navi-bar's main thread reads icons, fonts and `.desktop` files this way).
     #[test]
