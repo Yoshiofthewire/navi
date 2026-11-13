@@ -570,44 +570,47 @@ bundling a degoogled, resource-tested Chromium variant is reserved for a future 
   | Dock app with no desktop entry | header, **Close window** / **Close all N windows** |
   | Launcher app row | header, **Open**, desktop actions, **Pin to dock** / **Unpin from dock** |
 
-  The header (the app's name) and the lines between groups can't be selected. Desktop actions
-  come from the entry's `Actions=` (at most six, each with a name and an `Exec` the launcher
-  would run). A left press or Enter runs an item; Up/Down move (wrapping), Home/End go to the
-  ends, and every other key is swallowed. Hovering an item selects it. Esc closes only the menu;
-  a left press elsewhere on the shell closes it and does nothing else. A click into a window,
-  the lock, a window going fullscreen on the bar's monitor, the taskbar moving and the app
-  going away all close it. Opening it closes the session menu, and from the dock the launcher.
-  It holds the keyboard while open and returns it as the launcher does. A dock menu sits 12 px
-  above the dock, its left edge at the pointer, flipped left at the end of the dock, and centred
-  over a dock narrower than the menu (260 px); a launcher menu stays inside the launcher, and
-  its row stays highlighted. Only the launcher's menu opens from the keyboard (Menu,
-  Shift+F10); the dock's opens with the mouse, then takes the keyboard like the other.
-  **Close** is polite: the same request as a window's ✕ (`xdg_toplevel.close`, or
-  `WM_DELETE_WINDOW` for X11), for each of the app's windows; the app decides, and may ask
-  about unsaved work. **Force close:** if a window's first close (✕ or the dock) has gone
-  unanswered for 90 s, its dock menu offers **Force close…** below Close, and Close itself
-  now asks to force close. So does another ✕ on navi's title bar: it asks the app again and
-  opens that app's dock menu straight in the confirmation, over its dock slot. The 90 s count
-  from the first close and never restart, so a window kept open by cancelling a "Save
-  changes?" prompt is offered it too. The confirmation names the app and says that force
-  close ends its process (an X11 app: its X connection) with every window it has open, which
-  may include windows the dock shows under another app, and that unsaved work is lost.
-  Cancel is selected, and only the arrow keys and Tab move the selection; hovering doesn't.
-  Its buttons sit under the heading, away from the rows that open it. For 500 ms after it
-  appears it acts on nothing (Enter then is swallowed), and a button press counts only once
-  the pointer has really moved, not for the motion navi sends when the panel resizes, so
-  neither a double-click nor a double Enter can confirm. Opened from a ✕, the pointer's first
-  spot on the panel is its reference. An output, scale or configure change while it's open
-  restarts the 500 ms, and the pointer's next spot becomes its new reference. Confirmed,
-  navi checks the 90 s itself, then ends that window's client: a Wayland app is sent SIGKILL
-  through a pidfd taken when it connected and disconnected; an X11 app's X connection is
-  ended with XKillClient, never a signal, over a connection that gives up after 2 s. navi,
-  navi-bar, the locker and Xwayland are never force closed, and once Xwayland is gone no X11
-  force close is tried. Nothing is automatic. If navi refuses, fails or doesn't answer for a
-  window that is still open, navi-bar posts one card naming the app that says it wasn't
-  force closed and gives the log's path (`~/.local/state/navi/navi.log`); it follows the
-  notification settings like the window-limit card. A Lock from the session menu waits for
-  at most one force close.
+  The header (the app's name) and the lines between groups can't be selected. Desktop actions come
+  from the entry's `Actions=` (at most six, each with a name and an `Exec` the launcher would run).
+  A left press or Enter runs an item; Up/Down move (wrapping), Home/End go to the ends, and every
+  other key is swallowed. Hovering an item selects it. Esc closes only the menu; a left press
+  elsewhere on the shell closes it and does nothing else. A click into a window, the lock, a window
+  going fullscreen on the bar's monitor, the taskbar moving and the app going away all close it.
+  Opening it closes the session menu, and from the dock the launcher. It holds the keyboard while
+  open and returns it as the launcher does. A dock menu sits 12 px above the dock, its left edge at
+  the pointer, flipped left at the end of the dock, and centred over a dock narrower than the menu;
+  a launcher menu stays inside the launcher, and its row stays highlighted. The menu scales with the
+  text size: 260 px wide at 14 px text and wider with bigger text, up to the launcher's 420 px, with
+  rows growing to match, so every label and the whole confirmation fit at any size Settings allows.
+  Names too long for a row are cut with `…`; the confirmation's heading cuts only the name, so
+  "Force close" and the "?" stay. Only the launcher's menu opens from the keyboard (Menu,
+  Shift+F10); the dock's opens with the mouse, then takes the keyboard like the other. **Close** is
+  polite: the same request as a window's ✕ (`xdg_toplevel.close`, or `WM_DELETE_WINDOW` for X11),
+  for each of the app's windows; the app decides, and may ask about unsaved work. **Force close:**
+  if a window's first close (✕ or the dock) has gone unanswered for 90 s, its dock menu offers
+  **Force close…** below Close, and Close itself now asks to force close. So does another ✕ on
+  navi's title bar: it asks the app again and opens that app's dock menu straight in the
+  confirmation, over its dock slot. The 90 s count from the first close and never restart, so a
+  window kept open by cancelling a "Save changes?" prompt is offered it too. The confirmation names
+  the app and says that force close ends its process (an X11 app: its X connection) with every
+  window it has open, which may include windows the dock shows under another app, and that unsaved
+  work is lost. Cancel is selected, and only the arrow keys and Tab move the selection. Hovering a
+  button only tints it (`HOVER`, no accent mark): it never selects, so Enter still acts on the
+  selected one. Its buttons sit under the heading, away from the rows that open it. For 500 ms after
+  it appears it acts on nothing (Enter then is swallowed), and a button press counts only once the
+  pointer has really moved, not for the motion navi sends when the panel resizes, so neither a
+  double-click nor a double Enter can confirm. Opened from a ✕, the pointer's first spot on the
+  panel is its reference. An output, scale, configure or text-size change while it's open restarts
+  the 500 ms, and the pointer's next spot becomes its new reference. Confirmed, navi checks the 90 s
+  itself, then ends that window's client: a Wayland app is sent SIGKILL through a pidfd taken when
+  it connected and disconnected; an X11 app's X connection is ended with XKillClient, never a
+  signal, over a connection that gives up after 2 s. navi, navi-bar, the locker and Xwayland are
+  never force closed, and once Xwayland is gone no X11 force close is tried. Nothing is automatic.
+  If navi refuses, fails or doesn't answer for a window that is still open, navi-bar posts one card
+  naming the app that says it wasn't force closed and gives the path of the log navi writes,
+  `$XDG_STATE_HOME/navi/navi.log` (default `~/.local/state/navi/navi.log`), or "navi's log" with no
+  usable state dir; it follows the notification settings like the window-limit card. A Lock from the
+  session menu waits for at most one force close.
 - **Laptop alone:** the same layout with a slimmer taskbar.
 - **No virtual desktops.**
 - **Look:** cyberpunk, with no animations: every state change is instant. (The half-second hold
@@ -625,9 +628,9 @@ bundling a degoogled, resource-tested Chromium variant is reserved for a future 
   cards) float:
   12 px (`INSET`) from the screen edges and from what they sit next to, with 10 px corners
   (`RADIUS`), the shell fill and a 1 px rim. The dock and band, which sit over the wallpaper,
-  are 85 % opaque; the launcher, session menu and cards, which sit over windows, are 98 %, so
-  window text doesn't ghost through them before the blur lands. That opacity alone keeps their
-  text 4.5:1 and marks 3:1 over any wallpaper, white or black; high contrast makes them opaque.
+  are 85 % opaque; that alone keeps their text 4.5:1 and marks 3:1 over any wallpaper, white
+  or black, and high contrast makes them opaque. The pop-ups (launcher, session menu, context
+  menus and cards) sit over windows and are opaque, so nothing under them shows through.
   Panels pad their content 12 px. Folder and session glyphs draw in the text colour, so they
   hold 3:1 in every scheme; app icons keep their own colours. The launcher's search field is
   the selected fill with a rim, so it has a shape even in high contrast. A context menu's
@@ -644,18 +647,18 @@ bundling a degoogled, resource-tested Chromium variant is reserved for a future 
 
 ## Themes
 
-`src/theme.rs` owns the compositor/shell palette and its scheme-dependent accent values.
-The default background, shell surface and text are `#0B0D12`, `#151922` and `#D0D4DC`;
-light mode uses `#F5F6F8`, white and `#202734`, with a darker blue accent (`#0077AA`).
-High contrast uses black/white surfaces and text in the selected scheme. Shell panels use
-`RADIUS` 10 and `INSET` 12, the `BAR_BG` fill at `panel_alpha()` (0.85 for the dock and band,
-0.98 for pop-ups, 1.0 with high contrast), `DIM` `#A3ABBC` (light `#525E70`) for secondary text, and `PANEL_EDGE` `#848C9E`
-(light `#6B7689`) for their rims and the dock's pinned mark; `theme` tests prove both 4.5:1 text
-and 3:1 marks on a panel composited over white and black, for every scheme and accent. The GTK
-utilities keep `#7A8396` for `DIM` and `SHELL_EDGE` for their borders. Settings maps these
-same roles onto native GTK controls in `app.py` and `extra_ui.py`, with separate control borders
-and secondary-text values for legibility. Noto Sans remains the Settings/shell typeface; the
-default text size is 14 logical px, adjustable from 12 to 24 without changing the layout model.
+`src/theme.rs` owns the compositor/shell palette and its scheme-dependent accent values. The default
+background, shell surface and text are `#0B0D12`, `#151922` and `#D0D4DC`; light mode uses
+`#F5F6F8`, white and `#202734`, with a darker blue accent (`#0077AA`). High contrast uses
+black/white surfaces and text in the selected scheme. Shell panels use `RADIUS` 10 and `INSET` 12,
+the `BAR_BG` fill at `panel_alpha()` (0.85 for the dock and band, 1.0 for pop-ups and with
+high contrast), `DIM` `#A3ABBC` (light `#525E70`) for secondary text, and `PANEL_EDGE` `#848C9E`
+(light `#6B7689`) for their rims and the dock's pinned mark; `theme` tests prove both 4.5:1 text and
+3:1 marks on a panel composited over white and black, for every scheme and accent. The GTK utilities
+keep `#7A8396` for `DIM` and `SHELL_EDGE` for their borders. Settings maps these same roles onto
+native GTK controls in `app.py` and `extra_ui.py`, with separate control borders and secondary-text
+values for legibility. Noto Sans remains the Settings/shell typeface; the default text size is 14
+logical px, adjustable from 12 to 24 without changing the layout model.
 
 navi uses the user's installed themes and ships none of its own. Icons, cursors and sounds
 follow freedesktop.org standards, so any theme from the distro's repos or the KDE Store works,

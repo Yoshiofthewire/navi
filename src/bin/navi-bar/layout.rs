@@ -1,7 +1,6 @@
 //! Dock and launcher geometry in logical pixels; transparent margins stay outside input regions.
 
 use crate::{
-    context::MENU_W,
     desktop::{Category, Entry},
     menu::{Menu, ROWS, Row},
     theme::{ACCENT, BAR_BG, DIM, INK, INSET, PANEL_EDGE, Panel, SELECTED},
@@ -17,7 +16,7 @@ const ATTENTION_DOT: i32 = 8;
 const DOCK_PAD: i32 = 8;
 const DOCK_H: i32 = 40;
 const PAD: i32 = 12;
-const PANEL_W: i32 = 420;
+pub const PANEL_W: i32 = 420;
 const HEADER_H: i32 = 32;
 const SEARCH_H: i32 = 40;
 const FOOTER_H: i32 = 32;
@@ -118,12 +117,12 @@ impl Layout {
         (x - self.w / 2, y - self.h)
     }
 
-    /// Opens a context menu `h` tall at `anchor`. A dock menu grows the surface and sits `INSET`
-    /// above the dock; a launcher menu stays inside the launcher, which grows to hold it.
-    pub fn with_context(mut self, anchor: (i32, i32), h: i32) -> Self {
+    /// Opens a context menu `w` × `h` at `anchor`. A dock menu grows the surface and sits
+    /// `INSET` above the dock; a launcher menu stays inside the launcher, which grows to hold it.
+    pub fn with_context(mut self, anchor: (i32, i32), w: i32, h: i32) -> Self {
         let bounds = match self.panel() {
             None => {
-                self.w = self.w.max(MENU_W);
+                self.w = self.w.max(w);
                 self.h = BAR_H + PANEL_GAP + h;
                 Rect {
                     x: 0,
@@ -143,13 +142,13 @@ impl Layout {
             at.clamp(lo, (lo + size - len).max(lo))
         };
         self.context = Some(Rect {
-            x: flip(x, MENU_W, bounds.x, bounds.w),
+            x: flip(x, w, bounds.x, bounds.w),
             y: if self.open {
                 flip(y, h, bounds.y, bounds.h)
             } else {
                 0
             },
-            w: MENU_W,
+            w,
             h,
         });
         self
@@ -601,41 +600,96 @@ mod tests {
         }
     }
 
-    /// AC4: dock menus lie inside the surface, `INSET` above the dock, from either end.
+    /// The biggest dock menu's force-close confirmation and launcher menu at text size `px`:
+    /// width and both heights.
+    fn menu_size(px: i32) -> (i32, i32, i32) {
+        let advance = |_| Some(px as f32 * 0.6);
+        let t = crate::context::Text {
+            px,
+            advance: &advance,
+        };
+        let mut e = terminal();
+        e.actions = (0..crate::desktop::MAX_ACTIONS)
+            .map(|n| crate::desktop::Action {
+                id: n.to_string(),
+                name: "A".into(),
+                argv: vec!["a".into()],
+            })
+            .collect();
+        let app = |windows| crate::context::App {
+            entry: Some(&e),
+            app_id: "",
+            pinned: false,
+            windows,
+            overdue: windows,
+        };
+        let menu = |dock| {
+            let target = crate::context::Target {
+                key: e.id.clone(),
+                dock,
+            };
+            let lines = crate::context::lines(&app(usize::from(dock) * 2), dock);
+            crate::context::Menu::new(target, lines, (0, 0), true)
+        };
+        let mut dock = menu(true);
+        dock.ask_force(std::time::Instant::now(), (0, 0));
+        let h = dock.height(&t).max(menu(true).height(&t));
+        (crate::context::width(px), h, menu(false).height(&t))
+    }
+
+    /// AC4, job 041 AC9: dock menus lie inside the surface, `INSET` above the dock, from either
+    /// end, at the default and the biggest text size.
     #[test]
     fn ac4_dock_menu_placement() {
-        let h = 300;
-        for windows in [1, 3, 12] {
-            let dock = Layout::new(windows, false);
-            let b = dock.bar();
-            for x in [b.x, b.x + b.w / 2, b.x + b.w - 1] {
-                let anchor = dock.anchor(x, b.y + 10);
-                let l = Layout::new(windows, false).with_context(anchor, h);
-                let r = l.context().unwrap();
-                assert!(
-                    r.x >= 0 && r.x + r.w <= l.w,
-                    "{windows} {x}: {r:?} in {}",
-                    l.w
-                );
-                assert_eq!(r.y + r.h + INSET, l.bar().y, "{windows} {x}");
-                assert_eq!((l.w, l.h), (dock.w.max(MENU_W), BAR_H + INSET + h));
-                assert_eq!(l.bar().w, b.w, "the dock stays put");
-                // Hits: the menu above, dock icons beside it.
-                assert_eq!(l.hit(r.x + 4, r.y + 4), Some(Hit::Menu));
-                assert_eq!(
-                    l.hit(l.target(0).x + 2, l.target(0).y + 2),
-                    Some(Hit::Button)
-                );
-                assert!(l.input().contains(&r));
+        assert_eq!(menu_size(14).0, 260);
+        assert!(menu_size(24).0 > 260);
+        for (w, h, _) in [menu_size(14), menu_size(24)] {
+            for windows in [1, 3, 12] {
+                let dock = Layout::new(windows, false);
+                let b = dock.bar();
+                for x in [b.x, b.x + b.w / 2, b.x + b.w - 1] {
+                    let anchor = dock.anchor(x, b.y + 10);
+                    let l = Layout::new(windows, false).with_context(anchor, w, h);
+                    let r = l.context().unwrap();
+                    assert!(
+                        r.x >= 0 && r.x + r.w <= l.w,
+                        "{windows} {x}: {r:?} in {}",
+                        l.w
+                    );
+                    assert_eq!(r.w, w);
+                    // At the pointer, flipped to end there, or pushed in from the surface's end.
+                    let px = anchor.0 + l.w / 2;
+                    let placed = [r.x == px, r.x + r.w == px, r.x == 0, r.x + r.w == l.w];
+                    assert!(placed.contains(&true), "{windows} {x}: {r:?} at {px}");
+                    assert_eq!(r.y + r.h + INSET, l.bar().y, "{windows} {x}");
+                    assert_eq!((l.w, l.h), (dock.w.max(w), BAR_H + INSET + h));
+                    assert_eq!(l.bar().w, b.w, "the dock stays put");
+                    // Hits: the menu above, dock icons beside it.
+                    assert_eq!(l.hit(r.x + 4, r.y + 4), Some(Hit::Menu));
+                    assert_eq!(
+                        l.hit(l.target(0).x + 2, l.target(0).y + 2),
+                        Some(Hit::Button)
+                    );
+                    assert!(l.input().contains(&r));
+                }
             }
         }
     }
 
-    /// AC4: a launcher menu flips at each corner and stays in the panel; the biggest one fits.
+    /// AC4, job 041 AC9: a launcher menu flips at each corner and stays in the panel; the
+    /// biggest one fits, at the default and the biggest text size.
     #[test]
     fn ac4_launcher_menu_placement() {
+        for px in [14, 24] {
+            launcher_menu_placement(px);
+        }
+    }
+
+    fn launcher_menu_placement(px: i32) {
         let open = Layout::new(3, true);
         let p = open.panel().unwrap();
+        let (w, _, biggest) = menu_size(px);
+        assert!(w <= p.w, "{px}: {w}");
         let h = 200;
         for (x, y) in [
             (p.x + 1, p.y + 1),
@@ -643,13 +697,14 @@ mod tests {
             (p.x + 1, p.y + p.h - 2),
             (p.x + p.w - 2, p.y + p.h - 2),
         ] {
-            let l = open.with_context(open.anchor(x, y), h);
+            let l = open.with_context(open.anchor(x, y), w, h);
             let r = l.context().unwrap();
             let p = l.panel().unwrap();
             assert!(r.x >= p.x && r.x + r.w <= p.x + p.w, "{x},{y}: {r:?}");
             assert!(r.y >= p.y && r.y + r.h <= p.y + p.h, "{x},{y}: {r:?}");
-            // Opened at the pointer, or flipped to end there.
-            assert!(r.x == x || r.x + r.w == x, "{x}: {r:?}");
+            // Opened at the pointer, or flipped to end there; as wide as the launcher, in it.
+            let edge = r.w == p.w && r.x == p.x;
+            assert!(r.x == x || r.x + r.w == x || edge, "{x}: {r:?}");
             assert!(r.y == y || r.y + r.h == y, "{y}: {r:?}");
             let row = l.row(2);
             if r.contains(row.x + 100, row.y + 4) {
@@ -660,34 +715,27 @@ mod tests {
                 );
             }
         }
-        // The biggest launcher menu: header, Open, six actions, a line and Pin.
-        let mut e = terminal();
-        e.actions = (0..crate::desktop::MAX_ACTIONS)
-            .map(|n| crate::desktop::Action {
-                id: n.to_string(),
-                name: "A".into(),
-                argv: vec!["a".into()],
-            })
-            .collect();
-        let app = crate::context::App {
-            entry: Some(&e),
-            app_id: "",
-            pinned: false,
-            windows: 0,
-            overdue: 0,
-        };
-        let target = crate::context::Target {
-            key: e.id.clone(),
-            dock: false,
-        };
-        let m = crate::context::Menu::new(target, crate::context::lines(&app, false), (0, 0), true);
-        assert!(m.height() <= PANEL_H, "{}", m.height());
-        // A short result list grows back to hold it.
-        let short = Layout::new(3, true).with_rows(1);
-        let l = short.with_context(short.anchor(p.x + 1, short.row(0).y), m.height());
-        assert!(l.panel().unwrap().h >= m.height());
-        let r = l.context().unwrap();
-        assert!(l.panel().unwrap().contains(r.x, r.y));
+        // The biggest launcher menu: header, Open, six actions, a line and Pin. At the default
+        // size the full launcher holds it; a short result list, or bigger text, grows it back.
+        if px == 14 {
+            assert!(biggest <= PANEL_H, "{biggest}");
+        }
+        for launcher in [open, Layout::new(3, true).with_rows(1)] {
+            let at = launcher.anchor(p.x + 1, launcher.row(0).y);
+            let l = launcher.with_context(at, w, biggest);
+            let panel = l.panel().unwrap();
+            assert!(panel.h >= biggest, "{px}");
+            let r = l.context().unwrap();
+            assert!(
+                r.x >= panel.x && r.x + r.w <= panel.x + panel.w,
+                "{px}: {r:?}"
+            );
+            assert!(
+                r.y >= panel.y && r.y + r.h <= panel.y + panel.h,
+                "{px}: {r:?}"
+            );
+            assert!(r.y + r.h <= l.bar().y, "{px}: above the dock");
+        }
     }
 
     /// AC4: anchored at the bottom centre, a menu keeps its spot on screen as the surface grows.
@@ -701,7 +749,7 @@ mod tests {
             let o = origin(&dock, out_w, 1440);
             let on_screen = (o.0 + px, o.1 + py);
             let anchor = dock.anchor(px, py);
-            let grown = Layout::new(windows, false).with_context(anchor, 250);
+            let grown = Layout::new(windows, false).with_context(anchor, 260, 250);
             let g = origin(&grown, out_w, 1440);
             let back = (anchor.0 + grown.w / 2 + g.0, anchor.1 + grown.h + g.1);
             assert_eq!(back, on_screen, "{out_w} {windows}");

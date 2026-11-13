@@ -15,6 +15,9 @@ pub const BAR_BG: u32 = 0x151922;
 /// An inactive tab, and the selected menu row.
 pub const TAB_BG: u32 = 0x262C38;
 pub const SELECTED: u32 = TAB_BG;
+/// The pointer's tint on a button that hover doesn't select: a step past `SELECTED`, which
+/// alone carries the accent mark.
+pub const HOVER: u32 = 0x313849;
 /// Settings' and the GTK utilities' subtle boundary.
 pub const SHELL_EDGE: u32 = 0x303847;
 /// A shell panel's 1 px rim and the dock's pinned mark: 3:1 on the panel over any wallpaper.
@@ -36,8 +39,9 @@ pub const PANEL_TEXT: [u32; 2] = [INK, DIM];
 #[cfg(test)]
 pub const PANEL_MARKS: [u32; 2] = [ACCENT, PANEL_EDGE];
 #[cfg(test)]
-pub const ON_FILL: [(u32, &[u32]); 3] = [
+pub const ON_FILL: [(u32, &[u32]); 4] = [
     (SELECTED, &[INK, DIM]),
+    (HOVER, &[INK, DIM]),
     (BAR_BG, &[INK, DIM, ACCENT]),
     (ACCENT, &[INK_ON_ACCENT]),
 ];
@@ -96,23 +100,22 @@ pub fn resolve(color: u32) -> u32 {
 }
 
 /// Which shell panel: the dock and band, which sit over the wallpaper, or a pop-up (launcher,
-/// session menu, card), which sits over windows whose text would ghost through until blur.
+/// session menu, card, context menu), which sits over windows and is opaque so none shows through.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Panel {
     Bar,
     Popup,
 }
 
-/// A shell panel's opacity: translucent, opaque with high contrast.
+/// A shell panel's opacity: a translucent bar, opaque with high contrast; pop-ups always opaque.
 pub fn panel_alpha(panel: Panel) -> f32 {
     panel_alpha_flags(panel, APPEARANCE.load(std::sync::atomic::Ordering::Relaxed))
 }
 
 fn panel_alpha_flags(panel: Panel, flags: u32) -> f32 {
     match (flags & 32 != 0, panel) {
-        (true, _) => 1.0,
         (false, Panel::Bar) => 0.85,
-        (false, Panel::Popup) => 0.98,
+        _ => 1.0,
     }
 }
 
@@ -132,6 +135,7 @@ fn resolve_flags(color: u32, flags: u32) -> u32 {
             INK => 0x000000,
             DIM | SHELL_EDGE | PANEL_EDGE => 0x333333,
             TAB_BG => 0xDDDDDD,
+            HOVER => 0xC8C8C8,
             _ => color,
         };
     }
@@ -140,6 +144,7 @@ fn resolve_flags(color: u32, flags: u32) -> u32 {
             BG => 0xF5F6F8,
             BAR_BG => 0xFFFFFF,
             TAB_BG => 0xE3E7ED,
+            HOVER => 0xD5DBE4,
             INK => 0x202734,
             DIM => 0x525E70,
             SHELL_EDGE => 0xA0AABA,
@@ -208,11 +213,10 @@ mod tests {
         assert_eq!((RADIUS, INSET), (10, 12));
         for flags in all_flags() {
             let high = flags & 32 != 0;
-            let want = [(Panel::Bar, 0.85), (Panel::Popup, 0.98)];
-            for (panel, alpha) in want {
-                let alpha = if high { 1.0 } else { alpha };
-                assert_eq!(panel_alpha_flags(panel, flags), alpha, "flags {flags}");
-            }
+            let bar = if high { 1.0 } else { 0.85 };
+            assert_eq!(panel_alpha_flags(Panel::Bar, flags), bar, "flags {flags}");
+            // Job 041 AC4: pop-ups are opaque in every scheme.
+            assert_eq!(panel_alpha_flags(Panel::Popup, flags), 1.0, "flags {flags}");
         }
     }
 
@@ -248,6 +252,21 @@ mod tests {
             let r = |c| resolve_flags(c, flags);
             let c = contrast(r(ACCENT), r(SELECTED));
             assert!(c >= 3.0, "flags {flags}: {c}");
+        }
+    }
+
+    /// Job 041 AC3: INK reads 4.5:1 on the hover tint, which is a visible step from the panel
+    /// and apart from the selection in every scheme and accent.
+    #[test]
+    fn hover_tint_is_readable_and_distinct() {
+        for flags in all_flags() {
+            let r = |c| resolve_flags(c, flags);
+            let c = contrast(r(INK), r(HOVER));
+            assert!(c >= 4.5, "flags {flags}: {c}");
+            let panel = contrast(r(HOVER), r(BAR_BG));
+            assert!(panel >= 1.3, "flags {flags}: {panel} from the panel");
+            let selected = contrast(r(HOVER), r(SELECTED));
+            assert!(selected >= 1.1, "flags {flags}: {selected} from SELECTED");
         }
     }
 

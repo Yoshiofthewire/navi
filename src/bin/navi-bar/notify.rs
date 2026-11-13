@@ -2,10 +2,14 @@
 //! shown, for how long, and what each call may change. Every field comes from any process on the
 //! session bus, so it is sanitised before it is stored. Times are ms on an injected clock.
 
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
+
 pub const MAX_SHOWN: usize = 3;
 const APP_CHARS: usize = 64;
 const SUMMARY_CHARS: usize = 120;
 const BODY_CHARS: usize = 400;
+const PATH_CHARS: usize = 200;
 const DEFAULT_MS: u64 = 5_000;
 const MIN_MS: u64 = 1_000;
 const MAX_MS: u64 = 10_000;
@@ -101,11 +105,14 @@ impl Notes {
     }
 
     /// A confirmed force close of `app` didn't happen: navi refused, failed or didn't answer.
-    /// The same `LOCAL` card as `window_limit`.
-    pub fn force_refused(&mut self, now: u64, app: &str) -> (u32, Vec<Closed>) {
+    /// The same `LOCAL` card as `window_limit`, naming navi's `log` (`log_path`).
+    pub fn force_refused(&mut self, now: u64, app: &str, log: Option<&Path>) -> (u32, Vec<Closed>) {
         // `app` may be a client's raw app ID.
         let app = sanitize(app, 64);
-        let body = format!("{app} wasn't force closed. Details: ~/.local/state/navi/navi.log");
+        let log = log.map_or("navi's log".into(), |p| {
+            sanitize(&p.to_string_lossy(), PATH_CHARS)
+        });
+        let body = format!("{app} wasn't force closed. Details: {log}");
         self.local(now, "Force close didn't happen", body)
     }
 
@@ -294,6 +301,13 @@ pub fn sanitize(s: &str, max: usize) -> String {
     let mut out: String = kept[..max.saturating_sub(1)].iter().collect();
     out.push('…');
     out
+}
+
+/// The log navi writes on real hardware, by `persist::state_file`'s rule, from the values of
+/// `$XDG_STATE_HOME` and `$HOME`.
+pub fn log_path(state: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
+    let dir = crate::files::xdg_dir(state, home, ".local/state")?;
+    Some(dir.join("navi").join("navi.log"))
 }
 
 fn bidi(c: char) -> bool {
@@ -571,5 +585,46 @@ mod tests {
         let (id, _) = n.notify(0, ":1.1", &req("a"));
         assert_eq!(n.dismiss(id), Some((id, DISMISSED)));
         assert!(n.shown().is_empty());
+    }
+
+    /// Job 041 AC10: the card names the log navi writes, by `persist::state_file`'s rule.
+    #[test]
+    fn the_refusal_card_names_the_real_log() {
+        let os = |s: &'static str| Some(OsStr::new(s));
+        let path = |s: &str| Some(PathBuf::from(s));
+        assert_eq!(
+            log_path(os("/x/state"), os("/h")),
+            path("/x/state/navi/navi.log")
+        );
+        assert_eq!(
+            log_path(None, os("/h")),
+            path("/h/.local/state/navi/navi.log")
+        );
+        assert_eq!(
+            log_path(os("rel"), os("/h")),
+            path("/h/.local/state/navi/navi.log")
+        );
+        assert_eq!(log_path(os("rel"), os("h")), None);
+        assert_eq!(log_path(None, None), None);
+
+        let body = |log: Option<&Path>| {
+            let mut n = Notes::default();
+            n.force_refused(0, "Konsole", log);
+            n.shown()[0].body.clone()
+        };
+        let log = log_path(os("/x/state"), None);
+        assert_eq!(
+            body(log.as_deref()),
+            "Konsole wasn't force closed. Details: /x/state/navi/navi.log"
+        );
+        assert_eq!(
+            body(None),
+            "Konsole wasn't force closed. Details: navi's log"
+        );
+        let hostile = Path::new("/x/\u{202E}evil\u{7}/navi/navi.log");
+        assert_eq!(
+            body(Some(hostile)),
+            "Konsole wasn't force closed. Details: /x/evil/navi/navi.log"
+        );
     }
 }
