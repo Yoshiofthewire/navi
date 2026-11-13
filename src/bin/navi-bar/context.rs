@@ -156,9 +156,9 @@ impl Confirm {
         [
             "It ignored Close for 90 s.",
             "Force close ends its process",
-            "(or X connection) at once, with",
-            "every window it has open.",
-            "Unsaved work is lost.",
+            "(or X connection) at once,",
+            "with every window it has",
+            "open. Unsaved work is lost.",
         ]
     }
 
@@ -1063,7 +1063,7 @@ mod tests {
     }
 
     /// Job 040 AC4: the confirmation is true for either kind of kill, counts nothing, and every
-    /// line fits the 260 px menu at the default font.
+    /// line fits the 260 px menu at the default size in every font navi-bar may load.
     #[test]
     fn ac4_confirmation_text_is_honest_and_fits() {
         let mut m = menu(3);
@@ -1075,21 +1075,36 @@ mod tests {
         assert!(body.contains("Unsaved work is lost"), "{body}");
         let digits: String = body.chars().filter(char::is_ascii_digit).collect();
         assert_eq!(digits, "90", "no window count: {body}");
-        let font = crate::font::load().expect("Noto Sans (fonts-noto-core)");
         let r = Rect {
             x: 0,
             y: 0,
             w: MENU_W,
             h: m.height(),
         };
-        let mut lines = 0;
-        for item in m.draw(r) {
-            if let Item::Text(text, at, DIM) = item {
-                let w = crate::text_w(&font, &text, crate::text_px());
-                assert!(w <= at.w as f32, "{text:?} is {w} px, room {}", at.w);
-                lines += 1;
+        // Whichever of `font::PATHS` this host has; CI's release job has only DejaVu Sans.
+        let fonts: Vec<_> = crate::font::PATHS
+            .iter()
+            .filter_map(|p| {
+                let bytes = std::fs::read(p).ok()?;
+                let f = fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default());
+                Some((p, f.unwrap()))
+            })
+            .collect();
+        assert!(!fonts.is_empty(), "no font from font::PATHS installed");
+        for (path, font) in &fonts {
+            let mut lines = 0;
+            for item in m.draw(r) {
+                if let Item::Text(text, at, DIM) = item {
+                    let w = crate::text_w(font, &text, crate::text_px());
+                    assert!(
+                        w <= at.w as f32,
+                        "{path}: {text:?} is {w} px, room {}",
+                        at.w
+                    );
+                    lines += 1;
+                }
             }
+            assert_eq!(lines, 5);
         }
-        assert_eq!(lines, 5);
     }
 }
