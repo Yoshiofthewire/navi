@@ -119,7 +119,9 @@ pub(crate) fn socket(display: &str) -> Option<std::path::PathBuf> {
 pub(crate) fn kill_client(socket: &std::path::Path, window: u32) -> Result<(), String> {
     use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType, sockopt};
     use smithay::reexports::x11rb::{
-        protocol::xproto::ConnectionExt, rust_connection::RustConnection,
+        errors::ReplyError,
+        protocol::{ErrorKind, xproto::ConnectionExt},
+        rust_connection::RustConnection,
     };
     let fd = rustix::net::socket_with(
         AddressFamily::UNIX,
@@ -143,9 +145,12 @@ pub(crate) fn kill_client(socket: &std::path::Path, window: u32) -> Result<(), S
     *conn.stream().deadline.lock().map_err(|e| e.to_string())? =
         std::time::Instant::now() + X11_KILL_TIMEOUT;
     let cookie = conn.kill_client(window).map_err(|e| e.to_string())?;
-    // `check` waits for the server's answer.
-    cookie.check().map_err(|e| e.to_string())?;
-    Ok(())
+    // `check` waits for the server's answer. BadValue: no such client, as the force close of
+    // its other window just ended it.
+    match cookie.check() {
+        Err(ReplyError::X11Error(e)) if e.error_kind == ErrorKind::Value => Ok(()),
+        done => done.map_err(|e| e.to_string()),
+    }
 }
 
 /// x11rb's stream, whose waits end at `deadline`.
@@ -3223,6 +3228,10 @@ pub(crate) mod tests {
             c.get_input_focus().unwrap().reply().is_ok(),
             "a new X client connects"
         );
+        // Job 040: a force close of a window whose client just ended (with its other window) is
+        // done, not a refusal.
+        let socket = socket(&xdisplay).unwrap();
+        assert_eq!(super::kill_client(&socket, wa), Ok(()));
     }
 
     /// Job 040 AC7: with no X display, an X11 force close is refused at once; once the X

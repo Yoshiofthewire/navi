@@ -60,7 +60,10 @@ use smithay_client_toolkit::{
         client::{
             Connection, Dispatch, Proxy, QueueHandle, event_created_child,
             globals::registry_queue_init,
-            protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
+            protocol::{
+                wl_callback, wl_display, wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm,
+                wl_surface,
+            },
         },
         protocols_wlr::foreign_toplevel::v1::client::{
             zwlr_foreign_toplevel_handle_v1::{self as handle, ZwlrForeignToplevelHandleV1},
@@ -289,6 +292,7 @@ fn run() -> Result<(), String> {
         band_hover: false,
         session_tx,
         force_tx,
+        display: conn.display(),
         full_session: dbus::wants_export(var("NAVI_EXPORT_ENV").as_deref()),
         logout: false,
         cards_layer: None,
@@ -419,6 +423,7 @@ struct Bar {
     session_tx: channel::Sender<session::Reply>,
     /// A confirmed force close's app name and its replies, by handle ID.
     force_tx: channel::Sender<(String, Vec<(u32, bool)>)>,
+    display: wl_display::WlDisplay,
     full_session: bool,
     logout: bool,
     /// The notification cards' surface, while any are shown.
@@ -676,8 +681,14 @@ impl Bar {
         self.relayout();
     }
 
-    /// A confirmation's replies are in: one card if a window still listed wasn't force closed.
+    /// A confirmation's replies are in. navi may answer before it sends the window list's
+    /// `closed` for a window that ended meanwhile: a round trip first, then `force_check`.
     fn force_replies(&mut self, app: String, replies: Vec<(u32, bool)>) {
+        self.display.sync(&self.qh, ForceCheck { app, replies });
+    }
+
+    /// One card if a window still listed wasn't force closed.
+    fn force_check(&mut self, ForceCheck { app, replies }: &ForceCheck) {
         let listed: Vec<u32> = self
             .windows
             .iter()
@@ -685,7 +696,7 @@ impl Bar {
             .collect();
         let now = self.now_ms();
         let repeat = self.notes.shown().iter().any(|n| n.sender == notify::LOCAL);
-        let Some((id, closed)) = force_card(&mut self.notes, now, &app, &replies, &listed) else {
+        let Some((id, closed)) = force_card(&mut self.notes, now, app, replies, &listed) else {
             return;
         };
         info!(id, app, "force close refused card");
@@ -1999,6 +2010,25 @@ impl ActivationHandler for Bar {
         if let Some(p) = self.take_pending(data.seq) {
             self.go_on(p, Some(&token));
         }
+    }
+}
+
+/// A confirmation's replies, waiting for the round trip that `force_replies` started.
+struct ForceCheck {
+    app: String,
+    replies: Vec<(u32, bool)>,
+}
+
+impl Dispatch<wl_callback::WlCallback, ForceCheck> for Bar {
+    fn event(
+        bar: &mut Self,
+        _: &wl_callback::WlCallback,
+        _: wl_callback::Event,
+        check: &ForceCheck,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        bar.force_check(check);
     }
 }
 
