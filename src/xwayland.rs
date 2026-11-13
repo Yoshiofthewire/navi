@@ -3235,7 +3235,8 @@ pub(crate) mod tests {
     }
 
     /// Job 040 AC7: with no X display, an X11 force close is refused at once; once the X
-    /// connection is gone (`XwmHandler::disconnected`), navi forgets its display. Named so CI's `x11_lifecycle_and_input` filter runs it.
+    /// connection is gone (`XwmHandler::disconnected`), navi forgets its display. Named so
+    /// CI's `x11_lifecycle_and_input` filter runs it.
     #[test]
     #[ignore = "requires the Xwayland executable"]
     fn x11_lifecycle_and_input_xwayland_gone() {

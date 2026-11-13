@@ -103,7 +103,9 @@ impl Notes {
     /// A confirmed force close of `app` didn't happen: navi refused, failed or didn't answer.
     /// The same `LOCAL` card as `window_limit`.
     pub fn force_refused(&mut self, now: u64, app: &str) -> (u32, Vec<Closed>) {
-        let body = format!("{app} wasn't force closed. The Navi log says why.");
+        // `app` may be a client's raw app ID.
+        let app = sanitize(app, 64);
+        let body = format!("{app} wasn't force closed. Details: ~/.local/state/navi/navi.log");
         self.local(now, "Force close didn't happen", body)
     }
 

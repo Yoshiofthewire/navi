@@ -605,8 +605,9 @@ bundling a degoogled, resource-tested Chromium variant is reserved for a future 
   navi-bar, the locker and Xwayland are never force closed, and once Xwayland is gone no X11
   force close is tried. Nothing is automatic. If navi refuses, fails or doesn't answer for a
   window that is still open, navi-bar posts one card naming the app that says it wasn't
-  force closed and points to the Navi log; it follows the notification settings like the
-  window-limit card. A Lock from the session menu waits for at most one force close.
+  force closed and gives the log's path (`~/.local/state/navi/navi.log`); it follows the
+  notification settings like the window-limit card. A Lock from the session menu waits for
+  at most one force close.
 - **Laptop alone:** the same layout with a slimmer taskbar.
 - **No virtual desktops.**
 - **Look:** cyberpunk, with no animations: every state change is instant. (The half-second hold

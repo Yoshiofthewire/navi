@@ -2864,8 +2864,15 @@ mod tests {
         assert_eq!(card.summary, "Force close didn't happen");
         assert_eq!(
             card.body,
-            "Konsole wasn't force closed. The Navi log says why."
+            "Konsole wasn't force closed. Details: ~/.local/state/navi/navi.log"
         );
+        // A raw app ID is cut to 64 chars and loses controls and bidi overrides.
+        let mut raw = Notes::default();
+        let app_id = format!("a\u{202E}b\u{7}{}", "x".repeat(100));
+        raw.force_refused(0, &app_id);
+        let body = &raw.shown()[0].body;
+        assert!(body.starts_with("abxx") && body.contains('…'), "{body}");
+        assert!(!body.contains('\u{202E}') && !body.contains('\u{7}'));
         assert_eq!(n.history.len(), 1);
         // A second confirmation's card replaces it.
         let (again, _) = force_card(&mut n, 10, "Konsole", &mixed, &[1]).unwrap();
