@@ -38,7 +38,11 @@ use std::{os::fd::OwnedFd, process::Stdio};
 use tracing::{info, warn};
 
 pub fn start(handle: &LoopHandle<'static, CalloopData>, state: &Navi) -> Option<String> {
-    let (server, client) = match XWayland::spawn(
+    // Smithay 0.7's `X11Lock::grab` reclaims a dead server's display lock by remove, then
+    // create: two spawns racing on one stale lock both get the display. One at a time.
+    static SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let spawning = SPAWN.lock().unwrap_or_else(|e| e.into_inner());
+    let spawned = XWayland::spawn(
         &state.display_handle,
         None,
         std::iter::empty::<(String, String)>(),
@@ -46,7 +50,9 @@ pub fn start(handle: &LoopHandle<'static, CalloopData>, state: &Navi) -> Option<
         Stdio::null(),
         Stdio::inherit(),
         |_| {},
-    ) {
+    );
+    drop(spawning);
+    let (server, client) = match spawned {
         Ok(pair) => pair,
         Err(e) => {
             warn!("XWayland unavailable; native Wayland remains available: {e}");
@@ -3105,6 +3111,59 @@ pub(crate) mod tests {
         b.destroy_window(bw).unwrap();
         b.flush().unwrap();
         pump(&mut event_loop, &mut data, |d| d.state.windows.is_empty());
+    }
+
+    /// Job 042: parallel starts never share a display, even past stale locks a dead server left
+    /// (Smithay 0.7 hands such a display to every spawn that races on it). Named so CI's
+    /// `x11_lifecycle_and_input` filter runs it.
+    #[test]
+    #[ignore = "requires the Xwayland executable"]
+    fn x11_lifecycle_and_input_stale_display_locks() {
+        let mut done = std::process::Command::new("true").spawn().unwrap();
+        let dead = done.id();
+        done.wait().unwrap();
+        for _ in 0..2 {
+            // Only numbers nobody holds; what a start doesn't reclaim is removed after.
+            let planted: Vec<String> = (2..33)
+                .map(|n| format!("/tmp/.X{n}-lock"))
+                .filter(|f| {
+                    let new = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(f);
+                    let pid = format!("{dead:>10}\n");
+                    new.and_then(|mut l| std::io::Write::write_all(&mut l, pid.as_bytes()))
+                        .is_ok()
+                })
+                .collect();
+            let gate = std::sync::Arc::new(std::sync::Barrier::new(8));
+            let starts: Vec<_> = (0..8)
+                .map(|_| {
+                    let gate = gate.clone();
+                    std::thread::spawn(move || {
+                        let (event_loop, data) = harness();
+                        gate.wait();
+                        let display = start(&event_loop.handle(), &data.state);
+                        // Holds the display until every start has picked one.
+                        gate.wait();
+                        display
+                    })
+                })
+                .collect();
+            let mut displays: Vec<String> = starts
+                .into_iter()
+                .map(|t| t.join().unwrap().unwrap())
+                .collect();
+            for f in planted {
+                if std::fs::read_to_string(&f).is_ok_and(|c| c.trim() == dead.to_string()) {
+                    let _ = std::fs::remove_file(&f);
+                }
+            }
+            displays.sort();
+            let all = displays.len();
+            displays.dedup();
+            assert_eq!(displays.len(), all, "{displays:?}");
+        }
     }
 
     /// Job 034 AC13: a force close of an X window that ignores WM_DELETE_WINDOW ends its X
