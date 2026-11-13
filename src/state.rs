@@ -1283,6 +1283,28 @@ impl Navi {
         }
     }
 
+    /// The ✕ on navi's own title bar at `now`: a polite close, and on a window whose first close
+    /// is overdue, navi-bar's offer to force close it.
+    pub fn close_button(&mut self, id: WinId, now: std::time::Instant) {
+        let m = self.windows.iter().find(|m| m.tile == Some(id));
+        let overdue = m.is_some_and(|m| crate::force::overdue(m.close_sent, now));
+        self.close_window(id);
+        if !overdue || self.lock.active {
+            return;
+        }
+        // navi-bar is the one privileged client; a dead one holds no live handle.
+        let privileged = |c: &&Client| privileged(c.get_data::<ClientState>());
+        let bars = self.protected.iter().filter(privileged);
+        let handle = bars
+            .filter_map(|bar| self.toplevels.handle_of(bar, id))
+            .next();
+        let (Some(handle), Some(c)) = (handle, &self.bar_control) else {
+            return;
+        };
+        let sent = crate::shell::send_command(c, crate::control::Command::ForceOffer(handle));
+        info!(id, handle, sent, "force-offer");
+    }
+
     /// Keeps `client` from ever being force closed, with its pid.
     pub fn protect(&mut self, client: Client) {
         let dh = self.display_handle.backend_handle();
@@ -1371,20 +1393,19 @@ impl Navi {
                 signalled
             }
             Ok(Plan::X11 { window, client }) => {
-                let Some(display) = self.xdisplay.clone() else {
+                let Some(socket) = self.xdisplay.as_deref().and_then(crate::xwayland::socket)
+                else {
+                    info!(
+                        id,
+                        x11_client = client,
+                        "force close refused: Xwayland is gone"
+                    );
                     let _ = reply.send(false);
                     return false;
                 };
                 // Its own connection, so a stuck Xwayland never blocks the event loop.
                 std::thread::spawn(move || {
-                    use smithay::reexports::x11rb::{self, protocol::xproto::ConnectionExt};
-                    let done = x11rb::connect(Some(&display))
-                        .map_err(|e| e.to_string())
-                        .and_then(|(conn, _)| {
-                            // `check` waits for the server's answer.
-                            let cookie = conn.kill_client(window).map_err(|e| e.to_string())?;
-                            cookie.check().map_err(|e| e.to_string())
-                        });
+                    let done = crate::xwayland::kill_client(&socket, window);
                     match &done {
                         Ok(()) => info!(id, x11_client = client, by = "bar", "force close"),
                         Err(e) => warn!(id, x11_client = client, "force close failed: {e}"),

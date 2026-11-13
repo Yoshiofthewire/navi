@@ -73,13 +73,19 @@ pub struct Bar {
 /// it was sent.
 pub fn send_command(control: &UnixStream, command: control::Command) -> bool {
     use rustix::net::{SendFlags, send};
-    match send(
-        control,
-        &[command.byte()],
-        SendFlags::DONTWAIT | SendFlags::NOSIGNAL,
-    ) {
-        Ok(1) => true,
-        Ok(_) => false,
+    let bytes = command.bytes();
+    match send(control, &bytes, SendFlags::DONTWAIT | SendFlags::NOSIGNAL) {
+        Ok(n) if n == bytes.len() => true,
+        // Linux sends a frame this small whole or not at all. Were it ever cut, navi-bar would
+        // read the next bytes as its ID: end the stream instead.
+        Ok(n) => {
+            warn!(
+                ?command,
+                n, "control command cut short, closing navi-bar's control stream"
+            );
+            let _ = control.shutdown(std::net::Shutdown::Both);
+            false
+        }
         Err(e) => {
             warn!(?command, "control command dropped: {e}");
             false

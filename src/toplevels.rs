@@ -66,12 +66,11 @@ impl Toplevels {
     }
 
     /// The handle `client` holds for window `id`, by object ID.
-    #[cfg(test)]
     pub fn handle_of(&self, client: &Client, id: WinId) -> Option<u32> {
         let (_, sent) = self.windows.iter().find(|(w, _)| *w == id)?;
         let s = sent
             .iter()
-            .find(|s| s.handle.client().as_ref() == Some(client))?;
+            .find(|s| s.handle.client().as_ref() == Some(client) && s.handle.is_alive())?;
         Some(s.handle.id().protocol_id())
     }
 

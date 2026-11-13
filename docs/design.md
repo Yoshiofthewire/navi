@@ -586,18 +586,28 @@ bundling a degoogled, resource-tested Chromium variant is reserved for a future 
   `WM_DELETE_WINDOW` for X11), for each of the app's windows; the app decides, and may ask
   about unsaved work. **Force close:** if a window's first close (✕ or the dock) has gone
   unanswered for 90 s, its dock menu offers **Force close…** below Close, and Close itself
-  now asks to force close. The 90 s count from the first close and never restart, so a window
-  kept open by cancelling a "Save changes?" prompt is offered it too. The confirmation names
-  the app, says unsaved work is lost and, for an app with more windows, that they close too.
+  now asks to force close. So does another ✕ on navi's title bar: it asks the app again and
+  opens that app's dock menu straight in the confirmation, over its dock slot. The 90 s count
+  from the first close and never restart, so a window kept open by cancelling a "Save
+  changes?" prompt is offered it too. The confirmation names the app and says that force
+  close ends its process (an X11 app: its X connection) with every window it has open, which
+  may include windows the dock shows under another app, and that unsaved work is lost.
   Cancel is selected, and only the arrow keys and Tab move the selection; hovering doesn't.
   Its buttons sit under the heading, away from the rows that open it. For 500 ms after it
   appears it acts on nothing (Enter then is swallowed), and a button press counts only once
   the pointer has really moved, not for the motion navi sends when the panel resizes, so
-  neither a double-click nor a double Enter can confirm. An output, scale or configure change
-  while it's open restarts the 500 ms, and the pointer's next spot becomes its new reference. Confirmed, navi checks the 90 s itself, then ends that window's client: a
-  Wayland app is sent SIGKILL through a pidfd taken when it connected and disconnected; an X11
-  app's X connection is ended with XKillClient, never a signal. navi, navi-bar, the locker and
-  Xwayland are never force closed. Nothing is automatic, and a refusal is only logged.
+  neither a double-click nor a double Enter can confirm. Opened from a ✕, the pointer's first
+  spot on the panel is its reference. An output, scale or configure change while it's open
+  restarts the 500 ms, and the pointer's next spot becomes its new reference. Confirmed,
+  navi checks the 90 s itself, then ends that window's client: a Wayland app is sent SIGKILL
+  through a pidfd taken when it connected and disconnected; an X11 app's X connection is
+  ended with XKillClient, never a signal, over a connection that gives up after 2 s. navi,
+  navi-bar, the locker and Xwayland are never force closed, and once Xwayland is gone no X11
+  force close is tried. Nothing is automatic. If navi refuses, fails or doesn't answer for a
+  window that is still open, navi-bar posts one card naming the app that says it wasn't
+  force closed and gives the log's path (`~/.local/state/navi/navi.log`); it follows the
+  notification settings like the window-limit card. A Lock from the session menu waits for
+  at most one force close.
 - **Laptop alone:** the same layout with a slimmer taskbar.
 - **No virtual desktops.**
 - **Look:** cyberpunk, with no animations: every state change is instant. (The half-second hold

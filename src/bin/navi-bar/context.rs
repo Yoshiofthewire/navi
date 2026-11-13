@@ -139,8 +139,6 @@ pub fn lines(app: &App, dock: bool) -> Vec<Line> {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Confirm {
     pub name: String,
-    /// The app's windows, as the Close item counted them.
-    pub windows: usize,
     /// 0 Cancel, 1 Force close.
     pub selected: usize,
     pub opened: Instant,
@@ -153,16 +151,15 @@ pub struct Confirm {
 }
 
 impl Confirm {
-    fn body(&self) -> Vec<String> {
-        let mut out = vec![
-            "It ignored Close for 90 s.".to_string(),
-            "Force close ends it at once,".into(),
-            "and unsaved work is lost.".into(),
-        ];
-        if self.windows > 1 {
-            out.push(format!("Its other {} windows close too.", self.windows - 1));
-        }
-        out
+    /// navi-bar can't see which windows share a process or X connection, so no count.
+    fn body(&self) -> [&'static str; 5] {
+        [
+            "It ignored Close for 90 s.",
+            "Force close ends its process",
+            "(or X connection) at once,",
+            "with every window it has",
+            "open. Unsaved work is lost.",
+        ]
     }
 
     fn aged(&self, now: Instant) -> bool {
@@ -286,13 +283,8 @@ impl Menu {
             Some(Line::Header(n)) => n.clone(),
             _ => String::new(),
         };
-        let windows = self.lines.iter().find_map(|l| match l {
-            Line::Item(Kind::Close(n), _) => Some(*n),
-            _ => None,
-        });
         self.confirm = Some(Confirm {
             name,
-            windows: windows.unwrap_or(1),
             selected: 0,
             opened: now,
             at: Some(at),
@@ -438,7 +430,7 @@ impl Menu {
             let top = buttons[0].y + BUTTON_H + GAP;
             for (i, text) in c.body().into_iter().enumerate() {
                 let at = row(top + i as i32 * LINE_H, LINE_H);
-                out.push(Item::Text(text, inset_x(at, 12), DIM));
+                out.push(Item::Text(text.into(), inset_x(at, 12), DIM));
             }
             return out;
         }
@@ -521,6 +513,37 @@ pub fn resolve(
         overdue: a.overdue,
     };
     Some(lines(&app, true))
+}
+
+/// navi's offer to force close the window whose handle has object ID `id`: `handles` are the
+/// shown windows' IDs and overdue states, in `apps`' window order. Only for a listed, overdue
+/// window, `open` becomes its app's dock menu, straight in the confirmation; the pointer is
+/// off the surface, so its first spot there is the reference. Returns the app's index.
+pub fn offer(
+    open: &mut Option<Menu>,
+    id: u32,
+    handles: &[(u32, bool)],
+    apps: &[crate::dock::App],
+    entries: &[Entry],
+    pins: &[String],
+    now: Instant,
+) -> Option<usize> {
+    let win = handles
+        .iter()
+        .position(|&(h, overdue)| h == id && overdue)?;
+    let at = apps.iter().position(|a| a.windows.contains(&win))?;
+    let target = Target {
+        key: key(&apps[at], entries),
+        dock: true,
+    };
+    let lines = resolve(&target, apps, entries, pins)?;
+    let mut m = Menu::new(target, lines, (0, 0), false);
+    m.ask_force(now, (0, 0));
+    if let Some(c) = &mut m.confirm {
+        c.at = None;
+    }
+    *open = Some(m);
+    Some(at)
 }
 
 /// A dock app's menu key: its desktop ID, else its app ID.
@@ -888,9 +911,6 @@ mod tests {
             let c = m.confirm.as_ref().unwrap();
             assert!(!c.armed(t + ARM - Duration::from_millis(1)));
             assert!(c.armed(t + ARM));
-            // The window count is honest: a line only when there are others.
-            let others = c.body().iter().any(|l| l.contains("other"));
-            assert_eq!(others, windows > 1);
         }
     }
 
@@ -965,5 +985,126 @@ mod tests {
         m.entered((40, -60));
         m.pointer((40, -60));
         assert!(!m.confirm.as_ref().unwrap().armed(later + ARM));
+    }
+
+    /// Job 040 AC3: navi's offer opens the app's dock menu in the confirmation, only for a
+    /// listed, overdue window.
+    #[test]
+    fn ac3_force_offer_opens_the_confirmation_only_when_overdue() {
+        let entries = [konsole()];
+        let pins: [String; 0] = [];
+        let running = |overdue| crate::dock::Running {
+            app_id: "org.kde.konsole",
+            focused: false,
+            minimized: false,
+            attention: false,
+            overdue,
+        };
+        let other = crate::dock::Running {
+            app_id: "other",
+            ..running(false)
+        };
+        let windows = [other, running(false), running(true)];
+        let apps = crate::dock::apps(&pins, &entries, &windows);
+        let handles = [
+            (0xFF00_0001, false),
+            (0xFF00_0002, false),
+            (0xFF00_0003, true),
+        ];
+        let t = Instant::now();
+        let mut open = None;
+        let at = offer(&mut open, 0xFF00_0003, &handles, &apps, &entries, &pins, t);
+        assert_eq!(apps[at.unwrap()].entry, Some(0), "Konsole's slot");
+        let m = open.as_ref().unwrap();
+        assert_eq!(m.target.key, "org.kde.konsole.desktop");
+        assert!(m.target.dock);
+        let c = m.confirm.as_ref().expect("in the confirmation");
+        assert_eq!(c.name, "Konsole");
+        assert_eq!(c.selected, 0, "Cancel");
+        assert!(!c.armed(t + Duration::from_secs(60)), "no motion yet");
+        // The pointer comes from off the surface: its first spot is the reference.
+        let mut m = m.clone();
+        m.pointer((3, -40));
+        assert!(!m.confirm.as_ref().unwrap().armed(t + ARM));
+        m.pointer((4, -40));
+        assert!(
+            !m.confirm
+                .as_ref()
+                .unwrap()
+                .armed(t + ARM - Duration::from_millis(1))
+        );
+        assert!(m.confirm.as_ref().unwrap().armed(t + ARM));
+
+        // Unknown, listed but not overdue (another app's, or this app's other window): nothing,
+        // and an open menu stays as it was.
+        let mine = Menu::new(
+            Target {
+                key: "other".into(),
+                dock: true,
+            },
+            vec![Line::Header("other".into())],
+            (7, -9),
+            true,
+        );
+        for id in [0, 0xFF00_0001, 0xFF00_0002, 0xFF00_0009] {
+            let mut open = Some(mine.clone());
+            assert_eq!(
+                offer(&mut open, id, &handles, &apps, &entries, &pins, t),
+                None
+            );
+            assert_eq!(open.as_ref(), Some(&mine), "{id:#x}");
+            let mut none = None;
+            assert_eq!(
+                offer(&mut none, id, &handles, &apps, &entries, &pins, t),
+                None
+            );
+            assert!(none.is_none());
+        }
+    }
+
+    /// Job 040 AC4: the confirmation is true for either kind of kill, counts nothing, and every
+    /// line fits the 260 px menu at the default size in every font navi-bar may load.
+    #[test]
+    fn ac4_confirmation_text_is_honest_and_fits() {
+        let mut m = menu(3);
+        m.ask_force(Instant::now(), (0, 0));
+        let body = m.confirm.as_ref().unwrap().body().join(" ");
+        assert!(body.contains("process"), "{body}");
+        assert!(body.contains("(or X connection)"), "{body}");
+        assert!(body.contains("every window it has open"), "{body}");
+        assert!(body.contains("Unsaved work is lost"), "{body}");
+        let digits: String = body.chars().filter(char::is_ascii_digit).collect();
+        assert_eq!(digits, "90", "no window count: {body}");
+        let r = Rect {
+            x: 0,
+            y: 0,
+            w: MENU_W,
+            h: m.height(),
+        };
+        // Whichever of `font::PATHS` this host has; CI's release job has only DejaVu Sans.
+        let fonts: Vec<_> = crate::font::PATHS
+            .iter()
+            .filter_map(|p| {
+                let bytes = std::fs::read(p).ok()?;
+                let f = fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default());
+                Some((p, f.unwrap()))
+            })
+            .collect();
+        assert!(!fonts.is_empty(), "no font from font::PATHS installed");
+        for (path, font) in &fonts {
+            let mut lines = 0;
+            for item in m.draw(r) {
+                if let Item::Text(text, at, DIM) = item {
+                    let w = crate::text_w(font, &text, crate::text_px());
+                    assert!(
+                        w <= at.w as f32,
+                        "{path}: {text:?} is {w} px, room {}",
+                        at.w
+                    );
+                    lines += 1;
+                }
+            }
+            assert_eq!(lines, 5);
+        }
     }
 }

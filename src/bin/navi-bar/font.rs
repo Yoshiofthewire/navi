@@ -6,7 +6,7 @@ use crate::files::read_bytes;
 
 const MAX_FILE: u64 = 32 << 20;
 /// Noto Sans, DejaVu Sans, Liberation Sans, in Arch and Debian layouts.
-const PATHS: &[&str] = &[
+pub(crate) const PATHS: &[&str] = &[
     "/usr/share/fonts/noto/NotoSans-Regular.ttf",
     "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
     "/usr/share/fonts/TTF/DejaVuSans.ttf",

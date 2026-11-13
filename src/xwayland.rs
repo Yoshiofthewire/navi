@@ -19,8 +19,13 @@ use smithay::{
     delegate_xwayland_shell,
     desktop::Window,
     reexports::{
-        calloop::LoopHandle, wayland_server::protocol::wl_surface::WlSurface,
-        x11rb::properties::WmSizeHints,
+        calloop::LoopHandle,
+        wayland_server::protocol::wl_surface::WlSurface,
+        x11rb::{
+            properties::WmSizeHints,
+            rust_connection::{DefaultStream, PollMode, Stream},
+            utils::RawFdContainer,
+        },
     },
     utils::{Logical, Rectangle},
     wayland::xwayland_shell::{XWaylandShellHandler, XWaylandShellState},
@@ -98,6 +103,92 @@ pub(crate) const XWAYLAND_RESOURCE_ID_MASK: u32 = 0x001F_FFFF;
 /// client's own range, so no client can name another's.
 pub(crate) fn x_client(id: u32) -> u32 {
     id & !XWAYLAND_RESOURCE_ID_MASK
+}
+
+/// How long a force close's X connection may take to connect, and then to get the answer.
+pub(crate) const X11_KILL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// X display `:N`'s filesystem socket.
+pub(crate) fn socket(display: &str) -> Option<std::path::PathBuf> {
+    let n: u32 = display.strip_prefix(':')?.parse().ok()?;
+    Some(format!("/tmp/.X11-unix/X{n}").into())
+}
+
+/// XKillClient on `window`'s X client, over a new connection to `socket`. Connecting and the
+/// server's answer each get `X11_KILL_TIMEOUT`, so a stuck Xwayland never holds the caller.
+pub(crate) fn kill_client(socket: &std::path::Path, window: u32) -> Result<(), String> {
+    use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType, sockopt};
+    use smithay::reexports::x11rb::{
+        errors::ReplyError,
+        protocol::{ErrorKind, xproto::ConnectionExt},
+        rust_connection::RustConnection,
+    };
+    let fd = rustix::net::socket_with(
+        AddressFamily::UNIX,
+        SocketType::STREAM,
+        SocketFlags::CLOEXEC,
+        None,
+    )
+    .map_err(|e| e.to_string())?;
+    // Connect waits while the listener's backlog is full; the send timeout bounds that.
+    let timeout = Some(X11_KILL_TIMEOUT);
+    sockopt::set_socket_timeout(&fd, sockopt::Timeout::Send, timeout).map_err(|e| e.to_string())?;
+    let addr = SocketAddrUnix::new(socket).map_err(|e| e.to_string())?;
+    rustix::net::connect(&fd, &addr).map_err(|e| format!("connect: {e}"))?;
+    let stream = std::os::unix::net::UnixStream::from(fd);
+    let (stream, _) = DefaultStream::from_unix_stream(stream).map_err(|e| e.to_string())?;
+    let stream = Bounded {
+        stream,
+        deadline: std::sync::Mutex::new(std::time::Instant::now() + X11_KILL_TIMEOUT),
+    };
+    let conn = RustConnection::connect_to_stream(stream, 0).map_err(|e| format!("setup: {e}"))?;
+    *conn.stream().deadline.lock().map_err(|e| e.to_string())? =
+        std::time::Instant::now() + X11_KILL_TIMEOUT;
+    let cookie = conn.kill_client(window).map_err(|e| e.to_string())?;
+    // `check` waits for the server's answer. BadValue: no such client, as the force close of
+    // its other window just ended it.
+    match cookie.check() {
+        Err(ReplyError::X11Error(e)) if e.error_kind == ErrorKind::Value => Ok(()),
+        done => done.map_err(|e| e.to_string()),
+    }
+}
+
+/// x11rb's stream, whose waits end at `deadline`.
+struct Bounded {
+    stream: DefaultStream,
+    deadline: std::sync::Mutex<std::time::Instant>,
+}
+
+impl Stream for Bounded {
+    fn poll(&self, mode: PollMode) -> std::io::Result<()> {
+        use rustix::event::{PollFd, PollFlags, Timespec, poll};
+        let deadline = *self
+            .deadline
+            .lock()
+            .map_err(|_| std::io::ErrorKind::Other)?;
+        let mut flags = PollFlags::empty();
+        flags.set(PollFlags::IN, mode.readable());
+        flags.set(PollFlags::OUT, mode.writable());
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            let left = Timespec::try_from(left).map_err(|_| std::io::ErrorKind::InvalidInput)?;
+            let mut fds = [PollFd::new(&self.stream, flags)];
+            match poll(&mut fds, Some(&left)) {
+                Ok(0) => return Err(std::io::ErrorKind::TimedOut.into()),
+                Ok(_) => return Ok(()),
+                Err(rustix::io::Errno::INTR) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
+    fn read(&self, buf: &mut [u8], fds: &mut Vec<RawFdContainer>) -> std::io::Result<usize> {
+        self.stream.read(buf, fds)
+    }
+
+    fn write(&self, buf: &[u8], fds: &mut Vec<RawFdContainer>) -> std::io::Result<usize> {
+        self.stream.write(buf, fds)
+    }
 }
 
 impl Navi {
@@ -458,6 +549,8 @@ impl XwmHandler for Navi {
         for x in windows {
             self.remove_x11(&x);
         }
+        // Another process may take its number; force close must never reach that server.
+        self.xdisplay = None;
         warn!("XWayland disconnected; restart Navi to run X11 apps again");
     }
 }
@@ -685,6 +778,46 @@ pub(crate) mod tests {
             event_loop.dispatch(Duration::from_millis(5), data).unwrap();
             crate::after_dispatch(data);
         }
+    }
+
+    /// Job 040 AC6: a force close's X connection to a server that never answers gives up within
+    /// `X11_KILL_TIMEOUT`, and one to nobody fails at once.
+    #[test]
+    fn ac6_x11_kill_gives_up_on_a_silent_server() {
+        assert_eq!(socket(":3"), Some("/tmp/.X11-unix/X3".into()));
+        for bad in ["", "3", ":", ":x", ":3.0", "host:3"] {
+            assert_eq!(socket(bad), None, "{bad:?}");
+        }
+        let dir = std::env::temp_dir().join(format!("navi-x11-kill-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let silent = dir.join("X0");
+        let listener = std::os::unix::net::UnixListener::bind(&silent).unwrap();
+        let (done, end) = std::sync::mpsc::channel::<()>();
+        // Accepts, then holds the connection open without a byte until the test ends.
+        let server = std::thread::spawn(move || {
+            let held = listener.accept().unwrap();
+            let _ = end.recv();
+            drop(held);
+        });
+        let start = Instant::now();
+        let path = silent.clone();
+        let worker = std::thread::spawn(move || super::kill_client(&path, 0x0060_0007));
+        let result = worker.join().unwrap();
+        let took = start.elapsed();
+        assert!(result.is_err(), "{result:?}");
+        assert!(took >= X11_KILL_TIMEOUT, "{took:?}");
+        assert!(took < X11_KILL_TIMEOUT + Duration::from_secs(1), "{took:?}");
+        let _ = done.send(());
+        server.join().unwrap();
+
+        // A socket file nobody listens on any more, and no file at all.
+        for path in [silent, dir.join("X1")] {
+            let start = Instant::now();
+            assert!(super::kill_client(&path, 0x0060_0007).is_err(), "{path:?}");
+            assert!(start.elapsed() < Duration::from_millis(500), "{path:?}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3054,18 +3187,33 @@ pub(crate) mod tests {
 
         // The bar's close: A hears WM_DELETE_WINDOW and ignores it.
         data.state.close_window(id);
-        let mut asked = false;
-        pump(&mut event_loop, &mut data, |_| {
-            while let Some(event) = a.poll_for_event().unwrap() {
-                if let Event::ClientMessage(e) = event {
-                    asked |= e.window == wa && e.data.as_data32()[0] == delete;
+        let asked = |event_loop: &mut EventLoop<CalloopData>, data: &mut CalloopData| {
+            let mut asked = false;
+            pump(event_loop, data, |_| {
+                while let Some(event) = a.poll_for_event().unwrap() {
+                    if let Event::ClientMessage(e) = event {
+                        asked |= e.window == wa && e.data.as_data32()[0] == delete;
+                    }
                 }
-            }
-            asked
-        });
+                asked
+            });
+        };
+        asked(&mut event_loop, &mut data);
         assert!(!force(&mut event_loop, &mut data), "not overdue yet");
         let m = data.state.windows.iter_mut().find(|m| m.tile == Some(id));
         m.unwrap().close_sent = Some(Instant::now() - crate::force::FORCE_AFTER);
+        // Job 040 AC9: a ✕ on the overdue window asks again and offers force close.
+        data.state.protect(bar.clone());
+        let (bar_end, navi_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        bar_end.set_nonblocking(true).unwrap();
+        data.state.bar_control = Some(navi_end);
+        data.state.close_button(id, Instant::now());
+        asked(&mut event_loop, &mut data);
+        let mut offer = [0; 8];
+        let n = std::io::Read::read(&mut &bar_end, &mut offer).unwrap();
+        let mut want = vec![crate::control::FORCE_OFFER];
+        want.extend(handle.to_le_bytes());
+        assert_eq!(offer[..n], want, "FORCE_OFFER and A's handle");
         assert!(force(&mut event_loop, &mut data), "force closed at +90 s");
 
         // A's connection is gone; B and Xwayland are not.
@@ -3080,6 +3228,107 @@ pub(crate) mod tests {
             c.get_input_focus().unwrap().reply().is_ok(),
             "a new X client connects"
         );
+        // Job 040: a force close of a window whose client just ended (with its other window) is
+        // done, not a refusal.
+        let socket = socket(&xdisplay).unwrap();
+        assert_eq!(super::kill_client(&socket, wa), Ok(()));
+    }
+
+    /// Job 040 AC7: with no X display, an X11 force close is refused at once; once the X
+    /// connection is gone (`XwmHandler::disconnected`), navi forgets its display. Named so
+    /// CI's `x11_lifecycle_and_input` filter runs it.
+    #[test]
+    #[ignore = "requires the Xwayland executable"]
+    fn x11_lifecycle_and_input_xwayland_gone() {
+        let (mut event_loop, mut data) = harness();
+        let (server, client) = std::os::unix::net::UnixStream::pair().unwrap();
+        let bar = data
+            .state
+            .display_handle
+            .insert_client(
+                server,
+                std::sync::Arc::new(crate::state::ClientState {
+                    privileged: true,
+                    ..Default::default()
+                }),
+            )
+            .unwrap();
+        let shell = WaylandConnection::from_socket(client).unwrap();
+        let mut queue = shell.new_event_queue::<Metadata>();
+        let _registry = shell.display().get_registry(&queue.handle(), ());
+        let mut metadata = Metadata::default();
+        queue.flush().unwrap();
+        let xdisplay = start(&event_loop.handle(), &data.state).expect("spawn Xwayland");
+        pump(&mut event_loop, &mut data, |d| d.state.xwm.is_some());
+        assert_eq!(data.state.xdisplay.as_deref(), Some(xdisplay.as_str()));
+        let (a, screen) = smithay::reexports::x11rb::connect(Some(&xdisplay)).unwrap();
+        let root = a.setup().roots[screen].root;
+        let win = a.generate_id().unwrap();
+        a.create_window(
+            smithay::reexports::x11rb::COPY_DEPTH_FROM_PARENT,
+            win,
+            root,
+            0,
+            0,
+            64,
+            48,
+            0,
+            WindowClass::INPUT_OUTPUT,
+            0,
+            &CreateWindowAux::new().background_pixel(0x6688aa),
+        )
+        .unwrap();
+        a.map_window(win).unwrap();
+        a.flush().unwrap();
+        let tile = |d: &CalloopData| {
+            let mut ws = d.state.windows.iter();
+            let m = ws.find(|m| m.window.x11_surface().is_some_and(|x| x.window_id() == win));
+            m.and_then(|m| m.tile)
+        };
+        pump(&mut event_loop, &mut data, |d| tile(d).is_some());
+        let id = tile(&data).unwrap();
+        pump(&mut event_loop, &mut data, |d| {
+            metadata.read(&mut queue);
+            d.state.toplevels.handle_of(&bar, id).is_some()
+        });
+        let handle = data.state.toplevels.handle_of(&bar, id).unwrap();
+        data.state.close_window(id);
+        let m = data.state.windows.iter_mut().find(|m| m.tile == Some(id));
+        m.unwrap().close_sent = Some(Instant::now() - crate::force::FORCE_AFTER);
+
+        // No display: `NO` before force_close returns, and A lives.
+        let display = data.state.xdisplay.take();
+        let (tx, rx) = std::sync::mpsc::channel();
+        data.state.force_close(&bar, handle, tx);
+        assert_eq!(rx.try_recv(), Ok(false), "answered without a worker");
+        assert!(
+            a.get_input_focus().unwrap().reply().is_ok(),
+            "A still connected"
+        );
+        data.state.xdisplay = display;
+
+        // The window manager's X connection ends: navi forgets `:N`. Killing Xwayland itself
+        // would free its display number to parallel tests while this one still holds it.
+        let atom = |name: &[u8]| a.intern_atom(false, name).unwrap().reply().unwrap().atom;
+        let check = a
+            .get_property(
+                false,
+                root,
+                atom(b"_NET_SUPPORTING_WM_CHECK"),
+                AtomEnum::WINDOW,
+                0,
+                1,
+            )
+            .unwrap()
+            .reply()
+            .unwrap();
+        let wm = check
+            .value32()
+            .and_then(|mut v| v.next())
+            .expect("the WM's window");
+        a.kill_client(wm).unwrap().check().unwrap();
+        pump(&mut event_loop, &mut data, |d| d.state.xdisplay.is_none());
+        assert!(tile(&data).is_none(), "its windows are gone");
     }
 
     /// Job 038 AC5: Xwayland's stack follows navi's drawn order. A float stays above the tile
