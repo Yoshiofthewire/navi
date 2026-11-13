@@ -7,10 +7,13 @@ use crate::{
     desktop::Entry,
     layout::{Item, Rect},
     menu::Row,
-    theme::{ACCENT, BAR_BG, DIM, INK, PANEL_EDGE, Panel, SELECTED},
+    theme::{ACCENT, BAR_BG, DIM, HOVER, INK, PANEL_EDGE, Panel, SELECTED},
 };
 
+/// The width at `BASE_PX`, and the least at any size.
 pub const MENU_W: i32 = 260;
+/// The text size the sizes below are for; bigger text scales the menu with it.
+const BASE_PX: i32 = 14;
 const PAD: i32 = 12;
 const ROW_H: i32 = 32;
 /// A 1 px line with 4 px above and below.
@@ -20,6 +23,13 @@ const BUTTON_H: i32 = 36;
 /// Space around the confirmation's buttons.
 const GAP: i32 = 12;
 const MARK_W: i32 = 3;
+/// A label's inset in its row or button.
+const TEXT_X: i32 = 12;
+/// Untrusted names are cut to this many chars before they are measured.
+const NAME_CHARS: usize = 256;
+/// navi-bar can't see which windows share a process or X connection, so no count.
+const BODY: &str = "It ignored Close for 90 s. Force close ends its process (or X connection) at \
+                    once, with every window it has open. Unsaved work is lost.";
 /// The confirmation acts on nothing for this long after it appears: a double-click or a double
 /// Enter on the item that opened it never confirms.
 pub const ARM: Duration = Duration::from_millis(500);
@@ -56,12 +66,58 @@ pub enum Line {
 }
 
 impl Line {
-    fn h(&self) -> i32 {
+    fn h(&self, t: &Text) -> i32 {
         match self {
             Line::Sep => SEP_H,
-            _ => ROW_H,
+            _ => t.scale(ROW_H),
         }
     }
+}
+
+/// The text size in px, and a glyph's advance at it, `None` for one the font lacks.
+pub struct Text<'a> {
+    pub px: i32,
+    pub advance: &'a dyn Fn(char) -> Option<f32>,
+}
+
+impl Text<'_> {
+    /// `v` px at `BASE_PX`, at this text size; never smaller.
+    fn scale(&self, v: i32) -> i32 {
+        v * self.px.max(BASE_PX) / BASE_PX
+    }
+
+    fn w(&self, s: &str) -> f32 {
+        s.chars().filter_map(self.advance).sum()
+    }
+
+    /// `text` without controls or bidi overrides, cut with `…` to `max` px.
+    fn fit(&self, text: &str, max: f32) -> String {
+        let clean = crate::notify::sanitize(text, NAME_CHARS);
+        crate::font::fit(&clean, max, self.advance)
+            .into_iter()
+            .collect()
+    }
+
+    /// `Force close {name}?`, cutting only the name. 1 px spare, so the whole heading measured
+    /// at once still fits.
+    fn heading(&self, name: &str, max: f32) -> String {
+        let room = max - self.w("Force close ?") - 1.0;
+        format!("Force close {}?", self.fit(name, room))
+    }
+}
+
+/// The menu's width at text size `px`: no wider than the launcher, which holds it.
+pub fn width(px: i32) -> i32 {
+    let t = Text {
+        px,
+        advance: &|_| None,
+    };
+    t.scale(MENU_W).min(crate::layout::PANEL_W)
+}
+
+/// The text room in a row of the menu `w` wide.
+fn text_w(w: i32) -> f32 {
+    (w - 2 * PAD - 2 * TEXT_X) as f32
 }
 
 /// The app a menu acts on: its desktop ID, else its app ID, and whether it's a dock icon's.
@@ -148,18 +204,14 @@ pub struct Confirm {
     pub at: Option<(i32, i32)>,
     /// The pointer really moved since it opened.
     pub moved: bool,
+    /// The button the pointer rests on, tinted only: hover never selects.
+    pub hovered: Option<usize>,
 }
 
 impl Confirm {
-    /// navi-bar can't see which windows share a process or X connection, so no count.
-    fn body(&self) -> [&'static str; 5] {
-        [
-            "It ignored Close for 90 s.",
-            "Force close ends its process",
-            "(or X connection) at once,",
-            "with every window it has",
-            "open. Unsaved work is lost.",
-        ]
+    /// `BODY` in lines that fit the menu `w` wide.
+    fn body(w: i32, t: &Text) -> Vec<String> {
+        crate::cards::wrap(BODY, text_w(w), usize::MAX, &t.advance)
     }
 
     fn aged(&self, now: Instant) -> bool {
@@ -289,6 +341,7 @@ impl Menu {
             opened: now,
             at: Some(at),
             moved: false,
+            hovered: None,
         });
     }
 
@@ -317,37 +370,48 @@ impl Menu {
         }
     }
 
-    pub fn height(&self) -> i32 {
+    /// The text size went from `was` to `size`. A new size can move a button under a still
+    /// pointer, so it re-arms as `moved_on_screen` does.
+    pub fn text_size(&mut self, was: u32, size: u32, now: Instant) {
+        if was != size {
+            self.moved_on_screen(now);
+        }
+    }
+
+    pub fn height(&self, t: &Text) -> i32 {
         match &self.confirm {
-            Some(c) => PAD + ROW_H + GAP + BUTTON_H + GAP + c.body().len() as i32 * LINE_H + PAD,
-            None => PAD + self.lines.iter().map(Line::h).sum::<i32>() + PAD,
+            Some(_) => {
+                let body = Confirm::body(width(t.px), t).len() as i32 * t.scale(LINE_H);
+                PAD + t.scale(ROW_H) + GAP + t.scale(BUTTON_H) + GAP + body + PAD
+            }
+            None => PAD + self.lines.iter().map(|l| l.h(t)).sum::<i32>() + PAD,
         }
     }
 
     /// Each line's rect in the menu at `r`.
-    fn rects(&self, r: Rect) -> impl Iterator<Item = (usize, Rect)> + '_ {
+    fn rects<'a>(&'a self, r: Rect, t: &'a Text) -> impl Iterator<Item = (usize, Rect)> + 'a {
         let mut y = r.y + PAD;
         self.lines.iter().enumerate().map(move |(i, l)| {
             let at = Rect {
                 x: r.x + PAD,
                 y,
                 w: r.w - 2 * PAD,
-                h: l.h(),
+                h: l.h(t),
             };
-            y += l.h();
+            y += at.h;
             (i, at)
         })
     }
 
     /// Cancel and Force close, right under the heading: far above the bottom rows (Close,
     /// Force close…) that open the confirmation, whose bottom edge stays put.
-    fn buttons(&self, r: Rect) -> [Rect; 2] {
+    fn buttons(&self, r: Rect, t: &Text) -> [Rect; 2] {
         let w = (r.w - 3 * PAD) / 2;
         let cancel = Rect {
             x: r.x + PAD,
-            y: r.y + PAD + ROW_H + GAP,
+            y: r.y + PAD + t.scale(ROW_H) + GAP,
             w,
-            h: BUTTON_H,
+            h: t.scale(BUTTON_H),
         };
         [
             cancel,
@@ -359,34 +423,46 @@ impl Menu {
     }
 
     /// What's at `(x, y)` in the menu at `r`: an item or a button.
-    pub fn hit(&self, r: Rect, x: i32, y: i32) -> Option<Hit> {
+    pub fn hit(&self, r: Rect, t: &Text, x: i32, y: i32) -> Option<Hit> {
         if self.confirm.is_some() {
-            let [cancel, force] = self.buttons(r);
+            let [cancel, force] = self.buttons(r, t);
             return match (cancel.contains(x, y), force.contains(x, y)) {
                 (true, _) => Some(Hit::Cancel),
                 (_, true) => Some(Hit::Confirm),
                 _ => None,
             };
         }
-        let mut lines = self.rects(r);
+        let mut lines = self.rects(r, t);
         let (i, _) = lines.find(|(_, at)| at.contains(x, y))?;
         matches!(self.lines[i], Line::Item(..)).then_some(Hit::Line(i))
     }
 
-    /// Hover selects the item under the pointer; returns whether that changed. It never moves
-    /// the confirmation's selection: only keys do, so Enter acts on what the user chose.
+    /// Hover selects the item under the pointer, and only tints a confirmation's button; returns
+    /// whether either changed. Only keys move the confirmation's selection, so Enter acts on
+    /// what the user chose.
     pub fn hover(&mut self, hit: Hit) -> bool {
-        match (hit, &self.confirm) {
+        match (hit, &mut self.confirm) {
             (Hit::Line(i), None) if self.selected != Some(i) => {
                 self.selected = Some(i);
                 true
+            }
+            (Hit::Cancel | Hit::Confirm, Some(c)) => {
+                let was = c.hovered.replace(usize::from(hit == Hit::Confirm));
+                was != c.hovered
             }
             _ => false,
         }
     }
 
+    /// The pointer is on neither button, or left: no tint. Returns whether that changed.
+    pub fn unhover(&mut self) -> bool {
+        self.confirm
+            .as_mut()
+            .is_some_and(|c| c.hovered.take().is_some())
+    }
+
     /// The menu at `r`, on top of everything else on the surface.
-    pub fn draw(&self, r: Rect) -> Vec<Item> {
+    pub fn draw(&self, r: Rect, t: &Text) -> Vec<Item> {
         let mut out = vec![Item::Panel(r, Panel::Popup, PANEL_EDGE, 1)];
         let row = |y, h| Rect {
             x: r.x + PAD,
@@ -394,26 +470,31 @@ impl Menu {
             w: r.w - 2 * PAD,
             h,
         };
+        let text = |s: &str, at: Rect, rgb| {
+            let at = inset_x(at, TEXT_X);
+            Item::Text(t.fit(s, at.w as f32), at, rgb)
+        };
         if let Some(c) = &self.confirm {
-            let heading = row(r.y + PAD, ROW_H);
-            out.push(Item::Text(
-                format!("Force close {}?", c.name),
-                inset_x(heading, 12),
-                INK,
-            ));
+            let heading = row(r.y + PAD, t.scale(ROW_H));
+            let at = inset_x(heading, TEXT_X);
+            out.push(Item::Text(t.heading(&c.name, at.w as f32), at, INK));
             let line = Rect {
-                y: heading.y + ROW_H + GAP / 2,
+                y: heading.y + heading.h + GAP / 2,
                 h: 1,
                 ..heading
             };
             out.push(Item::Fill(line, PANEL_EDGE));
-            let buttons = self.buttons(r);
+            let buttons = self.buttons(r, t);
             for (i, (b, label)) in buttons
                 .into_iter()
                 .zip(["Cancel", "Force close"])
                 .enumerate()
             {
-                let fill = if c.selected == i { SELECTED } else { BAR_BG };
+                let fill = match (c.selected == i, c.hovered == Some(i)) {
+                    (true, _) => SELECTED,
+                    (false, true) => HOVER,
+                    (false, false) => BAR_BG,
+                };
                 // Force close, the destructive one, always has an accent rim.
                 let inner = if i == 1 {
                     out.push(Item::Round(b, 8, ACCENT));
@@ -425,18 +506,17 @@ impl Menu {
                 if c.selected == i {
                     out.push(Item::Fill(mark(inner), ACCENT));
                 }
-                out.push(Item::Text(label.into(), inset_x(b, 12), INK));
+                out.push(text(label, b, INK));
             }
-            let top = buttons[0].y + BUTTON_H + GAP;
-            for (i, text) in c.body().into_iter().enumerate() {
-                let at = row(top + i as i32 * LINE_H, LINE_H);
-                out.push(Item::Text(text.into(), inset_x(at, 12), DIM));
+            let (top, line_h) = (buttons[0].y + buttons[0].h + GAP, t.scale(LINE_H));
+            for (i, body) in Confirm::body(r.w, t).iter().enumerate() {
+                out.push(text(body, row(top + i as i32 * line_h, line_h), DIM));
             }
             return out;
         }
-        for (i, at) in self.rects(r) {
+        for (i, at) in self.rects(r, t) {
             match &self.lines[i] {
-                Line::Header(name) => out.push(Item::Text(name.clone(), inset_x(at, 12), DIM)),
+                Line::Header(name) => out.push(text(name, at, DIM)),
                 Line::Sep => out.push(Item::Fill(
                     Rect {
                         y: at.y + 4,
@@ -450,7 +530,7 @@ impl Menu {
                         out.push(Item::Round(at, 7, SELECTED));
                         out.push(Item::Fill(mark(at), ACCENT));
                     }
-                    out.push(Item::Text(label.clone(), inset_x(at, 12), INK));
+                    out.push(text(label, at, INK));
                 }
             }
         }
@@ -558,6 +638,55 @@ pub fn key(app: &crate::dock::App, entries: &[Entry]) -> String {
 mod tests {
     use super::*;
     use crate::desktop::{Action, Category};
+
+    fn seven(_: char) -> Option<f32> {
+        Some(7.0)
+    }
+
+    /// The default size, every glyph 7 px.
+    const T14: Text = Text {
+        px: 14,
+        advance: &seven,
+    };
+    const T24: Text = Text {
+        px: 24,
+        advance: &seven,
+    };
+
+    /// Whichever of `font::PATHS` this host has; CI's release job has only DejaVu Sans.
+    fn fonts() -> Vec<(&'static str, fontdue::Font)> {
+        let fonts: Vec<_> = crate::font::PATHS
+            .iter()
+            .filter_map(|&p| {
+                let bytes = std::fs::read(p).ok()?;
+                let f = fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default());
+                Some((p, f.unwrap()))
+            })
+            .collect();
+        assert!(!fonts.is_empty(), "no font from font::PATHS installed");
+        fonts
+    }
+
+    /// `f` with `font` at `px`, measured as `draw_text` draws.
+    fn sized<R>(font: &fontdue::Font, px: i32, f: impl FnOnce(&Text) -> R) -> R {
+        let advance = |c: char| {
+            (font.lookup_glyph_index(c) != 0).then(|| font.metrics(c, px as f32).advance_width)
+        };
+        f(&Text {
+            px,
+            advance: &advance,
+        })
+    }
+
+    /// The menu's rect at the surface's top-left.
+    fn at(m: &Menu, t: &Text) -> Rect {
+        Rect {
+            x: 0,
+            y: 0,
+            w: width(t.px),
+            h: m.height(t),
+        }
+    }
 
     fn konsole() -> Entry {
         Entry {
@@ -700,18 +829,13 @@ mod tests {
             (0, 0),
             false,
         );
-        let r = Rect {
-            x: 0,
-            y: 0,
-            w: MENU_W,
-            h: m.height(),
-        };
+        let r = at(&m, &T14);
         for _ in 0..20 {
             m.step(1);
             assert!(m.selected_kind().is_some());
         }
-        for (i, at) in m.rects(r).collect::<Vec<_>>() {
-            let hit = m.hit(r, at.x + 4, at.y + at.h / 2);
+        for (i, at) in m.rects(r, &T14).collect::<Vec<_>>() {
+            let hit = m.hit(r, &T14, at.x + 4, at.y + at.h / 2);
             let item = matches!(m.lines[i], Line::Item(..));
             assert_eq!(hit.is_some(), item, "{:?}", m.lines[i]);
         }
@@ -815,21 +939,16 @@ mod tests {
     #[test]
     fn ac6_selection_look() {
         let mut m = menu(1);
-        let r = Rect {
-            x: 0,
-            y: 0,
-            w: MENU_W,
-            h: m.height(),
-        };
+        let r = at(&m, &T14);
         let marks = |items: &[Item]| {
             let n = items
                 .iter()
                 .filter(|i| matches!(i, Item::Fill(f, ACCENT) if f.w == MARK_W));
             n.count()
         };
-        assert_eq!(marks(&m.draw(r)), 0);
+        assert_eq!(marks(&m.draw(r, &T14)), 0);
         m.home();
-        let items = m.draw(r);
+        let items = m.draw(r, &T14);
         assert_eq!(marks(&items), 1);
         let fill = items.iter().find_map(|i| match i {
             Item::Round(f, 7, SELECTED) => Some(*f),
@@ -845,7 +964,7 @@ mod tests {
         assert!(matches!(items[0], Item::Panel(p, Panel::Popup, PANEL_EDGE, 1) if p == r));
         // The confirmation: Cancel selected first.
         m.ask_force(Instant::now(), (0, 0));
-        let items = m.draw(Rect { h: m.height(), ..r });
+        let items = m.draw(at(&m, &T14), &T14);
         assert_eq!(marks(&items), 1);
         assert!(
             items
@@ -860,7 +979,7 @@ mod tests {
     }
 
     /// Round 1: a double press on the row that opens the confirmation (Close or Force close…)
-    /// never lands on a button, and the buttons wait for `ARM` and fresh motion.
+    /// never lands on a button, and the buttons wait for `ARM` and fresh motion; at any size.
     #[test]
     fn a_double_press_never_confirms() {
         let e = konsole();
@@ -868,20 +987,20 @@ mod tests {
             key: e.id.clone(),
             dock: true,
         };
-        for windows in [1, 3] {
+        for (windows, t) in [(1, &T14), (3, &T14), (1, &T24), (3, &T24)] {
             let lines = lines(&app(Some(&e), false, windows, 1), true);
             let mut m = Menu::new(target.clone(), lines, (0, 0), false);
             // Bottom-anchored like the dock menu: both panels share their bottom edge.
             let bottom = 800;
             let at = |m: &Menu| Rect {
                 x: 100,
-                y: bottom - m.height(),
-                w: MENU_W,
-                h: m.height(),
+                y: bottom - m.height(t),
+                w: width(t.px),
+                h: m.height(t),
             };
             let menu = at(&m);
             let rows: Vec<Rect> = m
-                .rects(menu)
+                .rects(menu, t)
                 .filter(|(i, _)| {
                     matches!(
                         m.lines[*i],
@@ -891,26 +1010,27 @@ mod tests {
                 .map(|(_, r)| r)
                 .collect();
             assert_eq!(rows.len(), 2);
-            let t = Instant::now();
-            m.ask_force(t, (5, -50));
+            let now = Instant::now();
+            m.ask_force(now, (5, -50));
             let confirm = at(&m);
             assert_eq!(confirm.y + confirm.h, bottom);
             for r in &rows {
                 for x in r.x..r.x + r.w {
                     for y in r.y..r.y + r.h {
-                        assert_eq!(m.hit(confirm, x, y), None, "{windows}: ({x}, {y})");
+                        let hit = m.hit(confirm, t, x, y);
+                        assert_eq!(hit, None, "{windows}: ({x}, {y})");
                     }
                 }
             }
             let c = m.confirm.clone().unwrap();
-            assert!(!c.armed(t + ARM), "no motion yet");
+            assert!(!c.armed(now + ARM), "no motion yet");
             // navi's motion for the resize, at the same spot, doesn't arm it.
             m.pointer((5, -50));
-            assert!(!m.confirm.as_ref().unwrap().armed(t + ARM));
+            assert!(!m.confirm.as_ref().unwrap().armed(now + ARM));
             m.pointer((6, -50));
             let c = m.confirm.as_ref().unwrap();
-            assert!(!c.armed(t + ARM - Duration::from_millis(1)));
-            assert!(c.armed(t + ARM));
+            assert!(!c.armed(now + ARM - Duration::from_millis(1)));
+            assert!(c.armed(now + ARM));
         }
     }
 
@@ -931,7 +1051,7 @@ mod tests {
         );
         let t = Instant::now();
         m.ask_force(t, (0, 0));
-        assert!(!m.hover(Hit::Confirm));
+        assert!(m.hover(Hit::Confirm), "a tint");
         assert!(!m.hover(Hit::Line(1)), "the items are gone");
         let c = m.confirm.as_ref().unwrap();
         assert_eq!(c.selected, 0, "hover leaves Cancel selected");
@@ -1062,49 +1182,246 @@ mod tests {
         }
     }
 
-    /// Job 040 AC4: the confirmation is true for either kind of kill, counts nothing, and every
-    /// line fits the 260 px menu at the default size in every font navi-bar may load.
+    fn confirming() -> Menu {
+        let mut m = menu(3);
+        m.lines = lines(&app(Some(&konsole()), false, 3, 1), true);
+        m.ask_force(Instant::now(), (0, 0));
+        m
+    }
+
+    /// Job 041 AC1: hovering a button tints it and changes nothing else.
+    #[test]
+    fn hover_tints_without_selecting() {
+        let mut m = confirming();
+        let t = m.confirm.as_ref().unwrap().opened;
+        m.pointer((1, 0));
+        let before = m.confirm.clone().unwrap();
+        assert!(m.hover(Hit::Confirm));
+        let c = m.confirm.clone().unwrap();
+        assert_eq!(c.hovered, Some(1));
+        assert_eq!(c.selected, 0);
+        assert_eq!(c.enter(t + ARM), Some(Hit::Cancel));
+        assert_eq!(c.armed(t + ARM), before.armed(t + ARM));
+        assert_eq!(c.armed(t), before.armed(t));
+        assert_eq!(
+            (c.moved, c.at, c.opened),
+            (before.moved, before.at, before.opened)
+        );
+        assert!(!m.hover(Hit::Confirm), "no change");
+        assert!(m.hover(Hit::Cancel));
+        assert_eq!(m.confirm.as_ref().unwrap().hovered, Some(0));
+    }
+
+    fn marks(items: &[Item]) -> Vec<Rect> {
+        let marks = items.iter().filter_map(|i| match i {
+            Item::Fill(f, ACCENT) if f.w == MARK_W => Some(*f),
+            _ => None,
+        });
+        marks.collect()
+    }
+
+    /// Job 041 AC2: the hovered button gets the `HOVER` fill and no mark; motion off both
+    /// buttons and a leave clear it.
+    #[test]
+    fn hover_tint_draws_and_clears() {
+        let mut m = confirming();
+        let r = at(&m, &T14);
+        let plain = m.draw(r, &T14);
+        let [cancel, force] = m.buttons(r, &T14);
+        assert!(m.hover(Hit::Confirm));
+        let tinted = m.draw(r, &T14);
+        assert_ne!(tinted, plain);
+        // Force close's fill sits inside its accent rim.
+        let fill = tinted.iter().find_map(|i| match i {
+            Item::Round(b, 8, c) if *b == inset(force, 2) => Some(*c),
+            _ => None,
+        });
+        let fill = fill.expect("Force close's fill");
+        assert_eq!(fill, HOVER);
+        assert!(fill != BAR_BG && fill != SELECTED);
+        let cancel_fill = tinted.iter().find_map(|i| match i {
+            Item::Round(b, 8, c) if *b == cancel => Some(*c),
+            _ => None,
+        });
+        assert_eq!(cancel_fill, Some(SELECTED));
+        let marks = marks(&tinted);
+        assert_eq!(marks.len(), 1);
+        assert!(
+            cancel.contains(marks[0].x, marks[0].y),
+            "the mark is on Cancel"
+        );
+
+        // A motion off both buttons (main.rs: no `hit`), then a leave, clear it.
+        assert!(m.unhover());
+        assert_eq!(m.confirm.as_ref().unwrap().hovered, None);
+        assert_eq!(m.draw(r, &T14), plain);
+        assert!(m.hover(Hit::Confirm));
+        assert!(m.unhover());
+        assert!(!m.unhover(), "already clear");
+        assert_eq!(m.draw(r, &T14), plain);
+        // Hovering the selected one keeps the selection's look.
+        assert!(m.hover(Hit::Cancel));
+        assert_eq!(m.draw(r, &T14), plain);
+    }
+
+    /// Job 041 AC5 and 040 AC4: the confirmation is true for either kind of kill, counts
+    /// nothing, and shows in full in every font navi-bar may load at every size Settings allows.
     #[test]
     fn ac4_confirmation_text_is_honest_and_fits() {
-        let mut m = menu(3);
-        m.ask_force(Instant::now(), (0, 0));
-        let body = m.confirm.as_ref().unwrap().body().join(" ");
-        assert!(body.contains("process"), "{body}");
-        assert!(body.contains("(or X connection)"), "{body}");
-        assert!(body.contains("every window it has open"), "{body}");
-        assert!(body.contains("Unsaved work is lost"), "{body}");
-        let digits: String = body.chars().filter(char::is_ascii_digit).collect();
-        assert_eq!(digits, "90", "no window count: {body}");
-        let r = Rect {
-            x: 0,
-            y: 0,
-            w: MENU_W,
-            h: m.height(),
-        };
-        // Whichever of `font::PATHS` this host has; CI's release job has only DejaVu Sans.
-        let fonts: Vec<_> = crate::font::PATHS
-            .iter()
-            .filter_map(|p| {
-                let bytes = std::fs::read(p).ok()?;
-                let f = fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default());
-                Some((p, f.unwrap()))
-            })
-            .collect();
-        assert!(!fonts.is_empty(), "no font from font::PATHS installed");
-        for (path, font) in &fonts {
-            let mut lines = 0;
-            for item in m.draw(r) {
-                if let Item::Text(text, at, DIM) = item {
-                    let w = crate::text_w(font, &text, crate::text_px());
-                    assert!(
-                        w <= at.w as f32,
-                        "{path}: {text:?} is {w} px, room {}",
-                        at.w
-                    );
-                    lines += 1;
-                }
+        assert!(BODY.contains("process"), "{BODY}");
+        assert!(BODY.contains("(or X connection)"), "{BODY}");
+        assert!(BODY.contains("every window it has open"), "{BODY}");
+        assert!(BODY.contains("Unsaved work is lost"), "{BODY}");
+        let digits: String = BODY.chars().filter(char::is_ascii_digit).collect();
+        assert_eq!(digits, "90", "no window count: {BODY}");
+        let m = confirming();
+        for (path, font) in &fonts() {
+            for px in 12..=24 {
+                sized(font, px, |t| {
+                    let mut body = Vec::new();
+                    for item in m.draw(at(&m, t), t) {
+                        if let Item::Text(text, at, DIM) = item {
+                            let w = t.w(&text);
+                            assert!(w <= at.w as f32, "{path} {px}: {text:?} {w} > {}", at.w);
+                            assert!(!text.contains('…'), "{path} {px}: {text:?}");
+                            body.push(text);
+                        }
+                    }
+                    assert_eq!(body.join(" "), BODY, "{path} {px}");
+                });
             }
-            assert_eq!(lines, 5);
         }
+    }
+
+    /// Job 041 AC6: fixed labels fit whole at every size, and the panel holds what it draws.
+    #[test]
+    fn fixed_text_fits_and_the_panel_holds_it() {
+        let e = konsole();
+        let menus = [
+            lines(&app(Some(&e), false, 99, 1), true),
+            lines(&app(Some(&e), true, 1, 0), true),
+            lines(&app(Some(&e), false, 0, 0), false),
+        ];
+        let fixed = [
+            "Open",
+            "New window",
+            "Pin to dock",
+            "Unpin from dock",
+            "Close window",
+            "Close all 99 windows",
+            "Force close…",
+            "Cancel",
+            "Force close",
+        ];
+        for (path, font) in &fonts() {
+            for px in 12..=24 {
+                sized(font, px, |t| {
+                    let mut seen = std::collections::HashSet::new();
+                    for lines in &menus {
+                        let mut m = menu(1);
+                        m.lines = lines.clone();
+                        for confirm in [false, true] {
+                            if confirm {
+                                m.ask_force(Instant::now(), (0, 0));
+                            }
+                            let r = at(&m, t);
+                            let items = m.draw(r, t);
+                            let mut bottom = 0;
+                            for item in &items[1..] {
+                                let (Item::Text(_, b, _) | Item::Fill(b, _) | Item::Round(b, ..)) =
+                                    item
+                                else {
+                                    continue;
+                                };
+                                bottom = bottom.max(b.y + b.h);
+                                let Item::Text(text, b, _) = item else {
+                                    continue;
+                                };
+                                let w = t.w(text);
+                                if fixed.contains(&text.as_str()) {
+                                    assert!(w <= b.w as f32, "{path} {px}: {text:?} {w}");
+                                    seen.insert(text.clone());
+                                }
+                            }
+                            // The last row or body line, then the padding.
+                            let last = match confirm {
+                                true => bottom,
+                                false => m.rects(r, t).last().map(|(_, l)| l.y + l.h).unwrap(),
+                            };
+                            assert_eq!(last, bottom, "{path} {px}");
+                            assert_eq!(r.y + m.height(t), bottom + PAD, "{path} {px}");
+                        }
+                    }
+                    // Every fixed label drew whole, so none was cut with `…`.
+                    assert_eq!(seen.len(), fixed.len(), "{path} {px}: {seen:?}");
+                });
+            }
+        }
+    }
+
+    /// Job 041 AC7: a long, hostile name is cut; "Force close" and "?" stay.
+    #[test]
+    fn long_names_keep_their_key_words() {
+        let name = format!("A\u{202E}B\u{7}{}", "x".repeat(196));
+        assert_eq!(name.chars().count(), 200);
+        for (path, font) in &fonts() {
+            for px in [14, 24] {
+                sized(font, px, |t| {
+                    let mut m = menu(1);
+                    m.lines[0] = Line::Header(name.clone());
+                    let texts = |m: &Menu| {
+                        let items = m.draw(at(m, t), t);
+                        let texts = items.into_iter().filter_map(|i| match i {
+                            Item::Text(s, r, _) => Some((s, r)),
+                            _ => None,
+                        });
+                        texts.collect::<Vec<_>>()
+                    };
+                    let (header, r) = texts(&m)[0].clone();
+                    assert!(header.ends_with('…'), "{path} {px}: {header}");
+                    assert!(header.starts_with("AB"), "{path} {px}: {header}");
+                    assert!(t.w(&header) <= r.w as f32, "{path} {px}: {header}");
+                    m.ask_force(Instant::now(), (0, 0));
+                    let (heading, r) = texts(&m)[0].clone();
+                    assert!(
+                        heading.starts_with("Force close AB"),
+                        "{path} {px}: {heading}"
+                    );
+                    assert!(heading.ends_with("…?"), "{path} {px}: {heading}");
+                    assert!(t.w(&heading) <= r.w as f32, "{path} {px}: {heading}");
+                    for s in [&header, &heading] {
+                        assert!(!s.contains('\u{202E}') && !s.contains('\u{7}'), "{s:?}");
+                    }
+                    // What `draw_text` draws of it: all of it.
+                    let drawn: String = crate::font::fit(&heading, r.w as f32, t.advance)
+                        .into_iter()
+                        .collect();
+                    assert_eq!(drawn, heading, "{path} {px}");
+                });
+            }
+        }
+    }
+
+    /// Job 041 AC8: a new text size re-arms an open confirmation as a panel move does; the
+    /// same size changes nothing.
+    #[test]
+    fn a_text_size_change_rearms() {
+        let mut m = confirming();
+        let t = m.confirm.as_ref().unwrap().opened;
+        m.pointer((1, 0));
+        assert!(m.confirm.as_ref().unwrap().armed(t + ARM));
+        let same = m.clone();
+        m.text_size(14, 14, t + ARM);
+        assert_eq!(m, same);
+        let later = t + ARM;
+        m.text_size(14, 24, later);
+        let c = m.confirm.as_ref().unwrap();
+        assert!(!c.armed(later + ARM));
+        assert_eq!(c.at, None);
+        assert_eq!(c.enter(later + ARM - Duration::from_millis(1)), None);
+        assert_eq!(c.enter(later + ARM), Some(Hit::Cancel));
+        // Like an output change: the next spot is only the reference.
+        m.pointer((1, 0));
+        assert!(!m.confirm.as_ref().unwrap().armed(later + ARM));
     }
 }

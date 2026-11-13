@@ -521,7 +521,9 @@ impl Bar {
         let rows = self.menu.as_ref().map_or(menu::ROWS, |m| m.rows().count());
         let mut l = Layout::new(self.dock_apps().len(), self.menu.is_some()).with_rows(rows);
         if let Some(c) = &self.context {
-            l = l.with_context(c.anchor, c.height());
+            let advance = advance(self.font.as_ref(), text_px());
+            let t = text(&advance);
+            l = l.with_context(c.anchor, context::width(t.px), c.height(&t));
         }
         if l == self.layout {
             return self.draw();
@@ -696,7 +698,12 @@ impl Bar {
             .collect();
         let now = self.now_ms();
         let repeat = self.notes.shown().iter().any(|n| n.sender == notify::LOCAL);
-        let Some((id, closed)) = force_card(&mut self.notes, now, app, replies, &listed) else {
+        let log = notify::log_path(
+            std::env::var_os("XDG_STATE_HOME").as_deref(),
+            std::env::var_os("HOME").as_deref(),
+        );
+        let card = force_card(&mut self.notes, now, app, replies, &listed, log.as_deref());
+        let Some((id, closed)) = card else {
             return;
         };
         info!(id, app, "force close refused card");
@@ -881,12 +888,19 @@ impl Bar {
         }
     }
 
+    /// What's at `(x, y)` in the open context menu.
+    fn context_hit(&self, x: i32, y: i32) -> Option<context::Hit> {
+        let advance = advance(self.font.as_ref(), text_px());
+        let (r, c) = self.layout.context().zip(self.context.as_ref())?;
+        c.hit(r, &text(&advance), x, y)
+    }
+
     fn click(&mut self, serial: u32, qh: &QueueHandle<Self>) {
         let (x, y) = (self.pointer_at.0 as i32, self.pointer_at.1 as i32);
         debug!(x, y, hit = ?self.layout.hit(x, y), "dock click");
         if let Some(c) = &self.context {
             // A click outside the menu only closes it.
-            let hit = self.layout.context().and_then(|r| c.hit(r, x, y));
+            let hit = self.context_hit(x, y);
             return match (hit, self.layout.hit(x, y)) {
                 (Some(context::Hit::Line(i)), _) => self.context_activate(i, serial, qh),
                 // Buttons count only once armed: a double-click can't confirm unseen.
@@ -1136,7 +1150,7 @@ impl Bar {
             &self.pin_message,
         );
         let context = match (&self.context, l.context()) {
-            (Some(c), Some(r)) => c.draw(r),
+            (Some(c), Some(r)) => c.draw(r, &text(&advance(self.font.as_ref(), text_px()))),
             _ => Vec::new(),
         };
         if let Ok(region) = Region::new(&self.compositor) {
@@ -1395,10 +1409,11 @@ impl Bar {
         match call {
             Call::Configure(settings) => {
                 theme::configure(&settings);
-                TEXT_SIZE.store(
-                    settings["font_size"].as_u64().unwrap_or(14) as u32,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
+                let size = settings["font_size"].as_u64().unwrap_or(14) as u32;
+                let was = TEXT_SIZE.swap(size, std::sync::atomic::Ordering::Relaxed);
+                if let Some(c) = &mut self.context {
+                    c.text_size(was, size, Instant::now());
+                }
                 if settings["icon_theme"] != self.desktop_settings["icon_theme"] {
                     let config = files::xdg_dir(
                         std::env::var_os("XDG_CONFIG_HOME").as_deref(),
@@ -1437,7 +1452,8 @@ impl Bar {
                     self.notes.history.clear();
                 }
                 self.desktop_settings = settings;
-                self.draw();
+                // A new text size resizes an open context menu.
+                self.relayout();
                 self.draw_band();
                 self.show_cards();
             }
@@ -1726,17 +1742,34 @@ fn lock_request(control: Option<&control::Control>) -> Result<(), String> {
     control::request(c, control::Request::Lock)
 }
 
-/// A confirmation's `replies` for `app`: one local card if a request for a window still in
-/// `listed` wasn't done. One that closed on its own meanwhile is no refusal.
+/// A confirmation's `replies` for `app`: one local card naming navi's `log` if a request for a
+/// window still in `listed` wasn't done. One that closed on its own meanwhile is no refusal.
 fn force_card(
     notes: &mut Notes,
     now: u64,
     app: &str,
     replies: &[(u32, bool)],
     listed: &[u32],
+    log: Option<&Path>,
 ) -> Option<(u32, Vec<Closed>)> {
     let refused = replies.iter().any(|(id, ok)| !ok && listed.contains(id));
-    refused.then(|| notes.force_refused(now, app))
+    refused.then(|| notes.force_refused(now, app, log))
+}
+
+/// A glyph's advance at `px`, as `draw_text` measures it; `None` for a glyph `font` lacks.
+fn advance(font: Option<&fontdue::Font>, px: f32) -> impl Fn(char) -> Option<f32> + '_ {
+    move |c| {
+        let font = font.filter(|f| f.lookup_glyph_index(c) != 0)?;
+        Some(font.metrics(c, px).advance_width)
+    }
+}
+
+/// The context menu's text at the current size.
+fn text(advance: &dyn Fn(char) -> Option<f32>) -> context::Text<'_> {
+    context::Text {
+        px: text_px() as i32,
+        advance,
+    }
 }
 
 fn text_w(font: &fontdue::Font, text: &str, px: f32) -> f32 {
@@ -2432,12 +2465,16 @@ impl PointerHandler for Bar {
                         (PointerEventKind::Enter { .. }, Some(c)) => c.entered(at),
                         _ => {}
                     }
-                    let in_menu = self.layout.context().zip(self.context.as_ref());
-                    let on_item = in_menu.and_then(|(r, c)| c.hit(r, x, y));
+                    let on_item = match hover {
+                        Some(layout::Hit::Menu) => self.context_hit(x, y),
+                        _ => None,
+                    };
                     let selected = match (self.menu.as_mut(), self.context.as_mut(), hover) {
-                        (_, Some(c), Some(layout::Hit::Menu)) => {
-                            on_item.is_some_and(|h| c.hover(h))
-                        }
+                        // Off both buttons, or gone: no tint.
+                        (_, Some(c), _) => match on_item {
+                            Some(h) => c.hover(h),
+                            None => c.unhover(),
+                        },
                         (Some(menu), None, Some(layout::Hit::Row(k))) => menu.select_row(k),
                         _ => false,
                     };
@@ -2633,21 +2670,29 @@ mod tests {
             dock: true,
         };
         let mut m = context::Menu::new(target, context::lines(&app, true), (0, 0), false);
+        let advance = |_| Some(8.0);
+        let t = context::Text {
+            px: 14,
+            advance: &advance,
+        };
         let r = |m: &context::Menu| Rect {
             x: 0,
             y: 0,
-            w: context::MENU_W,
-            h: m.height(),
+            w: context::width(t.px),
+            h: m.height(&t),
         };
-        out.push(m.draw(r(&m)));
+        out.push(m.draw(r(&m), &t));
         for _ in 0..m.lines.len() {
             m.step(1);
-            out.push(m.draw(r(&m)));
+            out.push(m.draw(r(&m), &t));
         }
         m.ask_force(Instant::now(), (0, 0));
-        for _ in 0..2 {
-            m.step(1);
-            out.push(m.draw(r(&m)));
+        for hover in [context::Hit::Confirm, context::Hit::Cancel] {
+            m.hover(hover);
+            for _ in 0..2 {
+                m.step(1);
+                out.push(m.draw(r(&m), &t));
+            }
         }
         out
     }
@@ -2842,8 +2887,75 @@ mod tests {
         check();
         theme::configure(&serde_json::json!({}));
         assert_eq!(theme::panel_alpha(Panel::Bar), 0.85);
-        assert_eq!(theme::panel_alpha(Panel::Popup), 0.98);
+        assert_eq!(theme::panel_alpha(Panel::Popup), 1.0);
         assert_eq!(INSET, 12);
+    }
+
+    /// Job 041 AC4: nothing under a pop-up shows through. A context menu panel drawn over white
+    /// and over black has the same pixels, but in its rounded corners.
+    #[test]
+    fn popups_hide_what_is_under_them() {
+        let advance = |_| Some(8.0);
+        let t = context::Text {
+            px: 14,
+            advance: &advance,
+        };
+        let e = desktop::Entry {
+            id: "k.desktop".into(),
+            name: "K".into(),
+            icon: None,
+            argv: vec!["k".into()],
+            wm_class: None,
+            category: desktop::Category::System,
+            actions: Vec::new(),
+        };
+        let app = context::App {
+            entry: Some(&e),
+            app_id: "k",
+            pinned: false,
+            windows: 1,
+            overdue: 1,
+        };
+        let target = context::Target {
+            key: e.id.clone(),
+            dock: true,
+        };
+        let mut m = context::Menu::new(target, context::lines(&app, true), (0, 0), true);
+        for confirm in [false, true] {
+            if confirm {
+                m.ask_force(Instant::now(), (0, 0));
+                m.hover(context::Hit::Confirm);
+            }
+            let r = Rect {
+                x: 0,
+                y: 0,
+                w: context::width(14),
+                h: m.height(&t),
+            };
+            // One render, so a test changing the scheme meanwhile can't tell the two apart.
+            let menu = rendered(&m.draw(r, &t), r.w, r.h);
+            let over = |bg: Color| {
+                let mut canvas = Pixmap::new(r.w as u32, r.h as u32).unwrap();
+                canvas.fill(bg);
+                let (paint, id) = (PixmapPaint::default(), Transform::identity());
+                canvas.draw_pixmap(0, 0, menu.as_ref(), &paint, id, None);
+                canvas
+            };
+            let (white, black) = (over(Color::WHITE), over(Color::BLACK));
+            let corner = |x: i32, y: i32| {
+                let near = |v: i32, len: i32| v < theme::RADIUS || v >= len - theme::RADIUS;
+                near(x, r.w) && near(y, r.h)
+            };
+            let mut same = 0;
+            for y in 0..r.h {
+                for x in (0..r.w).filter(|&x| !corner(x, y)) {
+                    let at = |c: &Pixmap| c.pixel(x as u32, y as u32).unwrap();
+                    assert_eq!(at(&white), at(&black), "{confirm}: ({x}, {y})");
+                    same += 1;
+                }
+            }
+            assert!(same > r.w * r.h * 9 / 10, "{same}");
+        }
     }
 
     /// Job 040 AC5: one confirmation's refusals post one local card naming the app, under the
@@ -2854,7 +2966,10 @@ mod tests {
         // Refused, done, timed out.
         let mixed = [(1, false), (2, true), (3, false)];
         let mut n = Notes::default();
-        let (id, closed) = force_card(&mut n, 0, "Konsole", &mixed, &[1, 2, 3]).expect("a card");
+        let log = notify::log_path(Some("/h/state".as_ref()), None);
+        let log = log.as_deref();
+        let (id, closed) =
+            force_card(&mut n, 0, "Konsole", &mixed, &[1, 2, 3], log).expect("a card");
         assert!(closed.is_empty());
         assert!(!settle(&mut n, &on, id, ""));
         let [card] = n.shown() else {
@@ -2864,25 +2979,26 @@ mod tests {
         assert_eq!(card.summary, "Force close didn't happen");
         assert_eq!(
             card.body,
-            "Konsole wasn't force closed. Details: ~/.local/state/navi/navi.log"
+            "Konsole wasn't force closed. Details: /h/state/navi/navi.log"
         );
         // A raw app ID is cut to 64 chars and loses controls and bidi overrides.
         let mut raw = Notes::default();
         let app_id = format!("a\u{202E}b\u{7}{}", "x".repeat(100));
-        raw.force_refused(0, &app_id);
+        raw.force_refused(0, &app_id, None);
         let body = &raw.shown()[0].body;
         assert!(body.starts_with("abxx") && body.contains('…'), "{body}");
         assert!(!body.contains('\u{202E}') && !body.contains('\u{7}'));
+        assert!(body.ends_with("Details: navi's log"), "{body}");
         assert_eq!(n.history.len(), 1);
         // A second confirmation's card replaces it.
-        let (again, _) = force_card(&mut n, 10, "Konsole", &mixed, &[1]).unwrap();
+        let (again, _) = force_card(&mut n, 10, "Konsole", &mixed, &[1], log).unwrap();
         assert_eq!((again, n.shown().len()), (id, 1));
 
         let mut n = Notes::default();
         let done = [(1, true), (2, true)];
-        assert!(force_card(&mut n, 0, "Konsole", &done, &[1, 2]).is_none());
+        assert!(force_card(&mut n, 0, "Konsole", &done, &[1, 2], log).is_none());
         // 1 and 3 closed on their own before the replies came.
-        assert!(force_card(&mut n, 0, "Konsole", &mixed, &[2, 9]).is_none());
+        assert!(force_card(&mut n, 0, "Konsole", &mixed, &[2, 9], log).is_none());
         assert!(n.shown().is_empty() && n.history.is_empty());
 
         // DND, notifications off, history off: as the window-limit card is treated.
@@ -2898,7 +3014,7 @@ mod tests {
             let (id, _) = limit.window_limit(0);
             let limit_hidden = settle(&mut limit, s, id, "");
             let mut force = Notes::default();
-            let (id, _) = force_card(&mut force, 0, "Konsole", &mixed, &[1]).unwrap();
+            let (id, _) = force_card(&mut force, 0, "Konsole", &mixed, &[1], log).unwrap();
             assert_eq!(settle(&mut force, s, id, ""), limit_hidden, "{s}");
             let got = (force.shown().len(), force.history.len());
             assert_eq!(got, (limit.shown().len(), limit.history.len()), "{s}");
