@@ -4,13 +4,15 @@
 //!
 //! One step per line, in global logical px: `wait <ms>`, `move <x> <y>`, `press`, `release`
 //! (the left button), `press right`, `release right`, `key <evdev keycode>` (press and
-//! release), and `down <code>` / `up <code>` to hold a key, such as a modifier. Blank lines and
-//! `#` comments are skipped. Any other line is an error, and then nothing is replayed.
+//! release), `down <code>` / `up <code>` to hold a key, such as a modifier, and `wheel up` /
+//! `wheel down` (one notch). Blank lines and `#` comments are skipped. Any other line is an
+//! error, and then nothing is replayed.
 
 use std::time::Duration;
 
 use smithay::{
-    backend::input::KeyState,
+    backend::input::{Axis, AxisSource, KeyState},
+    input::pointer::AxisFrame,
     reexports::calloop::{
         LoopHandle,
         timer::{TimeoutAction, Timer},
@@ -36,6 +38,8 @@ enum Step {
     Key(u32),
     Down(u32),
     Up(u32),
+    /// One wheel notch: down (towards the user) is positive.
+    Wheel(i32),
 }
 
 fn parse(script: &str) -> Result<Vec<Step>, String> {
@@ -58,6 +62,8 @@ fn parse(script: &str) -> Result<Vec<Step>, String> {
             ["key", code] => keycode(code).map(Step::Key),
             ["down", code] => keycode(code).map(Step::Down),
             ["up", code] => keycode(code).map(Step::Up),
+            ["wheel", "up"] => Some(Step::Wheel(-1)),
+            ["wheel", "down"] => Some(Step::Wheel(1)),
             _ => None,
         };
         steps.push(step.ok_or_else(|| format!("line {}: {line:?}", n + 1))?);
@@ -113,6 +119,13 @@ pub fn start(handle: &LoopHandle<'static, CalloopData>) {
                 }
                 Step::Down(code) => state.keyboard_key((code + 8).into(), KeyState::Pressed, time),
                 Step::Up(code) => state.keyboard_key((code + 8).into(), KeyState::Released, time),
+                // As libinput reports a notch: 15 px, 120 v120 units.
+                Step::Wheel(n) => state.pointer_axis(
+                    AxisFrame::new(time)
+                        .source(AxisSource::Wheel)
+                        .value(Axis::Vertical, f64::from(15 * n))
+                        .v120(Axis::Vertical, 120 * n),
+                ),
             }
         }
         info!("replay done");
@@ -128,9 +141,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_the_four_steps() {
+    fn parses_every_step() {
         let script = "# drag a\nwait 500\n\nmove 100 2\npress\nmove -5 1439\nrelease\nkey 46\n\
-                      down 29\nup 29\npress right\nrelease right\n";
+                      down 29\nup 29\npress right\nrelease right\nwheel down\nwheel up\n";
         assert_eq!(
             parse(script),
             Ok(vec![
@@ -144,6 +157,8 @@ mod tests {
                 Step::Up(29),
                 Step::Press(BTN_RIGHT),
                 Step::Release(BTN_RIGHT),
+                Step::Wheel(1),
+                Step::Wheel(-1),
             ])
         );
     }
@@ -174,6 +189,9 @@ mod tests {
             "up",
             "up -1",
             "down 29 1",
+            "wheel",
+            "wheel left",
+            "wheel down 2",
         ] {
             let script = format!("move 1 1\n{bad}\nrelease");
             assert_eq!(parse(&script), Err(format!("line 2: {bad:?}")), "{bad}");

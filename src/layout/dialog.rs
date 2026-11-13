@@ -178,6 +178,16 @@ pub fn stack_order(ranks: &[Rank]) -> Vec<usize> {
     order
 }
 
+/// The X11 windows in the order navi draws them, bottom first, as indices into `space`: each
+/// shown window bottom first, with its float's place in `Layout::floats` (front first; `None`
+/// in the tile layer) and whether it is X11. The tile layer goes below the floats, the back
+/// float lowest; each keeps its space order within.
+pub fn x11_stack(space: &[(Option<usize>, bool)]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..space.len()).filter(|&i| space[i].1).collect();
+    order.sort_by_key(|&i| space[i].0.map(std::cmp::Reverse));
+    order
+}
+
 /// The last window up `start`'s parents: the head of an orphan's family. Capped and loop-safe
 /// like `root`.
 pub fn head<K: Copy + PartialEq>(start: K, mut parent_of: impl FnMut(K) -> Option<K>) -> K {
@@ -350,6 +360,48 @@ mod tests {
 
     fn order(wins: &[Stacked]) -> Vec<usize> {
         stack_order(&ranks(wins))
+    }
+
+    /// Job 038 AC4: Xwayland gets navi's drawn order of its X11 windows: the tile layer by
+    /// rank, a menu above its owner's family, then the floats, back one first. It is a function
+    /// of ranks alone, which navi's own refocus never changes (`Navi::focus_by`; the live
+    /// check is `x11_lifecycle_and_input_stacking`); a user raise of a tile stays below floats.
+    #[test]
+    fn x11_stack_is_navis_drawn_order() {
+        // 0 Wayland tile, 1 X11 tile, 2 X11 float, 3 X11 dialog of 1, 4 X11 menu of 1,
+        // 5 Wayland float (in front), 6 X11 tile never raised.
+        let mut wins = vec![
+            win(Kin::Tiled(0), false, 1, 1),
+            win(Kin::Tiled(1), false, 2, 2),
+            win(Kin::Tiled(2), false, 3, 3),
+            win(Kin::Tiled(1), true, 2, 2),
+            win(Kin::Menu(1), false, 0, 0),
+            win(Kin::Tiled(5), false, 4, 4),
+            win(Kin::Tiled(6), false, 0, 0),
+        ];
+        let x11 = [false, true, true, true, true, false, true];
+        // `Layout::floats`, front first: 5, then 2.
+        let float = |i: usize| match i {
+            5 => Some(0),
+            2 => Some(1),
+            _ => None,
+        };
+        let stack = |wins: &[Stacked]| {
+            let space = order(wins);
+            let at: Vec<_> = space.iter().map(|&i| (float(i), x11[i])).collect();
+            let out: Vec<usize> = x11_stack(&at).into_iter().map(|k| space[k]).collect();
+            out
+        };
+        assert_eq!(stack(&wins), vec![6, 1, 3, 4, 2]);
+        // A user raise of it puts it over tile 1's family, still under the float.
+        wins[6].rank = 5;
+        wins[6].user_rank = 5;
+        assert_eq!(stack(&wins), vec![1, 3, 4, 6, 2]);
+        // A float stays above a tile that comes after it in space order.
+        assert_eq!(
+            x11_stack(&[(None, true), (Some(0), true), (None, true)]),
+            vec![0, 2, 1]
+        );
     }
 
     /// Round 3/4: one order from raises. A neighbour raised after a family stays above every

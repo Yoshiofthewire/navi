@@ -492,32 +492,14 @@ type Piece = (layout::Rect, [f32; 4], Option<Cut>);
 impl Solids {
     /// Each of `rects`' elements. A rect meeting its cut's corner squares is split: the part
     /// outside them stays solid, the part inside is antialiased to the cut (`rounded`: the
-    /// programs compiled; else everything is square). A ring's corner squares are drawn whole,
-    /// once, by the first of its rects to reach each.
+    /// programs compiled; else everything is square), as `layout::pieces` splits it.
     fn chrome<R: Gl>(&mut self, rects: Vec<Piece>, rounded: bool) -> Vec<Vec<Frame<R>>> {
         let n = rects.len();
-        let (mut plain, mut corners) = (Vec::new(), Vec::new());
-        let mut drawn: Vec<(Cut, usize)> = Vec::new();
-        for (i, (r, k, cut)) in rects.into_iter().enumerate() {
-            let Some(c) = cut.filter(|c| rounded && c.shape.meets(r)) else {
-                plain.push((i, r, k));
-                continue;
-            };
-            plain.extend(c.shape.outside_corners(r).into_iter().map(|p| (i, p, k)));
-            for (at, sq) in c.shape.corners().into_iter().enumerate() {
-                let Some(part) = layout::intersect(r, sq) else {
-                    continue;
-                };
-                match c.hole {
-                    Some(_) if drawn.contains(&(c, at)) => {}
-                    Some(_) => {
-                        drawn.push((c, at));
-                        corners.push((i, sq, k, c));
-                    }
-                    None => corners.push((i, part, k, c)),
-                }
-            }
-        }
+        let rects: Vec<Piece> = rects
+            .into_iter()
+            .map(|(r, k, c)| (r, k, c.filter(|_| rounded)))
+            .collect();
+        let (plain, corners) = layout::pieces(&rects);
         let mut out: Vec<Vec<Frame<R>>> = (0..n).map(|_| Vec::new()).collect();
         let solids = solid(
             &mut self.rects,

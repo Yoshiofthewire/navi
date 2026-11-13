@@ -150,7 +150,7 @@ impl Layout {
                 .map(|t| t.id)
         };
         // Top zones go last: where one meets the bottom zone of a tile above, that one wins.
-        let hit = ids()
+        let zone = ids()
             .flat_map(|id| {
                 [
                     Hit::Strip(id),
@@ -160,7 +160,14 @@ impl Layout {
                 ]
             })
             .chain(ids().map(|id| Hit::Edge(id, Side::Top)))
-            .find(|&h| self.zone(h).is_some_and(|z| z.contains(p)) && !self.cut_off(h.id(), p))?;
+            .find(|&h| self.zone(h).is_some_and(|z| z.contains(p)) && !self.cut_off(h.id(), p));
+        // Else a cut-off corner's px under the frame are that corner, as a float's are; a
+        // maximized tile has no corners.
+        let Some(hit) = zone else {
+            return ids()
+                .filter(|&id| self.cut_off(id, p) && !self.is_maximized(id))
+                .find_map(|id| self.ring_corner(id, p, focused));
+        };
         let Hit::Strip(id) = hit else {
             return Some(self.corner_hit(hit, p));
         };
@@ -189,6 +196,30 @@ impl Layout {
     pub(super) fn cut_off(&self, id: WinId, p: (i32, i32)) -> bool {
         self.shape(id)
             .is_some_and(|s| s.rect.contains(p) && !s.contains(p))
+    }
+
+    /// The corner of `id` whose frame ring, `focused` or dim, `p` lies on; its side from the
+    /// outline's middle.
+    pub(super) fn ring_corner(
+        &self,
+        id: WinId,
+        p: (i32, i32),
+        focused: Option<WinId>,
+    ) -> Option<Hit> {
+        let (_, ring) = self.frame_ring(id, frame_px(focused == Some(id)))?;
+        let o = self.shape(id)?.rect;
+        if !ring.shape.contains(p) {
+            return None;
+        }
+        let x = match p.0 < o.x + o.w / 2 {
+            true => Side::Left,
+            false => Side::Right,
+        };
+        let y = match p.1 < o.y + o.h / 2 {
+            true => Side::Top,
+            false => Side::Bottom,
+        };
+        Some(Hit::Corner(id, x, y))
     }
 
     /// The rect `id`'s frame surrounds and the ring it is drawn in, `px` wide: just outside the
@@ -1118,7 +1149,7 @@ pub fn overlay(
     // A float's zones light in its own layer.
     let hover = hover.filter(|h| !l.tile(h.id()).is_some_and(|t| t.floating));
     let mut tiles = Vec::new();
-    light(l, hover, &mut tiles);
+    light(l, hover, focused, &mut tiles);
     decorations(l, |t| !t.floating, hover, focused, &mut tiles);
     out.extend(
         tiles
@@ -1129,8 +1160,8 @@ pub fn overlay(
 }
 
 /// The hovered or pressed zone: a strip up to its buttons, an edge, or a corner's two edges and
-/// strip end.
-fn light(l: &Layout, hover: Option<Hit>, out: &mut Vec<Chrome>) {
+/// strip end, cut to a quarter ring around the frame.
+fn light(l: &Layout, hover: Option<Hit>, focused: Option<WinId>, out: &mut Vec<Chrome>) {
     let lit = match hover {
         Some(Hit::Strip(id)) => l.zone(Hit::Strip(id)).map(|z| {
             let buttons = l.bar(id).map_or(0, |b| b.buttons.len() as i32);
@@ -1152,13 +1183,54 @@ fn light(l: &Layout, hover: Option<Hit>, out: &mut Vec<Chrome>) {
     };
     out.extend(lit.map(|z| (id, z, accent(1.0), cut)));
     if let Some(Hit::Corner(_, x, y)) = hover {
-        for side in [x, y] {
-            out.extend(
-                l.zone(Hit::Edge(id, side))
-                    .map(|z| (id, z, accent(1.0), None)),
-            );
-        }
-        out.extend(l.corner_strip(id, x, y).map(|z| (id, z, accent(1.0), None)));
+        let lit: Vec<Rect> = [x, y]
+            .into_iter()
+            .filter_map(|side| l.zone(Hit::Edge(id, side)))
+            .chain(l.corner_strip(id, x, y))
+            .collect();
+        let cut = l.lit_corner(id, x, y, focused, &lit);
+        out.extend(lit.into_iter().map(|z| (id, z, accent(1.0), cut)));
+    }
+}
+
+impl Layout {
+    /// What a lit corner's rects are cut to: from `id`'s outline out to an arc concentric with
+    /// its frame (`focused` or dim), as far as the `lit` rects reach past the frame. Like a lit
+    /// straight run, it covers the frame.
+    fn lit_corner(
+        &self,
+        id: WinId,
+        x: Side,
+        y: Side,
+        focused: Option<WinId>,
+        lit: &[Rect],
+    ) -> Option<Cut> {
+        let (_, ring) = self.frame_ring(id, frame_px(focused == Some(id)))?;
+        let o = ring.shape.rect;
+        let reach = |z: &Rect| {
+            match x {
+                Side::Left => o.x - z.x,
+                _ => z.x + z.w - (o.x + o.w),
+            }
+            .max(match y {
+                Side::Top => o.y - z.y,
+                _ => z.y + z.h - (o.y + o.h),
+            })
+        };
+        let d = lit.iter().map(reach).max()?.max(0);
+        let at = match (x, y) {
+            (Side::Left, Side::Top) => 0,
+            (_, Side::Top) => 1,
+            (Side::Left, _) => 3,
+            _ => 2,
+        };
+        let mut radii = [0; 4];
+        radii[at] = ring.shape.radii[at] + d;
+        let outer = Rect::new(o.x - d, o.y - d, o.w + 2 * d, o.h + 2 * d);
+        Some(Cut {
+            shape: Shape::with_radii(outer, radii),
+            hole: Some(self.shape(id)?),
+        })
     }
 }
 
@@ -1180,7 +1252,7 @@ pub fn float_overlay(
     };
     let hover = hover.filter(|h| l.tile(h.id()).is_some_and(|t| t.floating));
     for id in l.floats() {
-        light(l, hover.filter(|h| h.id() == id), &mut out);
+        light(l, hover.filter(|h| h.id() == id), focused, &mut out);
         decorations(l, |t| t.id == id, hover, focused, &mut out);
     }
     out
@@ -1684,17 +1756,23 @@ pub(super) mod tests {
                 // Each px between the windows, inside the grid, is exactly one zone.
                 let g = o.area;
                 let in_window = |p| [a, b, c, d].iter().any(|r| r.contains(p));
+                let squares: Vec<Rect> = (0..4)
+                    .flat_map(|id| l.shape(id).unwrap().corners())
+                    .collect();
+                let cut =
+                    |p| squares.iter().any(|s| s.contains(p)) && (0..4).any(|id| l.cut_off(id, p));
                 for x in g.x..g.x + g.w {
                     for y in g.y..g.y + g.h {
                         let p = (x, y);
                         match in_window(p) {
+                            // But rounded corners, which are no zone where no frame is.
+                            _ if cut(p) => {
+                                let ring = (0..4).find_map(|id| l.ring_corner(id, p, None));
+                                assert_eq!(l.hit(p), ring, "{name} {p:?}")
+                            }
                             // Sampled: a hit test per window px is slow.
                             true if (x + y) % 61 == 0 => assert_eq!(l.hit(p), None, "{name} {p:?}"),
                             true => {}
-                            // But a bar's rounded corners, which are no zone.
-                            false if (0..4).any(|id| l.cut_off(id, p)) => {
-                                assert_eq!(l.hit(p), None, "{name} {p:?}")
-                            }
                             false => assert!(l.hit(p).is_some(), "{name} {p:?}"),
                         }
                     }
@@ -2041,8 +2119,9 @@ pub(super) mod tests {
         let (frame, win) = l.frame(0).unwrap();
         for x in frame.x - 5..frame.x + frame.w + 5 {
             for y in frame.y - 5..frame.y + frame.h + 5 {
+                // Or on the frame over a cut-off corner.
                 if matches!(l.hit((x, y)), Some(Hit::Corner(..))) {
-                    assert!(!win.contains((x, y)));
+                    assert!(!win.contains((x, y)) || l.cut_off(0, (x, y)));
                 }
             }
         }
@@ -2970,7 +3049,7 @@ pub(super) mod tests {
             assert!(bar.rect.y >= c.y + STRIP, "{name}");
             for x in bar.rect.x..bar.rect.x + bar.rect.w {
                 for y in bar.rect.y..bar.rect.y + bar.rect.h {
-                    // The bar's rounded corners are no zone.
+                    // The bar's rounded corners are no zone, but where its frame is drawn.
                     let want = bar
                         .buttons
                         .iter()
@@ -2978,7 +3057,7 @@ pub(super) mod tests {
                         .find(|(_, b)| b.contains((x, y)))
                         .map(|&(b, _)| Hit::Button(id, b))
                         .or_else(|| match bar.tabs.is_empty() {
-                            _ if l.cut_off(id, (x, y)) => None,
+                            _ if l.cut_off(id, (x, y)) => l.ring_corner(id, (x, y), None),
                             true => Some(Hit::Strip(id)),
                             false => bar
                                 .tabs
@@ -3114,6 +3193,321 @@ pub(super) mod tests {
                 d.cancel(&mut l);
             }
         }
+    }
+
+    /// Two tiles side by side, tile 0 with a bar if `bar`; tile 2 a float in front of tile 0's
+    /// bottom-right corner if `float`.
+    fn corner_tiles(bar: bool, float: bool) -> Layout {
+        let mut l = with(&[c(0, 2, 12, 8), c(12, 2, 12, 8)]);
+        l.set_decorated(0, bar);
+        if float {
+            let r = l.rect(0).unwrap();
+            l.tiles.push(Tile {
+                id: 2,
+                app: "f".into(),
+                output: "uw".into(),
+                floating: true,
+                user_rect: Some(Rect::new(r.x + r.w - 300, r.y + r.h - 200, 600, 400)),
+                stamp: 9,
+                ..Tile::default()
+            });
+        }
+        l
+    }
+
+    /// The corner, by `Shape::corners` order, whose square `p` is in.
+    fn square_of(s: Shape, p: (i32, i32)) -> Option<(Side, Side)> {
+        let sides = [
+            (Side::Left, Side::Top),
+            (Side::Right, Side::Top),
+            (Side::Right, Side::Bottom),
+            (Side::Left, Side::Bottom),
+        ];
+        s.corners()
+            .into_iter()
+            .zip(sides)
+            .find(|(sq, _)| sq.contains(p))
+            .map(|(_, at)| at)
+    }
+
+    /// Job 038 AC1: a tile's frame px over its cut-off corners are its corner zones, with and
+    /// without a bar, bright and dim; the rest of a cut-off corner hits nothing. A maximized
+    /// tile has none; a float in front keeps its own px.
+    #[test]
+    fn tile_frame_px_over_cut_corners_are_corners() {
+        for bar in [false, true] {
+            let l = corner_tiles(bar, false);
+            let s = l.shape(0).unwrap();
+            for focused in [Some(0), None] {
+                let (_, ring) = l.frame_ring(0, frame_px(focused == Some(0))).unwrap();
+                let mut seen = [0; 4];
+                for x in s.rect.x..s.rect.x + s.rect.w {
+                    for y in s.rect.y..s.rect.y + s.rect.h {
+                        let p = (x, y);
+                        if !l.cut_off(0, p) {
+                            continue;
+                        }
+                        let want = match ring.shape.contains(p) {
+                            true => {
+                                let (sx, sy) = square_of(s, p).unwrap();
+                                seen[s.corners().iter().position(|q| q.contains(p)).unwrap()] += 1;
+                                Some(Hit::Corner(0, sx, sy))
+                            }
+                            false => None,
+                        };
+                        let name = format!("bar {bar} focused {focused:?} {p:?}");
+                        assert_eq!(l.hit_where(p, |_| false, focused), want, "{name}");
+                    }
+                }
+                assert!(
+                    seen.iter().all(|&n| n > 0),
+                    "every corner has ring px: {seen:?}"
+                );
+            }
+            // Maximized: no corners, so its cut-off px hit nothing, as before.
+            let mut m = corner_tiles(bar, false);
+            assert!(m.maximize(0));
+            let s = m.shape(0).unwrap();
+            for x in s.rect.x..s.rect.x + s.rect.w {
+                for y in s.rect.y..s.rect.y + s.rect.h {
+                    if m.cut_off(0, (x, y)) {
+                        assert_eq!(m.hit_where((x, y), |_| false, Some(0)), None);
+                    }
+                }
+            }
+            // A float in front of the bottom-right corner keeps its window px.
+            let f = corner_tiles(bar, true);
+            let fr = f.rect(2).unwrap();
+            let sq = s_corner(&f, 0, 2);
+            let mut covered = 0;
+            for x in sq.x..sq.x + sq.w {
+                for y in sq.y..sq.y + sq.h {
+                    if f.cut_off(0, (x, y)) && fr.contains((x, y)) {
+                        covered += 1;
+                        assert_eq!(f.hit_where((x, y), |_| false, Some(0)), None, "{x},{y}");
+                    }
+                }
+            }
+            assert!(covered > 0);
+        }
+    }
+
+    /// `id`'s outline corner square `at`.
+    fn s_corner(l: &Layout, id: WinId, at: usize) -> Rect {
+        l.shape(id).unwrap().corners()[at]
+    }
+
+    /// Job 038 AC2: at each corner, a frame px over the cut-off corner and the frame px beside it
+    /// in the gap both hit the tile, so a press there focuses it.
+    #[test]
+    fn cut_corner_frame_px_focus_like_the_gap_frame_beside_them() {
+        for bar in [false, true] {
+            let l = corner_tiles(bar, false);
+            let s = l.shape(0).unwrap();
+            let (_, ring) = l.frame_ring(0, IDLE_PX).unwrap();
+            for (at, sq) in s.corners().into_iter().enumerate() {
+                // Every ring px over the cut-off corner, and the gap frame px level with it.
+                let left = at == 0 || at == 3;
+                let ring_px: Vec<(i32, i32)> = (sq.x..sq.x + sq.w)
+                    .flat_map(|x| (sq.y..sq.y + sq.h).map(move |y| (x, y)))
+                    .filter(|&p| l.cut_off(0, p) && ring.shape.contains(p))
+                    .collect();
+                assert!(!ring_px.is_empty());
+                for p in ring_px {
+                    let gap = match left {
+                        true => (s.rect.x - 1, p.1),
+                        false => (s.rect.x + s.rect.w, p.1),
+                    };
+                    for q in [p, gap] {
+                        let hit = l.hit(q);
+                        assert_eq!(hit.map(Hit::id), Some(0), "bar {bar} corner {at} {q:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Lit chrome as the renderer draws it (`pieces`): whether px `p` is lit.
+    fn rasterize(rects: &[(Rect, [f32; 4], Option<Cut>)]) -> impl Fn((i32, i32)) -> bool {
+        let (plain, corners) = super::super::pieces(rects);
+        move |p| {
+            plain.iter().any(|(_, r, _)| r.contains(p))
+                || corners
+                    .iter()
+                    .any(|(_, r, _, c)| r.contains(p) && c.keeps(p))
+        }
+    }
+
+    /// Job 038 AC3: a hovered or pressed corner lights a quarter ring concentric with the frame,
+    /// from the outline (covering the frame, as a straight run does) out to where its zones
+    /// reach; straight runs keep today's rects; edges and strips are as they were.
+    #[test]
+    fn lit_corners_follow_the_arc() {
+        let mut checked = 0;
+        for bar in [false, true] {
+            let l = corner_tiles(bar, true);
+            let (c0, _) = l.frame(0).unwrap();
+            let (o, _) = l.frame(2).unwrap();
+            let e = super::super::float::FLOAT_EDGE;
+            let cases = [
+                (
+                    0,
+                    (c0.x + 2, c0.y + c0.h - 2),
+                    Hit::Corner(0, Side::Left, Side::Bottom),
+                ),
+                (
+                    0,
+                    on_strip(&l, 0, 20),
+                    Hit::Corner(0, Side::Left, Side::Top),
+                ),
+                (
+                    2,
+                    (o.x + o.w + e - 2, o.y + o.h + e - 2),
+                    Hit::Corner(2, Side::Right, Side::Bottom),
+                ),
+            ];
+            for (id, p, want) in cases {
+                assert_eq!(l.hit(p), Some(want), "bar {bar} {p:?}");
+                let Hit::Corner(_, x, y) = want else {
+                    unreachable!()
+                };
+                for (focused, pressed) in [(None, false), (None, true), (Some(id), false)] {
+                    let d = pressed.then(|| Drag::press(&l, p).unwrap());
+                    let chrome: Vec<(Rect, [f32; 4], Option<Cut>)> = match id {
+                        2 => float_overlay(&l, d.as_ref(), l.hit(p), focused)
+                            .into_iter()
+                            .map(|(_, r, k, c)| (r, k, c))
+                            .collect(),
+                        _ => overlay(&l, d.as_ref(), l.hit(p), 0, focused)
+                            .into_iter()
+                            .map(|(_, r, k, c)| (r, k, c))
+                            .collect(),
+                    };
+                    let px = frame_px(focused == Some(id));
+                    let (_, ring) = l.frame_ring(id, px).unwrap();
+                    // The lit rects: today's, each now cut the same way.
+                    let mut today: Vec<Rect> = [x, y]
+                        .into_iter()
+                        .filter_map(|s| l.zone(Hit::Edge(id, s)))
+                        .collect();
+                    today.extend(l.corner_strip(id, x, y));
+                    let lit: Vec<_> = chrome
+                        .iter()
+                        .copied()
+                        .filter(|(r, k, c)| {
+                            *k == accent(1.0)
+                                && today.contains(r)
+                                && c.is_some_and(|c| c.hole == l.shape(id))
+                        })
+                        .collect();
+                    assert_eq!(lit.len(), today.len(), "bar {bar} {want:?}");
+                    let cut = lit[0].2.unwrap();
+                    let at = match (x, y) {
+                        (Side::Left, Side::Top) => 0,
+                        (Side::Right, Side::Bottom) => 2,
+                        _ => 3,
+                    };
+                    let sq = cut.shape.corners()[at];
+                    let rad = cut.shape.radii[at];
+                    let inner = ring.shape.radii[at];
+                    // Concentric: the outer arc's centre is the frame's.
+                    let centre = |s: Rect, r: i32| {
+                        let cx = if at == 0 || at == 3 {
+                            s.x + r
+                        } else {
+                            s.x + s.w - r
+                        };
+                        let cy = if at < 2 { s.y + r } else { s.y + s.h - r };
+                        (cx, cy)
+                    };
+                    let (cx, cy) = centre(sq, rad);
+                    assert_eq!((cx, cy), centre(ring.shape.corners()[at], inner));
+                    let lit_at = rasterize(&lit);
+                    let bbox = lit
+                        .iter()
+                        .map(|z| z.0)
+                        .reduce(|a, b| {
+                            let (x0, y0) = (a.x.min(b.x), a.y.min(b.y));
+                            let x1 = (a.x + a.w).max(b.x + b.w);
+                            let y1 = (a.y + a.h).max(b.y + b.h);
+                            Rect::new(x0, y0, x1 - x0, y1 - y0)
+                        })
+                        .unwrap();
+                    // The zones' outer corner px.
+                    let outer = (
+                        if at == 0 || at == 3 {
+                            bbox.x
+                        } else {
+                            bbox.x + bbox.w - 1
+                        },
+                        if at < 2 { bbox.y } else { bbox.y + bbox.h - 1 },
+                    );
+                    assert!(!lit_at(outer), "outer corner {outer:?} bar {bar} {want:?}");
+                    let shape = l.shape(id).unwrap();
+                    let dist = |(px, py): (i32, i32)| {
+                        let dx = f64::from(px) + 0.5 - f64::from(cx);
+                        let dy = f64::from(py) + 0.5 - f64::from(cy);
+                        (dx * dx + dy * dy).sqrt()
+                    };
+                    let mut diagonal = 0;
+                    for px in sq.x..sq.x + sq.w {
+                        for py in sq.y..sq.y + sq.h {
+                            let q = (px, py);
+                            assert!(!(lit_at(q) && shape.contains(q)), "inside the shape {q:?}");
+                            // Between the arcs, in the zones' box: lit, so nothing behind shows.
+                            let d = dist(q);
+                            if bbox.contains(q)
+                                && d > f64::from(inner) + 0.75
+                                && d < f64::from(rad) - 0.75
+                            {
+                                assert!(lit_at(q), "between the arcs {q:?} bar {bar} {want:?}");
+                                let (ox, oy) = (q.0 - sq.x, q.1 - sq.y);
+                                diagonal += i32::from(ox == oy || ox == sq.w - 1 - oy);
+                            }
+                            // The frame under it is covered, as on a straight run.
+                            if bbox.contains(q) && !shape.contains(q) && ring.shape.contains(q) {
+                                assert!(lit_at(q), "on the frame {q:?} bar {bar} {want:?}");
+                            }
+                            if !bbox.contains(q) || d > f64::from(rad) + 0.75 {
+                                assert!(!lit_at(q), "past the zones or the outer arc {q:?}");
+                            }
+                        }
+                    }
+                    assert!(diagonal > 0);
+                    // Past the corner square, exactly today's rects.
+                    for z in &today {
+                        let around = Rect::new(z.x - 3, z.y - 3, z.w + 6, z.h + 6);
+                        for px in around.x..around.x + around.w {
+                            for py in around.y..around.y + around.h {
+                                let q = (px, py);
+                                if !sq.contains(q) {
+                                    assert_eq!(
+                                        lit_at(q),
+                                        today.iter().any(|t| t.contains(q)),
+                                        "{q:?}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    checked += 1;
+                }
+            }
+            // Edge and strip hovers are as they were: an edge uncut, a strip cut as its bar.
+            let mid = (c0.x + 2, c0.y + c0.h / 2);
+            let edge = l.zone(Hit::Edge(0, Side::Left)).unwrap();
+            assert_eq!(l.hit(mid), Some(Hit::Edge(0, Side::Left)));
+            let mut out = Vec::new();
+            light(&l, l.hit(mid), None, &mut out);
+            assert_eq!(out, vec![(0, edge, accent(1.0), None)]);
+            let top = on_strip(&l, 0, c0.w / 2);
+            assert_eq!(l.hit(top), Some(Hit::Strip(0)));
+            out.clear();
+            light(&l, l.hit(top), None, &mut out);
+            let cut = l.shape(0).map(Cut::solid);
+            assert!(out.len() == 1 && out[0].3 == cut, "{out:?}");
+        }
+        assert_eq!(checked, 18);
     }
 
     #[test]

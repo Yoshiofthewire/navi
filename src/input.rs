@@ -275,9 +275,6 @@ impl Navi {
                 self.pointer_button(event.button_code(), left, pressed, event.time_msec());
             }
             InputEvent::PointerAxis { event, .. } => {
-                let Some(pointer) = self.seat.get_pointer() else {
-                    return;
-                };
                 let source = event.source();
                 let mut frame = AxisFrame::new(event.time_msec()).source(source);
                 for axis in [Axis::Horizontal, Axis::Vertical] {
@@ -295,8 +292,7 @@ impl Navi {
                         frame = frame.stop(axis);
                     }
                 }
-                pointer.axis(self, frame);
-                pointer.frame(self);
+                self.pointer_axis(frame);
             }
             _ => {}
         }
@@ -498,6 +494,9 @@ impl Navi {
         let Some(pointer) = self.seat.get_pointer() else {
             return;
         };
+        if !pointer.is_grabbed() {
+            self.drop_x11();
+        }
         let inside = self
             .space
             .outputs()
@@ -528,6 +527,17 @@ impl Navi {
             }
         } else {
             self.bar_hover(pos);
+        }
+    }
+
+    /// A scroll, to what has the pointer; an X11 window there is lifted as for a press.
+    pub fn pointer_axis(&mut self, frame: AxisFrame) {
+        if let Some(pointer) = self.seat.get_pointer() {
+            if let Some(s) = pointer.current_focus() {
+                self.lift_x11(&s);
+            }
+            pointer.axis(self, frame);
+            pointer.frame(self);
         }
     }
 
@@ -642,6 +652,9 @@ impl Navi {
                 let shown = crate::activation::shown_for(&self.layers_shown, &s, now);
                 (u32::from(serial), s, shown)
             });
+        }
+        if pressed && let Some(s) = pointer.current_focus() {
+            self.lift_x11(&s);
         }
         pointer.button(
             self,

@@ -83,7 +83,7 @@ use smithay::{
     },
 };
 use std::{os::fd::OwnedFd, sync::Arc};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::CalloopData;
 use crate::activation::{self, may_issue, may_redeem};
@@ -177,6 +177,10 @@ pub struct Navi {
     pub layout: Layout,
     pub memory: Store,
     pub xwm: Option<X11Wm>,
+    /// An X11 window is on top of Xwayland's stack for a press (`lift_x11`).
+    x11_lifted: bool,
+    /// The last X11 restack failed; logged once until one succeeds.
+    x11_restack_failed: bool,
     pub xwayland_shell: XWaylandShellState,
     pub windows: Vec<Managed>,
     /// A drag in navi's strip or edges, from press to release.
@@ -325,6 +329,8 @@ impl Navi {
             layout,
             memory,
             xwm: None,
+            x11_lifted: false,
+            x11_restack_failed: false,
             xwayland_shell: XWaylandShellState::new::<Self>(&dh),
             windows: Vec::new(),
             drag: None,
@@ -1410,12 +1416,6 @@ impl Navi {
             None => window_surface(w).map(Focus::Wayland),
         });
         let surface = target.as_ref().and_then(Focus::surface);
-        if let Some(x) = window.as_ref().and_then(|w| w.x11_surface())
-            && let Some(wm) = self.xwm.as_mut()
-            && let Err(e) = wm.raise_window(x)
-        {
-            warn!("X11 raise: {e}");
-        }
         match &window {
             Some(w) => {
                 // Activates it; `restack` puts it back in the one order.
@@ -1439,8 +1439,9 @@ impl Navi {
                 // `restack` gives every float its family's rank, which leads that order.
                 if by != Raise::Not
                     && let Some(id) = self.float_owner(w)
+                    && self.layout.raise(id)
                 {
-                    self.layout.raise(id);
+                    self.sync_x11_stack();
                 }
             }
             None => self.space.elements().for_each(|w| {
@@ -1913,6 +1914,67 @@ impl Navi {
             })
             .collect();
         restack_space(&mut self.space, &shown, &dialog::stack_order(&shown_ranks));
+        self.sync_x11_stack();
+    }
+
+    /// Puts the X11 window whose `surface` gets a press or scroll on top of Xwayland's stack, so
+    /// it reaches that window even inside a front X11 window's cut-off corner. It stays there
+    /// until the pointer moves with no button held: by then Xwayland has the event.
+    pub(crate) fn lift_x11(&mut self, surface: &WlSurface) {
+        let x = self
+            .windows
+            .iter()
+            .filter_map(|m| m.window.x11_surface())
+            .find(|x| x.wl_surface().as_ref() == Some(surface))
+            .cloned();
+        if let Some(x) = x
+            && let Some(wm) = self.xwm.as_mut()
+        {
+            match wm.raise_window(&x) {
+                Ok(()) => self.x11_lifted = true,
+                Err(e) => warn!("X11 raise: {e}"),
+            }
+        }
+    }
+
+    /// Ends `lift_x11`: navi's order again.
+    pub(crate) fn drop_x11(&mut self) {
+        if std::mem::take(&mut self.x11_lifted) {
+            self.sync_x11_stack();
+        }
+    }
+
+    /// Gives Xwayland navi's drawn order of its windows, so X11 pointer events where they
+    /// overlap go to the one in front. One way: a client's own restack stays ignored.
+    fn sync_x11_stack(&mut self) {
+        let floats = self.layout.floats();
+        let shown: Vec<&Window> = self.space.elements().collect();
+        let at: Vec<(Option<usize>, bool)> = shown
+            .iter()
+            .map(|w| {
+                let float = self.float_owner(w);
+                let x11 = w.x11_surface().is_some();
+                (
+                    float.and_then(|id| floats.iter().position(|&f| f == id)),
+                    x11,
+                )
+            })
+            .collect();
+        let order: Vec<_> = dialog::x11_stack(&at)
+            .into_iter()
+            .filter_map(|i| shown[i].x11_surface().cloned())
+            .collect();
+        let Some(wm) = self.xwm.as_mut() else {
+            return;
+        };
+        // Once per run of failures: a dead Xwayland would fail every layout pass.
+        match wm.update_stacking_order_upwards(order.iter()) {
+            Ok(()) => self.x11_restack_failed = false,
+            Err(e) if !std::mem::replace(&mut self.x11_restack_failed, true) => {
+                warn!("X11 restack: {e}")
+            }
+            Err(e) => debug!("X11 restack: {e}"),
+        }
     }
 
     /// Window `i` as the stacking order sees it.
