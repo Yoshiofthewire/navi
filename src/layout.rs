@@ -1,6 +1,6 @@
 //! The grid layout from docs/design.md. Pure geometry, no Wayland types.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 mod bar;
 pub mod dialog;
@@ -151,7 +151,7 @@ pub fn takes(clip: Option<Rect>, cut: Option<Shape>, p: (i32, i32)) -> bool {
 }
 
 /// A rectangle of whole grid cells.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Cells {
     pub col: i32,
     pub row: i32,
@@ -285,9 +285,17 @@ pub struct Tile {
     pub rank: u64,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// `Tile::tabbed` calls on this thread: how tests measure group work.
+    static TABBED_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl Tile {
     /// Itself, or a tile on the same output and cells: tabbed together. Floats never tab.
     fn tabbed(&self, o: &Tile) -> bool {
+        #[cfg(test)]
+        TABBED_CALLS.with(|c| c.set(c.get() + 1));
         self.id == o.id
             || (!self.floating && !o.floating && self.output == o.output && self.cells == o.cells)
     }
@@ -777,6 +785,38 @@ impl Layout {
             .filter(|u| u.tabbed(t))
             .max_by_key(|u| (!u.minimized, u.stamp))
             .map(|u| u.id)
+    }
+
+    /// Per tile, whether it is its group's `active` one, every group in one pass: `active` on
+    /// every tile is O(n²), too slow for the hit test each loop iteration runs (job 042).
+    fn actives(&self) -> Vec<bool> {
+        let key = |u: &Tile| (!u.minimized, u.stamp);
+        let mut best: HashMap<(&str, Cells), usize> = HashMap::new();
+        for (i, t) in self.tiles.iter().enumerate().filter(|(_, t)| !t.floating) {
+            let b = best.entry((t.output.as_str(), t.cells)).or_insert(i);
+            // `>=`: `max_by_key` keeps the last of equal keys.
+            if key(t) >= key(&self.tiles[*b]) {
+                *b = i;
+            }
+        }
+        let mut shown: Vec<bool> = self.tiles.iter().map(|t| t.floating).collect();
+        for i in best.into_values() {
+            shown[i] = true;
+        }
+        shown
+    }
+
+    /// The tiles `is_maximized` names, every group in one pass (see `actives`).
+    pub fn maximized_tiles(&self) -> HashSet<WinId> {
+        let groups: HashSet<(&str, Cells)> = (self.tiles.iter())
+            .filter(|u| u.maximized && !u.floating)
+            .map(|u| (u.output.as_str(), u.cells))
+            .collect();
+        let tabbed = |t: &Tile| !t.floating && groups.contains(&(t.output.as_str(), t.cells));
+        (self.tiles.iter())
+            .filter(|t| t.maximized || tabbed(t))
+            .map(|t| t.id)
+            .collect()
     }
 
     fn maximized(&self, t: &Tile) -> bool {
@@ -4190,5 +4230,83 @@ mod tests {
         let whole = (inside.x..inside.x + inside.w)
             .flat_map(|x| (inside.y..inside.y + inside.h).map(move |y| (x, y)));
         assert!(whole.into_iter().all(|p| takes(Some(inside), Some(s), p)));
+    }
+
+    /// One client's `CLIENT_TOPLEVELS` windows on the harness's 1280 × 720 output: past the grid
+    /// they tab into a few groups.
+    fn flooded() -> Layout {
+        let mut l = layout(vec![out("test", 0, 0, 1280, 720, 0)]);
+        for _ in 0..CLIENT_TOPLEVELS {
+            l.place("flood", (0, 0)).unwrap();
+        }
+        l
+    }
+
+    /// Job 042: navi hit-tests the pointer on every loop iteration, and Smithay 0.7 hands it at
+    /// most 6 X11 events per iteration. `active` per tile made the hit test O(n²) in a flooding
+    /// client's windows, so its event backlog starved every other X client's map for seconds.
+    #[test]
+    fn hit_test_group_work_is_linear_in_tiles() {
+        let l = flooded();
+        let n = l.tiles().len();
+        let groups = l.tiles().iter().filter(|t| l.visible(t.id)).count();
+        assert_eq!(n, CLIENT_TOPLEVELS);
+        assert!(groups < 8, "{groups} groups");
+        // Each shown group's zones may scan the tiles; each tile may not.
+        for p in [(0, 0), (640, 360), (1279, 719)] {
+            TABBED_CALLS.with(|c| c.set(0));
+            l.hit(p);
+            let calls = TABBED_CALLS.with(|c| c.get());
+            assert!(
+                calls <= 16 * groups * n,
+                "{p:?}: {calls} group checks, {n} tiles"
+            );
+        }
+    }
+
+    /// `actives` and `maximized_tiles` give, for every tile, what `active` and `is_maximized` do.
+    #[test]
+    fn group_answers_in_one_pass_match_per_tile_ones() {
+        let mut l = flooded();
+        l.set_outputs(vec![
+            out("test", 0, 0, 1280, 720, 0),
+            out("next", 1280, 0, 1280, 720, 1),
+        ]);
+        let ids: Vec<WinId> = (0..40)
+            .map(|_| l.place("b", (1300, 10)).unwrap().0)
+            .collect();
+        let big = Hints::new((1270, 710), (0, 0));
+        let (float, step) = l.place_with("big", (10, 10), big, false).unwrap();
+        assert_eq!(step, Step::Floating);
+        let check = |l: &Layout| {
+            let max = l.maximized_tiles();
+            for (t, active) in l.tiles().iter().zip(l.actives()) {
+                assert_eq!(active, l.active(t.id) == Some(t.id), "{}", t.id);
+                assert_eq!(max.contains(&t.id), l.is_maximized(t.id), "{}", t.id);
+            }
+        };
+        check(&l);
+        for (k, &id) in ids.iter().enumerate() {
+            match k % 5 {
+                0 => l.minimize(id),
+                2 => l.activate(id),
+                _ => false,
+            };
+        }
+        // The shown tile of `o`'s biggest group.
+        let shown = |l: &Layout, o: &str| {
+            let ts = l
+                .tiles()
+                .iter()
+                .filter(|t| t.output == o && l.visible(t.id));
+            ts.max_by_key(|t| l.group(t.id).len()).unwrap().id
+        };
+        assert!(l.maximize(shown(&l, "test")));
+        assert!(l.maximize(shown(&l, "next")));
+        assert!(!l.maximize(float), "floats never maximize");
+        assert!(l.maximized_tiles().len() > 20, "two maximized groups");
+        check(&l);
+        l.minimize(shown(&l, "test"));
+        check(&l);
     }
 }
