@@ -15,8 +15,9 @@ pub const BAR_BG: u32 = 0x151922;
 /// An inactive tab, and the selected menu row.
 pub const TAB_BG: u32 = 0x262C38;
 pub const SELECTED: u32 = TAB_BG;
-/// The pointer's tint on a button that hover doesn't select: between the panel and `SELECTED`.
-pub const HOVER: u32 = 0x1E232D;
+/// The pointer's tint on a button that hover doesn't select: a step past `SELECTED`, which
+/// alone carries the accent mark.
+pub const HOVER: u32 = 0x313849;
 /// Settings' and the GTK utilities' subtle boundary.
 pub const SHELL_EDGE: u32 = 0x303847;
 /// A shell panel's 1 px rim and the dock's pinned mark: 3:1 on the panel over any wallpaper.
@@ -134,7 +135,7 @@ fn resolve_flags(color: u32, flags: u32) -> u32 {
             INK => 0x000000,
             DIM | SHELL_EDGE | PANEL_EDGE => 0x333333,
             TAB_BG => 0xDDDDDD,
-            HOVER => 0xEEEEEE,
+            HOVER => 0xC8C8C8,
             _ => color,
         };
     }
@@ -143,7 +144,7 @@ fn resolve_flags(color: u32, flags: u32) -> u32 {
             BG => 0xF5F6F8,
             BAR_BG => 0xFFFFFF,
             TAB_BG => 0xE3E7ED,
-            HOVER => 0xF0F2F5,
+            HOVER => 0xD5DBE4,
             INK => 0x202734,
             DIM => 0x525E70,
             SHELL_EDGE => 0xA0AABA,
@@ -254,16 +255,18 @@ mod tests {
         }
     }
 
-    /// Job 041 AC3: INK reads 4.5:1 on the hover tint, which is a fill apart from the panel and
-    /// the selection in every scheme and accent.
+    /// Job 041 AC3: INK reads 4.5:1 on the hover tint, which is a visible step from the panel
+    /// and apart from the selection in every scheme and accent.
     #[test]
     fn hover_tint_is_readable_and_distinct() {
         for flags in all_flags() {
             let r = |c| resolve_flags(c, flags);
             let c = contrast(r(INK), r(HOVER));
             assert!(c >= 4.5, "flags {flags}: {c}");
-            assert_ne!(r(HOVER), r(SELECTED), "flags {flags}");
-            assert_ne!(r(HOVER), r(BAR_BG), "flags {flags}");
+            let panel = contrast(r(HOVER), r(BAR_BG));
+            assert!(panel >= 1.3, "flags {flags}: {panel} from the panel");
+            let selected = contrast(r(HOVER), r(SELECTED));
+            assert!(selected >= 1.1, "flags {flags}: {selected} from SELECTED");
         }
     }
 
