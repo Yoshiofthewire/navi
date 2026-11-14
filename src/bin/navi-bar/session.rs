@@ -7,7 +7,7 @@ use zbus::blocking::{Connection, Proxy, connection::Builder};
 use crate::{
     layout::{IconOf, Item, Rect},
     status::Battery,
-    theme::{ACCENT, BAR_BG, DIM, INK, INSET, PANEL_EDGE, Panel, SELECTED},
+    theme::{ACCENT, BAR_BG, DIM, HOVER, INK, INSET, PANEL_EDGE, Panel, SELECTED},
 };
 
 pub const BAND_H: i32 = 32;
@@ -325,13 +325,34 @@ impl Menu {
     }
 }
 
-/// The status band, `w` wide: the Navi button (`lit` when hovered or open), the clock and
-/// the battery, each text with its width in px.
+/// The tray's targets for `n` shown items in the band `w` wide, whose clock and battery texts
+/// are `clock_w` and `battery_w` px: left of the battery glyph, else at the right padding.
+pub fn tray_targets(w: i32, clock_w: i32, battery_w: Option<i32>, n: usize) -> Vec<Rect> {
+    let end = battery_w.map_or(w, |b| battery_x(w, b) - BATTERY_GLYPH);
+    crate::tray::targets(end, (w - clock_w) / 2 + clock_w, n)
+}
+
+/// Where the battery's text starts, and how far left of it its glyph begins.
+fn battery_x(w: i32, label_w: i32) -> i32 {
+    w - 12 - label_w
+}
+const BATTERY_GLYPH: i32 = 27;
+
+/// The tray: the shown items' attention states, and the hovered one.
+#[derive(Default)]
+pub struct Tray<'a> {
+    pub attention: &'a [bool],
+    pub hover: Option<usize>,
+}
+
+/// The status band, `w` wide: the Navi button (`lit` when hovered or open), the clock, the
+/// tray and the battery, each text with its width in px.
 pub fn band(
     w: i32,
     lit: bool,
     clock: (String, i32),
     battery: Option<(String, i32, Battery)>,
+    tray: Tray,
 ) -> Vec<Item> {
     let text = |t, x, w| {
         Item::Text(
@@ -379,12 +400,41 @@ pub fn band(
     ));
     out.push(text("Navi".into(), 36, 64));
     let (clock, clock_w) = clock;
+    let targets = tray_targets(
+        w,
+        clock_w,
+        battery.as_ref().map(|b| b.1),
+        tray.attention.len(),
+    );
     out.push(text(clock, (w - clock_w) / 2, clock_w + 1));
+    for (i, t) in targets.into_iter().enumerate() {
+        if tray.hover == Some(i) {
+            out.push(Item::Round(t, 8, HOVER));
+        }
+        let inset = (crate::tray::TARGET - crate::tray::ICON) / 2;
+        let icon = Rect {
+            x: t.x + inset,
+            y: t.y + inset,
+            w: crate::tray::ICON,
+            h: crate::tray::ICON,
+        };
+        out.push(Item::Icon(IconOf::Tray(i), icon, 1.0));
+        if tray.attention[i] {
+            let d = crate::layout::ATTENTION_DOT;
+            let dot = Rect {
+                x: icon.x + icon.w - d / 2,
+                y: icon.y - d / 2,
+                w: d,
+                h: d,
+            };
+            out.push(Item::Round(dot, d / 2, ACCENT));
+        }
+    }
     if let Some((label, label_w, b)) = battery {
-        let x = w - 12 - label_w;
+        let x = battery_x(w, label_w);
         out.push(text(label, x, label_w + 1));
         let r = Rect {
-            x: x - 27,
+            x: x - BATTERY_GLYPH,
             y: 11,
             w: 18,
             h: 10,
@@ -593,7 +643,7 @@ mod tests {
         let mut m = Menu::default();
         assert_eq!(m.input(), [BUTTON]);
         m.open = true;
-        let band = band(800, false, ("12:00".into(), 40), None);
+        let band = band(800, false, ("12:00".into(), 40), None, Tray::default());
         let Some(&Item::Panel(b, ..)) = band.first() else {
             panic!("the band is a panel")
         };

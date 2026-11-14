@@ -25,6 +25,8 @@ const GAP: i32 = 12;
 const MARK_W: i32 = 3;
 /// A label's inset in its row or button.
 const TEXT_X: i32 = 12;
+/// The room a tray row keeps at its right end for `›`, `✓` or `•`.
+const TRAIL_W: i32 = 20;
 /// Untrusted names are cut to this many chars before they are measured.
 const NAME_CHARS: usize = 256;
 /// navi-bar can't see which windows share a process or X connection, so no count.
@@ -45,14 +47,24 @@ pub enum Kind {
     /// Close the app's windows, this many.
     Close(usize),
     ForceClose,
+    /// A tray menu item: its dbusmenu id, its `✓`/`•` when on, and whether it opens a submenu.
+    Tray {
+        id: i32,
+        mark: Option<char>,
+        sub: bool,
+    },
+    /// Out of a tray submenu.
+    Back,
 }
 
 impl Kind {
-    /// The same item across a re-resolve: Pin and Unpin are one toggle, Close any count.
+    /// The same item across a re-resolve: Pin and Unpin are one toggle, Close any count, a tray
+    /// item its id.
     fn same(&self, other: &Kind) -> bool {
         use Kind::*;
         match (self, other) {
             (Pin | Unpin, Pin | Unpin) | (Close(_), Close(_)) => true,
+            (Tray { id: a, .. }, Tray { id: b, .. }) => a == b,
             (a, b) => a == b,
         }
     }
@@ -62,6 +74,8 @@ impl Kind {
 pub enum Line {
     Header(String),
     Item(Kind, String),
+    /// A disabled item: drawn DIM, never selected.
+    Off(Kind, String),
     Sep,
 }
 
@@ -169,6 +183,7 @@ pub fn lines(app: &App, dock: bool) -> Vec<Line> {
             Kind::Close(1) => "Close window".into(),
             Kind::Close(n) => format!("Close all {n} windows"),
             Kind::ForceClose => "Force close…".into(),
+            Kind::Tray { .. } | Kind::Back => String::new(),
         };
         Line::Item(kind, label)
     };
@@ -525,12 +540,38 @@ impl Menu {
                     },
                     PANEL_EDGE,
                 )),
-                Line::Item(_, label) => {
+                Line::Item(kind, label) | Line::Off(kind, label) => {
+                    let on = matches!(self.lines[i], Line::Item(..));
                     if self.selected == Some(i) {
                         out.push(Item::Round(at, 7, SELECTED));
                         out.push(Item::Fill(mark(at), ACCENT));
                     }
-                    out.push(text(label, at, INK));
+                    let color = if on { INK } else { DIM };
+                    let (glyph, trail) = match kind {
+                        Kind::Tray { sub: true, .. } => (Some('›'), true),
+                        Kind::Tray { mark: Some(m), .. } => (Some(*m), true),
+                        _ => (None, false),
+                    };
+                    let room = if trail {
+                        Rect {
+                            w: at.w - TRAIL_W,
+                            ..at
+                        }
+                    } else {
+                        at
+                    };
+                    out.push(text(label, room, color));
+                    let end = Rect {
+                        x: at.x + at.w - TRAIL_W - TEXT_X / 2,
+                        w: TRAIL_W,
+                        ..at
+                    };
+                    match glyph {
+                        // Noto Sans has no ✓: a drawn one.
+                        Some('✓') => out.push(Item::Check(inset_x(end, 4), color)),
+                        Some(g) => out.push(Item::Text(g.into(), inset_x(end, TEXT_X / 2), color)),
+                        None => {}
+                    }
                 }
             }
         }
@@ -718,6 +759,7 @@ mod tests {
         let label = |l: &Line| match l {
             Line::Header(h) => format!("[{h}]"),
             Line::Item(_, t) => t.clone(),
+            Line::Off(_, t) => format!("({t})"),
             Line::Sep => "-".into(),
         };
         lines.iter().map(label).collect()

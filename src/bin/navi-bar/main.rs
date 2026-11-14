@@ -32,9 +32,11 @@ mod menu;
 mod notify;
 mod runtime;
 mod session;
+mod sni;
 mod status;
 #[cfg(test)]
 mod testutil;
+mod tray;
 
 use std::fs::File;
 use std::os::fd::AsFd;
@@ -99,6 +101,7 @@ use theme::{DIM, INK};
 
 const BTN_LEFT: u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
+const BTN_MIDDLE: u32 = 0x112;
 fn text_px() -> f32 {
     TEXT_SIZE.load(std::sync::atomic::Ordering::Relaxed) as f32
 }
@@ -267,6 +270,15 @@ fn run() -> Result<(), String> {
             TimeoutAction::ToDuration(status::next_tick(&jiff::Zoned::now()))
         })
         .map_err(|e| e.to_string())?;
+    let (tray_tx, tray_rx) = channel::channel();
+    event_loop
+        .handle()
+        .insert_source(tray_rx, |event, _, bar| {
+            if let channel::Event::Msg(u) = event {
+                bar.tray_update(u);
+            }
+        })
+        .map_err(|e| e.to_string())?;
     let runtime = runtime::watch(
         tx.clone(),
         dbus::wants_export(var("NAVI_EXPORT_ENV").as_deref()),
@@ -276,6 +288,14 @@ fn run() -> Result<(), String> {
         runtime,
         dbus: dbus::serve(tx.clone()),
         _settings_dbus: dbus::serve_settings(tx.clone()),
+        tray: sni::serve(tray_tx),
+        tray_items: Vec::new(),
+        tray_targets: Vec::new(),
+        tray_hidden: 0,
+        tray_hover: None,
+        tray_scroll: tray::Scroll::default(),
+        tray_asked: None,
+        tray_menu: None,
         notes: Notes::default(),
         start: Instant::now(),
         band,
@@ -438,6 +458,19 @@ struct Bar {
     dbus: Option<zbus::blocking::Connection>,
     /// Independent owner for trusted Settings requests, even with another notification server.
     _settings_dbus: Option<zbus::blocking::Connection>,
+    /// The system tray, while navi-bar is the watcher.
+    tray: Option<sni::Tray>,
+    /// Registered items in order, with their properties once read.
+    tray_items: Vec<(tray::Key, Option<tray::Props>)>,
+    /// The band's targets as last drawn, and their items.
+    tray_targets: Vec<(Rect, tray::Key)>,
+    /// Shown items without a target, as last logged.
+    tray_hidden: usize,
+    tray_hover: Option<usize>,
+    tray_scroll: tray::Scroll,
+    /// A right press waiting for its item's menu, and the pointer's x on the band.
+    tray_asked: Option<(tray::Key, i32)>,
+    tray_menu: Option<TrayMenu>,
     /// The notifications' clock.
     start: Instant,
     registry: RegistryState,
@@ -474,8 +507,21 @@ struct Bar {
     closed: bool,
 }
 
+/// The open tray menu, on its own pop-up below the band.
+struct TrayMenu {
+    key: tray::Key,
+    title: String,
+    model: tray::Menu,
+    menu: context::Menu,
+    layer: LayerSurface,
+    configured: bool,
+    size: (i32, i32),
+}
+
 /// What waits for a token.
 enum Pending {
+    /// A tray click: the item, the target's centre (output-local) and whether it's secondary.
+    Tray(tray::Key, (i32, i32), bool),
     /// An entry, or one of its desktop actions by id.
     Launch(Entry, Option<String>),
     /// A card's `default` action: the note's id and sender, and its `NotificationClosed`, sent
@@ -634,6 +680,7 @@ impl Bar {
                     return self.toggle_pin(e);
                 }
             }
+            context::Kind::Tray { .. } | context::Kind::Back => self.context = None,
             context::Kind::Close(_) | context::Kind::ForceClose => {
                 self.context = None;
                 let windows = self.app_windows(&target.key);
@@ -807,6 +854,16 @@ impl Bar {
 
     fn go_on(&mut self, p: Pending, token: Option<&str>) {
         match p {
+            Pending::Tray(key, at, secondary) => {
+                if let Some(t) = &self.tray {
+                    t.send(sni::Job::Activate {
+                        key,
+                        token: token.map(String::from),
+                        at,
+                        secondary,
+                    });
+                }
+            }
             Pending::Launch(e, action) => spawn(&e, action.as_deref(), token),
             Pending::Action(id, sender, closed) => {
                 if let Some(conn) = &self.dbus {
@@ -1028,6 +1085,9 @@ impl Bar {
     }
 
     fn key(&mut self, event: KeyEvent, serial: u32, qh: &QueueHandle<Self>) {
+        if self.tray_menu.is_some() {
+            return self.tray_key(event);
+        }
         if self.session.open {
             match event.keysym {
                 Keysym::Escape => {
@@ -1077,6 +1137,14 @@ impl Bar {
 
     /// Typing and moving in the menu; the keys that repeat while held.
     fn edit(&mut self, event: KeyEvent) {
+        if let Some(m) = &mut self.tray_menu {
+            match event.keysym {
+                Keysym::Up => m.menu.step(-1),
+                Keysym::Down => m.menu.step(1),
+                _ => return,
+            }
+            return self.draw_tray_menu();
+        }
         if self.session.open {
             match event.keysym {
                 Keysym::Up | Keysym::Left => self.session.step(-1),
@@ -1163,9 +1231,11 @@ impl Bar {
         }
         for item in items.into_iter().chain(context) {
             match item {
-                Item::Fill(..) | Item::Round(..) | Item::Panel(..) | Item::Text(..) => {
-                    paint(&mut canvas, self.font.as_ref(), item, s)
-                }
+                Item::Fill(..)
+                | Item::Round(..)
+                | Item::Panel(..)
+                | Item::Text(..)
+                | Item::Check(..) => paint(&mut canvas, self.font.as_ref(), item, s),
                 Item::Icon(of, r, alpha) => {
                     let r = scaled(r, s);
                     let size = r.w as u32;
@@ -1186,6 +1256,7 @@ impl Bar {
                         }
                         IconOf::Folder(category) => self.icons.category(category, size),
                         IconOf::Session(name) => self.icons.get(name, &[name.into()], size),
+                        IconOf::Tray(_) => None,
                         IconOf::Entry(e) => {
                             let entry = &self.entries[e];
                             let names: Vec<String> = entry.icon.iter().cloned().collect();
@@ -1343,14 +1414,6 @@ impl Bar {
         let s = self.scale.max(1);
         let h = self.session.height();
         self.band.set_size(0, h as u32);
-        if let Ok(region) = Region::new(&self.compositor) {
-            for r in self.session.input() {
-                region.add(r.x, r.y, r.w, r.h);
-            }
-            self.band
-                .wl_surface()
-                .set_input_region(Some(region.wl_region()));
-        }
         let Some(mut canvas) = Pixmap::new((self.band_w * s) as u32, (h * s) as u32) else {
             return;
         };
@@ -1378,10 +1441,64 @@ impl Bar {
             ));
             (text, w, b)
         });
+        let shown: Vec<(tray::Key, tray::Props)> = self
+            .tray_items
+            .iter()
+            .filter_map(|(k, p)| Some((k.clone(), p.clone().filter(tray::Props::shown)?)))
+            .collect();
+        let targets = session::tray_targets(
+            self.band_w,
+            clock.1,
+            battery.as_ref().map(|b| b.1),
+            shown.len(),
+        );
+        let hidden = shown.len() - targets.len();
+        if hidden != self.tray_hidden {
+            info!(hidden, "tray: items without room in the band");
+            self.tray_hidden = hidden;
+        }
+        self.tray_targets = targets
+            .iter()
+            .zip(&shown)
+            .map(|(r, (k, _))| (*r, k.clone()))
+            .collect();
+        if let Ok(region) = Region::new(&self.compositor) {
+            for r in self.session.input().into_iter().chain(targets) {
+                region.add(r.x, r.y, r.w, r.h);
+            }
+            self.band
+                .wl_surface()
+                .set_input_region(Some(region.wl_region()));
+        }
+        let attention: Vec<bool> = shown
+            .iter()
+            .map(|(_, p)| p.status == tray::Status::NeedsAttention)
+            .collect();
+        let tray = session::Tray {
+            attention: &attention,
+            hover: self.tray_hover,
+        };
         let lit = self.session.open || self.band_hover;
-        let band = session::band(self.band_w, lit, clock, battery);
+        let band = session::band(self.band_w, lit, clock, battery, tray);
         for item in band.into_iter().chain(self.session.draw()) {
-            if let Item::Icon(IconOf::Button, r, _) = item {
+            if let Item::Icon(IconOf::Tray(i), r, _) = item {
+                let r = scaled(r, s);
+                let props = &shown[i].1;
+                if let Some(icon) = &props.pixmap {
+                    draw_pixmap_icon(&mut canvas, icon, r);
+                } else if let Some(name) = &props.icon_name {
+                    let path = props.theme_path.as_deref();
+                    match self.icons.tray(name, path, r.w as u32) {
+                        Some(px) => {
+                            let tint = name.ends_with("-symbolic").then_some(INK);
+                            draw_icon(&mut canvas, px, r, 1.0, tint);
+                        }
+                        None => placeholder(&mut canvas, r),
+                    }
+                } else {
+                    placeholder(&mut canvas, r);
+                }
+            } else if let Item::Icon(IconOf::Button, r, _) = item {
                 let r = scaled(r, s);
                 if let Some(icon) = self.icons.navi(r.w as u32) {
                     let (paint, t) = (PixmapPaint::default(), Transform::identity());
@@ -1629,6 +1746,280 @@ impl Bar {
         layer.commit();
     }
 
+    fn tray_update(&mut self, u: sni::Update) {
+        match u {
+            sni::Update::Added(key) => self.tray_items.push((key, None)),
+            sni::Update::Props(key, props) => {
+                if let Some(item) = self.tray_items.iter_mut().find(|(k, _)| *k == key) {
+                    item.1 = Some(props);
+                }
+                self.draw_band();
+            }
+            sni::Update::Removed(key) => {
+                self.tray_items.retain(|(k, _)| *k != key);
+                if self.tray_menu.as_ref().is_some_and(|m| m.key == key) {
+                    self.close_tray_menu();
+                }
+                self.tray_asked.take_if(|(k, _)| *k == key);
+                self.tray_hover = None;
+                self.draw_band();
+            }
+            sni::Update::Menu(key, root) => {
+                if let Some(m) = self.tray_menu.as_mut().filter(|m| m.key == key) {
+                    m.model.update(root);
+                    m.menu.update(m.model.lines(&m.title));
+                    return self.resize_tray_menu();
+                }
+                if let Some((_, x)) = self.tray_asked.take_if(|(k, _)| *k == key) {
+                    self.open_tray_menu(key, x, root);
+                }
+            }
+        }
+    }
+
+    /// The shown item `key`'s properties.
+    fn tray_props(&self, key: &tray::Key) -> Option<&tray::Props> {
+        let item = self.tray_items.iter().find(|(k, _)| k == key)?;
+        item.1.as_ref()
+    }
+
+    /// A press or wheel on the band at `(x, y)`; whether a tray target took it.
+    fn tray_input(&mut self, e: &PointerEvent, qh: &QueueHandle<Self>) -> bool {
+        let (x, y) = (e.position.0 as i32, e.position.1 as i32);
+        let Some(i) = tray::hit(
+            &self.tray_targets.iter().map(|t| t.0).collect::<Vec<_>>(),
+            x,
+            y,
+        ) else {
+            return false;
+        };
+        let (r, key) = self.tray_targets[i].clone();
+        let [top, _, _, left] = session::BAND_MARGIN;
+        let at = (left + r.x + r.w / 2, top + r.y + r.h / 2);
+        let Some(props) = self.tray_props(&key).cloned() else {
+            return true;
+        };
+        let (Some(t), surface) = (&self.tray, self.band.wl_surface().clone()) else {
+            return true;
+        };
+        match e.kind {
+            PointerEventKind::Press {
+                button: BTN_RIGHT, ..
+            } => match props.menu {
+                Some(_) => {
+                    self.tray_asked = Some((key.clone(), x));
+                    t.send(sni::Job::Menu(key));
+                }
+                None => t.send(sni::Job::ContextMenu(key, at)),
+            },
+            PointerEventKind::Press {
+                button: BTN_LEFT, ..
+            } if props.item_is_menu && props.menu.is_some() => {
+                self.tray_asked = Some((key.clone(), x));
+                t.send(sni::Job::Menu(key));
+            }
+            PointerEventKind::Press {
+                button: button @ (BTN_LEFT | BTN_MIDDLE),
+                serial,
+                ..
+            } => {
+                let p = Pending::Tray(key, at, button == BTN_MIDDLE);
+                self.ask_token(p, None, serial, surface, qh);
+            }
+            PointerEventKind::Axis {
+                horizontal,
+                vertical,
+                ..
+            } => {
+                for (axis, a, name) in [(0, vertical, "vertical"), (1, horizontal, "horizontal")] {
+                    for delta in self.tray_scroll.feed(axis, a.absolute, a.discrete) {
+                        t.send(sni::Job::Scroll(key.clone(), delta, name));
+                    }
+                }
+            }
+            _ => {}
+        }
+        true
+    }
+
+    /// The menu `root` of item `key`, opened below the band with its left edge at band x `x`.
+    fn open_tray_menu(&mut self, key: tray::Key, x: i32, root: tray::Node) {
+        let Some(props) = self.tray_props(&key) else {
+            return;
+        };
+        let title = match (props.title.is_empty(), props.id.is_empty()) {
+            (false, _) => props.title.clone(),
+            (true, false) => props.id.clone(),
+            (true, true) => "Menu".into(),
+        };
+        self.close_session();
+        self.close_menu();
+        self.close_tray_menu();
+        let model = tray::Menu {
+            root,
+            path: Vec::new(),
+        };
+        let target = context::Target {
+            key: String::new(),
+            dock: false,
+        };
+        let menu = context::Menu::new(target, model.lines(&title), (0, 0), false);
+        let surface = self.compositor.create_surface(&self.qh);
+        let layer = self.layer_shell.create_layer_surface(
+            &self.qh,
+            surface,
+            Layer::Top,
+            Some("navi-tray-menu"),
+            None,
+        );
+        layer.set_anchor(Anchor::TOP | Anchor::LEFT);
+        layer.set_exclusive_zone(0);
+        layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
+        let [_, right, _, left] = session::BAND_MARGIN;
+        let w = context::width(text_px() as i32);
+        // At the pointer, kept `INSET` inside the output's right edge (the band's own margin).
+        let output_w = self.band_w + left + right;
+        let x = (left + x).min(output_w - theme::INSET - w).max(left);
+        layer.set_margin(theme::INSET, 0, 0, x);
+        info!(sender = key.sender, path = key.path, "tray: menu opened");
+        if let Some(t) = &self.tray {
+            t.set_open(Some(key.clone()));
+        }
+        self.tray_menu = Some(TrayMenu {
+            key,
+            title,
+            model,
+            menu,
+            layer,
+            configured: false,
+            size: (0, 0),
+        });
+        self.resize_tray_menu();
+    }
+
+    /// Sizes the tray menu to its lines; drawn now, or on its first configure.
+    fn resize_tray_menu(&mut self) {
+        let Some(m) = &mut self.tray_menu else {
+            return;
+        };
+        let advance = advance(self.font.as_ref(), text_px());
+        let t = text(&advance);
+        let size = (context::width(t.px), m.menu.height(&t));
+        drop(advance);
+        if size != m.size {
+            m.size = size;
+            m.layer.set_size(size.0 as u32, size.1 as u32);
+            if !m.configured {
+                return m.layer.commit();
+            }
+        }
+        self.draw_tray_menu();
+    }
+
+    fn draw_tray_menu(&mut self) {
+        let Some(m) = &self.tray_menu else {
+            return;
+        };
+        if !m.configured {
+            return;
+        }
+        let s = self.scale.max(1);
+        let (w, h) = m.size;
+        let Some(mut canvas) = Pixmap::new((w * s) as u32, (h * s) as u32) else {
+            return;
+        };
+        let advance = advance(self.font.as_ref(), text_px());
+        let r = Rect { x: 0, y: 0, w, h };
+        for item in m.menu.draw(r, &text(&advance)) {
+            paint(&mut canvas, self.font.as_ref(), item, s);
+        }
+        present(&mut self.pool, &m.layer, &canvas, s);
+    }
+
+    fn close_tray_menu(&mut self) {
+        if self.tray_menu.take().is_some()
+            && let Some(t) = &self.tray
+        {
+            t.set_open(None);
+        }
+    }
+
+    /// What's at `(x, y)` on the tray menu.
+    fn tray_menu_hit(&self, x: i32, y: i32) -> Option<context::Hit> {
+        let m = self.tray_menu.as_ref()?;
+        let advance = advance(self.font.as_ref(), text_px());
+        let (w, h) = m.size;
+        m.menu.hit(Rect { x: 0, y: 0, w, h }, &text(&advance), x, y)
+    }
+
+    /// Runs line `i` of the tray menu; `keyboard` selects the first line of a level it opens.
+    fn tray_activate(&mut self, i: usize, keyboard: bool) {
+        let Some(m) = &mut self.tray_menu else {
+            return;
+        };
+        let kind = match m.menu.lines.get(i) {
+            Some(context::Line::Item(kind, _)) => kind.clone(),
+            _ => return,
+        };
+        let moved = match kind {
+            context::Kind::Back => m.model.back(),
+            context::Kind::Tray { id, sub: true, .. } => m.model.enter(id),
+            context::Kind::Tray { id, .. } => {
+                let key = m.key.clone();
+                if let Some(t) = &self.tray {
+                    t.send(sni::Job::Event(key, id));
+                }
+                return self.close_tray_menu();
+            }
+            _ => false,
+        };
+        if moved {
+            self.tray_level(keyboard);
+        }
+    }
+
+    /// The menu shows the model's level now.
+    fn tray_level(&mut self, keyboard: bool) {
+        if let Some(m) = &mut self.tray_menu {
+            let target = m.menu.target.clone();
+            m.menu = context::Menu::new(target, m.model.lines(&m.title), (0, 0), keyboard);
+        }
+        self.resize_tray_menu();
+    }
+
+    /// Keys while the tray menu is open, the context menu's rules.
+    fn tray_key(&mut self, event: KeyEvent) {
+        let Some(m) = &mut self.tray_menu else {
+            return;
+        };
+        let selected = m.menu.selected;
+        match event.keysym {
+            Keysym::Escape => return self.close_tray_menu(),
+            Keysym::Return | Keysym::KP_Enter | Keysym::Right => {
+                let sub = matches!(
+                    m.menu.selected_kind(),
+                    Some(context::Kind::Tray { sub: true, .. })
+                );
+                if let Some(i) = selected
+                    && (event.keysym != Keysym::Right || sub)
+                {
+                    self.tray_activate(i, true);
+                }
+                return;
+            }
+            Keysym::Left | Keysym::BackSpace => {
+                if m.model.back() {
+                    self.tray_level(true);
+                }
+                return;
+            }
+            Keysym::Home | Keysym::KP_Home => m.menu.home(),
+            Keysym::End | Keysym::KP_End => m.menu.end(),
+            _ => return self.edit(event),
+        }
+        self.draw_tray_menu();
+    }
+
     fn draw_cards(&mut self) {
         let (Some(layer), true) = (&self.cards_layer, self.cards_configured) else {
             return;
@@ -1696,6 +2087,7 @@ fn paint(canvas: &mut Pixmap, font: Option<&fontdue::Font>, item: Item, s: i32) 
                 draw_text(canvas, font, &text, scaled(r, s), text_px() * s as f32, rgb);
             }
         }
+        Item::Check(r, rgb) => check(canvas, scaled(r, s), rgb, s),
         _ => {}
     }
 }
@@ -1910,6 +2302,50 @@ fn tinted(icon: &Pixmap, rgb: u32) -> Pixmap {
         }
     }
     out
+}
+
+/// A check mark, `r`'s height at most, centred in it.
+fn check(canvas: &mut Pixmap, r: Rect, rgb: u32, s: i32) {
+    let side = r.w.min(r.h) as f32;
+    let (x, y) = (
+        r.x as f32 + (r.w as f32 - side) / 2.0,
+        r.y as f32 + (r.h as f32 - side) / 2.0,
+    );
+    let mut path = tiny_skia::PathBuilder::new();
+    path.move_to(x + 0.15 * side, y + 0.55 * side);
+    path.line_to(x + 0.4 * side, y + 0.8 * side);
+    path.line_to(x + 0.85 * side, y + 0.25 * side);
+    let Some(path) = path.finish() else {
+        return;
+    };
+    let mut paint = Paint::default();
+    paint.set_color(color(rgb, 1.0));
+    paint.anti_alias = true;
+    let stroke = tiny_skia::Stroke {
+        width: 2.0 * s as f32,
+        ..Default::default()
+    };
+    canvas.stroke_path(&path, &paint, &stroke, Transform::identity(), None);
+}
+
+/// A tray item's own pixels, scaled to fit `r`, centred.
+fn draw_pixmap_icon(canvas: &mut Pixmap, icon: &tray::Icon, r: Rect) {
+    let src = tiny_skia::IntSize::from_wh(icon.w, icon.h)
+        .and_then(|size| Pixmap::from_vec(icon.rgba.clone(), size));
+    let Some(src) = src else {
+        return placeholder(canvas, r);
+    };
+    let k = r.w.min(r.h) as f32 / icon.w.max(icon.h) as f32;
+    let (dx, dy) = (
+        r.x as f32 + (r.w as f32 - icon.w as f32 * k) / 2.0,
+        r.y as f32 + (r.h as f32 - icon.h as f32 * k) / 2.0,
+    );
+    let paint = PixmapPaint {
+        quality: tiny_skia::FilterQuality::Bicubic,
+        ..Default::default()
+    };
+    let t = Transform::from_scale(k, k).post_translate(dx, dy);
+    canvas.draw_pixmap(0, 0, src.as_ref(), &paint, t, None);
 }
 
 /// A dim outlined square where an icon couldn't be found.
@@ -2154,6 +2590,8 @@ impl LayerShellHandler for Bar {
                     self.closed = true;
                 }
             }
+        } else if self.tray_menu.as_ref().is_some_and(|m| &m.layer == layer) {
+            self.close_tray_menu();
         } else if self.cards_layer.as_ref() == Some(layer) {
             // The next notification makes a new one.
             self.cards_layer = None;
@@ -2177,6 +2615,9 @@ impl LayerShellHandler for Bar {
             self.band_configured = true;
             self.band_w = configure.new_size.0 as i32;
             self.draw_band();
+        } else if let Some(m) = self.tray_menu.as_mut().filter(|m| &m.layer == layer) {
+            m.configured = true;
+            self.draw_tray_menu();
         } else if self.cards_layer.as_ref() == Some(layer) {
             self.cards_configured = true;
             self.draw_cards();
@@ -2195,9 +2636,13 @@ impl CompositorHandler for Bar {
         if factor != self.scale {
             self.scale = factor;
             self.panel_moved();
+            if let Some(t) = &self.tray {
+                t.set_px((tray::ICON * factor) as u32);
+            }
             self.draw();
             self.draw_band();
             self.draw_cards();
+            self.draw_tray_menu();
         }
     }
 
@@ -2312,6 +2757,11 @@ impl KeyboardHandler for Bar {
         if surface == self.band.wl_surface() {
             self.close_session();
         }
+        // Lock, a fullscreen window or a click elsewhere takes the keyboard.
+        if self.tray_menu.as_ref().map(|m| m.layer.wl_surface()) == Some(surface) {
+            debug!("tray menu lost the keyboard");
+            self.close_tray_menu();
+        }
         if surface == self.layer.wl_surface() {
             debug!(
                 context = self.context.is_some(),
@@ -2366,6 +2816,30 @@ impl PointerHandler for Bar {
         for e in events {
             if &e.surface == self.band.wl_surface() {
                 let (x, y) = (e.position.0 as i32, e.position.1 as i32);
+                if matches!(
+                    e.kind,
+                    PointerEventKind::Press { .. } | PointerEventKind::Axis { .. }
+                ) && self.tray_input(e, qh)
+                {
+                    continue;
+                }
+                if let PointerEventKind::Enter { .. }
+                | PointerEventKind::Motion { .. }
+                | PointerEventKind::Leave { .. } = e.kind
+                {
+                    let targets: Vec<Rect> = self.tray_targets.iter().map(|t| t.0).collect();
+                    let hover = match e.kind {
+                        PointerEventKind::Leave { .. } => None,
+                        _ => tray::hit(&targets, x, y),
+                    };
+                    if hover.is_none() {
+                        self.tray_scroll.clear();
+                    }
+                    if hover != self.tray_hover {
+                        self.tray_hover = hover;
+                        self.draw_band();
+                    }
+                }
                 match e.kind {
                     PointerEventKind::Press {
                         button: BTN_LEFT, ..
@@ -2395,6 +2869,29 @@ impl PointerHandler for Bar {
                                 self.session.selected = selected;
                                 self.draw_band();
                             }
+                        }
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+            let on_tray = self.tray_menu.as_ref().map(|m| m.layer.wl_surface()) == Some(&e.surface);
+            if on_tray {
+                let (x, y) = (e.position.0 as i32, e.position.1 as i32);
+                let hit = self.tray_menu_hit(x, y);
+                match e.kind {
+                    PointerEventKind::Press {
+                        button: BTN_LEFT, ..
+                    } => {
+                        if let Some(context::Hit::Line(i)) = hit {
+                            self.tray_activate(i, false);
+                        }
+                    }
+                    PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
+                        if let (Some(h), Some(m)) = (hit, self.tray_menu.as_mut())
+                            && m.menu.hover(h)
+                        {
+                            self.draw_tray_menu();
                         }
                     }
                     _ => {}
@@ -2644,7 +3141,12 @@ mod tests {
                     };
                     ("50%".to_string(), 30, b)
                 });
-                out.push(session::band(800, lit, ("12:00".into(), 40), battery));
+                // A tray with an item hovered and one needing attention.
+                let tray = session::Tray {
+                    attention: &[false, true],
+                    hover: Some(0),
+                };
+                out.push(session::band(800, lit, ("12:00".into(), 40), battery, tray));
             }
         }
 
@@ -2851,7 +3353,7 @@ mod tests {
                 "launcher",
             );
 
-            let items = session::band(400, false, ("12:00".into(), 40), None);
+            let items = session::band(400, false, ("12:00".into(), 40), None, Default::default());
             let r = Rect {
                 x: 0,
                 y: 0,

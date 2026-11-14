@@ -336,13 +336,19 @@ fn render_png(bytes: &[u8], size: u32) -> Result<Pixmap, String> {
 pub struct Icons {
     pub themes: Themes,
     cache: HashMap<(String, u32), Option<Pixmap>>,
+    /// The tray's entries in `cache`, oldest first.
+    tray_keys: Vec<(String, u32)>,
 }
+
+/// Tray icons cached at most.
+const MAX_TRAY: usize = 128;
 
 impl Icons {
     pub fn new(themes: Themes) -> Icons {
         Icons {
             themes,
             cache: HashMap::new(),
+            tray_keys: Vec::new(),
         }
     }
 
@@ -372,6 +378,45 @@ impl Icons {
             &[format!("{name}-symbolic"), name.into(), "folder".into()],
             size,
         )
+    }
+
+    /// A tray item's icon `name` at `size` px: in its `IconThemePath` as a file or a theme base,
+    /// then the normal chain. Names that could form a path are refused before any file access.
+    pub fn tray(&mut self, name: &str, theme_path: Option<&Path>, size: u32) -> Option<&Pixmap> {
+        if !crate::tray::icon_name_ok(name) {
+            return None;
+        }
+        let dir = theme_path.filter(|p| p.is_absolute());
+        let k = (
+            format!(
+                "\0tray\0{}\0{name}",
+                dir.map_or(String::new(), |d| d.display().to_string())
+            ),
+            size,
+        );
+        if !self.cache.contains_key(&k) {
+            // Item names come and go: their entries are dropped before they pile up.
+            self.tray_keys.push(k.clone());
+            if self.tray_keys.len() > MAX_TRAY {
+                for old in self.tray_keys.drain(..MAX_TRAY / 2) {
+                    self.cache.remove(&old);
+                }
+            }
+            let own = dir.and_then(|d| {
+                let file = ["png", "svg"]
+                    .iter()
+                    .map(|ext| d.join(format!("{name}.{ext}")))
+                    .find(|p| p.is_file());
+                file.or_else(|| {
+                    Themes::new(vec![d.to_path_buf()], None, FALLBACK).lookup(name, size)
+                })
+            });
+            let px = own
+                .or_else(|| self.themes.lookup(name, size))
+                .and_then(|p| render_file(&p, size).ok());
+            self.cache.insert(k.clone(), px);
+        }
+        self.cache[&k].as_ref()
     }
 
     /// The menu button's icon: `navi` from the theme, else the embedded one.
