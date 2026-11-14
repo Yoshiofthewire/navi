@@ -1213,6 +1213,8 @@ impl Navi {
             .and_then(|kb| kb.current_focus())
             .and_then(|f| f.surface());
         let now = std::time::Instant::now();
+        // Runs on every loop iteration: `is_maximized` per window would be O(n²).
+        let maximized = self.layout.maximized_tiles();
         let list = self
             .windows
             .iter()
@@ -1221,7 +1223,7 @@ impl Navi {
                 let surface = window_surface(&m.window)?;
                 let tile = self.layout.tile(id)?;
                 let states = [
-                    (ListState::Maximized, self.layout.is_maximized(id)),
+                    (ListState::Maximized, maximized.contains(&id)),
                     (ListState::Minimized, tile.minimized),
                     (ListState::Activated, focus.as_ref() == Some(&surface)),
                     (ListState::Fullscreen, tile.fullscreen),

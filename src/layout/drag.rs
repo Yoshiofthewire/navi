@@ -142,13 +142,12 @@ impl Layout {
             return hit;
         }
         // One set of zones per group, from its active tile; none for a fullscreen tile or one it covers.
-        let ids = || {
-            self.tiles
-                .iter()
-                .filter(|t| !t.floating && self.active(t.id) == Some(t.id))
-                .filter(|t| !self.covered(t) && !t.fullscreen && !covered(t.id))
-                .map(|t| t.id)
-        };
+        let ids: Vec<WinId> = (self.tiles.iter().zip(self.actives()))
+            .filter(|(t, active)| !t.floating && *active)
+            .filter(|(t, _)| !self.covered(t) && !t.fullscreen && !covered(t.id))
+            .map(|(t, _)| t.id)
+            .collect();
+        let ids = || ids.iter().copied();
         // Top zones go last: where one meets the bottom zone of a tile above, that one wins.
         let zone = ids()
             .flat_map(|id| {
