@@ -641,3 +641,532 @@ fn run(conn: &Connection, shared: &Shared, job: Job) {
         Job::Wake => {}
     }
 }
+
+#[cfg(test)]
+pub mod tests {
+    //! `tray::tests::private_bus_tray`: the production watcher and worker on a private bus,
+    //! with `scripts/check-tray.py` items. No display.
+    use std::io::Write;
+    use std::path::PathBuf;
+    use std::process::{Child, Command, Stdio};
+    use std::sync::{Arc, Mutex};
+    use std::thread::sleep;
+    use std::time::{Duration, Instant};
+
+    use serde_json::Value as Json;
+    use smithay_client_toolkit::reexports::calloop::channel::{self, Channel};
+    use zbus::blocking::{Connection, MessageIterator, Proxy, fdo::DBusProxy};
+    use zbus::{MatchRule, message::Type, names::BusName};
+
+    use super::*;
+    use crate::testutil::Tmp;
+
+    struct Ui {
+        rx: Channel<Update>,
+        all: Vec<Update>,
+    }
+
+    impl Ui {
+        /// Waits up to `secs` for `done` to hold over every update so far.
+        fn until(&mut self, secs: u64, done: impl Fn(&[Update]) -> bool) -> bool {
+            let end = Instant::now() + Duration::from_secs(secs);
+            loop {
+                while let Ok(u) = self.rx.try_recv() {
+                    self.all.push(u);
+                }
+                if done(&self.all) {
+                    return true;
+                }
+                if Instant::now() > end {
+                    return false;
+                }
+                sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn props(&self, key: &Key) -> Option<&Props> {
+            self.all.iter().rev().find_map(|u| match u {
+                Update::Props(k, p) if k == key => Some(p),
+                _ => None,
+            })
+        }
+
+        fn menus(&self, key: &Key) -> Vec<&Node> {
+            let menus = self.all.iter().filter_map(|u| match u {
+                Update::Menu(k, n) if k == key => Some(n),
+                _ => None,
+            });
+            menus.collect()
+        }
+
+        fn removed(&self, key: &Key) -> bool {
+            self.all
+                .iter()
+                .any(|u| matches!(u, Update::Removed(k) if k == key))
+        }
+    }
+
+    /// A test item and its call log.
+    struct Py {
+        child: Child,
+        log: PathBuf,
+    }
+
+    impl Py {
+        fn new(dir: &Tmp, name: &str, args: &[&str]) -> Py {
+            let log = dir.0.join(format!("{name}.jsonl"));
+            let child = Command::new("python3")
+                .arg(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/scripts/check-tray.py"
+                ))
+                .arg("--log")
+                .arg(&log)
+                .args(args)
+                .stdin(Stdio::piped())
+                .spawn()
+                .expect("start check-tray.py");
+            Py { child, log }
+        }
+
+        fn calls(&self) -> Vec<Json> {
+            let text = std::fs::read_to_string(&self.log).unwrap_or_default();
+            text.lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect()
+        }
+
+        /// Waits for `n` log lines that `f` picks.
+        fn wait(&self, secs: u64, n: usize, f: impl Fn(&Json) -> bool) -> Vec<Json> {
+            let end = Instant::now() + Duration::from_secs(secs);
+            loop {
+                let picked: Vec<Json> = self.calls().into_iter().filter(|c| f(c)).collect();
+                if picked.len() >= n || Instant::now() > end {
+                    return picked;
+                }
+                sleep(Duration::from_millis(20));
+            }
+        }
+
+        /// Its first registration's key, once logged.
+        fn key(&self, path: &str) -> Key {
+            let r = self.wait(10, 1, |c| c.get("register").is_some());
+            Key {
+                sender: r[0]["conn"].as_str().unwrap().into(),
+                path: path.into(),
+            }
+        }
+
+        fn method(&self, c: &Json) -> String {
+            c["call"].as_str().unwrap_or("").into()
+        }
+
+        fn cmd(&mut self, line: &str) {
+            let stdin = self.child.stdin.as_mut().unwrap();
+            writeln!(stdin, "{line}").unwrap();
+        }
+
+        fn exit(mut self) {
+            self.cmd("exit");
+            let _ = self.child.wait();
+        }
+    }
+
+    fn methods(py: &Py) -> Vec<String> {
+        let calls = py.calls();
+        let m = calls.iter().map(|c| py.method(c)).filter(|m| !m.is_empty());
+        m.filter(|m| m != "GetAll").collect()
+    }
+
+    pub fn private_bus() {
+        let dir = Tmp::new("tray-bus");
+        let client = Connection::session().unwrap();
+        let dbus = DBusProxy::new(&client).unwrap();
+        let owner = |n: &str| {
+            let name = BusName::try_from(n).unwrap();
+            dbus.get_name_owner(name).ok().map(|o| o.to_string())
+        };
+        let host = format!("org.kde.StatusNotifierHost-{}", std::process::id());
+
+        // AC1: someone else's watcher: no name requested, nothing exported.
+        let (tx, rx) = channel::channel();
+        client.request_name(WATCHER).unwrap();
+        let mine = client.unique_name().unwrap().to_string();
+        assert!(serve(tx.clone()).is_none());
+        assert_eq!(owner(WATCHER).as_deref(), Some(mine.as_str()));
+        assert_eq!(owner(&host), None);
+        client.release_name(WATCHER).unwrap();
+
+        // Watcher signals, from here on.
+        let signals = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+        let rule = MatchRule::builder()
+            .msg_type(Type::Signal)
+            .interface(WATCHER)
+            .unwrap()
+            .build();
+        let it = MessageIterator::for_match_rule(rule, &client, Some(1024)).unwrap();
+        let seen = signals.clone();
+        std::thread::spawn(move || {
+            for m in it.flatten() {
+                let member = m
+                    .header()
+                    .member()
+                    .map(|m| m.to_string())
+                    .unwrap_or_default();
+                let arg = m.body().deserialize::<(String,)>().map(|a| a.0);
+                seen.lock().unwrap().push((member, arg.unwrap_or_default()));
+            }
+        });
+        // `member`'s arguments once `n` arrived, or after 5 s.
+        let signalled = |member: &str, n: usize| {
+            let end = Instant::now() + Duration::from_secs(5);
+            loop {
+                let s = signals.lock().unwrap();
+                let args: Vec<String> = s
+                    .iter()
+                    .filter(|(m, _)| m == member)
+                    .map(|s| s.1.clone())
+                    .collect();
+                if args.len() >= n || Instant::now() > end {
+                    return args;
+                }
+                drop(s);
+                sleep(Duration::from_millis(20));
+            }
+        };
+
+        let tray = serve(tx.clone()).expect("the watcher name is free");
+        let ours = owner(WATCHER).unwrap();
+        assert_ne!(ours, mine);
+        assert_eq!(owner(&host).as_deref(), Some(ours.as_str()), "host name");
+        assert!(serve(tx).is_none(), "a second serve never takes over");
+        assert_eq!(owner(WATCHER).as_deref(), Some(ours.as_str()));
+        let watcher: Proxy = zbus::blocking::proxy::Builder::new(&client)
+            .destination(WATCHER)
+            .and_then(|b| b.path(WATCHER_PATH))
+            .and_then(|b| b.interface(WATCHER))
+            .map(|b| b.cache_properties(zbus::proxy::CacheProperties::No))
+            .and_then(|b| b.build())
+            .unwrap();
+        let prop = |name: &str| watcher.get_property::<OwnedValue>(name).unwrap();
+        assert_eq!(
+            bool::try_from(prop("IsStatusNotifierHostRegistered")),
+            Ok(true)
+        );
+        assert_eq!(i32::try_from(prop("ProtocolVersion")), Ok(0));
+        let listed = || -> Vec<String> {
+            watcher
+                .get_property("RegisteredStatusNotifierItems")
+                .unwrap()
+        };
+        let mut ui = Ui {
+            rx,
+            all: Vec::new(),
+        };
+        println!("AC1 ok: watcher and host owned by {ours}");
+
+        // AC3: by bus name (twice: one entry) and by object path.
+        let mut a = Py::new(&dir, "a", &["--twice", "--title", "Secret Title A"]);
+        let ka = a.key("/StatusNotifierItem");
+        let b_args = [
+            "--register",
+            "path",
+            "--no-menu",
+            "--pixmap",
+            "none",
+            "--icon-name",
+            "nm-device-wireless",
+        ];
+        let b = Py::new(&dir, "b", &b_args);
+        let kb = b.key("/org/navi/TestItem");
+        assert!(ui.until(10, |all| has_props(all, &ka) && has_props(all, &kb)));
+        let name_a = a.wait(5, 1, |c| c.get("name").is_some())[0]["name"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let want = [
+            format!("{name_a}/StatusNotifierItem"),
+            format!("{}/org/navi/TestItem", kb.sender),
+        ];
+        assert_eq!(listed(), want);
+        assert_eq!(a.wait(5, 2, |c| c.get("register").is_some()).len(), 2);
+        assert_eq!(signalled("StatusNotifierItemRegistered", 2), want);
+        let pa = ui.props(&ka).unwrap().clone();
+        assert_eq!(pa.title, "Secret Title A");
+        let px = pa.pixmap.as_ref().expect("a valid pixmap");
+        assert_eq!((px.w, px.h), (22, 22), "the smallest at least 20 px");
+        assert_eq!(&px.rgba[..4], [255, 0, 0, 255]);
+        assert_eq!(pa.menu.as_deref(), Some("/MenuBar"));
+        let pb = ui.props(&kb).unwrap();
+        assert_eq!(
+            (pb.menu.as_deref(), pb.icon_name.as_deref()),
+            (None, Some("nm-device-wireless"))
+        );
+        println!("AC3 ok: {want:?}");
+
+        // AC4: a name owned by another connection, then the caps.
+        let spoof = Py::new(&dir, "spoof", &["--spoof", &name_a]);
+        let r = spoof.wait(10, 1, |c| c.get("register").is_some());
+        assert_eq!(r[0]["ok"], false, "{r:?}");
+        assert!(r[0]["error"].as_str().unwrap().contains("Spoofed"), "{r:?}");
+        assert_eq!(listed().len(), 2);
+        let fill = Py::new(&dir, "fill", &["--fill", "--no-menu"]);
+        // One connection with 5 items, then 8 with 4 each.
+        let r = fill.wait(30, 37, |c| c.get("register").is_some());
+        assert_eq!(r.len(), 37);
+        let ok = r.iter().filter(|c| c["ok"] == true).count();
+        assert_eq!(ok, tray::TOTAL - 2, "the 33rd item overall is refused");
+        assert!(
+            r[4]["error"].as_str().unwrap().contains("SenderFull"),
+            "{:?}",
+            r[4]
+        );
+        assert!(r[36]["error"].as_str().unwrap().contains("Full"));
+        assert_eq!(listed().len(), tray::TOTAL);
+        println!("AC4 ok: spoof refused, {ok} filled, sender and total caps hold");
+        fill.exit();
+        spoof.exit();
+        let back = |n| {
+            move |all: &[Update]| {
+                all.iter()
+                    .filter(|u| matches!(u, Update::Removed(_)))
+                    .count()
+                    >= n
+            }
+        };
+        assert!(ui.until(10, back(30)));
+        assert_eq!(listed().len(), 2, "the fill's items left with it");
+
+        // AC5: a registration with no object: its first GetAll fails.
+        let nothing = Py::new(&dir, "nothing", &["--no-object"]);
+        let kn = nothing.key("/Nothing");
+        assert!(ui.until(10, |all| {
+            all.iter()
+                .any(|u| matches!(u, Update::Removed(k) if *k == kn))
+        }));
+        assert_eq!(listed().len(), 2);
+        nothing.exit();
+
+        // AC7: hostile pixmaps fall back to no pixmap; the tray goes on.
+        for mode in ["huge", "negative", "mismatch", "zero", "many"] {
+            let p = Py::new(&dir, mode, &["--register", "path", "--pixmap", mode]);
+            let k = p.key("/org/navi/TestItem");
+            assert!(ui.until(10, |all| has_props(all, &k)), "{mode}");
+            assert_eq!(ui.props(&k).unwrap().pixmap, None, "{mode}");
+            p.exit();
+            assert!(ui.until(10, |all| {
+                all.iter()
+                    .any(|u| matches!(u, Update::Removed(r) if *r == k))
+            }));
+        }
+        println!("AC7 ok: hostile pixmaps dropped");
+
+        // AC12: the token before Activate, at the given spot; Activate alone without one.
+        let activate = |key: &Key, token: Option<&str>, secondary| Job::Activate {
+            key: key.clone(),
+            token: token.map(String::from),
+            at: (100, 20),
+            secondary,
+        };
+        tray.send(activate(&ka, Some("tok-a"), false));
+        a.wait(5, 1, |c| c["call"] == "Activate");
+        assert_eq!(methods(&a), ["ProvideXdgActivationToken", "Activate"]);
+        let calls = a.calls();
+        let call = |m: &str| calls.iter().find(|c| c["call"] == m).unwrap()["args"].clone();
+        assert_eq!(
+            call("ProvideXdgActivationToken"),
+            serde_json::json!(["tok-a"])
+        );
+        assert_eq!(call("Activate"), serde_json::json!([100, 20]));
+        let f = Py::new(
+            &dir,
+            "f",
+            &["--register", "path", "--no-menu", "--no-token-method"],
+        );
+        let kf = f.key("/org/navi/TestItem");
+        tray.send(activate(&kf, Some("tok-f"), false));
+        f.wait(5, 1, |c| c["call"] == "Activate");
+        assert_eq!(
+            methods(&f),
+            ["ProvideXdgActivationToken", "Activate"],
+            "UnknownMethod, then the click"
+        );
+        f.exit();
+        // AC13: middle with and without a token, the wheel, and ContextMenu without a Menu.
+        tray.send(activate(&kb, None, false));
+        tray.send(activate(&kb, Some("tok-b"), true));
+        tray.send(activate(&kb, None, true));
+        tray.send(Job::Scroll(kb.clone(), 120, "vertical"));
+        tray.send(Job::Scroll(kb.clone(), -120, "horizontal"));
+        tray.send(Job::ContextMenu(kb.clone(), (5, 6)));
+        b.wait(5, 1, |c| c["call"] == "ContextMenu");
+        assert_eq!(
+            methods(&b),
+            [
+                "Activate",
+                "ProvideXdgActivationToken",
+                "SecondaryActivate",
+                "SecondaryActivate",
+                "Scroll",
+                "Scroll",
+                "ContextMenu"
+            ]
+        );
+        let calls = b.calls();
+        let args: Vec<Json> = calls
+            .iter()
+            .filter(|c| c["call"] == "Scroll")
+            .map(|c| c["args"].clone())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                serde_json::json!([120, "vertical"]),
+                serde_json::json!([-120, "horizontal"])
+            ]
+        );
+        println!("AC12/AC13 ok: {:?}", methods(&b));
+
+        // AC14: AboutToShow, then GetLayout; the chosen item's Event.
+        tray.send(Job::Menu(ka.clone()));
+        assert!(ui.until(5, |all| {
+            all.iter()
+                .any(|u| matches!(u, Update::Menu(k, _) if *k == ka))
+        }));
+        let m = ui.menus(&ka)[0].clone();
+        let labels: Vec<&str> = m.children.iter().map(|c| c.label.as_str()).collect();
+        assert_eq!(labels[0], "Open Secret Title A label");
+        assert_eq!(m.children[4].mark, Some('✓'));
+        assert_eq!(
+            m.children[6].children[0].label,
+            "Secret Title A label inner"
+        );
+        assert_eq!(
+            (m.children[7].label.as_str(), m.children[7].enabled),
+            ("", true),
+            "wrong types ignored"
+        );
+        tray.send(Job::Event(ka.clone(), 9));
+        let ev = a.wait(5, 1, |c| c["call"] == "Event");
+        assert_eq!(
+            ev[0]["args"].as_array().unwrap()[..3],
+            [serde_json::json!(9), "clicked".into(), 0.into()]
+        );
+        let menu_calls: Vec<String> = methods(&a).into_iter().skip(2).collect();
+        assert_eq!(menu_calls, ["AboutToShow", "GetLayout", "Event"]);
+        let layout = a
+            .calls()
+            .into_iter()
+            .find(|c| c["call"] == "GetLayout")
+            .unwrap();
+        assert_eq!(layout["args"], serde_json::json!([0, -1, []]));
+        println!("AC14 ok: {menu_calls:?}");
+
+        // AC15: LayoutUpdated while open re-fetches, coalesced.
+        tray.set_open(Some(ka.clone()));
+        a.cmd("layout 100");
+        a.wait(5, 1, |c| c["done"] == "layout");
+        assert!(ui.until(5, |all| {
+            all.iter()
+                .filter(|u| matches!(u, Update::Menu(k, _) if *k == ka))
+                .count()
+                >= 2
+        }));
+        sleep(Duration::from_millis(600));
+        let fetches = a
+            .calls()
+            .iter()
+            .filter(|c| c["call"] == "GetLayout")
+            .count();
+        assert!(
+            (2..=3).contains(&fetches),
+            "{fetches} GetLayout for 100 LayoutUpdated"
+        );
+        tray.set_open(None);
+        // Hostile menus: wide and deep are capped, a hung one opens nothing.
+        let wide = Py::new(&dir, "wide", &["--register", "path", "--menu", "wide"]);
+        let deep = Py::new(&dir, "deep", &["--register", "path", "--menu", "deep"]);
+        let hang = Py::new(&dir, "hang", &["--register", "path", "--menu", "hang"]);
+        let (kw, kd, kh) = (
+            wide.key("/org/navi/TestItem"),
+            deep.key("/org/navi/TestItem"),
+            hang.key("/org/navi/TestItem"),
+        );
+        assert!(ui.until(10, |all| [&kw, &kd, &kh].iter().all(|k| has_props(all, k))));
+        for k in [&kw, &kd, &kh] {
+            tray.send(Job::Menu(k.clone()));
+        }
+        assert!(ui.until(10, |all| {
+            all.iter()
+                .any(|u| matches!(u, Update::Menu(k, _) if *k == kw))
+        }));
+        assert_eq!(ui.menus(&kw)[0].children.len(), tray::MENU_WIDTH);
+        assert_eq!(deep.wait(5, 1, |c| c["call"] == "GetLayout").len(), 1);
+        let deep_sent = deep.wait(5, 1, |c| c.get("depth").is_some())[0]["depth"].clone();
+        // GLib may refuse to send 100 levels; either way nothing over the cap arrives.
+        ui.until(3, |_| false);
+        if let Some(d) = ui.menus(&kd).first() {
+            fn depth(n: &Node) -> usize {
+                n.children.first().map_or(0, |c| 1 + depth(c))
+            }
+            assert!(depth(d) <= tray::MENU_DEPTH);
+        }
+        assert!(
+            ui.menus(&kh).is_empty(),
+            "a GetLayout that times out opens nothing"
+        );
+        println!(
+            "AC15 ok: wide capped, deep sent={deep_sent} menus={}, hang opened nothing",
+            ui.menus(&kd).len()
+        );
+        for p in [wide, deep, hang] {
+            p.exit();
+        }
+
+        // AC10: a NewIcon flood: few reads, and clicks still go through.
+        let before = a.calls().iter().filter(|c| c["call"] == "GetAll").count();
+        a.cmd("flood 10000");
+        a.wait(5, 1, |c| c.get("flood").is_some());
+        let sent = Instant::now();
+        tray.send(activate(&kb, None, false));
+        let clicks = b.wait(2, 2, |c| c["call"] == "Activate").len();
+        let click_ms = sent.elapsed().as_millis();
+        assert!(clicks >= 2, "a click during the flood");
+        a.wait(10, 1, |c| c.get("flooded").is_some());
+        let flood = a.calls();
+        let start = flood.iter().find(|c| c.get("flood").is_some()).unwrap()["t"]
+            .as_f64()
+            .unwrap();
+        let end = flood.iter().find(|c| c.get("flooded").is_some()).unwrap()["t"]
+            .as_f64()
+            .unwrap();
+        sleep(Duration::from_millis(600));
+        let reads = a.calls().iter().filter(|c| c["call"] == "GetAll").count() - before;
+        println!(
+            "AC10: 10000 NewIcon in {:.2} s gave {reads} GetAll; a click took {click_ms} ms",
+            end - start
+        );
+        assert!(end - start <= 1.1, "the flood took {} s", end - start);
+        assert!(reads <= 6, "{reads} GetAll");
+        assert!(click_ms < 1000);
+
+        // AC5: the owner leaves.
+        let gone = want[0].clone();
+        a.exit();
+        assert!(ui.until(10, |all| {
+            all.iter()
+                .any(|u| matches!(u, Update::Removed(k) if *k == ka))
+        }));
+        assert!(ui.removed(&ka));
+        assert_eq!(listed(), [want[1].clone()]);
+        let unregistered = signalled("StatusNotifierItemUnregistered", 37);
+        assert!(unregistered.contains(&gone), "{unregistered:?}");
+        println!("AC5 ok: {gone} unregistered");
+        b.exit();
+    }
+
+    fn has_props(all: &[Update], key: &Key) -> bool {
+        all.iter()
+            .any(|u| matches!(u, Update::Props(k, _) if k == key))
+    }
+}

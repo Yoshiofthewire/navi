@@ -681,6 +681,50 @@ mod tests {
     }
 
     #[test]
+    fn ac6_tray_icons_search_the_item_path_first() {
+        let tmp = Tmp::new("tray-icons");
+        let (own, sys) = (tmp.0.join("own"), tmp.0.join("sys"));
+        fs::create_dir_all(&own).unwrap();
+        // The item's own dir: a plain file, and a hicolor theme inside it.
+        fs::write(own.join("plain.svg"), SVG_RED).unwrap();
+        theme(&own, "hicolor", &index("", DIRS), &["48/themed.svg"]);
+        theme(
+            &sys,
+            "candy-icons",
+            &index("hicolor", DIRS),
+            &["48/chained.svg"],
+        );
+        theme(&sys, "hicolor", &index("", DIRS), &[]);
+        let mut icons = Icons::new(Themes::new(vec![sys.clone()], None, PREFERRED));
+        for name in ["plain", "themed", "chained"] {
+            let px = icons
+                .tray(name, Some(&own), 40)
+                .map(|p| (p.width(), center(p)));
+            assert_eq!(px, Some((40, [255, 0, 0, 255])), "{name} at 20 × 2");
+        }
+        assert!(
+            icons.tray("plain", None, 20).is_none(),
+            "only the item's path has it"
+        );
+        assert!(
+            icons.tray("plain", Some(Path::new("own")), 20).is_none(),
+            "relative"
+        );
+        // A name that could form a path is refused, even where the file exists.
+        fs::write(tmp.0.join("escape.svg"), SVG_RED).unwrap();
+        for bad in ["../escape", "/etc/passwd", ".plain", "a\\b", "x\0"] {
+            assert!(icons.tray(bad, Some(&own), 20).is_none(), "{bad:?}");
+        }
+        assert!(icons.tray(&"a".repeat(129), Some(&own), 20).is_none());
+        // Names that come and go don't pile up in the cache.
+        for i in 0..1000 {
+            icons.tray(&format!("n{i}"), Some(&own), 20);
+        }
+        assert!(icons.tray_keys.len() <= MAX_TRAY);
+        assert!(icons.cache.len() <= MAX_TRAY + 8);
+    }
+
+    #[test]
     fn ac6_decodes_safely() {
         let px = render_svg(SVG_RED.as_bytes(), 32).unwrap();
         assert_eq!((px.width(), px.height()), (32, 32));

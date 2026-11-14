@@ -192,6 +192,11 @@ pub fn icon_name_ok(name: &str) -> bool {
         && !name.chars().any(char::is_control)
 }
 
+/// A `*-symbolic` icon is a UI glyph, drawn in INK.
+pub fn tint(name: &str) -> Option<u32> {
+    name.ends_with("-symbolic").then_some(crate::theme::INK)
+}
+
 impl Props {
     pub fn new(raw: Raw) -> Props {
         let status = match raw.status.as_deref() {
@@ -549,6 +554,34 @@ mod tests {
         r.register(sender, arg, owner).map(|e| e.is_some())
     }
 
+    /// The watcher, host and item calls on a private bus that activates nothing, with
+    /// `scripts/check-tray.py` items; no display. The body is `sni::tests::private_bus`.
+    #[test]
+    #[ignore = "requires dbus-run-session and Python GI"]
+    fn private_bus_tray() {
+        if std::env::var_os("NAVI_TRAY_TEST").is_some() {
+            return crate::sni::tests::private_bus();
+        }
+        let status = std::process::Command::new("dbus-run-session")
+            .arg(concat!(
+                "--config-file=",
+                env!("CARGO_MANIFEST_DIR"),
+                "/scripts/private-bus.conf"
+            ))
+            .arg("--")
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tray::tests::private_bus_tray",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("NAVI_TRAY_TEST", "1")
+            .status()
+            .expect("start dbus-run-session");
+        assert!(status.success(), "private-bus tray test failed");
+    }
+
     #[test]
     fn ac3_name_and_path_forms_and_duplicates() {
         let mut r = Registry::default();
@@ -648,6 +681,8 @@ mod tests {
             assert_eq!(props("x", theme).theme_path, None, "{theme}");
         }
         assert_eq!(props("../x", "/a").icon_name, None);
+        assert_eq!(tint("network-wireless-symbolic"), Some(crate::theme::INK));
+        assert_eq!(tint("nextcloud"), None);
     }
 
     #[test]

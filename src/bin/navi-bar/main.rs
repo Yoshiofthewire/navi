@@ -1490,8 +1490,7 @@ impl Bar {
                     let path = props.theme_path.as_deref();
                     match self.icons.tray(name, path, r.w as u32) {
                         Some(px) => {
-                            let tint = name.ends_with("-symbolic").then_some(INK);
-                            draw_icon(&mut canvas, px, r, 1.0, tint);
+                            draw_icon(&mut canvas, px, r, 1.0, tray::tint(name));
                         }
                         None => placeholder(&mut canvas, r),
                     }

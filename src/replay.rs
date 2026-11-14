@@ -3,7 +3,7 @@
 //! input-injection tool.
 //!
 //! One step per line, in global logical px: `wait <ms>`, `move <x> <y>`, `press`, `release`
-//! (the left button), `press right`, `release right`, `key <evdev keycode>` (press and
+//! (the left button), `press right`, `release right`, `press middle`, `release middle`, `key <evdev keycode>` (press and
 //! release), `down <code>` / `up <code>` to hold a key, such as a modifier, and `wheel up` /
 //! `wheel down` (one notch). Blank lines and `#` comments are skipped. Any other line is an
 //! error, and then nothing is replayed.
@@ -24,6 +24,7 @@ use crate::CalloopData;
 
 const BTN_LEFT: u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
+const BTN_MIDDLE: u32 = 0x112;
 const MAX_BYTES: u64 = 1 << 20;
 /// evdev's KEY_MAX.
 const KEY_MAX: u32 = 0x2ff;
@@ -59,6 +60,8 @@ fn parse(script: &str) -> Result<Vec<Step>, String> {
             ["release"] => Some(Step::Release(BTN_LEFT)),
             ["press", "right"] => Some(Step::Press(BTN_RIGHT)),
             ["release", "right"] => Some(Step::Release(BTN_RIGHT)),
+            ["press", "middle"] => Some(Step::Press(BTN_MIDDLE)),
+            ["release", "middle"] => Some(Step::Release(BTN_MIDDLE)),
             ["key", code] => keycode(code).map(Step::Key),
             ["down", code] => keycode(code).map(Step::Down),
             ["up", code] => keycode(code).map(Step::Up),
@@ -141,9 +144,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_every_step() {
+    fn ac13_parses_every_step() {
         let script = "# drag a\nwait 500\n\nmove 100 2\npress\nmove -5 1439\nrelease\nkey 46\n\
-                      down 29\nup 29\npress right\nrelease right\nwheel down\nwheel up\n";
+                      down 29\nup 29\npress right\nrelease right\nwheel down\nwheel up\n\
+                      press middle\nrelease middle\n";
         assert_eq!(
             parse(script),
             Ok(vec![
@@ -159,6 +163,8 @@ mod tests {
                 Step::Release(BTN_RIGHT),
                 Step::Wheel(1),
                 Step::Wheel(-1),
+                Step::Press(BTN_MIDDLE),
+                Step::Release(BTN_MIDDLE),
             ])
         );
     }
@@ -173,8 +179,7 @@ mod tests {
             "move 1 2 3",
             "move x 2",
             "press 1",
-            "press middle",
-            "release middle",
+            "press middle 1",
             "press right 1",
             "press left",
             "click",

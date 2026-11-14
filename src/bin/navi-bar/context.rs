@@ -883,6 +883,75 @@ mod tests {
         }
     }
 
+    /// A tray menu's lines: Title, an item, a disabled one, ✓, •, a submenu.
+    fn tray_lines(long: &str) -> Vec<Line> {
+        let tray = |id, mark, sub| Kind::Tray { id, mark, sub };
+        vec![
+            Line::Header("Title".into()),
+            Line::Item(tray(1, None, false), long.into()),
+            Line::Off(tray(2, None, false), "Off".into()),
+            Line::Sep,
+            Line::Item(tray(3, Some('✓'), false), "Check".into()),
+            Line::Item(tray(4, Some('•'), false), "Radio".into()),
+            Line::Item(tray(5, None, true), "More".into()),
+        ]
+    }
+
+    #[test]
+    fn ac14_tray_rows_in_the_context_menu_style() {
+        let target = Target {
+            key: String::new(),
+            dock: false,
+        };
+        let long = "L".repeat(300);
+        let mut m = Menu::new(target, tray_lines(&long), (0, 0), true);
+        assert_eq!(m.selected, Some(1));
+        // Disabled rows are skipped by keys, hover and clicks.
+        m.step(1);
+        assert_eq!(m.selected, Some(4));
+        m.step(-1);
+        m.step(-1);
+        assert_eq!(m.selected, Some(6), "Up wraps past the disabled row");
+        let r = at(&m, &T14);
+        let rects: Vec<Rect> = m.rects(r, &T14).map(|(_, r)| r).collect();
+        assert_eq!(m.hit(r, &T14, rects[2].x + 4, rects[2].y + 4), None);
+        assert_eq!(
+            m.hit(r, &T14, rects[4].x + 4, rects[4].y + 4),
+            Some(Hit::Line(4))
+        );
+        assert!(m.hover(Hit::Line(4)));
+        let items = m.draw(r, &T14);
+        let texts: Vec<(&str, u32)> = items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Text(t, _, c) => Some((t.as_str(), *c)),
+                _ => None,
+            })
+            .collect();
+        assert!(texts.contains(&("Off", DIM)));
+        assert!(texts.contains(&("•", INK)) && texts.contains(&("›", INK)));
+        assert!(
+            !texts.iter().any(|(t, _)| *t == "✓"),
+            "✓ is drawn, not a glyph"
+        );
+        assert_eq!(
+            items
+                .iter()
+                .filter(|i| matches!(i, Item::Check(..)))
+                .count(),
+            1
+        );
+        // AC8: a long label is cut with … inside its row.
+        let cut = texts.iter().find(|(t, _)| t.starts_with('L')).unwrap().0;
+        assert!(cut.ends_with('…') && cut.chars().count() < 300);
+        // A new layout keeps the selection by id.
+        m.selected = Some(5);
+        let mut moved = tray_lines("x");
+        moved.swap(4, 5);
+        m.update(moved);
+        assert_eq!(m.selected, Some(4));
+    }
+
     fn menu(windows: usize) -> Menu {
         let e = konsole();
         let target = Target {
