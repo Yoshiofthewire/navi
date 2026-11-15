@@ -25,6 +25,8 @@ const GAP: i32 = 12;
 const MARK_W: i32 = 3;
 /// A label's inset in its row or button.
 const TEXT_X: i32 = 12;
+/// The room a tray row keeps at its right end for `›`, `✓` or `•`.
+const TRAIL_W: i32 = 20;
 /// Untrusted names are cut to this many chars before they are measured.
 const NAME_CHARS: usize = 256;
 /// navi-bar can't see which windows share a process or X connection, so no count.
@@ -45,14 +47,24 @@ pub enum Kind {
     /// Close the app's windows, this many.
     Close(usize),
     ForceClose,
+    /// A tray menu item: its dbusmenu id, its `✓`/`•` when on, and whether it opens a submenu.
+    Tray {
+        id: i32,
+        mark: Option<char>,
+        sub: bool,
+    },
+    /// Out of a tray submenu.
+    Back,
 }
 
 impl Kind {
-    /// The same item across a re-resolve: Pin and Unpin are one toggle, Close any count.
+    /// The same item across a re-resolve: Pin and Unpin are one toggle, Close any count, a tray
+    /// item its id.
     fn same(&self, other: &Kind) -> bool {
         use Kind::*;
         match (self, other) {
             (Pin | Unpin, Pin | Unpin) | (Close(_), Close(_)) => true,
+            (Tray { id: a, .. }, Tray { id: b, .. }) => a == b,
             (a, b) => a == b,
         }
     }
@@ -62,6 +74,8 @@ impl Kind {
 pub enum Line {
     Header(String),
     Item(Kind, String),
+    /// A disabled item: drawn DIM, never selected.
+    Off(Kind, String),
     Sep,
 }
 
@@ -169,6 +183,7 @@ pub fn lines(app: &App, dock: bool) -> Vec<Line> {
             Kind::Close(1) => "Close window".into(),
             Kind::Close(n) => format!("Close all {n} windows"),
             Kind::ForceClose => "Force close…".into(),
+            Kind::Tray { .. } | Kind::Back => String::new(),
         };
         Line::Item(kind, label)
     };
@@ -525,12 +540,38 @@ impl Menu {
                     },
                     PANEL_EDGE,
                 )),
-                Line::Item(_, label) => {
+                Line::Item(kind, label) | Line::Off(kind, label) => {
+                    let on = matches!(self.lines[i], Line::Item(..));
                     if self.selected == Some(i) {
                         out.push(Item::Round(at, 7, SELECTED));
                         out.push(Item::Fill(mark(at), ACCENT));
                     }
-                    out.push(text(label, at, INK));
+                    let color = if on { INK } else { DIM };
+                    let (glyph, trail) = match kind {
+                        Kind::Tray { sub: true, .. } => (Some('›'), true),
+                        Kind::Tray { mark: Some(m), .. } => (Some(*m), true),
+                        _ => (None, false),
+                    };
+                    let room = if trail {
+                        Rect {
+                            w: at.w - TRAIL_W,
+                            ..at
+                        }
+                    } else {
+                        at
+                    };
+                    out.push(text(label, room, color));
+                    let end = Rect {
+                        x: at.x + at.w - TRAIL_W - TEXT_X / 2,
+                        w: TRAIL_W,
+                        ..at
+                    };
+                    match glyph {
+                        // Noto Sans has no ✓: a drawn one.
+                        Some('✓') => out.push(Item::Check(inset_x(end, 4), color)),
+                        Some(g) => out.push(Item::Text(g.into(), inset_x(end, TEXT_X / 2), color)),
+                        None => {}
+                    }
                 }
             }
         }
@@ -718,6 +759,7 @@ mod tests {
         let label = |l: &Line| match l {
             Line::Header(h) => format!("[{h}]"),
             Line::Item(_, t) => t.clone(),
+            Line::Off(_, t) => format!("({t})"),
             Line::Sep => "-".into(),
         };
         lines.iter().map(label).collect()
@@ -839,6 +881,75 @@ mod tests {
             let item = matches!(m.lines[i], Line::Item(..));
             assert_eq!(hit.is_some(), item, "{:?}", m.lines[i]);
         }
+    }
+
+    /// A tray menu's lines: Title, an item, a disabled one, ✓, •, a submenu.
+    fn tray_lines(long: &str) -> Vec<Line> {
+        let tray = |id, mark, sub| Kind::Tray { id, mark, sub };
+        vec![
+            Line::Header("Title".into()),
+            Line::Item(tray(1, None, false), long.into()),
+            Line::Off(tray(2, None, false), "Off".into()),
+            Line::Sep,
+            Line::Item(tray(3, Some('✓'), false), "Check".into()),
+            Line::Item(tray(4, Some('•'), false), "Radio".into()),
+            Line::Item(tray(5, None, true), "More".into()),
+        ]
+    }
+
+    #[test]
+    fn ac14_tray_rows_in_the_context_menu_style() {
+        let target = Target {
+            key: String::new(),
+            dock: false,
+        };
+        let long = "L".repeat(300);
+        let mut m = Menu::new(target, tray_lines(&long), (0, 0), true);
+        assert_eq!(m.selected, Some(1));
+        // Disabled rows are skipped by keys, hover and clicks.
+        m.step(1);
+        assert_eq!(m.selected, Some(4));
+        m.step(-1);
+        m.step(-1);
+        assert_eq!(m.selected, Some(6), "Up wraps past the disabled row");
+        let r = at(&m, &T14);
+        let rects: Vec<Rect> = m.rects(r, &T14).map(|(_, r)| r).collect();
+        assert_eq!(m.hit(r, &T14, rects[2].x + 4, rects[2].y + 4), None);
+        assert_eq!(
+            m.hit(r, &T14, rects[4].x + 4, rects[4].y + 4),
+            Some(Hit::Line(4))
+        );
+        assert!(m.hover(Hit::Line(4)));
+        let items = m.draw(r, &T14);
+        let texts: Vec<(&str, u32)> = items
+            .iter()
+            .filter_map(|i| match i {
+                Item::Text(t, _, c) => Some((t.as_str(), *c)),
+                _ => None,
+            })
+            .collect();
+        assert!(texts.contains(&("Off", DIM)));
+        assert!(texts.contains(&("•", INK)) && texts.contains(&("›", INK)));
+        assert!(
+            !texts.iter().any(|(t, _)| *t == "✓"),
+            "✓ is drawn, not a glyph"
+        );
+        assert_eq!(
+            items
+                .iter()
+                .filter(|i| matches!(i, Item::Check(..)))
+                .count(),
+            1
+        );
+        // AC8: a long label is cut with … inside its row.
+        let cut = texts.iter().find(|(t, _)| t.starts_with('L')).unwrap().0;
+        assert!(cut.ends_with('…') && cut.chars().count() < 300);
+        // A new layout keeps the selection by id.
+        m.selected = Some(5);
+        let mut moved = tray_lines("x");
+        moved.swap(4, 5);
+        m.update(moved);
+        assert_eq!(m.selected, Some(4));
     }
 
     fn menu(windows: usize) -> Menu {

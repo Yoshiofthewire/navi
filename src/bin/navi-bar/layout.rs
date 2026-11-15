@@ -12,7 +12,7 @@ pub const SLOT: i32 = 36;
 const TARGET: i32 = 32;
 pub const ICON: i32 = 24;
 /// The attention dot on a dock icon whose app has a dialog waiting, in px.
-const ATTENTION_DOT: i32 = 8;
+pub const ATTENTION_DOT: i32 = 8;
 const DOCK_PAD: i32 = 8;
 const DOCK_H: i32 = 40;
 const PAD: i32 = 12;
@@ -65,6 +65,8 @@ pub enum IconOf {
     Entry(usize),
     Folder(Category),
     Session(&'static str),
+    /// The tray item at this index of the shown ones.
+    Tray(usize),
 }
 impl IconOf {
     /// Folder and session glyphs are UI marks, drawn in INK so they hold 3:1 on any panel and
@@ -82,6 +84,8 @@ pub enum Item {
     Icon(IconOf, Rect, f32),
     Text(String, Rect, u32),
     Field(String, Rect),
+    /// A check mark in the rect's middle.
+    Check(Rect, u32),
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Layout {

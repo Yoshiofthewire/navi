@@ -49,6 +49,8 @@ jobs:
       - run: cargo test --locked
       - name: Notification-only sandbox isolation (private D-Bus, no display)
         run: cargo test --locked dbus::tests::notification_only_proxy_isolation -- --ignored
+      - name: System tray watcher and items (private D-Bus, no display)
+        run: cargo test --locked tray::tests::private_bus_tray -- --ignored
       - name: XWayland integration (no host display or GPU)
         run: cargo test --locked xwayland::tests::x11_lifecycle_and_input -- --ignored
       - name: Swaylock protocol handshake (no host display or authentication)

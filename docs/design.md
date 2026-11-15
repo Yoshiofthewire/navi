@@ -514,14 +514,15 @@ bundling a degoogled, resource-tested Chromium variant is reserved for a future 
   band floats 12 px below the top edge and 12 px in from the sides, the same panel as the dock;
   with its margin it reserves 44 px. Navi's logo
   and name align left, the local date and 24-hour clock sit in the center, and a battery glyph
-  and percentage align right, labeled while charging. Battery capacity is the mean of the
+  and percentage align right, labeled while charging, with the system tray (*Tray*) just left
+  of it. Battery capacity is the mean of the
   system's batteries, read every 30 s; mice and headsets don't count. The bar takes space from
-  the grid and hides in fullscreen. Only the Navi button and its open session menu take clicks;
-  the rest of the band is transparent to input.
+  the grid and hides in fullscreen. Only the Navi button, its open session menu and the tray's
+  targets take clicks; the rest of the band is transparent to input.
   Notifications are top-left, 24 px below the band and from the left edge, so they float clear
   of the corner of the tile under them: panels with the accent as their rim (3 px with visual
   alerts). They wait, hidden and without expiring, while the session menu, which shares that
-  corner, is open, and come back with the time they had left. Volume, network and tray come later. Volume has no
+  corner, is open, and come back with the time they had left. Volume and network come later. Volume has no
   small route: PipeWire's native API is C (`libpipewire`, which needs `unsafe` and a new system
   library), pipewire-pulse has no D-Bus volume interface, and running `wpctl` would break the
   no-shell rule.
@@ -560,6 +561,28 @@ bundling a degoogled, resource-tested Chromium variant is reserved for a future 
   the window cap. navi asks for it at most once a second, over the private control channel and
   with no app text. A repeat replaces the shown card silently, so a flood shows one card. No bus
   sender can close or replace it.
+- **Tray:** navi-bar is the `org.kde.StatusNotifierWatcher` and its own host
+  (`org.kde.StatusNotifierHost-<pid>`) only when nobody else holds the watcher name, never
+  queueing for it or taking it: nested under Plasma it shows no tray. Items (Qt,
+  KStatusNotifierItem, libappindicator/Ayatana, Electron) draw at the status band's right end,
+  just left of the battery glyph (or at its 12 px padding), on the main monitor: 20 px icons in
+  28 px targets 4 px apart, in registration order. A target never comes within 12 px of the
+  clock; items that don't fit are hidden and their count logged. `Passive` items take no
+  target, `NeedsAttention` adds the dock's accent dot, and hovering a target fills it. An item's
+  `IconPixmap` (the smallest entry at least 20 × scale) wins over its `IconName`, which is looked
+  for as a PNG in its absolute `IconThemePath` (the dir itself, then
+  `hicolor/<n>x<n>/{apps,status}` at the drawn size and common sizes; no SVG or index there is
+  read, and the lookup runs off the UI thread, a placeholder showing meanwhile), then the icon
+  chain; `*-symbolic` icons draw in INK.
+  Left click is `Activate`, middle `SecondaryActivate`, each preceded by
+  `ProvideXdgActivationToken` when the press earned a token; the wheel sends `Scroll` (±120 a
+  notch, one per 15 px of touchpad). Right click, or a left click on an `ItemIsMenu` item, opens
+  its dbusmenu in the context-menu style on a pop-up 12 px below the band, its left edge at the
+  pointer and 12 px inside the output: the item's title as header, disabled rows DIM, ✓ and •
+  for toggles, `›` rows opening their submenu in place under a **Back** row (Left and Backspace
+  go back too). Choosing a row sends `Event(id, "clicked")`; an item with no menu gets
+  `ContextMenu`. Esc, a click elsewhere, locking, a fullscreen window and the item leaving
+  close the menu. XEmbed icons, tooltips, overlay and attention icons are not shown.
 - **Context menus:** a right-button press on a dock icon or a launcher app row opens that app's
   menu next to the pointer; the release is ignored. No other part of the shell has one.
 
@@ -795,8 +818,22 @@ session.
   shell syntax rejects the entry), with an XDG activation token, in its own process group and
   without navi-bar's socket. Running each app in its own `app-*.scope` comes later (it needs
   D-Bus).
-- **The session bus** reaches navi-bar only through the notification server: one name, one
-  object. Its environment export is on real hardware only: at start it sets `WAYLAND_DISPLAY`, `DISPLAY`,
+- **The session bus** reaches navi-bar only through the notification server (one name, one
+  object) and the tray (*Tray*), each on its own connection: `org.kde.StatusNotifierWatcher` at
+  `/StatusNotifierWatcher` and the name `org.kde.StatusNotifierHost-<pid>`, both only while free.
+  An item is registered by an object path of the sender's or a bus name whose owner is the
+  sender's own process (KStatusNotifierItem and Qt own it on a second connection), so no app can
+  add or remove another's icon. Caps: 4 items per connection and 32 in all; titles and labels
+  128 chars without controls; pixmaps 1–256 px a side with exactly 4·w·h bytes, 16 entries
+  read; menus 64 children a level, 4 levels, 256 nodes. Re-reads are coalesced to one `GetAll`
+  per item per 250 ms. One worker thread makes every call into items, behind a 32-call queue
+  that drops (and logs once a second) when full, with 1 s timeouts for menus and clicks and 5 s
+  for `GetAll`; the UI thread never waits on the bus. A signal flood holds at most one queue
+  slot, and an item whose `GetAll` fails or times out is dropped, so a hung item delays other
+  items' calls by one read (5 s at most) and never again; a dropped item's icon comes back
+  only when its app registers again. Icon names never form paths, and files
+  are read only through the capped icon loader. Item strings are never logged, only unique
+  names, object paths, counts and D-Bus error names (never an error's text). Clicks during a lock never reach an item. Its environment export is on real hardware only: at start it sets `WAYLAND_DISPLAY`, `DISPLAY`,
   `XDG_CURRENT_DESKTOP` and `XDG_SESSION_TYPE` (nothing else) through the bus's
   `UpdateActivationEnvironment` and systemd's `SetEnvironment`, so portals and D-Bus-started
   apps reach navi. Nested it never does, so the host's user services keep pointing at the host. Every field a notification carries is untrusted and is never logged;
