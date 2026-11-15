@@ -1457,11 +1457,16 @@ impl Bar {
             info!(hidden, "tray: items without room in the band");
             self.tray_hidden = hidden;
         }
-        self.tray_targets = targets
+        let placed: Vec<(Rect, tray::Key)> = targets
             .iter()
             .zip(&shown)
             .map(|(r, (k, _))| (*r, k.clone()))
             .collect();
+        if placed != self.tray_targets {
+            let xs: Vec<i32> = targets.iter().map(|r| r.x).collect();
+            debug!(?xs, "tray: band targets");
+            self.tray_targets = placed;
+        }
         if let Ok(region) = Region::new(&self.compositor) {
             for r in self.session.input().into_iter().chain(targets) {
                 region.add(r.x, r.y, r.w, r.h);
@@ -1568,8 +1573,9 @@ impl Bar {
                     self.notes.history.clear();
                 }
                 self.desktop_settings = settings;
-                // A new text size resizes an open context menu.
+                // A new text size resizes an open context or tray menu.
                 self.relayout();
+                self.resize_tray_menu();
                 self.draw_band();
                 self.show_cards();
             }

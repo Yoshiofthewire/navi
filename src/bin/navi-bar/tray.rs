@@ -34,7 +34,7 @@ pub const MENU_NODES: usize = 256;
 const SCROLL_PX: f64 = 15.0;
 pub const NOTCH: i32 = 120;
 
-/// An item: the unique name of the connection that registered it, and its object path.
+/// An item: the unique name of the connection that serves it, and its object path.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Key {
     pub sender: String,
@@ -73,28 +73,45 @@ fn valid_path(p: &str) -> bool {
             }))
 }
 
+/// A connection: its unique name and, if the bus knows it, its process.
+#[derive(Clone, Copy, Debug)]
+pub struct Conn<'a> {
+    pub name: &'a str,
+    pub pid: Option<u32>,
+}
+
+impl Conn<'_> {
+    /// The same connection, or another of the same process: KStatusNotifierItem owns its item's
+    /// name on a connection of its own and registers it from the app's main one.
+    fn same_app(&self, other: &Conn) -> bool {
+        self.name == other.name || (self.pid.is_some() && self.pid == other.pid)
+    }
+}
+
 impl Registry {
     /// `arg` is an object path (the item is the sender's) or a bus name, whose owner the bus
-    /// reported as `owner`; the item is at `DEFAULT_PATH` then. Only a bus name's own owner may
-    /// register it. Returns the new entry, or `None` for one already registered.
+    /// reported as `owner`; the item is at `DEFAULT_PATH` then, served by that owner. Only the
+    /// owner's own process may register a bus name. Returns the new entry, or `None` for one
+    /// already registered.
     pub fn register(
         &mut self,
-        sender: &str,
+        sender: Conn,
         arg: &str,
-        owner: Option<&str>,
+        owner: Option<Conn>,
     ) -> Result<Option<Entry>, Refused> {
-        let (name, path) = match arg.starts_with('/') {
-            true => (sender, arg),
-            false if owner == Some(sender) => (arg, DEFAULT_PATH),
-            false => return Err(Refused::Spoofed),
+        let (name, serves, path) = match (arg.starts_with('/'), owner) {
+            (true, _) => (sender.name, sender.name, arg),
+            (false, Some(o)) if o.same_app(&sender) => (arg, o.name, DEFAULT_PATH),
+            (false, _) => return Err(Refused::Spoofed),
         };
         if !valid_path(path) {
             return Err(Refused::BadPath);
         }
         let key = Key {
-            sender: sender.into(),
+            sender: serves.into(),
             path: path.into(),
         };
+        let sender = serves;
         if self.items.iter().any(|e| e.key == key) {
             return Ok(None);
         }
@@ -551,7 +568,14 @@ mod tests {
         arg: &str,
         owner: Option<&str>,
     ) -> Result<bool, Refused> {
-        r.register(sender, arg, owner).map(|e| e.is_some())
+        r.register(conn(sender), arg, owner.map(conn))
+            .map(|e| e.is_some())
+    }
+
+    /// Every connection here is its own process, numbered after its name.
+    fn conn(name: &str) -> Conn<'_> {
+        let pid = name.trim_start_matches(':').replace('.', "").parse().ok();
+        Conn { name, pid }
     }
 
     /// The watcher, host and item calls on a private bus that activates nothing, with
@@ -616,6 +640,40 @@ mod tests {
             Err(Refused::Spoofed)
         );
         assert!(r.listed().is_empty());
+        // Another connection of the sender's own process may hold the name; it serves the item.
+        let main = Conn {
+            name: ":1.7",
+            pid: Some(42),
+        };
+        let item = Conn {
+            name: ":1.8",
+            pid: Some(42),
+        };
+        let stranger = Conn {
+            name: ":1.9",
+            pid: Some(43),
+        };
+        let unknown = Conn {
+            name: ":1.8",
+            pid: None,
+        };
+        assert_eq!(
+            r.register(stranger, "org.kde.x", Some(item)),
+            Err(Refused::Spoofed)
+        );
+        let no_pid = Conn { pid: None, ..main };
+        assert_eq!(
+            r.register(no_pid, "org.kde.x", Some(unknown)),
+            Err(Refused::Spoofed)
+        );
+        let e = r.register(main, "org.kde.x", Some(item)).unwrap().unwrap();
+        assert_eq!(e.key.sender, ":1.8");
+        assert_eq!(e.listed, "org.kde.x/StatusNotifierItem");
+        assert_eq!(
+            r.gone(":1.8").len(),
+            1,
+            "it leaves with the connection serving it"
+        );
         for i in 0..PER_SENDER {
             assert_eq!(reg(&mut r, ":1.5", &format!("/i{i}"), None), Ok(true));
         }

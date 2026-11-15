@@ -125,6 +125,7 @@ class Item:
     def log(self, **entry):
         entry['conn'] = self.bus.get_unique_name()
         entry['t'] = time.monotonic()
+        entry['wall'] = time.time()
         with self.log_lock, open(self.args.log, 'a') as f:
             f.write(json.dumps(entry) + '\n')
 
@@ -186,9 +187,9 @@ def watcher(bus, method, arg):
                          5000, None)
 
 
-def register(item, arg):
+def register(item, arg, via=None):
     try:
-        watcher(item.bus, 'RegisterStatusNotifierItem', arg)
+        watcher(via or item.bus, 'RegisterStatusNotifierItem', arg)
         item.log(register=arg, ok=True)
     except GLib.Error as e:
         item.log(register=arg, ok=False, error=e.message)
@@ -252,6 +253,8 @@ def main():
     p.add_argument('--no-object', action='store_true', help='register a path with nothing there')
     p.add_argument('--spoof', help='register this bus name, owned by someone else')
     p.add_argument('--fill', action='store_true', help='9 connections: 5 items, then 4 each')
+    p.add_argument('--split', action='store_true',
+                   help='own the name on a second connection, as KStatusNotifierItem does')
     args = p.parse_args()
     loop = GLib.MainLoop()
     bus = connect()
@@ -273,14 +276,14 @@ def main():
         register(item, '/Nothing')
     else:
         path = ITEM_PATH if args.register == 'name' else '/org/navi/TestItem'
-        item = Item(args, bus, path)
+        item = Item(args, connect() if args.split else bus, path)
         name = f'org.kde.StatusNotifierItem-{os.getpid()}-1'
-        own(bus, name)
+        own(item.bus, name)
         item.log(name=name)
         arg = name if args.register == 'name' else path
         if args.register != 'none':
             for _ in range(2 if args.twice else 1):
-                register(item, arg)
+                register(item, arg, bus)
     threading.Thread(target=commands, args=(item, loop), daemon=True).start()
     loop.run()
 

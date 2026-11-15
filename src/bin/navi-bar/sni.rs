@@ -133,17 +133,30 @@ impl Watcher {
         service: &str,
     ) -> fdo::Result<()> {
         let sender = h.sender().map(|s| s.to_string()).unwrap_or_default();
-        // Only a name's owner may register it.
+        let bus = fdo::DBusProxy::new(conn).await?;
+        // Only the name owner's own process may register it.
         let owner = match BusName::try_from(service) {
-            Ok(name) if !service.starts_with('/') => fdo::DBusProxy::new(conn)
-                .await?
-                .get_name_owner(name)
-                .await
-                .ok()
-                .map(|o| o.to_string()),
+            Ok(name) if !service.starts_with('/') => {
+                bus.get_name_owner(name).await.ok().map(|o| o.to_string())
+            }
             _ => None,
         };
-        let added = lock(&self.0.registry).register(&sender, service, owner.as_deref());
+        let mut pids = [None, None];
+        if let Some(o) = owner.as_deref().filter(|o| *o != sender) {
+            for (pid, name) in pids.iter_mut().zip([sender.as_str(), o]) {
+                if let Ok(name) = BusName::try_from(name) {
+                    *pid = bus.get_connection_unix_process_id(name).await.ok();
+                }
+            }
+        }
+        let me = tray::Conn {
+            name: &sender,
+            pid: pids[0],
+        };
+        let owner = owner
+            .as_deref()
+            .map(|name| tray::Conn { name, pid: pids[1] });
+        let added = lock(&self.0.registry).register(me, service, owner);
         match added {
             Err(why) => {
                 info!(sender, ?why, "tray: registration refused");
@@ -910,6 +923,20 @@ pub mod tests {
         assert_eq!(r[0]["ok"], false, "{r:?}");
         assert!(r[0]["error"].as_str().unwrap().contains("Spoofed"), "{r:?}");
         assert_eq!(listed().len(), 2);
+        // KStatusNotifierItem's way: the name on a second connection of the same process.
+        let split = Py::new(&dir, "split", &["--split", "--no-menu"]);
+        let ks = split.key("/StatusNotifierItem");
+        assert!(
+            ui.until(10, |all| has_props(all, &ks)),
+            "served by the name's owner"
+        );
+        assert_eq!(split.wait(5, 1, |c| c["call"] == "GetAll").len(), 1);
+        assert_eq!(listed().len(), 3);
+        split.exit();
+        assert!(ui.until(10, |all| {
+            all.iter()
+                .any(|u| matches!(u, Update::Removed(k) if *k == ks))
+        }));
         let fill = Py::new(&dir, "fill", &["--fill", "--no-menu"]);
         // One connection with 5 items, then 8 with 4 each.
         let r = fill.wait(30, 37, |c| c.get("register").is_some());

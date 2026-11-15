@@ -19,6 +19,7 @@ and physical input still need hardware validation. See [limitations](#limitation
 - One-cell keyboard moves, grow and shrink with Alt/Super (+ Shift) + Arrow.
 - A rounded dock with persistent app pins, categorized app folders, search, and scrolling.
 - A top status bar with a clock and battery indicator, plus basic notifications.
+- A system tray for StatusNotifierItem apps, with their menus, when no other desktop holds it.
 - Native Wayland apps and X11 apps through XWayland, including clipboard text transfer.
 - Navi Files: Thunar with Navi's live utility theme, native file operations and MIME handlers.
 - Swaylock screen locking from the session menu or Super+L, including lock-before-sleep.
@@ -174,8 +175,8 @@ Extract the archive, keep the binaries and utility module together, and run `./n
 - One GPU, connector-advertised display modes, and no HDR, VRR, rotation, or mirroring.
 - XWayland primary selection, cross-protocol drag-and-drop, and automatic XWayland restart
   are not implemented.
-- Shell accessibility integration, virtual desktops, and volume/network/system-tray indicators
-  are pending. Network, Bluetooth and sound controls are available in Settings.
+- Shell accessibility integration, virtual desktops, and volume/network indicators are pending.
+  Legacy XEmbed tray icons are not shown. Network, Bluetooth and sound controls are available in Settings.
 - Nested rendering sleeps between changes; hardware idle CPU and full-session benchmarks
   remain unverified. See [performance measurements](docs/performance.md).
 
