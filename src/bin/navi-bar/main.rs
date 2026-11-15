@@ -279,6 +279,16 @@ fn run() -> Result<(), String> {
             }
         })
         .map_err(|e| e.to_string())?;
+    let (own_tx, own_rx) = channel::channel();
+    event_loop
+        .handle()
+        .insert_source(own_rx, |event, _, bar| {
+            if let channel::Event::Msg(own) = event {
+                bar.icons.tray_own(own);
+                bar.draw_band();
+            }
+        })
+        .map_err(|e| e.to_string())?;
     let runtime = runtime::watch(
         tx.clone(),
         dbus::wants_export(var("NAVI_EXPORT_ENV").as_deref()),
@@ -296,6 +306,9 @@ fn run() -> Result<(), String> {
         tray_scroll: tray::Scroll::default(),
         tray_asked: None,
         tray_menu: None,
+        tray_icons: icons::OwnLoader::spawn(move |own| {
+            let _ = own_tx.send(own);
+        }),
         notes: Notes::default(),
         start: Instant::now(),
         band,
@@ -471,6 +484,8 @@ struct Bar {
     /// A right press waiting for its item's menu, and the pointer's x on the band.
     tray_asked: Option<(tray::Key, i32)>,
     tray_menu: Option<TrayMenu>,
+    /// Finds icons in tray items' own dirs, off this thread.
+    tray_icons: Option<icons::OwnLoader>,
     /// The notifications' clock.
     start: Instant,
     registry: RegistryState,
@@ -1493,7 +1508,8 @@ impl Bar {
                     draw_pixmap_icon(&mut canvas, icon, r);
                 } else if let Some(name) = &props.icon_name {
                     let path = props.theme_path.as_deref();
-                    match self.icons.tray(name, path, r.w as u32) {
+                    let own = self.tray_icons.as_ref();
+                    match self.icons.tray(name, path, r.w as u32, own) {
                         Some(px) => {
                             draw_icon(&mut canvas, px, r, 1.0, tray::tint(name));
                         }

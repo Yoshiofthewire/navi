@@ -622,6 +622,7 @@ fn brief(e: &zbus::Error) -> String {
     match e {
         zbus::Error::MethodError(name, ..) => name.to_string(),
         zbus::Error::FDO(e) => zbus::DBusError::name(&**e).to_string(),
+        // The rest are zbus's own texts (I/O, timeouts, signatures), never an item's message.
         e => e.to_string(),
     }
 }

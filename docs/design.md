@@ -570,8 +570,10 @@ bundling a degoogled, resource-tested Chromium variant is reserved for a future 
   clock; items that don't fit are hidden and their count logged. `Passive` items take no
   target, `NeedsAttention` adds the dock's accent dot, and hovering a target fills it. An item's
   `IconPixmap` (the smallest entry at least 20 × scale) wins over its `IconName`, which is looked
-  for in its absolute `IconThemePath` (the dir itself and `hicolor/<size>x<size>/{apps,status}`,
-  `hicolor/scalable/apps`; no index there is read), then the icon chain; `*-symbolic` icons draw in INK.
+  for as a PNG in its absolute `IconThemePath` (the dir itself, then
+  `hicolor/<n>x<n>/{apps,status}` at the drawn size and common sizes; no SVG or index there is
+  read, and the lookup runs off the UI thread, a placeholder showing meanwhile), then the icon
+  chain; `*-symbolic` icons draw in INK.
   Left click is `Activate`, middle `SecondaryActivate`, each preceded by
   `ProvideXdgActivationToken` when the press earned a token; the wheel sends `Scroll` (±120 a
   notch, one per 15 px of touchpad). Right click, or a left click on an `ItemIsMenu` item, opens
@@ -828,7 +830,8 @@ session.
   that drops (and logs once a second) when full, with 1 s timeouts for menus and clicks and 5 s
   for `GetAll`; the UI thread never waits on the bus. A signal flood holds at most one queue
   slot, and an item whose `GetAll` fails or times out is dropped, so a hung item delays other
-  items' calls by one read (5 s at most) and never again. Icon names never form paths, and files
+  items' calls by one read (5 s at most) and never again; a dropped item's icon comes back
+  only when its app registers again. Icon names never form paths, and files
   are read only through the capped icon loader. Item strings are never logged, only unique
   names, object paths, counts and D-Bus error names (never an error's text). Clicks during a lock never reach an item. Its environment export is on real hardware only: at start it sets `WAYLAND_DISPLAY`, `DISPLAY`,
   `XDG_CURRENT_DESKTOP` and `XDG_SESSION_TYPE` (nothing else) through the bus's

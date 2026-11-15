@@ -4,6 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 
 use resvg::{tiny_skia, usvg};
 use tiny_skia::{FilterQuality, IntSize, Pixmap, PixmapPaint, Transform};
@@ -338,6 +339,66 @@ pub struct Icons {
     cache: HashMap<(String, u32), Option<Pixmap>>,
     /// The tray's entries in `cache`, oldest first.
     tray_keys: Vec<(String, u32)>,
+    /// Tray icons asked of `OwnLoader`, not answered yet.
+    tray_pending: HashSet<(String, u32)>,
+}
+
+/// A tray icon to look for in an item's own dir.
+pub struct OwnRequest {
+    key: (String, u32),
+    dir: PathBuf,
+    name: String,
+}
+
+/// What `OwnLoader` found.
+pub struct Own {
+    key: (String, u32),
+    name: String,
+    px: Option<Pixmap>,
+}
+
+/// Finds and decodes icons in tray items' own dirs on a thread of its own. The item picks that
+/// dir and its files: it may be slow (a FUSE mount the item serves), and only PNGs, whose
+/// decoding is capped, are read there; an SVG's render time has no such bound.
+pub struct OwnLoader(mpsc::SyncSender<OwnRequest>);
+
+impl OwnLoader {
+    /// `done` gets every answer, on the loader's thread.
+    pub fn spawn(mut done: impl FnMut(Own) + Send + 'static) -> Option<OwnLoader> {
+        let (tx, rx) = mpsc::sync_channel::<OwnRequest>(64);
+        let thread = std::thread::Builder::new().name("tray-icons".into());
+        let spawned = thread.spawn(move || {
+            for r in rx {
+                let size = r.key.1;
+                let px = own_png(&r.dir, &r.name, size).and_then(|p| render_file(&p, size).ok());
+                done(Own {
+                    key: r.key,
+                    name: r.name,
+                    px,
+                });
+            }
+        });
+        spawned
+            .inspect_err(|e| tracing::warn!("tray icon loader not started: {e}"))
+            .ok()
+            .map(|_| OwnLoader(tx))
+    }
+}
+
+/// `name`'s PNG in an item's own `dir`: the dir itself, then `hicolor/<n>x<n>/{apps,status}` at
+/// `size`, then at the common sizes. Nothing else there is read.
+pub fn own_png(dir: &Path, name: &str, size: u32) -> Option<PathBuf> {
+    let sizes = [size, 16, 22, 24, 32, 48, 64, 128, 256];
+    let sized = sizes
+        .into_iter()
+        .enumerate()
+        .filter(|&(i, s)| i == 0 || s != size);
+    let dirs = sized
+        .flat_map(|(_, s)| ["apps", "status"].map(|c| dir.join(format!("hicolor/{s}x{s}/{c}"))));
+    std::iter::once(dir.to_path_buf())
+        .chain(dirs)
+        .map(|d| d.join(format!("{name}.png")))
+        .find(|p| p.is_file())
 }
 
 /// Tray icons cached at most.
@@ -349,6 +410,7 @@ impl Icons {
             themes,
             cache: HashMap::new(),
             tray_keys: Vec::new(),
+            tray_pending: HashSet::new(),
         }
     }
 
@@ -380,48 +442,62 @@ impl Icons {
         )
     }
 
-    /// A tray item's icon `name` at `size` px: in its `IconThemePath`, then the normal chain.
-    /// That dir is the item's, so only fixed spots in it are tried and no index there is read.
-    /// Names that could form a path are refused before any file access.
-    pub fn tray(&mut self, name: &str, theme_path: Option<&Path>, size: u32) -> Option<&Pixmap> {
+    /// A tray item's icon `name` at `size` px: a PNG in its `IconThemePath` (found and decoded
+    /// by `own`, off this thread; `None` until it answers), else the normal chain. Names that
+    /// could form a path are refused before any file access.
+    pub fn tray(
+        &mut self,
+        name: &str,
+        theme_path: Option<&Path>,
+        size: u32,
+        own: Option<&OwnLoader>,
+    ) -> Option<&Pixmap> {
         if !crate::tray::icon_name_ok(name) {
             return None;
         }
         let dir = theme_path.filter(|p| p.is_absolute());
-        let k = (
-            format!(
-                "\0tray\0{}\0{name}",
-                dir.map_or(String::new(), |d| d.display().to_string())
-            ),
-            size,
-        );
+        let dir_key = dir.map_or(String::new(), |d| d.display().to_string());
+        let k = (format!("\0tray\0{dir_key}\0{name}"), size);
         if !self.cache.contains_key(&k) {
-            // Item names come and go: their entries are dropped before they pile up.
-            self.tray_keys.push(k.clone());
-            if self.tray_keys.len() > MAX_TRAY {
-                for old in self.tray_keys.drain(..MAX_TRAY / 2) {
-                    self.cache.remove(&old);
+            if let (Some(dir), Some(own)) = (dir, own) {
+                let ask = OwnRequest {
+                    key: k.clone(),
+                    dir: dir.to_path_buf(),
+                    name: name.into(),
+                };
+                // A full queue asks again on the next draw.
+                if !self.tray_pending.contains(&k) && own.0.try_send(ask).is_ok() {
+                    self.tray_pending.insert(k);
                 }
+                return None;
             }
-            let own = dir.and_then(|d| {
-                let sized = format!("hicolor/{size}x{size}");
-                let subs = [
-                    String::new(),
-                    format!("{sized}/apps"),
-                    format!("{sized}/status"),
-                    "hicolor/scalable/apps".into(),
-                ];
-                let files = subs.into_iter().flat_map(|sub| {
-                    ["png", "svg"].map(|ext| d.join(&sub).join(format!("{name}.{ext}")))
-                });
-                files.into_iter().find(|p| p.is_file())
-            });
-            let px = own
-                .or_else(|| self.themes.lookup(name, size))
-                .and_then(|p| render_file(&p, size).ok());
-            self.cache.insert(k.clone(), px);
+            let px = self.chain(name, size);
+            self.tray_put(k.clone(), px);
         }
         self.cache[&k].as_ref()
+    }
+
+    /// `own`'s answer: its PNG, else `name` from the normal chain.
+    pub fn tray_own(&mut self, own: Own) {
+        self.tray_pending.remove(&own.key);
+        let px = own.px.or_else(|| self.chain(&own.name, own.key.1));
+        self.tray_put(own.key, px);
+    }
+
+    fn chain(&self, name: &str, size: u32) -> Option<Pixmap> {
+        let path = self.themes.lookup(name, size)?;
+        render_file(&path, size).ok()
+    }
+
+    /// Caches a tray icon. Item names come and go: old entries are dropped before they pile up.
+    fn tray_put(&mut self, k: (String, u32), px: Option<Pixmap>) {
+        self.tray_keys.push(k.clone());
+        if self.tray_keys.len() > MAX_TRAY {
+            for old in self.tray_keys.drain(..MAX_TRAY / 2) {
+                self.cache.remove(&old);
+            }
+        }
+        self.cache.insert(k, px);
     }
 
     /// The menu button's icon: `navi` from the theme, else the embedded one.
@@ -689,12 +765,16 @@ mod tests {
     fn ac6_tray_icons_search_the_item_path_first() {
         let tmp = Tmp::new("tray-icons");
         let (own, sys) = (tmp.0.join("own"), tmp.0.join("sys"));
-        fs::create_dir_all(&own).unwrap();
-        // The item's own dir: a plain file, and hicolor-style dirs inside it.
-        fs::write(own.join("plain.svg"), SVG_RED).unwrap();
+        let red = png(1, 1, &[255, 0, 0, 255]);
         fs::create_dir_all(own.join("hicolor/40x40/status")).unwrap();
-        fs::write(own.join("hicolor/40x40/status/themed.svg"), SVG_RED).unwrap();
-        // A hostile index there is never parsed: a miss stays cheap.
+        fs::create_dir_all(own.join("hicolor/22x22/apps")).unwrap();
+        // The item's own dir: PNGs in the dir, at its size and at a common size.
+        fs::write(own.join("plain.png"), &red).unwrap();
+        fs::write(own.join("hicolor/40x40/status/themed.png"), &red).unwrap();
+        fs::write(own.join("hicolor/22x22/apps/small.png"), &red).unwrap();
+        // An SVG there is never rendered: its render time has no bound.
+        fs::write(own.join("vector.svg"), SVG_RED).unwrap();
+        // Nor is an index there parsed.
         let dirs: Vec<String> = (0..11_000).map(|i| format!("d{i}")).collect();
         let mut hostile = format!("[Icon Theme]\nDirectories={}\n", dirs.join(","));
         hostile.truncate(MAX_INDEX as usize);
@@ -706,39 +786,63 @@ mod tests {
             &["48/chained.svg"],
         );
         theme(&sys, "hicolor", &index("", DIRS), &[]);
+        assert_eq!(own_png(&own, "vector", 40), None);
+        assert_eq!(own_png(&own, "plain", 40), Some(own.join("plain.png")));
+        let (tx, rx) = mpsc::channel();
+        let loader = OwnLoader::spawn(move |o| tx.send(o).unwrap()).unwrap();
         let mut icons = Icons::new(Themes::new(vec![sys.clone()], None, PREFERRED));
-        for name in ["plain", "themed", "chained"] {
-            let px = icons
-                .tray(name, Some(&own), 40)
-                .map(|p| (p.width(), center(p)));
-            assert_eq!(px, Some((40, [255, 0, 0, 255])), "{name} at 20 × 2");
+        // The first ask only queues the lookup; the answer comes from the loader's thread.
+        let get = |icons: &mut Icons, name: &str| {
+            assert!(icons.tray(name, Some(&own), 40, Some(&loader)).is_none());
+            assert!(
+                icons.tray(name, Some(&own), 40, Some(&loader)).is_none(),
+                "asked once"
+            );
+            let answer = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            icons.tray_own(answer);
+            icons
+                .tray(name, Some(&own), 40, Some(&loader))
+                .map(|p| (p.width(), center(p)))
+        };
+        for name in ["plain", "themed", "small", "chained"] {
+            assert_eq!(
+                get(&mut icons, name),
+                Some((40, [255, 0, 0, 255])),
+                "{name}"
+            );
         }
+        assert_eq!(get(&mut icons, "vector"), None, "the item's SVG is ignored");
+        assert!(rx.try_recv().is_err());
         assert!(
-            icons.tray("plain", None, 20).is_none(),
+            icons.tray("plain", None, 20, Some(&loader)).is_none(),
             "only the item's path has it"
         );
-        let t = std::time::Instant::now();
-        for i in 0..50 {
-            assert!(icons.tray(&format!("miss{i}"), Some(&own), 40).is_none());
-        }
         assert!(
-            t.elapsed() < std::time::Duration::from_millis(500),
-            "{:?}",
-            t.elapsed()
-        );
-        assert!(
-            icons.tray("plain", Some(Path::new("own")), 20).is_none(),
+            icons
+                .tray("plain", Some(Path::new("own")), 20, Some(&loader))
+                .is_none(),
             "relative"
         );
         // A name that could form a path is refused, even where the file exists.
-        fs::write(tmp.0.join("escape.svg"), SVG_RED).unwrap();
+        fs::write(tmp.0.join("escape.png"), &red).unwrap();
         for bad in ["../escape", "/etc/passwd", ".plain", "a\\b", "x\0"] {
-            assert!(icons.tray(bad, Some(&own), 20).is_none(), "{bad:?}");
+            assert!(
+                icons.tray(bad, Some(&own), 20, Some(&loader)).is_none(),
+                "{bad:?}"
+            );
         }
-        assert!(icons.tray(&"a".repeat(129), Some(&own), 20).is_none());
+        assert!(
+            icons
+                .tray(&"a".repeat(129), Some(&own), 20, Some(&loader))
+                .is_none()
+        );
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(300))
+                .is_err()
+        );
         // Names that come and go don't pile up in the cache.
         for i in 0..1000 {
-            icons.tray(&format!("n{i}"), Some(&own), 20);
+            icons.tray(&format!("n{i}"), Some(&own), 20, None);
         }
         assert!(icons.tray_keys.len() <= MAX_TRAY);
         assert!(icons.cache.len() <= MAX_TRAY + 8);
