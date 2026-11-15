@@ -570,7 +570,8 @@ bundling a degoogled, resource-tested Chromium variant is reserved for a future 
   clock; items that don't fit are hidden and their count logged. `Passive` items take no
   target, `NeedsAttention` adds the dock's accent dot, and hovering a target fills it. An item's
   `IconPixmap` (the smallest entry at least 20 × scale) wins over its `IconName`, which is looked
-  up in its absolute `IconThemePath`, then the icon chain; `*-symbolic` icons draw in INK.
+  for in its absolute `IconThemePath` (the dir itself and `hicolor/<size>x<size>/{apps,status}`,
+  `hicolor/scalable/apps`; no index there is read), then the icon chain; `*-symbolic` icons draw in INK.
   Left click is `Activate`, middle `SecondaryActivate`, each preceded by
   `ProvideXdgActivationToken` when the press earned a token; the wheel sends `Scroll` (±120 a
   notch, one per 15 px of touchpad). Right click, or a left click on an `ItemIsMenu` item, opens
@@ -825,9 +826,11 @@ session.
   read; menus 64 children a level, 4 levels, 256 nodes. Re-reads are coalesced to one `GetAll`
   per item per 250 ms. One worker thread makes every call into items, behind a 32-call queue
   that drops (and logs once a second) when full, with 1 s timeouts for menus and clicks and 5 s
-  for `GetAll`; the UI thread never waits on the bus. Icon names never form paths, and files
+  for `GetAll`; the UI thread never waits on the bus. A signal flood holds at most one queue
+  slot, and an item whose `GetAll` fails or times out is dropped, so a hung item delays other
+  items' calls by one read (5 s at most) and never again. Icon names never form paths, and files
   are read only through the capped icon loader. Item strings are never logged, only unique
-  names, object paths and counts. Clicks during a lock never reach an item. Its environment export is on real hardware only: at start it sets `WAYLAND_DISPLAY`, `DISPLAY`,
+  names, object paths, counts and D-Bus error names (never an error's text). Clicks during a lock never reach an item. Its environment export is on real hardware only: at start it sets `WAYLAND_DISPLAY`, `DISPLAY`,
   `XDG_CURRENT_DESKTOP` and `XDG_SESSION_TYPE` (nothing else) through the bus's
   `UpdateActivationEnvironment` and systemd's `SetEnvironment`, so portals and D-Bus-started
   apps reach navi. Nested it never does, so the host's user services keep pointing at the host. Every field a notification carries is untrusted and is never logged;

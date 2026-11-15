@@ -4,7 +4,8 @@
 It registers with navi-bar's watcher by bus name or object path and logs every call it
 receives to a JSON-lines file (`GetAll` shows as one read of `Id`). Hostile modes send bad
 pixmaps, floods, deep or wide menus and spoofed names. Commands on stdin, one a line:
-`exit`, `flood N` (N NewIcon in 1 s), `layout N` (N LayoutUpdated), `status S`.
+`exit`, `flood N` (N NewIcon in 1 s), `layout N` (N LayoutUpdated), `status S`, `hang` (every
+later `GetAll` answers only after 6 s).
 """
 import argparse
 import json
@@ -114,6 +115,7 @@ class Item:
     def __init__(self, args, bus, path):
         self.args, self.bus, self.path = args, bus, path
         self.status = args.status
+        self.hang = False
         self.log_lock = threading.Lock()
         nodes = Gio.DBusNodeInfo.new_for_xml(
             ITEM_XML % ('' if args.no_menu else '<property name="Menu" type="o" access="read"/>'))
@@ -132,6 +134,8 @@ class Item:
     def prop(self, bus, sender, path, interface, name):
         if name == 'Id':
             self.log(call='GetAll')
+            if self.hang:
+                time.sleep(6)
         a = self.args
         return {
             'Category': GLib.Variant('s', 'ApplicationStatus'),
@@ -148,6 +152,8 @@ class Item:
 
     def call(self, bus, sender, path, interface, method, params, invocation):
         self.log(call=method, args=params.unpack())
+        if self.args.fail_calls and interface == 'org.kde.StatusNotifierItem':
+            return invocation.return_dbus_error('org.navi.Test.Failed', self.args.title)
         if method == 'ProvideXdgActivationToken' and self.args.no_token_method:
             return invocation.return_dbus_error(
                 'org.freedesktop.DBus.Error.UnknownMethod', 'no tokens here')
@@ -221,18 +227,20 @@ def commands(item, loop):
             n = int(words[1])
             item.log(flood=n)
             for i in range(n):
-                GLib.idle_add(item.emit, 'NewIcon')
+                item.emit('NewIcon')  # From this thread: works while the main loop hangs.
                 if i % 100 == 0:
                     time.sleep(0.006)
-            GLib.idle_add(lambda: item.log(flooded=n))
+            item.log(flooded=n)
         elif words[0] == 'layout':
             for _ in range(int(words[1])):
                 GLib.idle_add(item.emit, 'LayoutUpdated', GLib.Variant('(ui)', (2, 0)),
                               MENU_PATH, 'com.canonical.dbusmenu')
+        elif words[0] == 'hang':
+            item.hang = True
         elif words[0] == 'status':
             item.status = words[1]
             GLib.idle_add(item.emit, 'NewStatus', GLib.Variant('(s)', (words[1],)))
-        GLib.idle_add(lambda w=words: item.log(done=w[0]))
+        item.log(done=words[0])
     GLib.idle_add(loop.quit)
 
 
@@ -250,6 +258,8 @@ def main():
     p.add_argument('--no-menu', action='store_true')
     p.add_argument('--item-is-menu', action='store_true')
     p.add_argument('--no-token-method', action='store_true')
+    p.add_argument('--fail-calls', action='store_true',
+                   help='item methods fail with the title as the error text')
     p.add_argument('--no-object', action='store_true', help='register a path with nothing there')
     p.add_argument('--spoof', help='register this bus name, owned by someone else')
     p.add_argument('--fill', action='store_true', help='9 connections: 5 items, then 4 each')

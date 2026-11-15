@@ -380,8 +380,9 @@ impl Icons {
         )
     }
 
-    /// A tray item's icon `name` at `size` px: in its `IconThemePath` as a file or a theme base,
-    /// then the normal chain. Names that could form a path are refused before any file access.
+    /// A tray item's icon `name` at `size` px: in its `IconThemePath`, then the normal chain.
+    /// That dir is the item's, so only fixed spots in it are tried and no index there is read.
+    /// Names that could form a path are refused before any file access.
     pub fn tray(&mut self, name: &str, theme_path: Option<&Path>, size: u32) -> Option<&Pixmap> {
         if !crate::tray::icon_name_ok(name) {
             return None;
@@ -403,13 +404,17 @@ impl Icons {
                 }
             }
             let own = dir.and_then(|d| {
-                let file = ["png", "svg"]
-                    .iter()
-                    .map(|ext| d.join(format!("{name}.{ext}")))
-                    .find(|p| p.is_file());
-                file.or_else(|| {
-                    Themes::new(vec![d.to_path_buf()], None, FALLBACK).lookup(name, size)
-                })
+                let sized = format!("hicolor/{size}x{size}");
+                let subs = [
+                    String::new(),
+                    format!("{sized}/apps"),
+                    format!("{sized}/status"),
+                    "hicolor/scalable/apps".into(),
+                ];
+                let files = subs.into_iter().flat_map(|sub| {
+                    ["png", "svg"].map(|ext| d.join(&sub).join(format!("{name}.{ext}")))
+                });
+                files.into_iter().find(|p| p.is_file())
             });
             let px = own
                 .or_else(|| self.themes.lookup(name, size))
@@ -685,9 +690,15 @@ mod tests {
         let tmp = Tmp::new("tray-icons");
         let (own, sys) = (tmp.0.join("own"), tmp.0.join("sys"));
         fs::create_dir_all(&own).unwrap();
-        // The item's own dir: a plain file, and a hicolor theme inside it.
+        // The item's own dir: a plain file, and hicolor-style dirs inside it.
         fs::write(own.join("plain.svg"), SVG_RED).unwrap();
-        theme(&own, "hicolor", &index("", DIRS), &["48/themed.svg"]);
+        fs::create_dir_all(own.join("hicolor/40x40/status")).unwrap();
+        fs::write(own.join("hicolor/40x40/status/themed.svg"), SVG_RED).unwrap();
+        // A hostile index there is never parsed: a miss stays cheap.
+        let dirs: Vec<String> = (0..11_000).map(|i| format!("d{i}")).collect();
+        let mut hostile = format!("[Icon Theme]\nDirectories={}\n", dirs.join(","));
+        hostile.truncate(MAX_INDEX as usize);
+        fs::write(own.join("hicolor/index.theme"), hostile).unwrap();
         theme(
             &sys,
             "candy-icons",
@@ -705,6 +716,15 @@ mod tests {
         assert!(
             icons.tray("plain", None, 20).is_none(),
             "only the item's path has it"
+        );
+        let t = std::time::Instant::now();
+        for i in 0..50 {
+            assert!(icons.tray(&format!("miss{i}"), Some(&own), 40).is_none());
+        }
+        assert!(
+            t.elapsed() < std::time::Duration::from_millis(500),
+            "{:?}",
+            t.elapsed()
         );
         assert!(
             icons.tray("plain", Some(Path::new("own")), 20).is_none(),

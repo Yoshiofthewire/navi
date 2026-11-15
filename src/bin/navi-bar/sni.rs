@@ -3,8 +3,8 @@
 //! thread makes every call into items, each bounded by a method timeout, behind a bounded
 //! queue: the UI thread never waits on the bus.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
@@ -84,6 +84,8 @@ struct Shared {
     /// The icon size wanted, in px: 20 × the band's scale.
     want: AtomicU32,
     jobs: mpsc::SyncSender<Job>,
+    /// A `Wake` is queued: signal floods add no more, so clicks always find room.
+    woken: AtomicBool,
     ui: Sender<Update>,
 }
 
@@ -93,7 +95,9 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 impl Shared {
     fn wake(&self) {
-        let _ = self.jobs.try_send(Job::Wake);
+        if !self.woken.swap(true, Relaxed) && self.jobs.try_send(Job::Wake).is_err() {
+            self.woken.store(false, Relaxed);
+        }
     }
 
     /// Removes `gone` items: the watcher's signal, and the UI's.
@@ -275,6 +279,7 @@ pub fn serve(ui: Sender<Update>) -> Option<Tray> {
         open: Mutex::default(),
         want: AtomicU32::new(tray::ICON as u32),
         jobs,
+        woken: AtomicBool::new(false),
         ui,
     });
     if let Err(e) = read
@@ -393,7 +398,6 @@ fn signals(conn: Connection, shared: Arc<Shared>, interface: &'static str) -> im
 
 /// Runs queued calls first, then one due read, then waits for either.
 fn worker(read: &Connection, calls: &Connection, shared: &Shared, rx: mpsc::Receiver<Job>) {
-    let mut loaded: HashSet<Key> = HashSet::new();
     loop {
         while let Ok(job) = rx.try_recv() {
             run(calls, shared, job);
@@ -401,7 +405,7 @@ fn worker(read: &Connection, calls: &Connection, shared: &Shared, rx: mpsc::Rece
         let due = lock(&shared.reads).take(Instant::now());
         let job = match due {
             Ok(Read::Props(key)) => {
-                get_all(read, shared, &mut loaded, key);
+                get_all(read, shared, key);
                 continue;
             }
             Ok(Read::Menu(key)) => {
@@ -419,10 +423,10 @@ fn worker(read: &Connection, calls: &Connection, shared: &Shared, rx: mpsc::Rece
     }
 }
 
-/// Reads `key`'s properties. An item whose first read fails is removed.
-fn get_all(conn: &Connection, shared: &Shared, loaded: &mut HashSet<Key>, key: Key) {
+/// Reads `key`'s properties. An item whose read fails or times out is removed: a hung item
+/// holds the worker for one read, never again.
+fn get_all(conn: &Connection, shared: &Shared, key: Key) {
     if !lock(&shared.registry).contains(&key) {
-        loaded.remove(&key);
         return;
     }
     let reply = conn
@@ -437,16 +441,15 @@ fn get_all(conn: &Connection, shared: &Shared, loaded: &mut HashSet<Key>, key: K
     let map = match reply {
         Ok(map) => map,
         Err(e) => {
+            let e = brief(&e);
             warn!(
                 sender = key.sender,
                 path = key.path,
-                "tray: GetAll failed: {e}"
+                e,
+                "tray: GetAll failed"
             );
-            if !loaded.contains(&key) {
-                let gone = lock(&shared.registry).remove(&key);
-                shared.removed(conn, gone.into_iter().collect());
-            }
-            return;
+            let gone = lock(&shared.registry).remove(&key);
+            return shared.removed(conn, gone.into_iter().collect());
         }
     };
     let props = Props::new(raw(&map, shared.want.load(Relaxed)));
@@ -458,7 +461,6 @@ fn get_all(conn: &Connection, shared: &Shared, loaded: &mut HashSet<Key>, key: K
     drop(menus);
     // Gone while it was read: its removal already reached the UI.
     if lock(&shared.registry).contains(&key) {
-        loaded.insert(key.clone());
         let _ = shared.ui.send(Update::Props(key, props));
     }
 }
@@ -572,10 +574,12 @@ macro_rules! call {
             $body,
         );
         if let Err(e) = &r {
+            let e = brief(e);
             debug!(
                 sender = $key.sender,
                 method = $method,
-                "tray: call failed: {e}"
+                e,
+                "tray: call failed"
             );
         }
         r
@@ -604,7 +608,21 @@ fn layout(conn: &Connection, shared: &Shared, key: Key, about: bool) {
         Ok(node) => {
             let _ = shared.ui.send(Update::Menu(key, node));
         }
-        Err(e) => warn!(sender = key.sender, path, "tray: GetLayout failed: {e}"),
+        Err(e) => warn!(
+            sender = key.sender,
+            path,
+            e = brief(&e),
+            "tray: GetLayout failed"
+        ),
+    }
+}
+
+/// An error without the text an item wrote: a D-Bus error by its name alone.
+fn brief(e: &zbus::Error) -> String {
+    match e {
+        zbus::Error::MethodError(name, ..) => name.to_string(),
+        zbus::Error::FDO(e) => zbus::DBusError::name(&**e).to_string(),
+        e => e.to_string(),
     }
 }
 
@@ -651,7 +669,7 @@ fn run(conn: &Connection, shared: &Shared, job: Job) {
             let ok = call!(conn, key, path.as_str(), MENU, "Event", &body).is_ok();
             info!(sender = key.sender, id, ok, "tray: menu event");
         }
-        Job::Wake => {}
+        Job::Wake => shared.woken.store(false, Relaxed),
     }
 }
 
@@ -1177,6 +1195,59 @@ pub mod tests {
         assert!(reads <= 6, "{reads} GetAll");
         assert!(click_ms < 1000);
 
+        // A hung item flooding signals holds the worker for one read, then is dropped; other
+        // items' clicks wait for that read and none is lost.
+        let h = Py::new(&dir, "hung", &["--register", "path", "--no-menu"]);
+        let kh = h.key("/org/navi/TestItem");
+        assert!(ui.until(10, |all| has_props(all, &kh)));
+        let mut h = h;
+        h.cmd("hang");
+        h.cmd("flood 2000");
+        h.wait(5, 2, |c| c["call"] == "GetAll");
+        let before = b.calls().iter().filter(|c| c["call"] == "Activate").count();
+        // Fewer than the queue holds: the flood takes at most one slot.
+        for _ in 0..20 {
+            tray.send(activate(&kb, None, false));
+        }
+        let clicks = b.wait(10, before + 20, |c| c["call"] == "Activate").len() - before;
+        assert_eq!(clicks, 20, "every click during the hang arrives");
+        assert!(ui.until(10, |all| {
+            all.iter()
+                .any(|u| matches!(u, Update::Removed(k) if *k == kh))
+        }));
+        assert_eq!(
+            h.calls().iter().filter(|c| c["call"] == "GetAll").count(),
+            2
+        );
+        println!("hung item: dropped after one timed-out read, {clicks} clicks kept");
+        h.exit();
+
+        // AC8: an item's error text never reaches navi-bar's log, only the error's name.
+        let f = Py::new(
+            &dir,
+            "fail",
+            &[
+                "--register",
+                "path",
+                "--no-menu",
+                "--fail-calls",
+                "--title",
+                "Secret Error",
+            ],
+        );
+        let kf = f.key("/org/navi/TestItem");
+        let r = Connection::session().unwrap().call_method(
+            Some(kf.sender.as_str()),
+            "/org/navi/TestItem",
+            Some(ITEM),
+            "Activate",
+            &(1i32, 2i32),
+        );
+        let e = r.unwrap_err();
+        assert!(e.to_string().contains("Secret Error"), "{e}");
+        assert_eq!(brief(&e), "org.navi.Test.Failed");
+        f.exit();
+
         // AC5: the owner leaves.
         let gone = want[0].clone();
         a.exit();
@@ -1190,6 +1261,12 @@ pub mod tests {
         assert!(unregistered.contains(&gone), "{unregistered:?}");
         println!("AC5 ok: {gone} unregistered");
         b.exit();
+    }
+
+    #[test]
+    fn ac8_errors_are_logged_by_name_only() {
+        let e = zbus::Error::FDO(Box::new(fdo::Error::Failed("Secret Title".into())));
+        assert_eq!(brief(&e), "org.freedesktop.DBus.Error.Failed");
     }
 
     fn has_props(all: &[Update], key: &Key) -> bool {
